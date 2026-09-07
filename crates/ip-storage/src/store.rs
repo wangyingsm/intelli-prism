@@ -91,8 +91,7 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use ip_core::{ApiId, Capability, CapabilityScope, PassphraseHash, TnKey};
-    use time::OffsetDateTime;
+    use ip_core::{ApiId, Capability, CapabilityScope, PassphraseHash, Timestamp, TnKey};
 
     use super::*;
     use crate::error::Entity;
@@ -127,7 +126,7 @@ mod tests {
                 row_id: TenantRowId::new(self.next_row_id()),
                 id: new.id.clone(),
                 key: new.key,
-                created_at: OffsetDateTime::now_utc(),
+                created_at: Timestamp::now(),
             };
             tenants.insert(new.id, tenant.clone());
             Ok(tenant)
@@ -165,7 +164,7 @@ mod tests {
                 id: new.id.clone(),
                 passphrase: new.passphrase,
                 kind: new.kind,
-                created_at: OffsetDateTime::now_utc(),
+                created_at: Timestamp::now(),
             };
             users.insert(new.id, user.clone());
             Ok(user)

@@ -1,5 +1,4 @@
-use ip_core::{PassphraseHash, TenantId, TnKey, UserId};
-use time::OffsetDateTime;
+use ip_core::{PassphraseHash, TenantId, Timestamp, TnKey, UserId};
 
 /// Surrogate primary key of a stored tenant row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -43,7 +42,7 @@ pub struct Tenant {
     /// Root secret every `UtKey` under this tenant is derived from.
     pub key: TnKey,
     /// When the tenant was created.
-    pub created_at: OffsetDateTime,
+    pub created_at: Timestamp,
 }
 
 /// A tenant about to be created.
@@ -67,7 +66,7 @@ pub struct User {
     /// Whether the account is the system administrator.
     pub kind: AccountKind,
     /// When the user was created.
-    pub created_at: OffsetDateTime,
+    pub created_at: Timestamp,
 }
 
 /// A user about to be created.
