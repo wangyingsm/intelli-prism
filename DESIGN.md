@@ -169,6 +169,11 @@ by admin only, they are applied to every flow by default but with low priority.
 - Host is a network hostname or IP addr(v4 and v6).
 - Port is a u16 integer.
 - Abs path is a network slash separated string, which is the method name in gRPC.
+- Rules come from two sources and both are live at once:
+	- Static: the LLM upstreams declared in the configuration file, loaded at startup and on reload.
+	- Dynamic: extra API gateway routes held in the database, added or changed at runtime with no restart.
+- The router resolves against the union of the two sources, so a lookup never needs to know which one a rule came from.
+- Config wins: when a static and a dynamic rule share the same key, the configured one is served and the database one is ignored, so a runtime write can never subvert a deployed route.
 
 ### Cache
 
