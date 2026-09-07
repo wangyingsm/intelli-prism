@@ -278,6 +278,32 @@ secret = "0123456789abcdef0123456789abcdef"
     }
 
     #[test]
+    fn an_upstream_may_override_the_route_it_answers_on() {
+        let text = format!(
+            r#"{FULL}
+[upstream.route]
+protocol = "https"
+host = "ai.corp.example"
+port = 443
+path = "/chat"
+"#
+        );
+        let config = Config::parse(&text).unwrap();
+        let key = config.upstreams[0]
+            .route_key("127.0.0.1:8080".parse().unwrap())
+            .unwrap();
+        assert_eq!(key.to_string(), "https://ai.corp.example:443/chat");
+    }
+
+    #[test]
+    fn an_upstream_without_an_override_derives_its_route() {
+        let config = Config::parse(FULL).unwrap();
+        assert!(config.upstreams[0].route.is_none());
+        let key = config.upstreams[0].route_key(config.server.listen).unwrap();
+        assert_eq!(key.to_string(), "http://127.0.0.1:8080/anthropic");
+    }
+
+    #[test]
     fn rejects_an_unknown_key() {
         let text = FULL.replace("issuer =", "issuerr =");
         assert!(matches!(Config::parse(&text), Err(ConfigError::Parse(_))));

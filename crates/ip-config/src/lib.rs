@@ -10,4 +10,4 @@ pub use config::{
 };
 pub use error::ConfigError;
 pub use secret::Secret;
-pub use upstream::{ModelName, Temperature, UpstreamConfig};
+pub use upstream::{ModelName, RouteOverride, Temperature, UpstreamConfig};

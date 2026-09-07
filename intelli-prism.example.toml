@@ -37,3 +37,13 @@ base_url = "https://api.anthropic.com/"
 api_key = "sk-replace-me"
 model = "claude-opus-5"
 temperature = 0.7
+
+# Without a route block the key is derived from [server].listen with the id as the
+# path root, so the block above answers on http://127.0.0.1:8080/anthropic. Name any
+# part here to override it, which a gateway behind a proxy or serving several
+# hostnames needs.
+# [upstream.route]
+# protocol = "https"
+# host = "ai.corp.example"
+# port = 443
+# path = "/chat"

@@ -30,6 +30,20 @@ pub enum ConfigError {
     #[error("the jwt secret is {len} bytes, under the {min} byte minimum")]
     WeakJwtSecret { len: usize, min: usize },
 
+    /// The upstream's base url names no host to send to.
+    #[error("upstream {id} has no host in its base url")]
+    UpstreamHost {
+        /// The upstream that cannot be reached.
+        id: ApiId,
+    },
+
+    /// The upstream's base url names no port, and its scheme implies none.
+    #[error("upstream {id} has no port in its base url")]
+    UpstreamPort {
+        /// The upstream that cannot be reached.
+        id: ApiId,
+    },
+
     /// A temperature outside the range every upstream accepts.
     #[error("temperature {value} is outside {min} to {max}")]
     Temperature { value: f64, min: f32, max: f32 },
