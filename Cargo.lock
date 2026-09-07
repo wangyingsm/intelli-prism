@@ -665,7 +665,9 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "ip-core",
+ "ip-storage",
  "thiserror",
+ "tokio",
  "zeroize",
 ]
 

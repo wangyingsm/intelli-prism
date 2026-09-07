@@ -1,4 +1,5 @@
-use ip_core::CoreError;
+use ip_core::{CoreError, TenantId, UserId};
+use ip_storage::StorageError;
 
 /// Every way authentication can fail before an identity is established.
 #[derive(Debug, thiserror::Error)]
@@ -32,4 +33,42 @@ pub enum AuthError {
     /// A value failed its own validation.
     #[error(transparent)]
     Value(#[from] CoreError),
+
+    /// No tenant is registered under the id the request named.
+    #[error("no such tenant: {tenant}")]
+    UnknownTenant {
+        /// The tenant the request named.
+        tenant: TenantId,
+    },
+
+    /// No user is registered under the id the request named.
+    #[error("no such user: {user}")]
+    UnknownUser {
+        /// The user the request named.
+        user: UserId,
+    },
+
+    /// The user exists but is not attached to the tenant it signed for.
+    #[error("{user} is not a member of {tenant}")]
+    NotAMember {
+        /// The user the request named.
+        user: UserId,
+        /// The tenant the request named.
+        tenant: TenantId,
+    },
+
+    /// The signature is not the one the stored keys produce.
+    #[error("signature does not match")]
+    BadSignature,
+
+    /// The system administrator may only reach the api from the machine it runs on.
+    #[error("the system administrator may not call the api from {origin}")]
+    AdminOffLocalhost {
+        /// Where the call came from.
+        origin: std::net::IpAddr,
+    },
+
+    /// Storage could not answer.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }
