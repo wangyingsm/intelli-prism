@@ -29,6 +29,26 @@ pub enum CoreError {
     #[error("{kind} is not valid hex")]
     HexDigit { kind: &'static str },
 
+    /// A value that must open with a particular character does not.
+    #[error("{kind} must start with {expected:?}")]
+    MustStartWith {
+        /// What was being read.
+        kind: &'static str,
+        /// The character it must open with.
+        expected: char,
+    },
+
+    /// A protocol this application does not speak.
+    #[error("unknown protocol {value:?}")]
+    UnknownProtocol {
+        /// The text that named no protocol.
+        value: String,
+    },
+
+    /// Port zero names no service.
+    #[error("port zero is not a port")]
+    ZeroPort,
+
     /// A count of seconds that lands outside any representable moment.
     #[error("{seconds} is not a moment in time")]
     Timestamp {

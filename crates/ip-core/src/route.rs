@@ -1,0 +1,541 @@
+use std::fmt;
+use std::net::IpAddr;
+use std::str::FromStr;
+
+use crate::error::CoreError;
+
+const HOST_MAX_BYTES: usize = 253;
+const HOST_LABEL_MAX_BYTES: usize = 63;
+const PATH_MAX_BYTES: usize = 2048;
+
+/// The wire protocol one end of a route speaks.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    /// Plain http.
+    Http,
+    /// Http over tls.
+    Https,
+    /// Plain websocket.
+    Ws,
+    /// Websocket over tls.
+    Wss,
+    /// Raw tcp, which carries grpc.
+    Tcp,
+}
+
+impl Protocol {
+    /// The scheme as a routing rule spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http://",
+            Self::Https => "https://",
+            Self::Ws => "ws://",
+            Self::Wss => "wss://",
+            Self::Tcp => "tcp",
+        }
+    }
+
+    /// The port used when a rule names none.
+    pub fn default_port(self) -> Option<Port> {
+        match self {
+            Self::Http | Self::Ws => Some(Port(80)),
+            Self::Https | Self::Wss => Some(Port(443)),
+            Self::Tcp => None,
+        }
+    }
+
+    /// Whether this build carries requests of this protocol.
+    pub fn is_forwarded(self) -> bool {
+        matches!(self, Self::Http | Self::Https)
+    }
+
+    /// Whether the protocol runs over tls.
+    pub fn is_secure(self) -> bool {
+        matches!(self, Self::Https | Self::Wss)
+    }
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Protocol {
+    type Err = CoreError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "http://" | "http" => Ok(Self::Http),
+            "https://" | "https" => Ok(Self::Https),
+            "ws://" | "ws" => Ok(Self::Ws),
+            "wss://" | "wss" => Ok(Self::Wss),
+            "tcp" | "tcp://" => Ok(Self::Tcp),
+            other => Err(CoreError::UnknownProtocol {
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
+/// A hostname or ip address, held lowercase so routing matches whatever case was sent.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String")]
+pub struct Host(Box<str>);
+
+impl Host {
+    /// Name of this kind, as it appears in errors.
+    pub const KIND: &'static str = "host";
+
+    /// Validates a hostname or ip address and folds it to lowercase.
+    pub fn new(raw: &str) -> Result<Self, CoreError> {
+        let folded = raw.to_ascii_lowercase();
+        validate_host(&folded)?;
+        Ok(Self(folded.into_boxed_str()))
+    }
+
+    /// The host as text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The host as an ip address, when it is one rather than a name.
+    pub fn as_ip(&self) -> Option<IpAddr> {
+        self.0.parse().ok()
+    }
+}
+
+fn validate_host(raw: &str) -> Result<(), CoreError> {
+    let kind = Host::KIND;
+    if raw.is_empty() {
+        return Err(CoreError::Empty { kind });
+    }
+    if raw.len() > HOST_MAX_BYTES {
+        return Err(CoreError::TooLong {
+            kind,
+            len: raw.len(),
+            max: HOST_MAX_BYTES,
+        });
+    }
+    if raw.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    for label in raw.split('.') {
+        if label.is_empty() {
+            return Err(CoreError::Empty { kind: "host label" });
+        }
+        if label.len() > HOST_LABEL_MAX_BYTES {
+            return Err(CoreError::TooLong {
+                kind: "host label",
+                len: label.len(),
+                max: HOST_LABEL_MAX_BYTES,
+            });
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(CoreError::IllegalChar {
+                kind: "host label",
+                ch: '-',
+            });
+        }
+        if let Some(ch) = label
+            .chars()
+            .find(|ch| !(ch.is_ascii_alphanumeric() || *ch == '-'))
+        {
+            return Err(CoreError::IllegalChar {
+                kind: "host label",
+                ch,
+            });
+        }
+    }
+    Ok(())
+}
+
+impl fmt::Display for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for Host {
+    type Error = CoreError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::new(&raw)
+    }
+}
+
+/// A tcp port, which is never zero.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "u16")]
+pub struct Port(u16);
+
+impl Port {
+    /// Wraps a port after refusing zero.
+    pub fn new(value: u16) -> Result<Self, CoreError> {
+        if value == 0 {
+            return Err(CoreError::ZeroPort);
+        }
+        Ok(Self(value))
+    }
+
+    /// The port as a number.
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Display for Port {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl TryFrom<u16> for Port {
+    type Error = CoreError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+/// An absolute path, which is the method name when the protocol is grpc.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String")]
+pub struct AbsPath(Box<str>);
+
+impl AbsPath {
+    /// Name of this kind, as it appears in errors.
+    pub const KIND: &'static str = "path";
+
+    /// Validates a path that must be absolute and carry no query or fragment.
+    pub fn new(raw: &str) -> Result<Self, CoreError> {
+        validate_path(raw)?;
+        Ok(Self(Box::from(raw)))
+    }
+
+    /// The path as text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn validate_path(raw: &str) -> Result<(), CoreError> {
+    let kind = AbsPath::KIND;
+    if raw.is_empty() {
+        return Err(CoreError::Empty { kind });
+    }
+    if !raw.starts_with('/') {
+        return Err(CoreError::MustStartWith {
+            kind,
+            expected: '/',
+        });
+    }
+    if raw.len() > PATH_MAX_BYTES {
+        return Err(CoreError::TooLong {
+            kind,
+            len: raw.len(),
+            max: PATH_MAX_BYTES,
+        });
+    }
+    match raw
+        .chars()
+        .find(|ch| !ch.is_ascii_graphic() || matches!(ch, '?' | '#'))
+    {
+        Some(ch) => Err(CoreError::IllegalChar { kind, ch }),
+        None => Ok(()),
+    }
+}
+
+impl fmt::Display for AbsPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for AbsPath {
+    type Error = CoreError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        validate_path(&raw)?;
+        Ok(Self(raw.into_boxed_str()))
+    }
+}
+
+/// One end of a route: what to speak, where, and at what path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Endpoint {
+    /// What the endpoint speaks.
+    pub protocol: Protocol,
+    /// Where it lives.
+    pub host: Host,
+    /// Which port it answers on.
+    pub port: Port,
+    /// The absolute path, or the grpc method name.
+    pub path: AbsPath,
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{}:{}{}",
+            self.protocol, self.host, self.port, self.path
+        )
+    }
+}
+
+/// The endpoint a request arrives at, which a rule is looked up by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct RouteKey(Endpoint);
+
+impl RouteKey {
+    /// Wraps the endpoint a request arrived at.
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self(endpoint)
+    }
+
+    /// The endpoint itself.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.0
+    }
+}
+
+impl fmt::Display for RouteKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// The endpoint a matched request is sent on to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct RouteTarget(Endpoint);
+
+impl RouteTarget {
+    /// Wraps the endpoint a request is forwarded to.
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self(endpoint)
+    }
+
+    /// The endpoint itself.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.0
+    }
+}
+
+impl fmt::Display for RouteTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A routing rule: what arrives, and where it goes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RouteRule {
+    /// What the rule matches.
+    pub key: RouteKey,
+    /// Where a match is sent.
+    pub target: RouteTarget,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(protocol: Protocol, host: &str, port: u16, path: &str) -> Endpoint {
+        Endpoint {
+            protocol,
+            host: Host::new(host).unwrap(),
+            port: Port::new(port).unwrap(),
+            path: AbsPath::new(path).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_protocol_reads_back_from_how_a_rule_spells_it() {
+        for protocol in [
+            Protocol::Http,
+            Protocol::Https,
+            Protocol::Ws,
+            Protocol::Wss,
+            Protocol::Tcp,
+        ] {
+            assert_eq!(protocol.as_str().parse::<Protocol>().unwrap(), protocol);
+        }
+    }
+
+    #[test]
+    fn a_protocol_also_reads_without_the_separator() {
+        assert_eq!("https".parse::<Protocol>().unwrap(), Protocol::Https);
+    }
+
+    #[test]
+    fn an_unknown_protocol_is_refused() {
+        assert!(matches!(
+            "gopher://".parse::<Protocol>(),
+            Err(CoreError::UnknownProtocol { .. })
+        ));
+    }
+
+    #[test]
+    fn only_http_is_forwarded_by_this_build() {
+        assert!(Protocol::Http.is_forwarded());
+        assert!(Protocol::Https.is_forwarded());
+        assert!(!Protocol::Ws.is_forwarded());
+        assert!(!Protocol::Wss.is_forwarded());
+        assert!(!Protocol::Tcp.is_forwarded());
+    }
+
+    #[test]
+    fn default_ports_follow_the_scheme() {
+        assert_eq!(Protocol::Http.default_port(), Some(Port::new(80).unwrap()));
+        assert_eq!(
+            Protocol::Https.default_port(),
+            Some(Port::new(443).unwrap())
+        );
+        assert_eq!(Protocol::Wss.default_port(), Some(Port::new(443).unwrap()));
+        assert_eq!(Protocol::Tcp.default_port(), None);
+        assert!(Protocol::Https.is_secure());
+        assert!(!Protocol::Http.is_secure());
+    }
+
+    #[test]
+    fn a_host_is_folded_so_routing_ignores_case() {
+        assert_eq!(
+            Host::new("API.Example.COM").unwrap().as_str(),
+            "api.example.com"
+        );
+        assert_eq!(
+            Host::new("API.example.com").unwrap(),
+            Host::new("api.EXAMPLE.com").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_host_may_be_an_ip_address() {
+        assert_eq!(
+            Host::new("192.0.2.1").unwrap().as_ip(),
+            Some("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(
+            Host::new("2001:DB8::1").unwrap().as_ip(),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(Host::new("api.example.com").unwrap().as_ip(), None);
+    }
+
+    #[test]
+    fn a_host_with_an_empty_label_is_refused() {
+        assert_eq!(
+            Host::new("api..com"),
+            Err(CoreError::Empty { kind: "host label" })
+        );
+    }
+
+    #[test]
+    fn a_host_label_may_not_be_bounded_by_a_hyphen() {
+        assert_eq!(
+            Host::new("-api.example.com"),
+            Err(CoreError::IllegalChar {
+                kind: "host label",
+                ch: '-',
+            })
+        );
+    }
+
+    #[test]
+    fn a_host_with_an_illegal_character_is_refused() {
+        assert_eq!(
+            Host::new("api_example.com"),
+            Err(CoreError::IllegalChar {
+                kind: "host label",
+                ch: '_',
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_or_over_long_host_is_refused() {
+        assert_eq!(Host::new(""), Err(CoreError::Empty { kind: "host" }));
+        let raw = "a".repeat(HOST_MAX_BYTES + 1);
+        assert!(matches!(
+            Host::new(&raw),
+            Err(CoreError::TooLong { kind: "host", .. })
+        ));
+    }
+
+    #[test]
+    fn port_zero_is_refused() {
+        assert_eq!(Port::new(0), Err(CoreError::ZeroPort));
+        assert_eq!(Port::new(8080).unwrap().get(), 8080);
+    }
+
+    #[test]
+    fn a_path_must_be_absolute() {
+        assert_eq!(
+            AbsPath::new("v1/messages"),
+            Err(CoreError::MustStartWith {
+                kind: "path",
+                expected: '/',
+            })
+        );
+        assert_eq!(
+            AbsPath::new("/v1/messages").unwrap().as_str(),
+            "/v1/messages"
+        );
+    }
+
+    #[test]
+    fn a_grpc_method_name_is_a_path() {
+        assert!(AbsPath::new("/anthropic.Messages/Create").is_ok());
+    }
+
+    #[test]
+    fn a_path_carries_no_query_or_fragment() {
+        for raw in ["/v1?model=x", "/v1#top"] {
+            assert!(matches!(
+                AbsPath::new(raw),
+                Err(CoreError::IllegalChar { kind: "path", .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn an_endpoint_renders_as_a_url() {
+        let endpoint = endpoint(Protocol::Https, "api.example.com", 443, "/v1/messages");
+        assert_eq!(
+            endpoint.to_string(),
+            "https://api.example.com:443/v1/messages"
+        );
+    }
+
+    #[test]
+    fn a_key_and_a_target_are_not_the_same_type() {
+        let key = RouteKey::new(endpoint(Protocol::Https, "gateway.local", 443, "/v1"));
+        let target = RouteTarget::new(endpoint(Protocol::Https, "api.example.com", 443, "/v1"));
+        let rule = RouteRule {
+            key: key.clone(),
+            target: target.clone(),
+        };
+        assert_eq!(rule.key.endpoint().host.as_str(), "gateway.local");
+        assert_eq!(rule.target.endpoint().host.as_str(), "api.example.com");
+        assert_eq!(key.to_string(), "https://gateway.local:443/v1");
+    }
+
+    #[test]
+    fn a_key_deserializes_through_validation() {
+        let json = r#"{"protocol":"https","host":"API.example.com","port":443,"path":"/v1"}"#;
+        let endpoint: Endpoint = serde_json::from_str(json).unwrap();
+        assert_eq!(endpoint.host.as_str(), "api.example.com");
+        let bad = r#"{"protocol":"https","host":"api.example.com","port":0,"path":"/v1"}"#;
+        assert!(serde_json::from_str::<Endpoint>(bad).is_err());
+    }
+}
