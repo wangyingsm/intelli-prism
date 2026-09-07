@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Capability, CapabilityScope, Grant, Grants, PassphraseHash, TenantId, Timestamp, TnKey,
-    UserId,
+    ApiId, Capability, CapabilityScope, Endpoint, Grant, Grants, PassphraseHash, RouteKey,
+    RouteRule, RouteTarget, TenantId, Timestamp, TnKey, UserId,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -14,6 +14,7 @@ use crate::error::{Entity, StorageError};
 use crate::model::{
     AccountKind, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId, User, UserRowId,
 };
+use crate::route::RouteStore;
 use crate::store::{GrantStore, MembershipStore, TenantStore, UserStore};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -549,8 +550,116 @@ impl GrantStore for SqliteStore {
     }
 }
 
+#[async_trait]
+impl RouteStore for SqliteStore {
+    async fn put_route(&self, rule: RouteRule) -> Result<(), StorageError> {
+        let key = rule.key.endpoint();
+        let target = rule.target.endpoint();
+        sqlx::query(
+            "INSERT INTO routes (key_protocol, key_host, key_port, key_path, \
+             target_protocol, target_host, target_port, target_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
+             target_protocol = excluded.target_protocol, target_host = excluded.target_host, \
+             target_port = excluded.target_port, target_path = excluded.target_path",
+        )
+        .bind(key.protocol.name())
+        .bind(key.host.as_str())
+        .bind(i64::from(key.port.get()))
+        .bind(key.path.as_str())
+        .bind(target.protocol.name())
+        .bind(target.host.as_str())
+        .bind(i64::from(target.port.get()))
+        .bind(target.path.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(StorageError::backend)?;
+        Ok(())
+    }
+
+    async fn remove_route(&self, key: &RouteKey) -> Result<(), StorageError> {
+        let endpoint = key.endpoint();
+        let deleted = sqlx::query(
+            "DELETE FROM routes WHERE key_protocol = ? AND key_host = ? \
+             AND key_port = ? AND key_path = ?",
+        )
+        .bind(endpoint.protocol.name())
+        .bind(endpoint.host.as_str())
+        .bind(i64::from(endpoint.port.get()))
+        .bind(endpoint.path.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(StorageError::backend)?
+        .rows_affected();
+        if deleted == 0 {
+            return Err(StorageError::NotFound {
+                entity: Entity::Route,
+                id: key.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
+        let endpoint = key.endpoint();
+        let Some(row) = sqlx::query(
+            "SELECT target_protocol, target_host, target_port, target_path FROM routes \
+             WHERE key_protocol = ? AND key_host = ? AND key_port = ? AND key_path = ?",
+        )
+        .bind(endpoint.protocol.name())
+        .bind(endpoint.host.as_str())
+        .bind(i64::from(endpoint.port.get()))
+        .bind(endpoint.path.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StorageError::backend)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(RouteRule {
+            key: key.clone(),
+            target: target_of(&row)?,
+        }))
+    }
+
+    async fn routes(&self) -> Result<Vec<RouteRule>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT key_protocol, key_host, key_port, key_path, \
+             target_protocol, target_host, target_port, target_path FROM routes \
+             ORDER BY key_host, key_path, key_protocol, key_port",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StorageError::backend)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RouteRule {
+                    key: RouteKey::new(Endpoint::from_parts(
+                        row.get("key_protocol"),
+                        row.get("key_host"),
+                        row.get("key_port"),
+                        row.get("key_path"),
+                    )?),
+                    target: target_of(&row)?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn target_of(row: &sqlx::sqlite::SqliteRow) -> Result<RouteTarget, StorageError> {
+    Ok(RouteTarget::new(Endpoint::from_parts(
+        row.get("target_protocol"),
+        row.get("target_host"),
+        row.get("target_port"),
+        row.get("target_path"),
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
+    use ip_core::{AbsPath, Host, Port, Protocol};
+
     use super::*;
 
     async fn store() -> SqliteStore {
@@ -935,6 +1044,138 @@ mod tests {
                 entity: Entity::Grant,
                 ..
             })
+        ));
+    }
+
+    fn route_endpoint(protocol: Protocol, host: &str, port: u16, path: &str) -> Endpoint {
+        Endpoint::new(
+            protocol,
+            Host::new(host).unwrap(),
+            Port::new(port).unwrap(),
+            AbsPath::new(path).unwrap(),
+        )
+    }
+
+    fn rule(host: &str, path: &str, upstream: &str) -> RouteRule {
+        RouteRule {
+            key: RouteKey::new(route_endpoint(Protocol::Https, host, 443, path)),
+            target: RouteTarget::new(route_endpoint(Protocol::Https, upstream, 443, path)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_route_round_trips() {
+        let store = store().await;
+        let rule = rule("gateway.local", "/v1/messages", "api.example.com");
+        store.put_route(rule.clone()).await.unwrap();
+        assert_eq!(store.route(&rule.key).await.unwrap(), Some(rule.clone()));
+        assert_eq!(store.routes().await.unwrap(), vec![rule]);
+    }
+
+    #[tokio::test]
+    async fn writing_the_same_route_key_replaces_its_target() {
+        let store = store().await;
+        store
+            .put_route(rule("gateway.local", "/v1", "first.example.com"))
+            .await
+            .unwrap();
+        let second = rule("gateway.local", "/v1", "second.example.com");
+        store.put_route(second.clone()).await.unwrap();
+        assert_eq!(store.routes().await.unwrap(), vec![second]);
+    }
+
+    #[tokio::test]
+    async fn a_route_key_carries_every_part_of_the_tuple() {
+        let store = store().await;
+        let secure = rule("gateway.local", "/v1", "api.example.com");
+        let plain = RouteRule {
+            key: RouteKey::new(route_endpoint(Protocol::Http, "gateway.local", 443, "/v1")),
+            target: RouteTarget::new(route_endpoint(
+                Protocol::Https,
+                "api.example.com",
+                443,
+                "/v1",
+            )),
+        };
+        store.put_route(secure).await.unwrap();
+        store.put_route(plain).await.unwrap();
+        assert_eq!(store.routes().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn every_protocol_survives_a_round_trip() {
+        let store = store().await;
+        for protocol in [
+            Protocol::Http,
+            Protocol::Https,
+            Protocol::Ws,
+            Protocol::Wss,
+            Protocol::Tcp,
+        ] {
+            let key = RouteKey::new(route_endpoint(protocol, "gateway.local", 443, "/v1"));
+            store
+                .put_route(RouteRule {
+                    key: key.clone(),
+                    target: RouteTarget::new(route_endpoint(
+                        protocol,
+                        "api.example.com",
+                        443,
+                        "/v1",
+                    )),
+                })
+                .await
+                .unwrap();
+            let read = store.route(&key).await.unwrap().unwrap();
+            assert_eq!(read.target.endpoint().protocol, protocol);
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_a_route_that_is_absent_reports_it_missing() {
+        let store = store().await;
+        let key = RouteKey::new(route_endpoint(Protocol::Https, "gateway.local", 443, "/v1"));
+        assert!(matches!(
+            store.remove_route(&key).await,
+            Err(StorageError::NotFound {
+                entity: Entity::Route,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stored_protocol_the_code_does_not_know_is_refused() {
+        let store = store().await;
+        sqlx::query(
+            "INSERT INTO routes (key_protocol, key_host, key_port, key_path, \
+             target_protocol, target_host, target_port, target_path) \
+             VALUES ('gopher', 'gateway.local', 443, '/v1', 'https', 'api.example.com', 443, '/v1')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.routes().await,
+            Err(StorageError::Value(
+                ip_core::CoreError::UnknownProtocol { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stored_port_of_zero_is_refused_on_read() {
+        let store = store().await;
+        sqlx::query(
+            "INSERT INTO routes (key_protocol, key_host, key_port, key_path, \
+             target_protocol, target_host, target_port, target_path) \
+             VALUES ('https', 'gateway.local', 443, '/v1', 'https', 'api.example.com', 0, '/v1')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.routes().await,
+            Err(StorageError::Value(ip_core::CoreError::ZeroPort))
         ));
     }
 }
