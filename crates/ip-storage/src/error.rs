@@ -60,6 +60,8 @@ pub enum Entity {
     Membership,
     /// One capability held at one scope.
     Grant,
+    /// A dynamic routing rule.
+    Route,
 }
 
 impl fmt::Display for Entity {
@@ -69,6 +71,7 @@ impl fmt::Display for Entity {
             Self::User => "user",
             Self::Membership => "membership",
             Self::Grant => "grant",
+            Self::Route => "route",
         })
     }
 }
@@ -86,6 +89,7 @@ mod tests {
             (Entity::User, "user"),
             (Entity::Membership, "membership"),
             (Entity::Grant, "grant"),
+            (Entity::Route, "route"),
         ] {
             assert_eq!(entity.to_string(), name);
         }
