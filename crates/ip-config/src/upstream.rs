@@ -115,3 +115,85 @@ impl TryFrom<f64> for Temperature {
         Self::new(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_model_name_round_trips() {
+        let name = ModelName::new("claude-opus-5").unwrap();
+        assert_eq!(name.as_str(), "claude-opus-5");
+        assert_eq!(name.to_string(), "claude-opus-5");
+    }
+
+    #[test]
+    fn a_model_name_may_carry_a_vendor_prefix() {
+        assert!(ModelName::new("anthropic/claude-opus-5").is_ok());
+    }
+
+    #[test]
+    fn an_empty_model_name_is_refused() {
+        assert_eq!(
+            ModelName::new(""),
+            Err(CoreError::Empty { kind: "model name" })
+        );
+    }
+
+    #[test]
+    fn an_over_long_model_name_is_refused() {
+        let raw = "m".repeat(MODEL_NAME_MAX_BYTES + 1);
+        assert_eq!(
+            ModelName::new(&raw),
+            Err(CoreError::TooLong {
+                kind: "model name",
+                len: MODEL_NAME_MAX_BYTES + 1,
+                max: MODEL_NAME_MAX_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn a_model_name_with_a_space_is_refused() {
+        assert_eq!(
+            ModelName::new("claude opus"),
+            Err(CoreError::IllegalChar {
+                kind: "model name",
+                ch: ' ',
+            })
+        );
+    }
+
+    #[test]
+    fn an_owned_model_name_still_validates() {
+        assert!(ModelName::try_from("claude-opus-5".to_string()).is_ok());
+        assert!(ModelName::try_from("claude opus".to_string()).is_err());
+    }
+
+    #[test]
+    fn a_temperature_inside_the_range_is_kept() {
+        assert_eq!(Temperature::new(0.7).unwrap().get(), 0.7_f32);
+        assert_eq!(Temperature::new(0.0).unwrap().get(), Temperature::MIN);
+        assert_eq!(Temperature::new(2.0).unwrap().get(), Temperature::MAX);
+    }
+
+    #[test]
+    fn a_temperature_outside_the_range_is_refused() {
+        for value in [-0.1, 2.1] {
+            assert!(matches!(
+                Temperature::new(value),
+                Err(ConfigError::Temperature { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_temperature_that_is_not_a_number_is_refused() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                Temperature::try_from(value),
+                Err(ConfigError::Temperature { .. })
+            ));
+        }
+    }
+}
