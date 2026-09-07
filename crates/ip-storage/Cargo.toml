@@ -1,0 +1,13 @@
+[package]
+name = "ip-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+ip-core = { version = "0.1.0", path = "../ip-core" }
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "macros"] }
