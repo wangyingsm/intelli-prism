@@ -68,6 +68,8 @@ etc.
 logs, opentelemetry, performance collection, JWT relatives, etc.
 - Storage system(cluster): S3/rustfs or other compatibles.
 - Storage system(standalone): local toml file.
+- The configuration file path is taken from the command line. The current argument handling is hand
+rolled in the binary; refactor it to the `clap` crate before the CLI grows past that one positional path.
 
 #### Business data
 
