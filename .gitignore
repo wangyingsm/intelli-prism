@@ -16,7 +16,9 @@
 
 # Claude Code
 .claude/
+CLAUDE.md
 CLAUDE.local.md
+RTK.md
 .claude-*
 .mcp.json
 
