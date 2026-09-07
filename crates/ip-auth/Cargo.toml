@@ -1,0 +1,10 @@
+[package]
+name = "ip-auth"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+argon2 = "0.6.0"
+ip-core = { version = "0.1.0", path = "../ip-core" }
+thiserror = "2.0.20"
+zeroize = "1.9.0"
