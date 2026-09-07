@@ -28,6 +28,11 @@ RTK.md
 *.drsg.hnsw
 *.drsg.bm25
 
+# Runtime sqlite database
+*.db
+*.db-wal
+*.db-shm
+
 # Logs
 logs/
 *.log
