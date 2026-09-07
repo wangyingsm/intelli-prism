@@ -29,6 +29,13 @@ pub enum CoreError {
     #[error("{kind} is not valid hex")]
     HexDigit { kind: &'static str },
 
+    /// A count of seconds that lands outside any representable moment.
+    #[error("{seconds} is not a moment in time")]
+    Timestamp {
+        /// The count that could not be read as a moment.
+        seconds: i64,
+    },
+
     #[error("{capability:?} is scoped to {expected:?}, not {actual:?}")]
     ScopeMismatch {
         capability: Capability,

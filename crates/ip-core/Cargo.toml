@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 getrandom = "0.4.3"
 hex = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
