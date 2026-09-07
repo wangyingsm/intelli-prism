@@ -49,6 +49,13 @@ pub enum CoreError {
     #[error("port zero is not a port")]
     ZeroPort,
 
+    /// A stored number that is too large to be a port.
+    #[error("{value} is outside the range of a port")]
+    PortOutOfRange {
+        /// The number that named no port.
+        value: i64,
+    },
+
     /// A count of seconds that lands outside any representable moment.
     #[error("{seconds} is not a moment in time")]
     Timestamp {

@@ -27,6 +27,17 @@ pub enum Protocol {
 }
 
 impl Protocol {
+    /// The bare scheme, as a stored row or a serialized rule holds it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Ws => "ws",
+            Self::Wss => "wss",
+            Self::Tcp => "tcp",
+        }
+    }
+
     /// The scheme as a routing rule spells it.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -205,6 +216,16 @@ impl TryFrom<u16> for Port {
     }
 }
 
+/// Narrows the wider integer a database column or wire format hands back.
+impl TryFrom<i64> for Port {
+    type Error = CoreError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        let narrowed = u16::try_from(value).map_err(|_| CoreError::PortOutOfRange { value })?;
+        Self::new(narrowed)
+    }
+}
+
 /// An absolute path, which is the method name when the protocol is grpc.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -283,6 +304,33 @@ pub struct Endpoint {
     pub path: AbsPath,
 }
 
+impl Endpoint {
+    /// Assembles an endpoint from parts that are already validated.
+    pub fn new(protocol: Protocol, host: Host, port: Port, path: AbsPath) -> Self {
+        Self {
+            protocol,
+            host,
+            port,
+            path,
+        }
+    }
+
+    /// Rebuilds an endpoint from the text and numbers a stored row holds.
+    pub fn from_parts(
+        protocol: &str,
+        host: &str,
+        port: i64,
+        path: &str,
+    ) -> Result<Self, CoreError> {
+        Ok(Self {
+            protocol: protocol.parse()?,
+            host: Host::new(host)?,
+            port: Port::try_from(port)?,
+            path: AbsPath::new(path)?,
+        })
+    }
+}
+
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -351,12 +399,12 @@ mod tests {
     use super::*;
 
     fn endpoint(protocol: Protocol, host: &str, port: u16, path: &str) -> Endpoint {
-        Endpoint {
+        Endpoint::new(
             protocol,
-            host: Host::new(host).unwrap(),
-            port: Port::new(port).unwrap(),
-            path: AbsPath::new(path).unwrap(),
-        }
+            Host::new(host).unwrap(),
+            Port::new(port).unwrap(),
+            AbsPath::new(path).unwrap(),
+        )
     }
 
     #[test]
@@ -506,6 +554,65 @@ mod tests {
                 Err(CoreError::IllegalChar { kind: "path", .. })
             ));
         }
+    }
+
+    #[test]
+    fn a_scheme_has_a_bare_name_and_a_written_form() {
+        assert_eq!(Protocol::Https.name(), "https");
+        assert_eq!(Protocol::Https.as_str(), "https://");
+        for protocol in [
+            Protocol::Http,
+            Protocol::Https,
+            Protocol::Ws,
+            Protocol::Wss,
+            Protocol::Tcp,
+        ] {
+            assert_eq!(protocol.name().parse::<Protocol>().unwrap(), protocol);
+        }
+    }
+
+    #[test]
+    fn a_port_narrows_from_the_wider_integer_a_row_holds() {
+        assert_eq!(Port::try_from(8080_i64).unwrap().get(), 8080);
+        assert_eq!(Port::try_from(0_i64), Err(CoreError::ZeroPort));
+        assert_eq!(
+            Port::try_from(70_000_i64),
+            Err(CoreError::PortOutOfRange { value: 70_000 })
+        );
+        assert_eq!(
+            Port::try_from(-1_i64),
+            Err(CoreError::PortOutOfRange { value: -1 })
+        );
+    }
+
+    #[test]
+    fn an_endpoint_rebuilds_from_stored_parts() {
+        let rebuilt =
+            Endpoint::from_parts("https", "API.example.com", 443, "/v1/messages").unwrap();
+        assert_eq!(
+            rebuilt,
+            endpoint(Protocol::Https, "api.example.com", 443, "/v1/messages")
+        );
+    }
+
+    #[test]
+    fn stored_parts_that_are_not_an_endpoint_are_refused() {
+        assert!(matches!(
+            Endpoint::from_parts("gopher", "api.example.com", 443, "/v1"),
+            Err(CoreError::UnknownProtocol { .. })
+        ));
+        assert!(matches!(
+            Endpoint::from_parts("https", "api example.com", 443, "/v1"),
+            Err(CoreError::IllegalChar { .. })
+        ));
+        assert_eq!(
+            Endpoint::from_parts("https", "api.example.com", 0, "/v1"),
+            Err(CoreError::ZeroPort)
+        );
+        assert!(matches!(
+            Endpoint::from_parts("https", "api.example.com", 443, "v1"),
+            Err(CoreError::MustStartWith { .. })
+        ));
     }
 
     #[test]
