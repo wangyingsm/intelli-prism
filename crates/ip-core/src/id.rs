@@ -68,7 +68,8 @@ macro_rules! declare_id {
             type Error = CoreError;
 
             fn try_from(raw: String) -> Result<Self, Self::Error> {
-                Self::new(&raw)
+                validate_id(Self::KIND, &raw)?;
+                Ok(Self(raw.into_boxed_str()))
             }
         }
 
@@ -88,31 +89,34 @@ declare_id!(ApiId, "api id");
 #[serde(try_from = "String")]
 pub struct Nonce(Box<str>);
 
+fn validate_nonce(raw: &str) -> Result<(), CoreError> {
+    let kind = Nonce::KIND;
+    if raw.len() < NONCE_MIN_BYTES {
+        return Err(CoreError::TooShort {
+            kind,
+            len: raw.len(),
+            min: NONCE_MIN_BYTES,
+        });
+    }
+    if raw.len() > NONCE_MAX_BYTES {
+        return Err(CoreError::TooLong {
+            kind,
+            len: raw.len(),
+            max: NONCE_MAX_BYTES,
+        });
+    }
+    match raw.chars().find(|ch| !ch.is_ascii_graphic()) {
+        Some(ch) => Err(CoreError::IllegalChar { kind, ch }),
+        None => Ok(()),
+    }
+}
+
 impl Nonce {
     pub const KIND: &'static str = "nonce";
 
     pub fn new(raw: &str) -> Result<Self, CoreError> {
-        if raw.len() < NONCE_MIN_BYTES {
-            return Err(CoreError::TooShort {
-                kind: Self::KIND,
-                len: raw.len(),
-                min: NONCE_MIN_BYTES,
-            });
-        }
-        if raw.len() > NONCE_MAX_BYTES {
-            return Err(CoreError::TooLong {
-                kind: Self::KIND,
-                len: raw.len(),
-                max: NONCE_MAX_BYTES,
-            });
-        }
-        match raw.chars().find(|ch| !ch.is_ascii_graphic()) {
-            Some(ch) => Err(CoreError::IllegalChar {
-                kind: Self::KIND,
-                ch,
-            }),
-            None => Ok(Self(Box::from(raw))),
-        }
+        validate_nonce(raw)?;
+        Ok(Self(Box::from(raw)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -148,7 +152,8 @@ impl TryFrom<String> for Nonce {
     type Error = CoreError;
 
     fn try_from(raw: String) -> Result<Self, Self::Error> {
-        Self::new(&raw)
+        validate_nonce(&raw)?;
+        Ok(Self(raw.into_boxed_str()))
     }
 }
 
@@ -224,6 +229,29 @@ mod tests {
         let id: TenantId = serde_json::from_str("\"acme\"").unwrap();
         assert_eq!(id.as_str(), "acme");
         assert!(serde_json::from_str::<TenantId>("\"acme corp\"").is_err());
+    }
+
+    #[test]
+    fn owned_conversion_still_validates() {
+        assert_eq!(
+            TenantId::try_from("acme corp".to_string()),
+            Err(CoreError::IllegalChar {
+                kind: "tenant id",
+                ch: ' ',
+            })
+        );
+        assert_eq!(
+            Nonce::try_from("abc".to_string()),
+            Err(CoreError::TooShort {
+                kind: "nonce",
+                len: 3,
+                min: NONCE_MIN_BYTES,
+            })
+        );
+        assert_eq!(
+            TenantId::try_from("acme".to_string()).unwrap().as_str(),
+            "acme"
+        );
     }
 
     #[test]
