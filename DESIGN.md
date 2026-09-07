@@ -176,6 +176,12 @@ by admin only, they are applied to every flow by default but with low priority.
 	- Dynamic: extra API gateway routes held in the database, added or changed at runtime with no restart.
 - The router resolves against the union of the two sources, so a lookup never needs to know which one a rule came from.
 - Config wins: when a static and a dynamic rule share the same key, the configured one is served and the database one is ignored, so a runtime write can never subvert a deployed route.
+- Protocol, host and port match exactly. The abs path matches by longest prefix on segment boundaries,
+and the unmatched remainder is appended to the target's abs path, so one rule covers a whole upstream
+api. An exact tuple match is the case where that remainder is empty.
+- A configured upstream derives its key from the server's listen address with the upstream id as the
+path root. An `[upstream.route]` block overrides any part of that key, which is what a gateway behind
+a proxy or serving several hostnames needs.
 
 ### Cache
 
