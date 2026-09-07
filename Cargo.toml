@@ -1,0 +1,17 @@
+[package]
+name = "intelli-prism"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+ip-core = { path = "crates/ip-core" }
