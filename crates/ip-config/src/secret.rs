@@ -73,6 +73,17 @@ mod tests {
     }
 
     #[test]
+    fn exposes_its_bytes_for_hashing() {
+        assert_eq!(Secret::from("s3cret").as_bytes(), b"s3cret");
+    }
+
+    #[test]
+    fn knows_when_it_holds_nothing() {
+        assert!(Secret::from(String::new()).is_empty());
+        assert!(!Secret::from("s3cret".to_owned()).is_empty());
+    }
+
+    #[test]
     fn is_redacted_in_debug_output() {
         let secret = Secret::from("hunter2");
         assert_eq!(format!("{secret:?}"), "Secret(redacted)");
