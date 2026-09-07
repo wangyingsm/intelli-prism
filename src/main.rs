@@ -47,3 +47,14 @@ async fn shutdown() {
         tracing::info!("shutting down");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The shipped example must stay loadable, or it teaches a format the server rejects.
+    #[test]
+    fn the_example_configuration_parses() {
+        let config =
+            ip_config::Config::parse(include_str!("../intelli-prism.example.toml")).unwrap();
+        assert_eq!(config.upstreams.len(), 1);
+    }
+}

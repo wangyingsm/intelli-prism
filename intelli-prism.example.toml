@@ -1,0 +1,39 @@
+# Copy to intelli-prism.toml and edit. Every key is rejected if misspelled, so a
+# typo stops the server rather than silently taking a default.
+
+[server]
+listen = "127.0.0.1:8080"
+
+# Standalone deployment. The file is created and migrated on first start.
+[storage]
+backend = "sqlite"
+path = "./intelli-prism.db"
+
+# Cluster deployment uses postgres instead, which this build does not yet serve:
+# [storage]
+# backend = "postgres"
+# url = "postgres://intelli_prism:secret@localhost/intelli_prism"
+
+[auth]
+# Seconds a nonce stays spent. Default 300.
+nonce_ttl = 300
+
+[auth.jwt]
+issuer = "intelli-prism"
+# At least 32 bytes, or the server refuses to start. Draw it from a random source.
+secret = "replace-this-with-32-or-more-random-bytes"
+# Seconds a freshly issued token stays valid. Default 21600, six hours.
+ttl = 21600
+
+[telemetry]
+# trace, debug, info, warn or error. Default info.
+log_level = "info"
+# otlp_endpoint = "http://localhost:4317/"
+
+# One block per upstream llm. The id is what routing rules and api capabilities name.
+[[upstream]]
+id = "anthropic"
+base_url = "https://api.anthropic.com/"
+api_key = "sk-replace-me"
+model = "claude-opus-5"
+temperature = 0.7
