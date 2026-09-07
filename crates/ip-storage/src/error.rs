@@ -72,3 +72,51 @@ impl fmt::Display for Entity {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    #[test]
+    fn every_entity_names_itself() {
+        for (entity, name) in [
+            (Entity::Tenant, "tenant"),
+            (Entity::User, "user"),
+            (Entity::Membership, "membership"),
+            (Entity::Grant, "grant"),
+        ] {
+            assert_eq!(entity.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn a_missing_record_names_what_was_looked_for() {
+        let error = StorageError::NotFound {
+            entity: Entity::Tenant,
+            id: "acme".to_owned(),
+        };
+        assert_eq!(error.to_string(), "no such tenant: acme");
+    }
+
+    #[test]
+    fn a_conflict_names_what_was_written() {
+        let error = StorageError::Conflict {
+            entity: Entity::User,
+            id: "alice".to_owned(),
+        };
+        assert_eq!(error.to_string(), "user already exists: alice");
+    }
+
+    #[test]
+    fn a_backend_failure_keeps_its_cause() {
+        let cause = io::Error::other("disk went away");
+        let error = StorageError::backend(cause);
+        assert_eq!(error.to_string(), "storage backend failed");
+        assert_eq!(
+            error.source().map(ToString::to_string),
+            Some("disk went away".to_owned())
+        );
+    }
+}
