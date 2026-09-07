@@ -28,23 +28,28 @@ fn validate_id(kind: &'static str, raw: &str) -> Result<(), CoreError> {
 }
 
 macro_rules! declare_id {
-    ($name:ident, $kind:literal) => {
+    ($name:ident, $kind:literal, $doc:literal) => {
+        #[doc = $doc]
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
         #[serde(try_from = "String")]
         pub struct $name(Box<str>);
 
         impl $name {
+            /// Name of this kind, as it appears in errors.
             pub const KIND: &'static str = $kind;
 
+            /// Validates and wraps a raw identifier.
             pub fn new(raw: &str) -> Result<Self, CoreError> {
                 validate_id(Self::KIND, raw)?;
                 Ok(Self(Box::from(raw)))
             }
 
+            /// The identifier as text.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
 
+            /// The identifier as the bytes a key is derived from.
             pub fn as_bytes(&self) -> &[u8] {
                 self.0.as_bytes()
             }
@@ -81,10 +86,19 @@ macro_rules! declare_id {
     };
 }
 
-declare_id!(TenantId, "tenant id");
-declare_id!(UserId, "user id");
-declare_id!(ApiId, "api id");
+declare_id!(
+    TenantId,
+    "tenant id",
+    "Identifies a tenant, unique across the application."
+);
+declare_id!(
+    UserId,
+    "user id",
+    "Identifies a user, unique across the application."
+);
+declare_id!(ApiId, "api id", "Identifies one proxied upstream api.");
 
+/// Per request nonce carried by `X-Ip-Nonce`, which makes a signature single use.
 #[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct Nonce(Box<str>);
@@ -112,17 +126,21 @@ fn validate_nonce(raw: &str) -> Result<(), CoreError> {
 }
 
 impl Nonce {
+    /// Name of this kind, as it appears in errors.
     pub const KIND: &'static str = "nonce";
 
+    /// Validates and wraps a raw nonce.
     pub fn new(raw: &str) -> Result<Self, CoreError> {
         validate_nonce(raw)?;
         Ok(Self(Box::from(raw)))
     }
 
+    /// The nonce as text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// The nonce as the bytes a signature covers.
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }

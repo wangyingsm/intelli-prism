@@ -1,6 +1,7 @@
 use crate::capability::{Capability, ScopeKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Every way a core value can fail to be built.
 pub enum CoreError {
     #[error("{kind} is empty")]
     Empty { kind: &'static str },

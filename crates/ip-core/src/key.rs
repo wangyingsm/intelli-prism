@@ -7,7 +7,9 @@ use zeroize::Zeroize;
 use crate::error::CoreError;
 use crate::id::{Nonce, UserId};
 
+/// Length of a tenant root key.
 pub const TN_KEY_BYTES: usize = 16;
+/// Length of a sha256 digest.
 pub const DIGEST_BYTES: usize = 32;
 
 fn decode_hex<const N: usize>(kind: &'static str, raw: &str) -> Result<[u8; N], CoreError> {
@@ -34,22 +36,27 @@ fn digest_of(secret: &[u8], nonce: &Nonce) -> [u8; DIGEST_BYTES] {
 pub struct TnKey([u8; TN_KEY_BYTES]);
 
 impl TnKey {
+    /// Name of this kind, as it appears in errors.
     pub const KIND: &'static str = "tenant key";
 
+    /// Draws a new tenant key from the operating system entropy source.
     pub fn generate() -> Result<Self, getrandom::Error> {
         let mut bytes = [0u8; TN_KEY_BYTES];
         getrandom::fill(&mut bytes)?;
         Ok(Self(bytes))
     }
 
+    /// Parses the hex form.
     pub fn from_hex(raw: &str) -> Result<Self, CoreError> {
         decode_hex(Self::KIND, raw).map(Self)
     }
 
+    /// The hex form.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
+    /// The raw key bytes.
     pub fn as_bytes(&self) -> &[u8; TN_KEY_BYTES] {
         &self.0
     }
@@ -85,8 +92,10 @@ impl Drop for TnKey {
 pub struct UtKey([u8; DIGEST_BYTES]);
 
 impl UtKey {
+    /// Name of this kind, as it appears in errors.
     pub const KIND: &'static str = "user tenant key";
 
+    /// Derives the key of one user inside one tenant.
     pub fn derive(user: &UserId, tn_key: &TnKey) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(user.as_bytes());
@@ -94,14 +103,17 @@ impl UtKey {
         Self(hasher.finalize().into())
     }
 
+    /// Parses the hex form.
     pub fn from_hex(raw: &str) -> Result<Self, CoreError> {
         decode_hex(Self::KIND, raw).map(Self)
     }
 
+    /// The hex form.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
+    /// The raw key bytes.
     pub fn as_bytes(&self) -> &[u8; DIGEST_BYTES] {
         &self.0
     }
@@ -131,6 +143,7 @@ impl Drop for UtKey {
 pub struct Signature([u8; DIGEST_BYTES]);
 
 impl Signature {
+    /// Name of this kind, as it appears in errors.
     pub const KIND: &'static str = "signature";
 
     /// The scheme every ordinary user signs with.
@@ -143,14 +156,17 @@ impl Signature {
         Self(digest_of(tn_key.as_bytes(), nonce))
     }
 
+    /// Parses the hex form carried by the request header.
     pub fn from_hex(raw: &str) -> Result<Self, CoreError> {
         decode_hex(Self::KIND, raw).map(Self)
     }
 
+    /// The hex form.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
+    /// The raw digest bytes.
     pub fn as_bytes(&self) -> &[u8; DIGEST_BYTES] {
         &self.0
     }

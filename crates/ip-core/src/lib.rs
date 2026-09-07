@@ -1,3 +1,5 @@
+//! Identifiers, keys and capabilities shared by every layer of the proxy.
+
 pub mod capability;
 pub mod error;
 pub mod id;

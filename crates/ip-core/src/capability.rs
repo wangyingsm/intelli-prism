@@ -6,6 +6,7 @@ use crate::id::{ApiId, TenantId, UserId};
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
+/// A capability a subject may hold.
 pub enum Capability {
     TenantMgr,
     UserMgr,
@@ -17,6 +18,7 @@ pub enum Capability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// The tuple shape a capability is scoped by.
 pub enum ScopeKind {
     User,
     Tenant,
@@ -24,6 +26,7 @@ pub enum ScopeKind {
 }
 
 impl Capability {
+    /// The scope shape this capability must be granted at.
     pub fn scope_kind(self) -> ScopeKind {
         match self {
             Self::TenantMgr => ScopeKind::User,
@@ -42,6 +45,7 @@ impl Capability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// The subject and range one grant applies to.
 pub enum CapabilityScope {
     User {
         user: UserId,
@@ -58,6 +62,7 @@ pub enum CapabilityScope {
 }
 
 impl CapabilityScope {
+    /// The shape of this scope.
     pub fn kind(&self) -> ScopeKind {
         match self {
             Self::User { .. } => ScopeKind::User,
@@ -66,12 +71,14 @@ impl CapabilityScope {
         }
     }
 
+    /// The user this scope belongs to.
     pub fn user(&self) -> &UserId {
         match self {
             Self::User { user } | Self::Tenant { user, .. } | Self::Api { user, .. } => user,
         }
     }
 
+    /// The tenant this scope sits inside, if any.
     pub fn tenant(&self) -> Option<&TenantId> {
         match self {
             Self::User { .. } => None,
@@ -79,6 +86,7 @@ impl CapabilityScope {
         }
     }
 
+    /// The api this scope names, if any.
     pub fn api(&self) -> Option<&ApiId> {
         match self {
             Self::Api { api, .. } => Some(api),
@@ -88,12 +96,14 @@ impl CapabilityScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// One capability held at one scope.
 pub struct Grant {
     capability: Capability,
     scope: CapabilityScope,
 }
 
 impl Grant {
+    /// Pairs a capability with a scope of the shape it requires.
     pub fn new(capability: Capability, scope: CapabilityScope) -> Result<Self, CoreError> {
         let expected = capability.scope_kind();
         let actual = scope.kind();
@@ -107,10 +117,12 @@ impl Grant {
         Ok(Self { capability, scope })
     }
 
+    /// The capability granted.
     pub fn capability(&self) -> Capability {
         self.capability
     }
 
+    /// The scope it is granted at.
     pub fn scope(&self) -> &CapabilityScope {
         &self.scope
     }
@@ -121,30 +133,37 @@ impl Grant {
 pub struct Grants(HashSet<Grant>);
 
 impl Grants {
+    /// An empty set: nothing is held.
     pub fn new() -> Self {
         Self(HashSet::new())
     }
 
+    /// Adds a grant, reporting whether it was new.
     pub fn insert(&mut self, grant: Grant) -> bool {
         self.0.insert(grant)
     }
 
+    /// Revokes a grant, reporting whether it was present.
     pub fn remove(&mut self, grant: &Grant) -> bool {
         self.0.remove(grant)
     }
 
+    /// How many grants are held.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Whether nothing is held.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Every grant held.
     pub fn iter(&self) -> impl Iterator<Item = &Grant> {
         self.0.iter()
     }
 
+    /// Whether the capability is held at this scope, prerequisite included.
     pub fn holds(&self, capability: Capability, scope: &CapabilityScope) -> bool {
         if capability.scope_kind() != scope.kind() {
             return false;
@@ -171,6 +190,7 @@ impl FromIterator<Grant> for Grants {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The standing a subject has before any explicit grant.
 pub enum Role {
     SysAdmin,
     TenantAdmin(TenantId),
