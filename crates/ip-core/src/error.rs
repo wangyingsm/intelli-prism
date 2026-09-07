@@ -1,3 +1,5 @@
+use crate::capability::{Capability, ScopeKind};
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CoreError {
     #[error("{kind} is empty")]
@@ -25,4 +27,11 @@ pub enum CoreError {
 
     #[error("{kind} is not valid hex")]
     HexDigit { kind: &'static str },
+
+    #[error("{capability:?} is scoped to {expected:?}, not {actual:?}")]
+    ScopeMismatch {
+        capability: Capability,
+        expected: ScopeKind,
+        actual: ScopeKind,
+    },
 }
