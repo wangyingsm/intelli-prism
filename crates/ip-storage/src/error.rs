@@ -28,6 +28,15 @@ pub enum StorageError {
     #[error(transparent)]
     Value(#[from] CoreError),
 
+    /// A stored value cannot be read back as the type it belongs to.
+    #[error("stored {entity} is malformed: {detail}")]
+    Malformed {
+        /// What was being read.
+        entity: Entity,
+        /// What was wrong with it.
+        detail: String,
+    },
+
     /// The backend itself failed.
     #[error("storage backend failed")]
     Backend(#[source] Box<dyn Error + Send + Sync>),
