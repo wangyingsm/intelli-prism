@@ -864,6 +864,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-gateway"
+version = "0.1.0"
+dependencies = [
+ "ip-config",
+ "ip-core",
+ "ip-storage",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "ip-storage"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "ip-gateway"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ip-config = { version = "0.1.0", path = "../ip-config" }
+ip-core = { version = "0.1.0", path = "../ip-core" }
+ip-storage = { version = "0.1.0", path = "../ip-storage" }
+thiserror = "2.0.20"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "macros"] }
