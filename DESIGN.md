@@ -182,6 +182,10 @@ api. An exact tuple match is the case where that remainder is empty.
 - A configured upstream derives its key from the server's listen address with the upstream id as the
 path root. An `[upstream.route]` block overrides any part of that key, which is what a gateway behind
 a proxy or serving several hostnames needs.
+- Lookup is a hash on (protocol, host, port), then a linear scan of that group's rules ordered longest
+path first, so it costs O(n) in the size of one authority group. That is acceptable at the tens of
+rules a deployment starts with and is not acceptable at a million, where it would cost tens of
+milliseconds per request. Replace the scan with a path trie before rule counts grow.
 
 ### Cache
 

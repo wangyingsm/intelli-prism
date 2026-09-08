@@ -82,6 +82,9 @@ impl RoutingTable {
     }
 
     /// The rule that carries this request, if any.
+    ///
+    /// Costs a linear scan of one authority group. Replace with a path trie before a
+    /// group holds more than a few thousand rules.
     pub fn resolve(&self, key: &RouteKey) -> Option<Resolution> {
         let requested = key.endpoint();
         let group = self.by_authority.get(&authority(requested))?;
