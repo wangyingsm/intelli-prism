@@ -209,7 +209,6 @@ impl Flow<Authorized> {
             BodyProcessed::NAME,
             processors.request_body(),
             self.held.request.body_mut(),
-            processors.passes_request_body(),
         )
         .await?;
         if let Some(bytes) = body {
@@ -270,7 +269,6 @@ impl Flow<ResponseHeadersProcessed> {
             ResponseBodyProcessed::NAME,
             processors.response_body(),
             self.held.body_mut(),
-            processors.passes_response_body(),
         )
         .await?;
         if let Some(bytes) = body {
@@ -414,13 +412,15 @@ async fn run_headers(
 }
 
 /// Runs a body chain, or hands back `None` when the body may pass through untouched.
+///
+/// Whether it passes is read from the chain itself, so a body can only be buffered when
+/// something is actually there to rewrite it.
 async fn run_body(
     stage: StageName,
     chain: &[Arc<dyn BodyProcessor>],
     body: &mut GatewayBody,
-    passes: bool,
 ) -> Result<Option<Bytes>, GatewayError> {
-    if passes {
+    if chain.is_empty() {
         return Ok(None);
     }
     let read_stage = match stage {
