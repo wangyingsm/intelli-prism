@@ -82,6 +82,7 @@ mod tests {
 
     fn rule(host: &str, path: &str, upstream: &str) -> RouteRule {
         RouteRule {
+            api: ip_core::ApiId::new("anthropic").unwrap(),
             key: ip_core::RouteKey::new(endpoint(host, path)),
             target: RouteTarget::new(endpoint(upstream, path)),
         }

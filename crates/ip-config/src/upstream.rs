@@ -95,6 +95,7 @@ impl UpstreamConfig {
     /// The rule this upstream contributes to the routing table.
     pub fn route_rule(&self, listen: SocketAddr) -> Result<RouteRule, ConfigError> {
         Ok(RouteRule {
+            api: self.id.clone(),
             key: self.route_key(listen)?,
             target: self.route_target()?,
         })
@@ -330,6 +331,14 @@ mod tests {
             .unwrap();
         assert_eq!(rule.key.to_string(), "http://127.0.0.1:8080/anthropic");
         assert_eq!(rule.target.to_string(), "https://api.anthropic.com:443/v1");
+    }
+
+    #[test]
+    fn a_rule_serves_the_api_the_upstream_names() {
+        let rule = upstream("https://api.anthropic.com/v1", None)
+            .route_rule(listen())
+            .unwrap();
+        assert_eq!(rule.api, ApiId::new("anthropic").unwrap());
     }
 
     #[test]

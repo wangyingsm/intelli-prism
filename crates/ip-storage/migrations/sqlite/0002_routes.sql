@@ -1,5 +1,6 @@
 CREATE TABLE routes (
     row_id          INTEGER PRIMARY KEY,
+    api_id          TEXT    NOT NULL,
     key_protocol    TEXT    NOT NULL,
     key_host        TEXT    NOT NULL,
     key_port        INTEGER NOT NULL,
@@ -11,3 +12,5 @@ CREATE TABLE routes (
 );
 
 CREATE UNIQUE INDEX routes_key ON routes (key_protocol, key_host, key_port, key_path);
+
+CREATE INDEX routes_api ON routes (api_id);

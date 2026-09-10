@@ -216,6 +216,7 @@ model = "claude-opus-5"
 
     fn rule(key_path: &str, target_host: &str, target_path: &str) -> RouteRule {
         RouteRule {
+            api: ip_core::ApiId::new("anthropic").unwrap(),
             key: RouteKey::new(endpoint(Protocol::Http, "127.0.0.1", 8080, key_path)),
             target: RouteTarget::new(endpoint(Protocol::Https, target_host, 443, target_path)),
         }

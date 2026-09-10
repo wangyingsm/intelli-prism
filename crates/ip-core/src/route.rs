@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use crate::error::CoreError;
+use crate::id::ApiId;
 
 const HOST_MAX_BYTES: usize = 253;
 const HOST_LABEL_MAX_BYTES: usize = 63;
@@ -388,6 +389,8 @@ impl fmt::Display for RouteTarget {
 /// A routing rule: what arrives, and where it goes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RouteRule {
+    /// The api this rule serves, which api capabilities are granted against.
+    pub api: ApiId,
     /// What the rule matches.
     pub key: RouteKey,
     /// Where a match is sent.
@@ -629,6 +632,7 @@ mod tests {
         let key = RouteKey::new(endpoint(Protocol::Https, "gateway.local", 443, "/v1"));
         let target = RouteTarget::new(endpoint(Protocol::Https, "api.example.com", 443, "/v1"));
         let rule = RouteRule {
+            api: ApiId::new("gateway").unwrap(),
             key: key.clone(),
             target: target.clone(),
         };

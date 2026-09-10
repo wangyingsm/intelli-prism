@@ -556,13 +556,15 @@ impl RouteStore for SqliteStore {
         let key = rule.key.endpoint();
         let target = rule.target.endpoint();
         sqlx::query(
-            "INSERT INTO routes (key_protocol, key_host, key_port, key_path, \
+            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path, \
              target_protocol, target_host, target_port, target_path) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
+             api_id = excluded.api_id, \
              target_protocol = excluded.target_protocol, target_host = excluded.target_host, \
              target_port = excluded.target_port, target_path = excluded.target_path",
         )
+        .bind(rule.api.as_str())
         .bind(key.protocol.name())
         .bind(key.host.as_str())
         .bind(i64::from(key.port.get()))
@@ -603,7 +605,7 @@ impl RouteStore for SqliteStore {
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
         let endpoint = key.endpoint();
         let Some(row) = sqlx::query(
-            "SELECT target_protocol, target_host, target_port, target_path FROM routes \
+            "SELECT api_id, target_protocol, target_host, target_port, target_path FROM routes \
              WHERE key_protocol = ? AND key_host = ? AND key_port = ? AND key_path = ?",
         )
         .bind(endpoint.protocol.name())
@@ -617,6 +619,7 @@ impl RouteStore for SqliteStore {
             return Ok(None);
         };
         Ok(Some(RouteRule {
+            api: ApiId::new(row.get("api_id"))?,
             key: key.clone(),
             target: target_of(&row)?,
         }))
@@ -624,7 +627,7 @@ impl RouteStore for SqliteStore {
 
     async fn routes(&self) -> Result<Vec<RouteRule>, StorageError> {
         let rows = sqlx::query(
-            "SELECT key_protocol, key_host, key_port, key_path, \
+            "SELECT api_id, key_protocol, key_host, key_port, key_path, \
              target_protocol, target_host, target_port, target_path FROM routes \
              ORDER BY key_host, key_path, key_protocol, key_port",
         )
@@ -634,6 +637,7 @@ impl RouteStore for SqliteStore {
         rows.into_iter()
             .map(|row| {
                 Ok(RouteRule {
+                    api: ApiId::new(row.get("api_id"))?,
                     key: RouteKey::new(Endpoint::from_parts(
                         row.get("key_protocol"),
                         row.get("key_host"),
@@ -1058,6 +1062,7 @@ mod tests {
 
     fn rule(host: &str, path: &str, upstream: &str) -> RouteRule {
         RouteRule {
+            api: ApiId::new("anthropic").unwrap(),
             key: RouteKey::new(route_endpoint(Protocol::Https, host, 443, path)),
             target: RouteTarget::new(route_endpoint(Protocol::Https, upstream, 443, path)),
         }
@@ -1070,6 +1075,19 @@ mod tests {
         store.put_route(rule.clone()).await.unwrap();
         assert_eq!(store.route(&rule.key).await.unwrap(), Some(rule.clone()));
         assert_eq!(store.routes().await.unwrap(), vec![rule]);
+    }
+
+    #[tokio::test]
+    async fn a_route_names_the_api_it_serves() {
+        let store = store().await;
+        let mut rule = rule("gateway.local", "/internal", "llm.corp");
+        rule.api = ApiId::new("internal").unwrap();
+        store.put_route(rule.clone()).await.unwrap();
+        assert_eq!(
+            store.route(&rule.key).await.unwrap().unwrap().api,
+            ApiId::new("internal").unwrap()
+        );
+        assert_eq!(store.routes().await.unwrap()[0].api, rule.api);
     }
 
     #[tokio::test]
@@ -1089,6 +1107,7 @@ mod tests {
         let store = store().await;
         let secure = rule("gateway.local", "/v1", "api.example.com");
         let plain = RouteRule {
+            api: ApiId::new("anthropic").unwrap(),
             key: RouteKey::new(route_endpoint(Protocol::Http, "gateway.local", 443, "/v1")),
             target: RouteTarget::new(route_endpoint(
                 Protocol::Https,
@@ -1115,6 +1134,7 @@ mod tests {
             let key = RouteKey::new(route_endpoint(protocol, "gateway.local", 443, "/v1"));
             store
                 .put_route(RouteRule {
+                    api: ApiId::new("anthropic").unwrap(),
                     key: key.clone(),
                     target: RouteTarget::new(route_endpoint(
                         protocol,
@@ -1147,9 +1167,9 @@ mod tests {
     async fn a_stored_protocol_the_code_does_not_know_is_refused() {
         let store = store().await;
         sqlx::query(
-            "INSERT INTO routes (key_protocol, key_host, key_port, key_path, \
+            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path, \
              target_protocol, target_host, target_port, target_path) \
-             VALUES ('gopher', 'gateway.local', 443, '/v1', 'https', 'api.example.com', 443, '/v1')",
+             VALUES ('anthropic', 'gopher', 'gateway.local', 443, '/v1', 'https', 'api.example.com', 443, '/v1')",
         )
         .execute(&store.pool)
         .await
@@ -1166,9 +1186,9 @@ mod tests {
     async fn a_stored_port_of_zero_is_refused_on_read() {
         let store = store().await;
         sqlx::query(
-            "INSERT INTO routes (key_protocol, key_host, key_port, key_path, \
+            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path, \
              target_protocol, target_host, target_port, target_path) \
-             VALUES ('https', 'gateway.local', 443, '/v1', 'https', 'api.example.com', 0, '/v1')",
+             VALUES ('anthropic', 'https', 'gateway.local', 443, '/v1', 'https', 'api.example.com', 0, '/v1')",
         )
         .execute(&store.pool)
         .await
