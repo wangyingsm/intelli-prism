@@ -139,3 +139,44 @@ impl Stage for ResponseBodyProcessed {
     type Held = Response<GatewayBody>;
     const NAME: StageName = StageName::ResponseBodyProcess;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_stage_names_itself() {
+        for (stage, name) in [
+            (StageName::Receive, "receive"),
+            (StageName::Authentication, "authentication"),
+            (StageName::HeaderRead, "header read"),
+            (StageName::HeaderProcess, "header process"),
+            (StageName::Authorization, "authorization"),
+            (StageName::BodyRead, "body read"),
+            (StageName::BodyProcess, "body process"),
+            (StageName::Route, "route"),
+            (StageName::ResponseHeaderRead, "response header read"),
+            (StageName::ResponseHeaderProcess, "response header process"),
+            (StageName::ResponseBodyRead, "response body read"),
+            (StageName::ResponseBodyProcess, "response body process"),
+            (StageName::Send, "send"),
+        ] {
+            assert_eq!(stage.as_str(), name);
+            assert_eq!(stage.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn each_stage_type_carries_its_own_name() {
+        assert_eq!(Received::NAME, StageName::Receive);
+        assert_eq!(HeadersProcessed::NAME, StageName::HeaderProcess);
+        assert_eq!(Authorized::NAME, StageName::Authorization);
+        assert_eq!(BodyProcessed::NAME, StageName::BodyProcess);
+        assert_eq!(Forwarded::NAME, StageName::Route);
+        assert_eq!(
+            ResponseHeadersProcessed::NAME,
+            StageName::ResponseHeaderProcess
+        );
+        assert_eq!(ResponseBodyProcessed::NAME, StageName::ResponseBodyProcess);
+    }
+}
