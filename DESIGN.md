@@ -150,6 +150,9 @@ within its tenant.
 final result).
 - When a rule has no request or response body plugin processor, body can be just passed from fan-in to fan-out with a zero-copy mode.
 - SSE can have processors too, they will be a different plugin from normal body response. do the chunck processing jobs.
+- Known gap: the response chunk chain is declared but the dataflow does not run it yet. Running it means
+mapping frames as they stream, not buffering the body, since buffering is what a chunk processor exists
+to avoid. It lands with the plugin host.
 - Websocket and gRPC do not support processors for now.
 
 #### Plugins

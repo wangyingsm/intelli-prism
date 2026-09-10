@@ -135,6 +135,9 @@ impl ProcessorChain {
     }
 
     /// The response chunk chain, highest order first.
+    ///
+    /// Known gap: the dataflow does not run this chain yet. Running it means mapping
+    /// frames as they stream rather than buffering, which lands with the plugin host.
     pub fn response_chunk(&self) -> &[Arc<dyn BodyProcessor>] {
         &self.response_chunk
     }
@@ -146,7 +149,7 @@ impl ProcessorChain {
 
     /// Whether a response body may pass through without being read into memory.
     pub fn passes_response_body(&self) -> bool {
-        self.response_body.is_empty() && self.response_chunk.is_empty()
+        self.response_body.is_empty()
     }
 }
 

@@ -826,6 +826,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_chunk_plugin_does_not_force_the_body_to_be_buffered() {
+        let processors = ProcessorChain::new().with_response_chunk(Marker::at(10, "-chunk"));
+        assert!(processors.passes_response_body());
+        let gateway = Gateway::new(table(), processors, FakeUpstream::answering("pong"));
+        let response = gateway
+            .handle(context(granted()), request("/anthropic", ""))
+            .await
+            .unwrap();
+        assert_eq!(body_of(response).await, "pong");
+    }
+
+    #[tokio::test]
     async fn with_no_body_plugin_the_body_is_never_read() {
         let upstream = FakeUpstream::answering("pong");
         let processors = ProcessorChain::new();
