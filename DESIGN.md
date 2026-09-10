@@ -161,7 +161,7 @@ transformation. and UDW has instruction and time run limit.
 keyed by WASM file sha256 checksum. plugin types enum(ReqHeader, ReqBody, RespHeader, RespBody, RespChunk), and order as a u8 integer.
 - One request can be parsed an explicit tenant and an explicit user, then can load the plugin rule records from cache. those records
 form a sequential chain of plugins. in the way of high rule order prior to low order. so order should be unique in storage.
-- order defined in range [0, 63] is reserved for primary plugins, so maximum 172 UDW is allowed. so the primary plugins is managed
+- order defined in range [0, 63] is reserved for primary plugins, so maximum 192 UDW is allowed. so the primary plugins is managed
 by admin only, they are applied to every flow by default but with low priority. 
 
 #### Routing
