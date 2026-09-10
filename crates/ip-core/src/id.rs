@@ -227,6 +227,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_over_long_nonce() {
+        let raw = "a".repeat(NONCE_MAX_BYTES + 1);
+        assert_eq!(
+            Nonce::new(&raw),
+            Err(CoreError::TooLong {
+                kind: "nonce",
+                len: NONCE_MAX_BYTES + 1,
+                max: NONCE_MAX_BYTES,
+            })
+        );
+    }
+
+    #[test]
     fn rejects_nonce_with_whitespace() {
         assert_eq!(
             Nonce::new("nonce with space"),
