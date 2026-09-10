@@ -91,7 +91,7 @@ impl Upstream for HyperUpstream {
                 ))
             })?
             .map_err(|error| UpstreamError::new(error.to_string()))?;
-        Ok(sent.map(|body| body.map_err(Into::into).boxed()))
+        Ok(sent.map(|body| body.map_err(Into::into).boxed_unsync()))
     }
 }
 

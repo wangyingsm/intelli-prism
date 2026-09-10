@@ -866,11 +866,14 @@ dependencies = [
 name = "intelli-prism"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "bytes",
  "http-body-util",
  "ip-auth",
  "ip-config",
  "ip-core",
+ "ip-gateway",
  "ip-storage",
  "serde",
  "serde_json",

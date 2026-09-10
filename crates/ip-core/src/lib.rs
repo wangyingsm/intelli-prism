@@ -13,5 +13,7 @@ pub use error::CoreError;
 pub use id::{ApiId, Nonce, TenantId, UserId};
 pub use key::{Signature, TnKey, UtKey};
 pub use passphrase::PassphraseHash;
-pub use route::{AbsPath, Endpoint, Host, Port, Protocol, RouteKey, RouteRule, RouteTarget};
+pub use route::{
+    AbsPath, Endpoint, Host, Port, Protocol, RESERVED_PATH_PREFIX, RouteKey, RouteRule, RouteTarget,
+};
 pub use timestamp::Timestamp;

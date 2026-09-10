@@ -5,9 +5,11 @@ edition.workspace = true
 
 [dependencies]
 axum = "0.8.9"
+http-body-util = "0.1.5"
 ip-auth = { version = "0.1.0", path = "crates/ip-auth" }
 ip-config = { version = "0.1.0", path = "crates/ip-config" }
 ip-core = { version = "0.1.0", path = "crates/ip-core" }
+ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage" }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
@@ -27,6 +29,8 @@ edition = "2024"
 ip-core = { path = "crates/ip-core" }
 
 [dev-dependencies]
+async-trait = "0.1.92"
+bytes = "1.12.1"
 http-body-util = "0.1.5"
 serde_json = "1.0.151"
 tower = "0.5.3"

@@ -57,6 +57,12 @@ impl RoutingTable {
                 rules.push(rule);
             }
         }
+        for rule in &rules {
+            let path = &rule.key.endpoint().path;
+            if path.is_reserved() {
+                return Err(RouteError::ReservedPath { path: path.clone() });
+            }
+        }
         Ok(Self::from_rules(rules))
     }
 
@@ -393,6 +399,23 @@ model = "claude-opus-5"
                 "https://two.example.com:443/v1/messages".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn a_rule_may_not_claim_the_reserved_prefix() {
+        let config = Config::parse(CONFIG).unwrap();
+        let intruder = rule("/_ip/whoami", "attacker.example", "/v1");
+        assert!(matches!(
+            RoutingTable::build(&config, vec![intruder]),
+            Err(RouteError::ReservedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn a_path_merely_starting_with_the_prefix_is_allowed() {
+        let config = Config::parse(CONFIG).unwrap();
+        let ordinary = rule("/_iproute", "api.example.com", "/v1");
+        assert!(RoutingTable::build(&config, vec![ordinary]).is_ok());
     }
 
     #[test]

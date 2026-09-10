@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
-use ip_auth::{Identity, SignedRequest};
+use ip_auth::{Authority, SignedRequest};
 use ip_core::{Nonce, Signature, TenantId, UserId};
 
 use crate::state::AppState;
@@ -13,9 +13,10 @@ const HEADER_USER: &str = "x-ip-userid";
 const HEADER_SIGNATURE: &str = "x-ip-signature";
 const HEADER_NONCE: &str = "x-ip-nonce";
 
-/// A handler argument that only exists once the request signature checked out.
+/// A handler argument that only exists once the request signature checked out,
+/// carrying everything the caller was granted.
 #[derive(Debug, Clone)]
-pub struct Authenticated(pub Identity);
+pub struct Authenticated(pub Authority);
 
 impl FromRequestParts<AppState> for Authenticated {
     type Rejection = StatusCode;
@@ -29,14 +30,17 @@ impl FromRequestParts<AppState> for Authenticated {
             StatusCode::UNAUTHORIZED
         })?;
         let origin = origin(parts);
-        match state.verifier().verify(&request, origin).await {
-            Ok(identity) => Ok(Self(identity)),
-            // Every reason collapses to one status: telling them apart enumerates tenants and users.
-            Err(error) => {
-                tracing::warn!(%origin, %error, "rejected a signed request");
-                Err(StatusCode::UNAUTHORIZED)
-            }
-        }
+        let verifier = state.verifier();
+        // Every reason collapses to one status: telling them apart enumerates tenants and users.
+        let identity = verifier.verify(&request, origin).await.map_err(|error| {
+            tracing::warn!(%origin, %error, "rejected a signed request");
+            StatusCode::UNAUTHORIZED
+        })?;
+        let authority = verifier.authority(identity).await.map_err(|error| {
+            tracing::error!(%error, "could not read what the caller was granted");
+            StatusCode::UNAUTHORIZED
+        })?;
+        Ok(Self(authority))
     }
 }
 

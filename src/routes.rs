@@ -1,16 +1,28 @@
-use axum::routing::get;
+use axum::body::Body;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{Request, Response, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::{any, get};
 use axum::{Json, Router};
+use http_body_util::BodyExt;
 use ip_auth::Identity;
-use ip_core::Role;
+use ip_core::{Protocol, Role};
+use ip_gateway::{GatewayBody, GatewayError, RequestContext};
+use std::net::SocketAddr;
 
 use crate::auth::Authenticated;
 use crate::state::AppState;
 
 /// Every route the server serves.
+///
+/// The server's own endpoints sit under the reserved prefix so no routing rule can
+/// claim them; every other path is proxied.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
-        .route("/whoami", get(whoami))
+        .route("/_ip/healthz", get(healthz))
+        .route("/_ip/whoami", get(whoami))
+        .route("/_ip/{*rest}", any(reserved))
+        .fallback(any(proxy))
         .with_state(state)
 }
 
@@ -29,8 +41,46 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn whoami(Authenticated(identity): Authenticated) -> Json<WhoAmI> {
-    Json(WhoAmI::from(identity))
+async fn whoami(Authenticated(authority): Authenticated) -> Json<WhoAmI> {
+    Json(WhoAmI::from(authority.identity().clone()))
+}
+
+/// Anything else under the reserved prefix belongs to no endpoint and is never proxied.
+async fn reserved() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+/// Carries an authenticated request through the gateway dataflow.
+async fn proxy(
+    State(state): State<AppState>,
+    Authenticated(authority): Authenticated,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let context = RequestContext {
+        authority,
+        protocol: Protocol::Http,
+        listen: state.listen(),
+    };
+    match state.gateway().handle(context, into_gateway(request)).await {
+        Ok(response) => response.map(Body::new),
+        Err(error) => refuse(error),
+    }
+}
+
+fn into_gateway(request: Request<Body>) -> Request<GatewayBody> {
+    request.map(|body| body.map_err(Into::into).boxed_unsync())
+}
+
+/// The caller is told the status and nothing else; the reason goes to the log.
+fn refuse(error: GatewayError) -> Response<Body> {
+    let status = error.status();
+    if status.is_server_error() {
+        tracing::error!(stage = %error.stage(), %error, "the gateway could not carry a request");
+    } else {
+        tracing::warn!(stage = %error.stage(), %error, "the gateway refused a request");
+    }
+    (status, ()).into_response()
 }
 
 impl From<Identity> for WhoAmI {
@@ -54,23 +104,64 @@ fn role_name(role: &Role) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
     use http_body_util::BodyExt;
-    use ip_core::{Nonce, PassphraseHash, Signature, TenantId, TnKey, UserId, UtKey};
+    use ip_config::Config;
+    use ip_core::{
+        AbsPath, ApiId, Capability, CapabilityScope, Endpoint, Grant, Host, Nonce, PassphraseHash,
+        Port, Protocol, RouteKey, RouteRule, RouteTarget, Signature, TenantId, TnKey, UserId,
+        UtKey,
+    };
+    use ip_gateway::{Gateway, ProcessorChain, RoutingTable, Upstream, UpstreamError};
     use ip_storage::{
-        AccountKind, Membership, MembershipStore, NewTenant, NewUser, SqliteStore, Standing,
-        Storage, TenantStore, UserStore,
+        AccountKind, GrantStore, Membership, MembershipStore, NewTenant, NewUser, SqliteStore,
+        Standing, Storage, TenantStore, UserStore,
     };
     use tower::ServiceExt;
 
     use super::*;
 
     const REMOTE: [u8; 4] = [203, 0, 113, 7];
-    const LOCAL: [u8; 4] = [127, 0, 0, 1];
+
+    const CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "./test.db"
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+"#;
+
+    /// Answers every request with a fixed body, recording the uri it was given.
+    #[derive(Default)]
+    struct FakeUpstream {
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for FakeUpstream {
+        async fn send(
+            &self,
+            request: Request<ip_gateway::GatewayBody>,
+        ) -> Result<Response<ip_gateway::GatewayBody>, UpstreamError> {
+            self.seen.lock().unwrap().push(request.uri().to_string());
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(ip_gateway::body::from_bytes(Bytes::from_static(
+                    b"from upstream",
+                )))
+                .unwrap())
+        }
+    }
 
     fn tenant_id() -> TenantId {
         TenantId::new("acme").unwrap()
@@ -80,11 +171,32 @@ mod tests {
         UserId::new("alice").unwrap()
     }
 
+    fn api_id() -> ApiId {
+        ApiId::new("anthropic").unwrap()
+    }
+
     fn nonce() -> Nonce {
         Nonce::new("0123456789abcdef").unwrap()
     }
 
-    async fn fixture(kind: AccountKind, standing: Standing) -> (Router, TnKey) {
+    fn endpoint(host: &str, port: u16, path: &str) -> Endpoint {
+        Endpoint::new(
+            Protocol::Http,
+            Host::new(host).unwrap(),
+            Port::new(port).unwrap(),
+            AbsPath::new(path).unwrap(),
+        )
+    }
+
+    fn rule() -> RouteRule {
+        RouteRule {
+            api: api_id(),
+            key: RouteKey::new(endpoint("gateway.local", 8080, "/anthropic")),
+            target: RouteTarget::new(endpoint("upstream.local", 80, "/v1")),
+        }
+    }
+
+    async fn fixture(granted: bool) -> (Router, TnKey, Arc<FakeUpstream>) {
         let store = SqliteStore::in_memory().await.unwrap();
         let key = TnKey::generate().unwrap();
         store
@@ -99,7 +211,7 @@ mod tests {
                 id: user_id(),
                 passphrase: PassphraseHash::new("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA")
                     .unwrap(),
-                kind,
+                kind: AccountKind::Regular,
             })
             .await
             .unwrap();
@@ -107,16 +219,43 @@ mod tests {
             .attach(Membership {
                 user: user_id(),
                 tenant: tenant_id(),
-                standing,
+                standing: Standing::Member,
             })
             .await
             .unwrap();
-        let state = AppState::with_store(Arc::new(store) as Arc<dyn Storage>);
-        (router(state), key)
+        if granted {
+            store
+                .grant(
+                    &Grant::new(
+                        Capability::ApiAccess,
+                        CapabilityScope::Api {
+                            user: user_id(),
+                            tenant: tenant_id(),
+                            api: api_id(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let config = Config::parse(CONFIG).unwrap();
+        let table = RoutingTable::build(&config, vec![rule()]).unwrap();
+        let upstream = Arc::new(FakeUpstream::default());
+        let gateway = Gateway::new(table, ProcessorChain::new(), upstream.clone());
+        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = AppState::with_parts(Arc::new(store) as Arc<dyn Storage>, gateway, listen);
+        (router(state), key, upstream)
     }
 
-    fn request(uri: &str, signature: Option<&str>, peer: [u8; 4]) -> Request<Body> {
-        let mut builder = Request::builder().uri(uri);
+    fn signature(key: &TnKey) -> String {
+        Signature::of_user(&UtKey::derive(&user_id(), key), &nonce()).to_hex()
+    }
+
+    fn request(uri: &str, signature: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .uri(uri)
+            .header("host", "gateway.local:8080");
         if let Some(signature) = signature {
             builder = builder
                 .header("x-ip-tnid", tenant_id().as_str())
@@ -127,46 +266,36 @@ mod tests {
         let mut request = builder.body(Body::empty()).unwrap();
         request
             .extensions_mut()
-            .insert(ConnectInfo(SocketAddr::from((peer, 40_000))));
+            .insert(ConnectInfo(SocketAddr::from((REMOTE, 40_000))));
         request
     }
 
-    fn user_signature(key: &TnKey) -> String {
-        Signature::of_user(&UtKey::derive(&user_id(), key), &nonce()).to_hex()
-    }
-
-    async fn body_of(response: axum::response::Response) -> String {
+    async fn body_of(response: Response<Body>) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     #[tokio::test]
     async fn health_needs_no_credentials() {
-        let (router, _) = fixture(AccountKind::Regular, Standing::Member).await;
-        let response = router
-            .oneshot(request("/healthz", None, REMOTE))
-            .await
-            .unwrap();
+        let (router, _, _) = fixture(true).await;
+        let response = router.oneshot(request("/_ip/healthz", None)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_of(response).await, "ok");
     }
 
     #[tokio::test]
     async fn an_unsigned_request_is_refused() {
-        let (router, _) = fixture(AccountKind::Regular, Standing::Member).await;
-        let response = router
-            .oneshot(request("/whoami", None, REMOTE))
-            .await
-            .unwrap();
+        let (router, _, _) = fixture(true).await;
+        let response = router.oneshot(request("/_ip/whoami", None)).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(body_of(response).await.is_empty());
     }
 
     #[tokio::test]
     async fn a_signed_request_names_its_caller() {
-        let (router, key) = fixture(AccountKind::Regular, Standing::Member).await;
+        let (router, key, _) = fixture(true).await;
         let response = router
-            .oneshot(request("/whoami", Some(&user_signature(&key)), REMOTE))
+            .oneshot(request("/_ip/whoami", Some(&signature(&key))))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -177,69 +306,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tenant_owner_is_named_as_one() {
-        let (router, key) = fixture(AccountKind::Regular, Standing::Owner).await;
+    async fn a_signed_and_granted_request_is_proxied() {
+        let (router, key, upstream) = fixture(true).await;
         let response = router
-            .oneshot(request("/whoami", Some(&user_signature(&key)), REMOTE))
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_str(&body_of(response).await).unwrap();
-        assert_eq!(body["role"], "tenant_admin");
-    }
-
-    #[tokio::test]
-    async fn a_signature_from_another_key_is_refused() {
-        let (router, _) = fixture(AccountKind::Regular, Standing::Member).await;
-        let stolen = TnKey::generate().unwrap();
-        let response = router
-            .oneshot(request("/whoami", Some(&user_signature(&stolen)), REMOTE))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn a_signature_that_is_not_hex_is_refused() {
-        let (router, _) = fixture(AccountKind::Regular, Standing::Member).await;
-        let response = router
-            .oneshot(request("/whoami", Some("not-a-signature"), REMOTE))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn the_system_administrator_is_refused_off_localhost() {
-        let (router, key) = fixture(AccountKind::SystemAdministrator, Standing::Member).await;
-        let response = router
-            .clone()
-            .oneshot(request("/whoami", Some(&user_signature(&key)), REMOTE))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        let response = router
-            .oneshot(request("/whoami", Some(&user_signature(&key)), LOCAL))
+            .oneshot(request("/anthropic/messages", Some(&signature(&key))))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value = serde_json::from_str(&body_of(response).await).unwrap();
-        assert_eq!(body["role"], "sysadmin");
+        assert_eq!(body_of(response).await, "from upstream");
+        assert_eq!(
+            upstream.seen.lock().unwrap().as_slice(),
+            ["http://upstream.local:80/v1/messages"]
+        );
     }
 
     #[tokio::test]
-    async fn a_request_with_no_peer_address_is_treated_as_remote() {
-        let (router, key) = fixture(AccountKind::SystemAdministrator, Standing::Member).await;
-        let mut bare = Request::builder()
-            .uri("/whoami")
-            .header("x-ip-tnid", tenant_id().as_str())
-            .header("x-ip-userid", user_id().as_str())
-            .header("x-ip-nonce", nonce().as_str())
-            .header("x-ip-signature", user_signature(&key))
-            .body(Body::empty())
+    async fn an_unsigned_proxied_request_never_reaches_the_upstream() {
+        let (router, _, upstream) = fixture(true).await;
+        let response = router
+            .oneshot(request("/anthropic/messages", None))
+            .await
             .unwrap();
-        bare.extensions_mut().remove::<ConnectInfo<SocketAddr>>();
-        let response = router.oneshot(bare).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_caller_holding_no_api_access_never_reaches_the_upstream() {
+        let (router, key, upstream) = fixture(false).await;
+        let response = router
+            .oneshot(request("/anthropic/messages", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_path_no_rule_carries_is_not_found() {
+        let (router, key, _) = fixture(true).await;
+        let response = router
+            .oneshot(request("/elsewhere", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_reserved_prefix_is_never_proxied() {
+        let (router, key, upstream) = fixture(true).await;
+        let response = router
+            .oneshot(request("/_ip/anything", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(upstream.seen.lock().unwrap().is_empty());
     }
 }

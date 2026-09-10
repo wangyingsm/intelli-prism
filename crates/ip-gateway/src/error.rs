@@ -17,6 +17,16 @@ pub enum RouteError {
     /// The stored rules could not be read.
     #[error(transparent)]
     Storage(#[from] StorageError),
+
+    /// A rule claims a path the gateway keeps for its own endpoints.
+    #[error(
+        "{path} is inside {}, which the gateway keeps for itself",
+        ip_core::RESERVED_PATH_PREFIX
+    )]
+    ReservedPath {
+        /// The path the rule tried to claim.
+        path: ip_core::AbsPath,
+    },
 }
 
 /// A request that did not make it through the dataflow, and how far it got.

@@ -1,5 +1,8 @@
 # Copy to intelli-prism.toml and edit. Every key is rejected if misspelled, so a
 # typo stops the server rather than silently taking a default.
+#
+# The gateway keeps /_ip for its own endpoints: /_ip/healthz and /_ip/whoami. No
+# routing rule may claim a path under it. Every other path is proxied.
 
 [server]
 listen = "127.0.0.1:8080"

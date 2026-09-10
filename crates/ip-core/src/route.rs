@@ -5,6 +5,9 @@ use std::str::FromStr;
 use crate::error::CoreError;
 use crate::id::ApiId;
 
+/// The path prefix the gateway keeps for its own endpoints, which no rule may claim.
+pub const RESERVED_PATH_PREFIX: &str = "/_ip";
+
 const HOST_MAX_BYTES: usize = 253;
 const HOST_LABEL_MAX_BYTES: usize = 63;
 const PATH_MAX_BYTES: usize = 2048;
@@ -247,6 +250,14 @@ impl AbsPath {
     /// The path as text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this path lies inside the prefix the gateway keeps for itself.
+    pub fn is_reserved(&self) -> bool {
+        match self.0.strip_prefix(RESERVED_PATH_PREFIX) {
+            Some(rest) => rest.is_empty() || rest.starts_with('/'),
+            None => false,
+        }
     }
 }
 
@@ -568,6 +579,15 @@ mod tests {
             AbsPath::new("/v1/messages").unwrap().as_str(),
             "/v1/messages"
         );
+    }
+
+    #[test]
+    fn the_reserved_prefix_is_recognised_on_a_segment_boundary() {
+        assert!(AbsPath::new("/_ip").unwrap().is_reserved());
+        assert!(AbsPath::new("/_ip/healthz").unwrap().is_reserved());
+        assert!(!AbsPath::new("/_iproute").unwrap().is_reserved());
+        assert!(!AbsPath::new("/anthropic").unwrap().is_reserved());
+        assert!(!AbsPath::new("/").unwrap().is_reserved());
     }
 
     #[test]
