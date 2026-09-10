@@ -63,3 +63,51 @@ async fn open_store(config: &StorageConfig) -> Result<Arc<SqliteStore>, StartupE
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use ip_config::Config;
+
+    use super::*;
+
+    fn config(storage: &str) -> Config {
+        Config::parse(&format!(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+{storage}
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+"#
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_backend_this_build_does_not_carry_stops_startup() {
+        let config = config("[storage]\nbackend = \"postgres\"\nurl = \"postgres://ip@db/ip\"");
+        assert!(matches!(
+            AppState::open(&config).await,
+            Err(StartupError::UnsupportedBackend {
+                backend: "postgres"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn opening_the_sqlite_backend_builds_a_routing_table() {
+        let path = std::env::temp_dir().join(format!("ip-state-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let config = config(&format!(
+            "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+            path.display().to_string()
+        ));
+        let state = AppState::open(&config).await.unwrap();
+        assert_eq!(state.listen(), config.server.listen);
+        assert!(state.gateway().table().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+}
