@@ -364,25 +364,51 @@ impl fmt::Display for RouteKey {
     }
 }
 
-/// The endpoint a matched request is sent on to.
+/// The endpoints a matched request may be sent to, of which there is always at least one.
+///
+/// Several endpoints stand behind one target when an upstream is replicated. Which one
+/// a request goes to is a dispatch decision the gateway makes, not a property of the rule.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct RouteTarget(Endpoint);
+#[serde(try_from = "Vec<Endpoint>")]
+pub struct RouteTarget(Vec<Endpoint>);
 
 impl RouteTarget {
-    /// Wraps the endpoint a request is forwarded to.
+    /// Wraps the single endpoint a request is forwarded to.
     pub fn new(endpoint: Endpoint) -> Self {
-        Self(endpoint)
+        Self(vec![endpoint])
     }
 
-    /// The endpoint itself.
-    pub fn endpoint(&self) -> &Endpoint {
+    /// Wraps every endpoint standing behind one target, refusing an empty list.
+    pub fn from_endpoints(endpoints: Vec<Endpoint>) -> Result<Self, CoreError> {
+        if endpoints.is_empty() {
+            return Err(CoreError::NoEndpoint);
+        }
+        Ok(Self(endpoints))
+    }
+
+    /// Every endpoint a request may be sent to.
+    pub fn endpoints(&self) -> &[Endpoint] {
         &self.0
+    }
+
+    /// The endpoint used until a dispatch algorithm chooses between them.
+    pub fn primary(&self) -> &Endpoint {
+        &self.0[0]
+    }
+}
+
+impl TryFrom<Vec<Endpoint>> for RouteTarget {
+    type Error = CoreError;
+
+    fn try_from(endpoints: Vec<Endpoint>) -> Result<Self, Self::Error> {
+        Self::from_endpoints(endpoints)
     }
 }
 
 impl fmt::Display for RouteTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        let rendered: Vec<String> = self.0.iter().map(ToString::to_string).collect();
+        f.write_str(&rendered.join(", "))
     }
 }
 
@@ -637,8 +663,39 @@ mod tests {
             target: target.clone(),
         };
         assert_eq!(rule.key.endpoint().host.as_str(), "gateway.local");
-        assert_eq!(rule.target.endpoint().host.as_str(), "api.example.com");
+        assert_eq!(rule.target.primary().host.as_str(), "api.example.com");
         assert_eq!(key.to_string(), "https://gateway.local:443/v1");
+    }
+
+    #[test]
+    fn a_target_may_stand_for_several_endpoints() {
+        let target = RouteTarget::from_endpoints(vec![
+            endpoint(Protocol::Https, "one.example.com", 443, "/v1"),
+            endpoint(Protocol::Https, "two.example.com", 443, "/v1"),
+        ])
+        .unwrap();
+        assert_eq!(target.endpoints().len(), 2);
+        assert_eq!(target.primary().host.as_str(), "one.example.com");
+        assert_eq!(
+            target.to_string(),
+            "https://one.example.com:443/v1, https://two.example.com:443/v1"
+        );
+    }
+
+    #[test]
+    fn a_target_that_names_nowhere_is_refused() {
+        assert_eq!(
+            RouteTarget::from_endpoints(Vec::new()),
+            Err(CoreError::NoEndpoint)
+        );
+        assert!(serde_json::from_str::<RouteTarget>("[]").is_err());
+    }
+
+    #[test]
+    fn a_single_endpoint_target_still_reads_as_one() {
+        let target = RouteTarget::new(endpoint(Protocol::Https, "api.example.com", 443, "/v1"));
+        assert_eq!(target.endpoints().len(), 1);
+        assert_eq!(target.to_string(), "https://api.example.com:443/v1");
     }
 
     #[test]

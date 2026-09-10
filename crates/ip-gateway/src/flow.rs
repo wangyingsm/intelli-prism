@@ -80,7 +80,7 @@ impl Gateway {
         )
         .await?;
 
-        let forwarded = self.forward_request(request, body, resolution.target())?;
+        let forwarded = self.forward_request(request, body, resolution.primary())?;
         let mut response = self
             .upstream
             .send(forwarded)
@@ -137,11 +137,16 @@ impl Gateway {
                 GatewayErrorKind::NoRoute { key: key.clone() },
             )
         })?;
-        let protocol = resolution.target().protocol;
-        if !protocol.is_forwarded() {
+        if let Some(target) = resolution
+            .targets()
+            .iter()
+            .find(|target| !target.protocol.is_forwarded())
+        {
             return Err(GatewayError::new(
                 Stage::Authorization,
-                GatewayErrorKind::ProtocolNotServed { protocol },
+                GatewayErrorKind::ProtocolNotServed {
+                    protocol: target.protocol,
+                },
             ));
         }
         let identity = context.authority.identity();

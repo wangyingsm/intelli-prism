@@ -10,17 +10,23 @@ use crate::error::RouteError;
 /// The exactly matched part of a key: everything but the path.
 type Authority = (Protocol, Host, Port);
 
-/// Where a matched request is sent, and the rule that sent it.
+/// Where a matched request may be sent, and the rule that sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
     rule: RouteRule,
-    target: Endpoint,
+    targets: Vec<Endpoint>,
 }
 
 impl Resolution {
-    /// The endpoint to forward to, with the unmatched path remainder already appended.
-    pub fn target(&self) -> &Endpoint {
-        &self.target
+    /// Every endpoint the request may go to, each with the unmatched path remainder
+    /// already appended. Which one it goes to is a dispatch decision.
+    pub fn targets(&self) -> &[Endpoint] {
+        &self.targets
+    }
+
+    /// The endpoint used until a dispatch algorithm chooses between them.
+    pub fn primary(&self) -> &Endpoint {
+        &self.targets[0]
     }
 
     /// The rule that matched.
@@ -94,11 +100,19 @@ impl RoutingTable {
             else {
                 continue;
             };
-            let target = rule.target.endpoint();
-            let path = AbsPath::new(&join(target.path.as_str(), remainder)).ok()?;
+            let mut targets = Vec::with_capacity(rule.target.endpoints().len());
+            for target in rule.target.endpoints() {
+                let path = AbsPath::new(&join(target.path.as_str(), remainder)).ok()?;
+                targets.push(Endpoint::new(
+                    target.protocol,
+                    target.host.clone(),
+                    target.port,
+                    path,
+                ));
+            }
             return Some(Resolution {
                 rule: rule.clone(),
-                target: Endpoint::new(target.protocol, target.host.clone(), target.port, path),
+                targets,
             });
         }
         None
@@ -235,7 +249,7 @@ model = "claude-opus-5"
         let table = table(vec![rule("/anthropic", "api.example.com", "/v1")]);
         let resolved = table.resolve(&key("/anthropic")).unwrap();
         assert_eq!(
-            resolved.target().to_string(),
+            resolved.primary().to_string(),
             "https://api.example.com:443/v1"
         );
     }
@@ -245,7 +259,7 @@ model = "claude-opus-5"
         let table = table(vec![rule("/anthropic", "api.example.com", "/v1")]);
         let resolved = table.resolve(&key("/anthropic/messages")).unwrap();
         assert_eq!(
-            resolved.target().to_string(),
+            resolved.primary().to_string(),
             "https://api.example.com:443/v1/messages"
         );
     }
@@ -258,12 +272,12 @@ model = "claude-opus-5"
         ]);
         let resolved = table.resolve(&key("/anthropic/beta/messages")).unwrap();
         assert_eq!(
-            resolved.target().to_string(),
+            resolved.primary().to_string(),
             "https://beta.example.com:443/v1/messages"
         );
         let resolved = table.resolve(&key("/anthropic/messages")).unwrap();
         assert_eq!(
-            resolved.target().to_string(),
+            resolved.primary().to_string(),
             "https://api.example.com:443/v1/messages"
         );
     }
@@ -280,7 +294,7 @@ model = "claude-opus-5"
         let table = table(vec![rule("/", "api.example.com", "/v1")]);
         let resolved = table.resolve(&key("/messages")).unwrap();
         assert_eq!(
-            resolved.target().to_string(),
+            resolved.primary().to_string(),
             "https://api.example.com:443/v1/messages"
         );
     }
@@ -290,7 +304,7 @@ model = "claude-opus-5"
         let table = table(vec![rule("/anthropic", "api.example.com", "/")]);
         let resolved = table.resolve(&key("/anthropic/messages")).unwrap();
         assert_eq!(
-            resolved.target().to_string(),
+            resolved.primary().to_string(),
             "https://api.example.com:443/messages"
         );
     }
@@ -300,7 +314,7 @@ model = "claude-opus-5"
         let table = table(vec![rule("/anthropic/", "api.example.com", "/v1")]);
         let resolved = table.resolve(&key("/anthropic/messages")).unwrap();
         assert_eq!(
-            resolved.target().to_string(),
+            resolved.primary().to_string(),
             "https://api.example.com:443/v1/messages"
         );
     }
@@ -332,7 +346,7 @@ model = "claude-opus-5"
         assert_eq!(table.len(), 1);
         let resolved = table.resolve(&key("/anthropic/messages")).unwrap();
         assert_eq!(
-            resolved.target().to_string(),
+            resolved.primary().to_string(),
             "https://api.anthropic.com:443/v1/messages"
         );
     }
@@ -355,9 +369,29 @@ model = "claude-opus-5"
         assert_eq!(table.len(), 1);
         let resolved = table.resolve(&key("/anthropic")).unwrap();
         assert_eq!(
-            resolved.target().host.as_str(),
+            resolved.primary().host.as_str(),
             "api.anthropic.com",
             "the configured target must survive a stored rule under the same key"
+        );
+    }
+
+    #[test]
+    fn every_endpoint_of_a_replicated_target_carries_the_remainder() {
+        let mut replicated = rule("/anthropic", "one.example.com", "/v1");
+        replicated.target = ip_core::RouteTarget::from_endpoints(vec![
+            endpoint(Protocol::Https, "one.example.com", 443, "/v1"),
+            endpoint(Protocol::Https, "two.example.com", 443, "/v1"),
+        ])
+        .unwrap();
+        let table = table(vec![replicated]);
+        let resolved = table.resolve(&key("/anthropic/messages")).unwrap();
+        let rendered: Vec<String> = resolved.targets().iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "https://one.example.com:443/v1/messages".to_owned(),
+                "https://two.example.com:443/v1/messages".to_owned(),
+            ]
         );
     }
 

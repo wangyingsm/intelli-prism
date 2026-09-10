@@ -45,6 +45,10 @@ pub enum CoreError {
         value: String,
     },
 
+    /// A route target that names nowhere to send.
+    #[error("a route target names no endpoint")]
+    NoEndpoint,
+
     /// Port zero names no service.
     #[error("port zero is not a port")]
     ZeroPort,

@@ -283,7 +283,7 @@ mod tests {
         let target = upstream("https://api.anthropic.com", None)
             .route_target()
             .unwrap();
-        assert_eq!(target.endpoint().path.as_str(), "/");
+        assert_eq!(target.primary().path.as_str(), "/");
     }
 
     #[test]
@@ -291,7 +291,7 @@ mod tests {
         let target = upstream("https://llm.corp:8443/v1", None)
             .route_target()
             .unwrap();
-        assert_eq!(target.endpoint().port.get(), 8443);
+        assert_eq!(target.primary().port.get(), 8443);
     }
 
     #[test]
