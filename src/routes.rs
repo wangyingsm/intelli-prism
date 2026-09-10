@@ -306,6 +306,18 @@ secret = "0123456789abcdef0123456789abcdef"
     }
 
     #[tokio::test]
+    async fn a_request_signed_with_another_key_is_refused() {
+        let (router, _, upstream) = fixture(true).await;
+        let stolen = TnKey::generate().unwrap();
+        let response = router
+            .oneshot(request("/anthropic/messages", Some(&signature(&stolen))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_signed_and_granted_request_is_proxied() {
         let (router, key, upstream) = fixture(true).await;
         let response = router
