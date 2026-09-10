@@ -59,7 +59,7 @@ impl RoutingTable {
         Self::build(config, store.routes().await?)
     }
 
-    fn from_rules(rules: Vec<RouteRule>) -> Self {
+    pub(crate) fn from_rules(rules: Vec<RouteRule>) -> Self {
         let mut by_authority: HashMap<Authority, Vec<RouteRule>> = HashMap::new();
         for rule in rules {
             by_authority

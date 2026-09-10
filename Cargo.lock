@@ -867,6 +867,11 @@ dependencies = [
 name = "ip-gateway"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "http-body-util",
+ "ip-auth",
  "ip-config",
  "ip-core",
  "ip-storage",

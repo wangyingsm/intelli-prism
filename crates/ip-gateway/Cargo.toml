@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-trait = "0.1.92"
+bytes = "1.12.1"
+http = "1.5.0"
+http-body-util = "0.1.5"
+ip-auth = { version = "0.1.0", path = "../ip-auth" }
 ip-config = { version = "0.1.0", path = "../ip-config" }
 ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-storage = { version = "0.1.0", path = "../ip-storage" }
