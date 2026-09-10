@@ -12,7 +12,10 @@ use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey};
 use crate::body::{GatewayBody, from_bytes};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{BodyProcessor, HeaderProcessor, ProcessorChain};
-use crate::stage::Stage;
+use crate::stage::{
+    Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
+    ResponseHeadersProcessed, Routed, Stage, StageName,
+};
 use crate::table::{Resolution, RoutingTable, request_key};
 use crate::upstream::Upstream;
 
@@ -55,143 +58,313 @@ impl Gateway {
         &self.table
     }
 
-    /// Carries one request through every stage.
+    /// Carries one request through every stage, in the order the types allow.
     pub async fn handle(
         &self,
         context: RequestContext,
-        mut request: Request<GatewayBody>,
+        request: Request<GatewayBody>,
     ) -> Result<Response<GatewayBody>, GatewayError> {
-        let key = self.key_of(&context, &request)?;
+        Flow::received(context, request)
+            .process_headers(self.processors.request_headers())
+            .await?
+            .authorize(&self.table)?
+            .process_body(&self.processors)
+            .await?
+            .forward(self.upstream.as_ref())
+            .await?
+            .process_response_headers(self.processors.response_headers())
+            .await?
+            .process_response_body(&self.processors)
+            .await?
+            .into_response()
+    }
+}
 
-        run_headers(
-            Stage::HeaderProcess,
-            self.processors.request_headers(),
-            request.headers_mut(),
-        )
-        .await?;
+/// A request part way through the dataflow, with the stage it reached in its type.
+///
+/// Each transition is implemented only on the stage before it, so a step cannot be
+/// skipped or reordered: the call that would do so does not compile.
+///
+/// Stages run in order:
+///
+/// ```
+/// # use ip_gateway::{Flow, ProcessorChain, RoutingTable, RequestContext};
+/// # use ip_gateway::body::empty;
+/// # use ip_auth::{Authority, Identity};
+/// # use ip_core::{Grants, Protocol, Role, TenantId, UserId};
+/// # use http::Request;
+/// # fn context() -> RequestContext {
+/// #     RequestContext {
+/// #         authority: Authority::new(
+/// #             Identity {
+/// #                 user: UserId::new("alice").unwrap(),
+/// #                 tenant: TenantId::new("acme").unwrap(),
+/// #                 role: Role::Member,
+/// #             },
+/// #             Grants::new(),
+/// #         ),
+/// #         protocol: Protocol::Http,
+/// #         listen: "127.0.0.1:8080".parse().unwrap(),
+/// #     }
+/// # }
+/// # async fn run(table: &RoutingTable, chain: &ProcessorChain) {
+/// let request = Request::builder().uri("/x").body(empty()).unwrap();
+/// let flow = Flow::received(context(), request);
+/// let flow = flow.process_headers(chain.request_headers()).await.unwrap();
+/// let flow = flow.authorize(table).unwrap();
+/// # }
+/// ```
+///
+/// Skipping one does not compile:
+///
+/// ```compile_fail
+/// # use ip_gateway::{Flow, ProcessorChain, RoutingTable, RequestContext};
+/// # use ip_gateway::body::empty;
+/// # use ip_auth::{Authority, Identity};
+/// # use ip_core::{Grants, Protocol, Role, TenantId, UserId};
+/// # use http::Request;
+/// # fn context() -> RequestContext {
+/// #     RequestContext {
+/// #         authority: Authority::new(
+/// #             Identity {
+/// #                 user: UserId::new("alice").unwrap(),
+/// #                 tenant: TenantId::new("acme").unwrap(),
+/// #                 role: Role::Member,
+/// #             },
+/// #             Grants::new(),
+/// #         ),
+/// #         protocol: Protocol::Http,
+/// #         listen: "127.0.0.1:8080".parse().unwrap(),
+/// #     }
+/// # }
+/// # async fn run(table: &RoutingTable, chain: &ProcessorChain) {
+/// let request = Request::builder().uri("/x").body(empty()).unwrap();
+/// let flow = Flow::received(context(), request);
+/// // authorize belongs to Flow<HeadersProcessed>, not Flow<Received>.
+/// let flow = flow.authorize(table).unwrap();
+/// # }
+/// ```
+pub struct Flow<S: Stage> {
+    context: RequestContext,
+    held: S::Held,
+}
 
-        let resolution = self.authorize(&context, &key)?;
+impl<S: Stage> Flow<S> {
+    /// Who the caller is, and where the request arrived.
+    pub fn context(&self) -> &RequestContext {
+        &self.context
+    }
 
-        let body = run_body(
-            Stage::BodyProcess,
-            self.processors.request_body(),
-            request.body_mut(),
-            self.processors.passes_request_body(),
-        )
-        .await?;
+    /// The stage this flow has reached.
+    pub fn stage(&self) -> StageName {
+        S::NAME
+    }
+}
 
-        let forwarded = self.forward_request(request, body, resolution.primary())?;
-        let mut response = self
-            .upstream
-            .send(forwarded)
-            .await
-            .map_err(|error| GatewayError::new(Stage::Route, error.into()))?;
+impl Flow<Received> {
+    /// Takes a request that has been authenticated but not yet processed.
+    pub fn received(context: RequestContext, request: Request<GatewayBody>) -> Self {
+        Self {
+            context,
+            held: request,
+        }
+    }
 
-        run_headers(
-            Stage::ResponseHeaderProcess,
-            self.processors.response_headers(),
-            response.headers_mut(),
-        )
-        .await?;
-
-        let body = run_body(
-            Stage::ResponseBodyProcess,
-            self.processors.response_body(),
-            response.body_mut(),
-            self.processors.passes_response_body(),
-        )
-        .await?;
-
-        Ok(match body {
-            Some(bytes) => {
-                let (parts, _) = response.into_parts();
-                Response::from_parts(parts, from_bytes(bytes))
-            }
-            None => response,
+    /// Runs the request header chain.
+    pub async fn process_headers(
+        mut self,
+        chain: &[Arc<dyn HeaderProcessor>],
+    ) -> Result<Flow<HeadersProcessed>, GatewayError> {
+        run_headers(HeadersProcessed::NAME, chain, self.held.headers_mut()).await?;
+        Ok(Flow {
+            context: self.context,
+            held: self.held,
         })
     }
+}
 
-    fn key_of(
-        &self,
-        context: &RequestContext,
-        request: &Request<GatewayBody>,
-    ) -> Result<RouteKey, GatewayError> {
-        let host = authority_of(request, context.listen);
-        request_key(
-            context.protocol,
-            &host,
-            context.listen,
-            request.uri().path(),
+impl Flow<HeadersProcessed> {
+    /// Resolves the route and checks the caller may use it.
+    pub fn authorize(self, table: &RoutingTable) -> Result<Flow<Authorized>, GatewayError> {
+        let key = key_of(&self.context, &self.held)?;
+        let resolution = resolve(table, &key)?;
+        allow(&self.context, &resolution)?;
+        Ok(Flow {
+            context: self.context,
+            held: Routed {
+                request: self.held,
+                resolution,
+            },
+        })
+    }
+}
+
+impl Flow<Authorized> {
+    /// Runs the request body chain, or leaves the body untouched when there is none.
+    pub async fn process_body(
+        mut self,
+        processors: &ProcessorChain,
+    ) -> Result<Flow<BodyProcessed>, GatewayError> {
+        let body = run_body(
+            BodyProcessed::NAME,
+            processors.request_body(),
+            self.held.request.body_mut(),
+            processors.passes_request_body(),
         )
-        .map_err(|error| GatewayError::new(Stage::HeaderRead, error.into()))
-    }
-
-    fn authorize(
-        &self,
-        context: &RequestContext,
-        key: &RouteKey,
-    ) -> Result<Resolution, GatewayError> {
-        let resolution = self.table.resolve(key).ok_or_else(|| {
-            GatewayError::new(
-                Stage::Authorization,
-                GatewayErrorKind::NoRoute { key: key.clone() },
-            )
-        })?;
-        if let Some(target) = resolution
-            .targets()
-            .iter()
-            .find(|target| !target.protocol.is_forwarded())
-        {
-            return Err(GatewayError::new(
-                Stage::Authorization,
-                GatewayErrorKind::ProtocolNotServed {
-                    protocol: target.protocol,
-                },
-            ));
+        .await?;
+        if let Some(bytes) = body {
+            *self.held.request.body_mut() = from_bytes(bytes);
         }
-        let identity = context.authority.identity();
-        let scope = CapabilityScope::Api {
-            user: identity.user.clone(),
-            tenant: identity.tenant.clone(),
-            api: resolution.rule().api.clone(),
-        };
-        if !context.authority.allows(Capability::ApiAccess, &scope) {
-            return Err(GatewayError::new(
-                Stage::Authorization,
-                GatewayErrorKind::Forbidden {
-                    capability: Capability::ApiAccess,
-                },
-            ));
-        }
-        Ok(resolution)
+        Ok(Flow {
+            context: self.context,
+            held: self.held,
+        })
     }
+}
 
-    fn forward_request(
-        &self,
-        request: Request<GatewayBody>,
-        body: Option<Bytes>,
-        target: &Endpoint,
-    ) -> Result<Request<GatewayBody>, GatewayError> {
-        let query = request.uri().query().map(ToOwned::to_owned);
-        let (mut parts, original) = request.into_parts();
-        parts.uri = target_uri(target, query.as_deref()).map_err(|detail| {
-            GatewayError::new(Stage::Route, GatewayErrorKind::Malformed { detail })
-        })?;
-        let host = format!("{}:{}", target.host, target.port);
-        let host = host.parse().map_err(|_| {
-            GatewayError::new(
-                Stage::Route,
-                GatewayErrorKind::Malformed {
-                    detail: format!("{host} is not a host header"),
-                },
-            )
-        })?;
-        parts.headers.insert(HOST, host);
-        Ok(Request::from_parts(
-            parts,
-            body.map_or(original, from_bytes),
-        ))
+impl Flow<BodyProcessed> {
+    /// Sends the request to the endpoint the rule chose.
+    pub async fn forward(self, upstream: &dyn Upstream) -> Result<Flow<Forwarded>, GatewayError> {
+        let Routed {
+            request,
+            resolution,
+        } = self.held;
+        let request = rewrite(request, resolution.primary())?;
+        let response = upstream
+            .send(request)
+            .await
+            .map_err(|error| GatewayError::new(Forwarded::NAME, error.into()))?;
+        Ok(Flow {
+            context: self.context,
+            held: response,
+        })
     }
+}
+
+impl Flow<Forwarded> {
+    /// Runs the response header chain.
+    pub async fn process_response_headers(
+        mut self,
+        chain: &[Arc<dyn HeaderProcessor>],
+    ) -> Result<Flow<ResponseHeadersProcessed>, GatewayError> {
+        run_headers(
+            ResponseHeadersProcessed::NAME,
+            chain,
+            self.held.headers_mut(),
+        )
+        .await?;
+        Ok(Flow {
+            context: self.context,
+            held: self.held,
+        })
+    }
+}
+
+impl Flow<ResponseHeadersProcessed> {
+    /// Runs the response body chain, or leaves the body untouched when there is none.
+    pub async fn process_response_body(
+        mut self,
+        processors: &ProcessorChain,
+    ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
+        let body = run_body(
+            ResponseBodyProcessed::NAME,
+            processors.response_body(),
+            self.held.body_mut(),
+            processors.passes_response_body(),
+        )
+        .await?;
+        if let Some(bytes) = body {
+            *self.held.body_mut() = from_bytes(bytes);
+        }
+        Ok(Flow {
+            context: self.context,
+            held: self.held,
+        })
+    }
+}
+
+impl Flow<ResponseBodyProcessed> {
+    /// Hands the response back to the kernel.
+    pub fn into_response(self) -> Result<Response<GatewayBody>, GatewayError> {
+        Ok(self.held)
+    }
+}
+
+fn key_of(
+    context: &RequestContext,
+    request: &Request<GatewayBody>,
+) -> Result<RouteKey, GatewayError> {
+    let host = authority_of(request, context.listen);
+    request_key(
+        context.protocol,
+        &host,
+        context.listen,
+        request.uri().path(),
+    )
+    .map_err(|error| GatewayError::new(StageName::HeaderRead, error.into()))
+}
+
+fn resolve(table: &RoutingTable, key: &RouteKey) -> Result<Resolution, GatewayError> {
+    let resolution = table.resolve(key).ok_or_else(|| {
+        GatewayError::new(
+            Authorized::NAME,
+            GatewayErrorKind::NoRoute { key: key.clone() },
+        )
+    })?;
+    if let Some(target) = resolution
+        .targets()
+        .iter()
+        .find(|target| !target.protocol.is_forwarded())
+    {
+        return Err(GatewayError::new(
+            Authorized::NAME,
+            GatewayErrorKind::ProtocolNotServed {
+                protocol: target.protocol,
+            },
+        ));
+    }
+    Ok(resolution)
+}
+
+fn allow(context: &RequestContext, resolution: &Resolution) -> Result<(), GatewayError> {
+    let identity = context.authority.identity();
+    let scope = CapabilityScope::Api {
+        user: identity.user.clone(),
+        tenant: identity.tenant.clone(),
+        api: resolution.rule().api.clone(),
+    };
+    if context.authority.allows(Capability::ApiAccess, &scope) {
+        return Ok(());
+    }
+    Err(GatewayError::new(
+        Authorized::NAME,
+        GatewayErrorKind::Forbidden {
+            capability: Capability::ApiAccess,
+        },
+    ))
+}
+
+/// Points the request at the endpoint it was routed to, carrying its query across.
+fn rewrite(
+    request: Request<GatewayBody>,
+    target: &Endpoint,
+) -> Result<Request<GatewayBody>, GatewayError> {
+    let query = request.uri().query().map(ToOwned::to_owned);
+    let (mut parts, body) = request.into_parts();
+    parts.uri = target_uri(target, query.as_deref()).map_err(|detail| {
+        GatewayError::new(Forwarded::NAME, GatewayErrorKind::Malformed { detail })
+    })?;
+    let host = format!("{}:{}", target.host, target.port);
+    let host = host.parse().map_err(|_| {
+        GatewayError::new(
+            Forwarded::NAME,
+            GatewayErrorKind::Malformed {
+                detail: format!("{host} is not a host header"),
+            },
+        )
+    })?;
+    parts.headers.insert(HOST, host);
+    Ok(Request::from_parts(parts, body))
 }
 
 /// The authority a request names, which the `Host` header carries over http 1.1
@@ -227,7 +400,7 @@ fn target_uri(target: &Endpoint, query: Option<&str>) -> Result<Uri, String> {
 }
 
 async fn run_headers(
-    stage: Stage,
+    stage: StageName,
     chain: &[Arc<dyn HeaderProcessor>],
     headers: &mut HeaderMap,
 ) -> Result<(), GatewayError> {
@@ -242,7 +415,7 @@ async fn run_headers(
 
 /// Runs a body chain, or hands back `None` when the body may pass through untouched.
 async fn run_body(
-    stage: Stage,
+    stage: StageName,
     chain: &[Arc<dyn BodyProcessor>],
     body: &mut GatewayBody,
     passes: bool,
@@ -251,8 +424,8 @@ async fn run_body(
         return Ok(None);
     }
     let read_stage = match stage {
-        Stage::BodyProcess => Stage::BodyRead,
-        _ => Stage::ResponseBodyRead,
+        StageName::BodyProcess => StageName::BodyRead,
+        _ => StageName::ResponseBodyRead,
     };
     let taken = std::mem::replace(body, crate::body::empty());
     let mut bytes = taken
@@ -558,7 +731,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
-        assert_eq!(error.stage(), Stage::Authorization);
+        assert_eq!(error.stage(), StageName::Authorization);
     }
 
     #[tokio::test]
@@ -609,7 +782,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(error.stage(), Stage::Route);
+        assert_eq!(error.stage(), StageName::Route);
     }
 
     #[tokio::test]
@@ -636,7 +809,7 @@ mod tests {
             .handle(context(granted()), request("/anthropic", ""))
             .await
             .unwrap_err();
-        assert_eq!(error.stage(), Stage::HeaderProcess);
+        assert_eq!(error.stage(), StageName::HeaderProcess);
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -689,6 +862,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(upstream.last().body, Bytes::from("body-high-low"));
+    }
+
+    #[tokio::test]
+    async fn each_stage_names_itself_as_the_flow_advances() {
+        let request = request("/anthropic", "");
+        let flow = Flow::received(context(granted()), request);
+        assert_eq!(flow.stage(), StageName::Receive);
+        let processors = ProcessorChain::new();
+        let flow = flow
+            .process_headers(processors.request_headers())
+            .await
+            .unwrap();
+        assert_eq!(flow.stage(), StageName::HeaderProcess);
+        let flow = flow.authorize(&table()).unwrap();
+        assert_eq!(flow.stage(), StageName::Authorization);
+        let flow = flow.process_body(&processors).await.unwrap();
+        assert_eq!(flow.stage(), StageName::BodyProcess);
+        let upstream = FakeUpstream::answering("pong");
+        let flow = flow.forward(upstream.as_ref()).await.unwrap();
+        assert_eq!(flow.stage(), StageName::Route);
+        let flow = flow
+            .process_response_headers(processors.response_headers())
+            .await
+            .unwrap();
+        assert_eq!(flow.stage(), StageName::ResponseHeaderProcess);
+        let flow = flow.process_response_body(&processors).await.unwrap();
+        assert_eq!(flow.stage(), StageName::ResponseBodyProcess);
+        assert_eq!(body_of(flow.into_response().unwrap()).await, "pong");
     }
 
     #[test]

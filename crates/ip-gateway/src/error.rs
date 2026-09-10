@@ -4,7 +4,7 @@ use ip_core::{Capability, CoreError, Protocol, RouteKey};
 use ip_storage::StorageError;
 
 use crate::processor::ProcessorError;
-use crate::stage::Stage;
+use crate::stage::StageName;
 use crate::upstream::UpstreamError;
 
 /// Every way the routing table can fail to be built.
@@ -34,19 +34,19 @@ pub enum RouteError {
 #[error("{stage}: {kind}")]
 pub struct GatewayError {
     /// Where the request stopped.
-    stage: Stage,
+    stage: StageName,
     /// Why it stopped.
     kind: GatewayErrorKind,
 }
 
 impl GatewayError {
     /// Records a failure at a stage.
-    pub fn new(stage: Stage, kind: GatewayErrorKind) -> Self {
+    pub fn new(stage: StageName, kind: GatewayErrorKind) -> Self {
         Self { stage, kind }
     }
 
     /// Where the request stopped.
-    pub fn stage(&self) -> Stage {
+    pub fn stage(&self) -> StageName {
         self.stage
     }
 
