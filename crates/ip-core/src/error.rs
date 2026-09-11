@@ -45,6 +45,13 @@ pub enum CoreError {
         value: String,
     },
 
+    /// A plugin kind this application does not run.
+    #[error("unknown plugin kind {value:?}")]
+    UnknownPluginKind {
+        /// The text that named no kind.
+        value: String,
+    },
+
     /// A route target that names nowhere to send.
     #[error("a route target names no endpoint")]
     NoEndpoint,

@@ -12,7 +12,10 @@ pub const TN_KEY_BYTES: usize = 16;
 /// Length of a sha256 digest.
 pub const DIGEST_BYTES: usize = 32;
 
-fn decode_hex<const N: usize>(kind: &'static str, raw: &str) -> Result<[u8; N], CoreError> {
+pub(crate) fn decode_hex<const N: usize>(
+    kind: &'static str,
+    raw: &str,
+) -> Result<[u8; N], CoreError> {
     if raw.len() != N * 2 {
         return Err(CoreError::HexLength {
             kind,
