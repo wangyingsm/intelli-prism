@@ -7,6 +7,7 @@ use std::time::Duration;
 use ip_core::Checksum;
 use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
+use crate::abi::{self, ALLOC, DEALLOC, MEMORY, Packed, TRANSFORM, Transformed};
 use crate::error::PluginError;
 use crate::limits::PluginLimits;
 
@@ -39,8 +40,9 @@ impl PluginHost {
         self.limits
     }
 
-    /// Compiles wasm under its checksum. Refuses wasm that is not what the checksum names
-    /// or that imports anything. Loading a checksum that is already loaded does nothing.
+    /// Compiles wasm under its checksum. Refuses wasm that is not what the checksum names,
+    /// that imports anything, or that does not export the plugin abi. Loading a checksum
+    /// that is already loaded does nothing.
     pub fn load(&self, checksum: &Checksum, wasm: &[u8]) -> Result<(), PluginError> {
         if self.is_loaded(checksum) {
             return Ok(());
@@ -61,6 +63,7 @@ impl PluginHost {
                 import: format!("{}::{}", import.module(), import.name()),
             });
         }
+        abi::check_exports(*checksum, &module)?;
         self.modules
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -150,7 +153,6 @@ pub(crate) struct CallState {
 pub struct Invocation {
     checksum: Checksum,
     store: Store<CallState>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "first read by the guest abi"))]
     instance: Instance,
 }
 
@@ -163,6 +165,77 @@ impl Invocation {
     /// Fuel left for the rest of this call.
     pub fn fuel_left(&self) -> u64 {
         self.store.get_fuel().unwrap_or(0)
+    }
+
+    /// Hands the input to the plugin and reads back what it made of it. Consumes the
+    /// invocation, so one instance only ever serves one call.
+    pub fn transform(mut self, input: &[u8]) -> Result<Transformed, PluginError> {
+        let checksum = self.checksum;
+        let broken = |detail: String| PluginError::Abi { checksum, detail };
+        let trapped = |error: wasmtime::Error| {
+            PluginError::trapped(checksum, &error, |detail| PluginError::Trap {
+                checksum,
+                detail,
+            })
+        };
+
+        let memory = self
+            .instance
+            .get_memory(&mut self.store, MEMORY)
+            .ok_or_else(|| broken(format!("no `{MEMORY}` memory export")))?;
+        let alloc = self
+            .instance
+            .get_typed_func::<i32, i32>(&mut self.store, ALLOC)
+            .map_err(|error| broken(error.to_string()))?;
+        let dealloc = self
+            .instance
+            .get_typed_func::<(i32, i32), ()>(&mut self.store, DEALLOC)
+            .map_err(|error| broken(error.to_string()))?;
+        let transform = self
+            .instance
+            .get_typed_func::<(i32, i32), i64>(&mut self.store, TRANSFORM)
+            .map_err(|error| broken(error.to_string()))?;
+
+        let len = i32::try_from(input.len()).map_err(|_| {
+            broken(format!(
+                "an input of {} bytes cannot be addressed",
+                input.len()
+            ))
+        })?;
+        let at = alloc.call(&mut self.store, len).map_err(trapped)?;
+        let offset = u32::try_from(at)
+            .map_err(|_| broken(format!("`{ALLOC}` returned the negative address {at}")))?;
+        memory
+            .write(&mut self.store, offset as usize, input)
+            .map_err(|_| {
+                broken(format!(
+                    "`{ALLOC}` returned memory the input does not fit in"
+                ))
+            })?;
+
+        let raw = transform
+            .call(&mut self.store, (at, len))
+            .map_err(trapped)?;
+        let span = Packed::unpack(raw.cast_unsigned());
+        let mut out = vec![0_u8; span.len as usize];
+        memory
+            .read(&self.store, span.ptr as usize, &mut out)
+            .map_err(|_| broken(format!("`{TRANSFORM}` returned a span outside its memory")))?;
+
+        dealloc.call(&mut self.store, (at, len)).map_err(trapped)?;
+        dealloc
+            .call(
+                &mut self.store,
+                (span.ptr.cast_signed(), span.len.cast_signed()),
+            )
+            .map_err(trapped)?;
+
+        if span.refused {
+            return String::from_utf8(out)
+                .map(Transformed::Refused)
+                .map_err(|_| broken("the refusal reason is not utf-8".to_owned()));
+        }
+        Ok(Transformed::Output(out))
     }
 }
 
@@ -220,6 +293,18 @@ mod tests {
         checksum
     }
 
+    /// A module that keeps to the plugin abi, with `pages` of memory and `extra` definitions.
+    fn conforming(pages: u32, extra: &str) -> String {
+        format!(
+            r#"(module
+  (memory (export "memory") {pages})
+  (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "dealloc") (param i32 i32))
+  (func (export "transform") (param i32 i32) (result i64) (i64.const 0))
+  {extra})"#
+        )
+    }
+
     /// Calls an export that takes and returns nothing, classifying whatever stops it.
     fn call(invocation: &mut Invocation, export: &str) -> Result<(), PluginError> {
         let checksum = invocation.checksum;
@@ -235,13 +320,18 @@ mod tests {
         })
     }
 
-    const NOOP: &str = r#"(module (func (export "noop")))"#;
-    const SPIN: &str = r#"(module (func (export "spin") (loop (br 0))))"#;
+    fn noop() -> String {
+        conforming(1, r#"(func (export "noop"))"#)
+    }
+
+    fn spin() -> String {
+        conforming(1, r#"(func (export "spin") (loop (br 0)))"#)
+    }
 
     #[test]
     fn a_module_loads_under_its_checksum() {
         let host = host();
-        let checksum = loaded(&host, NOOP);
+        let checksum = loaded(&host, &noop());
         assert!(host.is_loaded(&checksum));
         assert_eq!(host.len(), 1);
     }
@@ -249,8 +339,8 @@ mod tests {
     #[test]
     fn loading_the_same_checksum_twice_compiles_once() {
         let host = host();
-        let first = loaded(&host, NOOP);
-        let second = loaded(&host, NOOP);
+        let first = loaded(&host, &noop());
+        let second = loaded(&host, &noop());
         assert_eq!(first, second);
         assert_eq!(host.len(), 1);
     }
@@ -258,7 +348,7 @@ mod tests {
     #[test]
     fn wasm_that_is_not_what_its_checksum_names_is_refused() {
         let host = host();
-        let (_, bytes) = wasm(NOOP);
+        let (_, bytes) = wasm(&noop());
         let claimed = Checksum::of(b"some other module");
         assert_eq!(
             host.load(&claimed, &bytes),
@@ -297,7 +387,7 @@ mod tests {
     #[test]
     fn an_unloaded_module_can_no_longer_be_instantiated() {
         let host = host();
-        let checksum = loaded(&host, NOOP);
+        let checksum = loaded(&host, &noop());
         assert!(host.unload(&checksum));
         assert!(!host.unload(&checksum));
         assert!(matches!(
@@ -309,7 +399,7 @@ mod tests {
     #[test]
     fn a_loaded_module_runs() {
         let host = host();
-        let checksum = loaded(&host, NOOP);
+        let checksum = loaded(&host, &noop());
         let mut invocation = host.instantiate(&checksum).unwrap();
         assert_eq!(call(&mut invocation, "noop"), Ok(()));
         assert!(invocation.fuel_left() < host.limits().fuel);
@@ -323,7 +413,7 @@ mod tests {
             ..PluginLimits::default()
         })
         .unwrap();
-        let checksum = loaded(&host, SPIN);
+        let checksum = loaded(&host, &spin());
         let mut invocation = host.instantiate(&checksum).unwrap();
         assert_eq!(
             call(&mut invocation, "spin"),
@@ -340,7 +430,7 @@ mod tests {
             ..PluginLimits::default()
         })
         .unwrap();
-        let checksum = loaded(&host, SPIN);
+        let checksum = loaded(&host, &spin());
         let mut invocation = host.instantiate(&checksum).unwrap();
         assert_eq!(
             call(&mut invocation, "spin"),
@@ -358,7 +448,7 @@ mod tests {
         .unwrap();
         let checksum = loaded(
             &host,
-            r#"(module (func $spin (loop (br 0))) (start $spin))"#,
+            &conforming(1, r#"(func $spin (loop (br 0))) (start $spin)"#),
         );
         assert!(matches!(
             host.instantiate(&checksum),
@@ -371,8 +461,10 @@ mod tests {
         let host = host();
         let checksum = loaded(
             &host,
-            r#"(module (memory 1)
-                 (func (export "grow") (drop (memory.grow (i32.const 2000)))))"#,
+            &conforming(
+                1,
+                r#"(func (export "grow") (drop (memory.grow (i32.const 2000))))"#,
+            ),
         );
         let mut invocation = host.instantiate(&checksum).unwrap();
         let outcome = call(&mut invocation, "grow");
@@ -385,7 +477,7 @@ mod tests {
     #[test]
     fn a_module_that_starts_larger_than_the_limit_is_not_instantiated() {
         let host = host();
-        let checksum = loaded(&host, r#"(module (memory 2000))"#);
+        let checksum = loaded(&host, &conforming(2000, ""));
         assert!(matches!(
             host.instantiate(&checksum),
             Err(PluginError::Instantiate { .. })
@@ -395,7 +487,10 @@ mod tests {
     #[test]
     fn a_trap_other_than_the_limits_is_reported_as_a_trap() {
         let host = host();
-        let checksum = loaded(&host, r#"(module (func (export "fail") unreachable))"#);
+        let checksum = loaded(
+            &host,
+            &conforming(1, r#"(func (export "fail") unreachable)"#),
+        );
         let mut invocation = host.instantiate(&checksum).unwrap();
         assert!(matches!(
             call(&mut invocation, "fail"),

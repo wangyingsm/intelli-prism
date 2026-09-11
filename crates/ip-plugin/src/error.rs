@@ -29,6 +29,15 @@ pub enum PluginError {
         import: String,
     },
 
+    /// The module does not keep to the plugin abi.
+    #[error("plugin {checksum} breaks the plugin abi: {detail}")]
+    Abi {
+        /// The plugin at fault.
+        checksum: Checksum,
+        /// What it did wrong.
+        detail: String,
+    },
+
     /// No module is loaded under this checksum.
     #[error("plugin {checksum} is not loaded")]
     NotLoaded {
