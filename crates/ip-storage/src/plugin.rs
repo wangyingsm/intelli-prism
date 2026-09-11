@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ip_core::{Checksum, PluginKind, Timestamp};
+use ip_core::{Checksum, NewPluginRule, PluginKind, PluginOrder, PluginRule, TenantId, Timestamp};
 
 use crate::error::StorageError;
 
@@ -69,6 +69,28 @@ pub trait PluginStore: Send + Sync {
     async fn remove_plugin(&self, checksum: &Checksum) -> Result<(), StorageError>;
 }
 
+/// Places stored plugins in chains, and reads back which run for whom.
+#[async_trait]
+pub trait PluginRuleStore: Send + Sync {
+    /// Places a stored plugin, taking its kind from the plugin itself. Refuses a plugin
+    /// that is not stored, and an order its tenant already uses for that kind.
+    async fn put_rule(&self, rule: NewPluginRule) -> Result<PluginRule, StorageError>;
+
+    /// Removes the rule at one kind and order, in a tenant or in the global chain.
+    async fn remove_rule(
+        &self,
+        tenant: Option<&TenantId>,
+        kind: PluginKind,
+        order: PluginOrder,
+    ) -> Result<(), StorageError>;
+
+    /// Every rule that could join a chain inside this tenant, the global ones included.
+    async fn rules_for_tenant(&self, tenant: &TenantId) -> Result<Vec<PluginRule>, StorageError>;
+
+    /// Every rule held.
+    async fn rules(&self) -> Result<Vec<PluginRule>, StorageError>;
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -80,6 +102,7 @@ mod tests {
     struct MemoryPlugins {
         held: Mutex<Vec<Plugin>>,
         next_row_id: Mutex<i64>,
+        rules: Mutex<Vec<PluginRule>>,
     }
 
     #[async_trait]
@@ -143,8 +166,97 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl PluginRuleStore for MemoryPlugins {
+        async fn put_rule(&self, rule: NewPluginRule) -> Result<PluginRule, StorageError> {
+            let kind = self
+                .held
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|plugin| &plugin.record.checksum == rule.checksum())
+                .map(|plugin| plugin.record.kind)
+                .ok_or_else(|| StorageError::NotFound {
+                    entity: Entity::Plugin,
+                    id: rule.checksum().to_string(),
+                })?;
+            let rule = rule.with_kind(kind);
+            let mut rules = self.rules.lock().unwrap();
+            if rules.iter().any(|held| {
+                held.scope().tenant() == rule.scope().tenant()
+                    && held.kind() == rule.kind()
+                    && held.order() == rule.order()
+            }) {
+                return Err(StorageError::Conflict {
+                    entity: Entity::PluginRule,
+                    id: format!("{} {}", rule.kind(), rule.order()),
+                });
+            }
+            rules.push(rule.clone());
+            Ok(rule)
+        }
+
+        async fn remove_rule(
+            &self,
+            tenant: Option<&TenantId>,
+            kind: PluginKind,
+            order: PluginOrder,
+        ) -> Result<(), StorageError> {
+            let mut rules = self.rules.lock().unwrap();
+            let before = rules.len();
+            rules.retain(|held| {
+                !(held.scope().tenant() == tenant && held.kind() == kind && held.order() == order)
+            });
+            if rules.len() == before {
+                return Err(StorageError::NotFound {
+                    entity: Entity::PluginRule,
+                    id: format!("{kind} {order}"),
+                });
+            }
+            Ok(())
+        }
+
+        async fn rules_for_tenant(
+            &self,
+            tenant: &TenantId,
+        ) -> Result<Vec<PluginRule>, StorageError> {
+            Ok(self
+                .rules
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|held| held.scope().tenant().is_none_or(|owner| owner == tenant))
+                .cloned()
+                .collect())
+        }
+
+        async fn rules(&self) -> Result<Vec<PluginRule>, StorageError> {
+            Ok(self.rules.lock().unwrap().clone())
+        }
+    }
+
     fn store() -> Arc<dyn PluginStore> {
         Arc::new(MemoryPlugins::default())
+    }
+
+    fn both() -> Arc<MemoryPlugins> {
+        Arc::new(MemoryPlugins::default())
+    }
+
+    fn acme() -> TenantId {
+        TenantId::new("acme").unwrap()
+    }
+
+    fn tenant_wide(tenant: TenantId) -> ip_core::PluginScope {
+        ip_core::PluginScope::Tenant {
+            tenant,
+            user: None,
+            api: None,
+        }
+    }
+
+    fn rule(checksum: Checksum, order: u8, scope: ip_core::PluginScope) -> NewPluginRule {
+        NewPluginRule::new(checksum, PluginOrder::new(order), scope).unwrap()
     }
 
     fn wasm(body: &[u8]) -> NewPlugin {
@@ -198,6 +310,125 @@ mod tests {
         let listed = store.plugins().await.unwrap();
         assert_eq!(listed, vec![record]);
         assert_eq!(listed[0].size, 6);
+    }
+
+    #[tokio::test]
+    async fn the_rule_surface_is_reachable_through_one_trait_object() {
+        let held = both();
+        let record = held.put_plugin(wasm(b"module")).await.unwrap();
+        let rules: Arc<dyn PluginRuleStore> = held;
+        let placed = rules
+            .put_rule(rule(record.checksum, 100, tenant_wide(acme())))
+            .await
+            .unwrap();
+        assert_eq!(rules.rules().await.unwrap(), vec![placed.clone()]);
+        rules
+            .remove_rule(Some(&acme()), placed.kind(), placed.order())
+            .await
+            .unwrap();
+        assert!(rules.rules().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rule_takes_its_kind_from_the_stored_plugin() {
+        let held = both();
+        let record = held
+            .put_plugin(NewPlugin {
+                kind: PluginKind::RespHeader,
+                wasm: b"module".to_vec(),
+            })
+            .await
+            .unwrap();
+        let placed = held
+            .put_rule(rule(record.checksum, 100, tenant_wide(acme())))
+            .await
+            .unwrap();
+        assert_eq!(placed.kind(), PluginKind::RespHeader);
+    }
+
+    #[tokio::test]
+    async fn a_rule_naming_a_plugin_that_is_not_stored_is_refused() {
+        let held = both();
+        assert!(matches!(
+            held.put_rule(rule(Checksum::of(b"absent"), 100, tenant_wide(acme())))
+                .await,
+            Err(StorageError::NotFound {
+                entity: Entity::Plugin,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_order_a_tenant_already_uses_for_that_kind_is_refused() {
+        let held = both();
+        let first = held.put_plugin(wasm(b"one")).await.unwrap();
+        let second = held.put_plugin(wasm(b"two")).await.unwrap();
+        held.put_rule(rule(first.checksum, 100, tenant_wide(acme())))
+            .await
+            .unwrap();
+        let user_scoped = ip_core::PluginScope::Tenant {
+            tenant: acme(),
+            user: Some(ip_core::UserId::new("bob").unwrap()),
+            api: None,
+        };
+        assert!(matches!(
+            held.put_rule(rule(second.checksum, 100, user_scoped)).await,
+            Err(StorageError::Conflict {
+                entity: Entity::PluginRule,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn another_tenant_may_reuse_the_order() {
+        let held = both();
+        let record = held.put_plugin(wasm(b"module")).await.unwrap();
+        held.put_rule(rule(record.checksum, 100, tenant_wide(acme())))
+            .await
+            .unwrap();
+        let globex = TenantId::new("globex").unwrap();
+        assert!(
+            held.put_rule(rule(record.checksum, 100, tenant_wide(globex)))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_sees_its_own_rules_and_the_global_ones() {
+        let held = both();
+        let record = held.put_plugin(wasm(b"module")).await.unwrap();
+        let globex = TenantId::new("globex").unwrap();
+        held.put_rule(rule(record.checksum, 10, ip_core::PluginScope::Global))
+            .await
+            .unwrap();
+        held.put_rule(rule(record.checksum, 100, tenant_wide(acme())))
+            .await
+            .unwrap();
+        held.put_rule(rule(record.checksum, 100, tenant_wide(globex)))
+            .await
+            .unwrap();
+        let seen = held.rules_for_tenant(&acme()).await.unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen.iter()
+                .all(|rule| rule.scope().tenant().is_none_or(|t| t == &acme()))
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_rule_that_is_absent_reports_it_missing() {
+        let held = both();
+        assert!(matches!(
+            held.remove_rule(Some(&acme()), PluginKind::ReqBody, PluginOrder::new(100))
+                .await,
+            Err(StorageError::NotFound {
+                entity: Entity::PluginRule,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

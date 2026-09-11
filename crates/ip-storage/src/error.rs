@@ -64,6 +64,8 @@ pub enum Entity {
     Route,
     /// A stored wasm plugin.
     Plugin,
+    /// A plugin placed in a chain.
+    PluginRule,
 }
 
 impl fmt::Display for Entity {
@@ -75,6 +77,7 @@ impl fmt::Display for Entity {
             Self::Grant => "grant",
             Self::Route => "route",
             Self::Plugin => "plugin",
+            Self::PluginRule => "plugin rule",
         })
     }
 }
@@ -94,6 +97,7 @@ mod tests {
             (Entity::Grant, "grant"),
             (Entity::Route, "route"),
             (Entity::Plugin, "plugin"),
+            (Entity::PluginRule, "plugin rule"),
         ] {
             assert_eq!(entity.to_string(), name);
         }
