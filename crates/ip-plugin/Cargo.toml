@@ -1,0 +1,12 @@
+[package]
+name = "ip-plugin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ip-core = { version = "0.1.0", path = "../ip-core" }
+thiserror = "2.0.20"
+wasmtime = { version = "48.0.2", default-features = false, features = ["cranelift", "runtime", "std"] }
+
+[dev-dependencies]
+wat = "1.259.0"
