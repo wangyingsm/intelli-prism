@@ -3,30 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
-
-/// Highest order reserved for the plugins the system ships.
-pub const PRIMARY_ORDER_MAX: u8 = 63;
-
-/// Where a plugin sits in a chain. Higher runs first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProcessorOrder(u8);
-
-impl ProcessorOrder {
-    /// Wraps a plugin's order.
-    pub const fn new(value: u8) -> Self {
-        Self(value)
-    }
-
-    /// The order as a number.
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-
-    /// Whether this order belongs to a plugin the system ships rather than a tenant's.
-    pub const fn is_primary(self) -> bool {
-        self.0 <= PRIMARY_ORDER_MAX
-    }
-}
+use ip_core::PluginOrder;
 
 /// A plugin refusing the request it was given.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -49,7 +26,7 @@ impl ProcessorError {
 #[async_trait]
 pub trait HeaderProcessor: Send + Sync {
     /// Where this plugin sits in its chain.
-    fn order(&self) -> ProcessorOrder;
+    fn order(&self) -> PluginOrder;
 
     /// Rewrites the headers in place.
     async fn process(&self, headers: &mut HeaderMap) -> Result<(), ProcessorError>;
@@ -59,7 +36,7 @@ pub trait HeaderProcessor: Send + Sync {
 #[async_trait]
 pub trait BodyProcessor: Send + Sync {
     /// Where this plugin sits in its chain.
-    fn order(&self) -> ProcessorOrder;
+    fn order(&self) -> PluginOrder;
 
     /// Turns the body it was given into the body that goes on.
     async fn process(&self, body: Bytes) -> Result<Bytes, ProcessorError>;

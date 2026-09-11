@@ -13,9 +13,7 @@ pub use body::{BoxError, GatewayBody};
 pub use error::{GatewayError, GatewayErrorKind, RouteError};
 pub use flow::{Flow, Gateway, RequestContext};
 pub use hyper_upstream::{HyperUpstream, UpstreamSettings};
-pub use processor::{
-    BodyProcessor, HeaderProcessor, ProcessorChain, ProcessorError, ProcessorOrder,
-};
+pub use processor::{BodyProcessor, HeaderProcessor, ProcessorChain, ProcessorError};
 pub use stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
     ResponseHeadersProcessed, Routed, Stage, StageName,

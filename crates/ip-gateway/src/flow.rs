@@ -463,7 +463,8 @@ mod tests {
 
     use super::*;
     use crate::body::from_bytes;
-    use crate::processor::{ProcessorError, ProcessorOrder};
+    use crate::processor::ProcessorError;
+    use ip_core::PluginOrder;
 
     /// Records what it was sent, and answers with what it was built with.
     struct FakeUpstream {
@@ -536,14 +537,14 @@ mod tests {
 
     /// Appends a marker so the order plugins ran in is visible in the output.
     struct Marker {
-        order: ProcessorOrder,
+        order: PluginOrder,
         mark: &'static str,
     }
 
     impl Marker {
         fn at(order: u8, mark: &'static str) -> Arc<Self> {
             Arc::new(Self {
-                order: ProcessorOrder::new(order),
+                order: PluginOrder::new(order),
                 mark,
             })
         }
@@ -551,7 +552,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BodyProcessor for Marker {
-        fn order(&self) -> ProcessorOrder {
+        fn order(&self) -> PluginOrder {
             self.order
         }
 
@@ -578,8 +579,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HeaderProcessor for SetHeader {
-        fn order(&self) -> ProcessorOrder {
-            ProcessorOrder::new(10)
+        fn order(&self) -> PluginOrder {
+            PluginOrder::new(10)
         }
 
         async fn process(&self, headers: &mut HeaderMap) -> Result<(), ProcessorError> {
@@ -592,8 +593,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HeaderProcessor for Refusing {
-        fn order(&self) -> ProcessorOrder {
-            ProcessorOrder::new(200)
+        fn order(&self) -> PluginOrder {
+            PluginOrder::new(200)
         }
 
         async fn process(&self, _: &mut HeaderMap) -> Result<(), ProcessorError> {
@@ -902,13 +903,5 @@ mod tests {
         let flow = flow.process_response_body(&processors).await.unwrap();
         assert_eq!(flow.stage(), StageName::ResponseBodyProcess);
         assert_eq!(body_of(flow.into_response().unwrap()).await, "pong");
-    }
-
-    #[test]
-    fn the_reserved_order_range_is_the_first_sixty_four() {
-        assert!(ProcessorOrder::new(0).is_primary());
-        assert!(ProcessorOrder::new(63).is_primary());
-        assert!(!ProcessorOrder::new(64).is_primary());
-        assert!(!ProcessorOrder::new(255).is_primary());
     }
 }

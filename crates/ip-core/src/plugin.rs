@@ -71,6 +71,39 @@ impl TryFrom<String> for Checksum {
     }
 }
 
+/// Highest order reserved for the plugins the system ships.
+pub const PRIMARY_ORDER_MAX: u8 = 63;
+
+/// Where a plugin sits in its chain. Higher runs first.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct PluginOrder(u8);
+
+impl PluginOrder {
+    /// Wraps a plugin's order.
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    /// The order as a number.
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    /// Whether this order belongs to a plugin the system ships rather than a tenant's.
+    pub const fn is_primary(self) -> bool {
+        self.0 <= PRIMARY_ORDER_MAX
+    }
+}
+
+impl fmt::Display for PluginOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Where in the dataflow a plugin runs.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -191,6 +224,28 @@ mod tests {
             "req_trailer".parse::<PluginKind>(),
             Err(CoreError::UnknownPluginKind { .. })
         ));
+    }
+
+    #[test]
+    fn the_reserved_order_range_is_the_first_sixty_four() {
+        assert!(PluginOrder::new(0).is_primary());
+        assert!(PluginOrder::new(PRIMARY_ORDER_MAX).is_primary());
+        assert!(!PluginOrder::new(PRIMARY_ORDER_MAX + 1).is_primary());
+        assert!(!PluginOrder::new(u8::MAX).is_primary());
+    }
+
+    #[test]
+    fn the_orders_left_for_tenants_number_one_hundred_and_ninety_two() {
+        let tenant_orders = (0..=u8::MAX)
+            .filter(|order| !PluginOrder::new(*order).is_primary())
+            .count();
+        assert_eq!(tenant_orders, 192);
+    }
+
+    #[test]
+    fn an_order_reads_as_its_number() {
+        assert_eq!(PluginOrder::new(200).get(), 200);
+        assert_eq!(PluginOrder::new(200).to_string(), "200");
     }
 
     #[test]

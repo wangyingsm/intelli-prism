@@ -14,7 +14,7 @@ pub use error::CoreError;
 pub use id::{ApiId, Nonce, TenantId, UserId};
 pub use key::{Signature, TnKey, UtKey};
 pub use passphrase::PassphraseHash;
-pub use plugin::{Checksum, PluginKind};
+pub use plugin::{Checksum, PRIMARY_ORDER_MAX, PluginKind, PluginOrder};
 pub use route::{
     AbsPath, Endpoint, Host, Port, Protocol, RESERVED_PATH_PREFIX, RouteKey, RouteRule, RouteTarget,
 };
