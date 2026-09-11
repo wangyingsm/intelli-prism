@@ -24,6 +24,15 @@ pub enum StorageError {
         id: String,
     },
 
+    /// The record is still referenced, so removing it would break what depends on it.
+    #[error("{entity} is still in use: {id}")]
+    InUse {
+        /// What was being removed.
+        entity: Entity,
+        /// How it was named.
+        id: String,
+    },
+
     /// A stored value no longer satisfies the rules of its type.
     #[error(transparent)]
     Value(#[from] CoreError),
@@ -119,6 +128,15 @@ mod tests {
             id: "alice".to_owned(),
         };
         assert_eq!(error.to_string(), "user already exists: alice");
+    }
+
+    #[test]
+    fn a_record_in_use_names_what_holds_it() {
+        let error = StorageError::InUse {
+            entity: Entity::Plugin,
+            id: "abc".to_owned(),
+        };
+        assert_eq!(error.to_string(), "plugin is still in use: abc");
     }
 
     #[test]

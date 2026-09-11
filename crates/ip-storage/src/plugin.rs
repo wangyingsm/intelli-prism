@@ -65,7 +65,7 @@ pub trait PluginStore: Send + Sync {
     /// What is stored, without reading any wasm.
     async fn plugins(&self) -> Result<Vec<PluginRecord>, StorageError>;
 
-    /// Removes a plugin, or reports it missing.
+    /// Removes a plugin, refusing one a rule still uses, or reports it missing.
     async fn remove_plugin(&self, checksum: &Checksum) -> Result<(), StorageError>;
 }
 
@@ -153,6 +153,18 @@ mod tests {
         }
 
         async fn remove_plugin(&self, checksum: &Checksum) -> Result<(), StorageError> {
+            if self
+                .rules
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|rule| rule.checksum() == checksum)
+            {
+                return Err(StorageError::InUse {
+                    entity: Entity::Plugin,
+                    id: checksum.to_string(),
+                });
+            }
             let mut held = self.held.lock().unwrap();
             let before = held.len();
             held.retain(|plugin| &plugin.record.checksum != checksum);
@@ -416,6 +428,22 @@ mod tests {
             seen.iter()
                 .all(|rule| rule.scope().tenant().is_none_or(|t| t == &acme()))
         );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_a_rule_still_uses_is_not_removed() {
+        let held = both();
+        let record = held.put_plugin(wasm(b"module")).await.unwrap();
+        held.put_rule(rule(record.checksum, 100, tenant_wide(acme())))
+            .await
+            .unwrap();
+        assert!(matches!(
+            held.remove_plugin(&record.checksum).await,
+            Err(StorageError::InUse {
+                entity: Entity::Plugin,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
