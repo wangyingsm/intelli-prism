@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod model;
+pub mod plugin;
 pub mod route;
 #[cfg(feature = "standalone-storage")]
 pub mod sqlite;
@@ -11,6 +12,7 @@ pub use error::{Entity, StorageError};
 pub use model::{
     AccountKind, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId, User, UserRowId,
 };
+pub use plugin::{NewPlugin, Plugin, PluginRecord, PluginRowId, PluginStore};
 pub use route::RouteStore;
 #[cfg(feature = "standalone-storage")]
 pub use sqlite::SqliteStore;

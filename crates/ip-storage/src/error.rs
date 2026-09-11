@@ -62,6 +62,8 @@ pub enum Entity {
     Grant,
     /// A dynamic routing rule.
     Route,
+    /// A stored wasm plugin.
+    Plugin,
 }
 
 impl fmt::Display for Entity {
@@ -72,6 +74,7 @@ impl fmt::Display for Entity {
             Self::Membership => "membership",
             Self::Grant => "grant",
             Self::Route => "route",
+            Self::Plugin => "plugin",
         })
     }
 }
@@ -90,6 +93,7 @@ mod tests {
             (Entity::Membership, "membership"),
             (Entity::Grant, "grant"),
             (Entity::Route, "route"),
+            (Entity::Plugin, "plugin"),
         ] {
             assert_eq!(entity.to_string(), name);
         }
