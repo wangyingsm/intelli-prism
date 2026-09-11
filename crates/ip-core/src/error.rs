@@ -52,6 +52,15 @@ pub enum CoreError {
         value: String,
     },
 
+    /// A plugin order outside the range its scope may use.
+    #[error("order {order} is not available to a {scope} plugin rule")]
+    OrderOutOfScope {
+        /// The order that was asked for.
+        order: u8,
+        /// Which scope asked for it.
+        scope: &'static str,
+    },
+
     /// A route target that names nowhere to send.
     #[error("a route target names no endpoint")]
     NoEndpoint,
