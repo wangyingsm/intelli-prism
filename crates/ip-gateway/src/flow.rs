@@ -2,7 +2,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::header::HOST;
+use http::header::{
+    CONNECTION, HOST, HeaderName, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
+    TRANSFER_ENCODING, UPGRADE,
+};
 use http::uri::{Authority as UriAuthority, Scheme};
 use http::{HeaderMap, Request, Response, Uri};
 use http_body_util::BodyExt;
@@ -229,10 +232,11 @@ impl Flow<BodyProcessed> {
             resolution,
         } = self.held;
         let request = rewrite(request, resolution.primary())?;
-        let response = upstream
+        let mut response = upstream
             .send(request)
             .await
             .map_err(|error| GatewayError::new(Forwarded::NAME, error.into()))?;
+        strip_hop_by_hop(response.headers_mut());
         Ok(Flow {
             context: self.context,
             held: response,
@@ -361,8 +365,43 @@ fn rewrite(
             },
         )
     })?;
+    strip_hop_by_hop(&mut parts.headers);
     parts.headers.insert(HOST, host);
     Ok(Request::from_parts(parts, body))
+}
+
+/// Headers that describe one connection, which a proxy must not pass on to the next.
+const HOP_BY_HOP: [HeaderName; 8] = [
+    CONNECTION,
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
+    PROXY_AUTHENTICATE,
+    PROXY_AUTHORIZATION,
+    TRAILER,
+    TRANSFER_ENCODING,
+    UPGRADE,
+];
+
+/// Drops every hop by hop header, including any the `Connection` header names.
+/// `te: trailers` survives, because grpc needs it end to end.
+fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    let listed: Vec<HeaderName> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect();
+    for name in listed.iter().chain(HOP_BY_HOP.iter()) {
+        headers.remove(name);
+    }
+    let trailers_only = headers
+        .get_all(TE)
+        .iter()
+        .all(|value| value.as_bytes().eq_ignore_ascii_case(b"trailers"));
+    if !trailers_only {
+        headers.remove(TE);
+    }
 }
 
 /// The authority a request names, which the `Host` header carries over http 1.1
@@ -471,6 +510,7 @@ mod tests {
         seen: Mutex<Vec<Seen>>,
         status: StatusCode,
         body: Bytes,
+        headers: Vec<(&'static str, &'static str)>,
         fail: bool,
     }
 
@@ -487,6 +527,7 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
                 status: StatusCode::OK,
                 body: Bytes::from(body.to_owned()),
+                headers: Vec::new(),
                 fail: false,
             })
         }
@@ -496,7 +537,21 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
                 status: StatusCode::OK,
                 body: Bytes::new(),
+                headers: Vec::new(),
                 fail: true,
+            })
+        }
+
+        fn answering_with_headers(
+            body: &str,
+            headers: Vec<(&'static str, &'static str)>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                status: StatusCode::OK,
+                body: Bytes::from(body.to_owned()),
+                headers,
+                fail: false,
             })
         }
 
@@ -528,10 +583,11 @@ mod tests {
                 headers,
                 body,
             });
-            Ok(Response::builder()
-                .status(self.status)
-                .body(from_bytes(self.body.clone()))
-                .unwrap())
+            let mut response = Response::builder().status(self.status);
+            for (name, value) in &self.headers {
+                response = response.header(*name, *value);
+            }
+            Ok(response.body(from_bytes(self.body.clone())).unwrap())
         }
     }
 
@@ -801,6 +857,74 @@ mod tests {
             upstream.last().headers.get("x-ip-trace").unwrap(),
             HeaderValue::from_static("yes")
         );
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_headers_never_reach_the_upstream() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone());
+        let mut request = request("/anthropic", "");
+        for (name, value) in [
+            ("connection", "keep-alive, x-private"),
+            ("keep-alive", "timeout=5"),
+            ("x-private", "for this hop only"),
+            ("upgrade", "websocket"),
+            ("transfer-encoding", "chunked"),
+            ("proxy-authorization", "Basic c2VjcmV0"),
+            ("te", "gzip"),
+            ("x-keep", "end to end"),
+        ] {
+            request.headers_mut().insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        gateway.handle(context(granted()), request).await.unwrap();
+        let sent = upstream.last().headers;
+        for name in [
+            "connection",
+            "keep-alive",
+            "x-private",
+            "upgrade",
+            "transfer-encoding",
+            "proxy-authorization",
+            "te",
+        ] {
+            assert!(sent.get(name).is_none(), "{name} reached the upstream");
+        }
+        assert_eq!(sent.get("x-keep").unwrap(), "end to end");
+    }
+
+    #[tokio::test]
+    async fn te_trailers_is_carried_for_grpc() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone());
+        let mut request = request("/anthropic", "");
+        request
+            .headers_mut()
+            .insert(TE, HeaderValue::from_static("trailers"));
+        gateway.handle(context(granted()), request).await.unwrap();
+        assert_eq!(upstream.last().headers.get(TE).unwrap(), "trailers");
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_headers_from_the_upstream_never_reach_the_caller() {
+        let upstream = FakeUpstream::answering_with_headers(
+            "pong",
+            vec![
+                ("connection", "close"),
+                ("keep-alive", "timeout=5"),
+                ("x-upstream-keep", "1"),
+            ],
+        );
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream);
+        let response = gateway
+            .handle(context(granted()), request("/anthropic", ""))
+            .await
+            .unwrap();
+        assert!(response.headers().get("connection").is_none());
+        assert!(response.headers().get("keep-alive").is_none());
+        assert_eq!(response.headers().get("x-upstream-keep").unwrap(), "1");
     }
 
     #[tokio::test]
