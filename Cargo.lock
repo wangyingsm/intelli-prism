@@ -1192,9 +1192,13 @@ dependencies = [
 name = "ip-plugin"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "http",
  "ip-core",
+ "ip-gateway",
  "thiserror",
+ "tokio",
  "wasmtime",
  "wat",
 ]
