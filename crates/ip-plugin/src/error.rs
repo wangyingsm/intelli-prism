@@ -100,3 +100,13 @@ impl PluginError {
         }
     }
 }
+
+/// A header block a plugin returned that does not parse as headers.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("line {line} of the header block {problem}")]
+pub struct HeaderBlockError {
+    /// The line at fault, counting from one.
+    pub line: usize,
+    /// What is wrong with it.
+    pub problem: &'static str,
+}

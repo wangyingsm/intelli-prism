@@ -1192,6 +1192,7 @@ dependencies = [
 name = "ip-plugin"
 version = "0.1.0"
 dependencies = [
+ "http",
  "ip-core",
  "thiserror",
  "wasmtime",
