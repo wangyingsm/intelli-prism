@@ -70,7 +70,7 @@ impl ProcessorChain {
         self
     }
 
-    /// Adds a plugin to the response chunk chain, which runs per streamed chunk.
+    /// Adds a plugin to the response chunk chain, which runs per server sent event.
     pub fn with_response_chunk(mut self, processor: Arc<dyn BodyProcessor>) -> Self {
         insert_body(&mut self.response_chunk, processor);
         self
@@ -96,10 +96,8 @@ impl ProcessorChain {
         &self.response_body
     }
 
-    /// The response chunk chain, highest order first.
-    ///
-    /// Known gap: the dataflow does not run this chain yet. Running it means mapping
-    /// frames as they stream rather than buffering, which lands with the plugin host.
+    /// The response chunk chain, highest order first. It runs once per server sent event
+    /// of a `text/event-stream` response, as the response streams.
     pub fn response_chunk(&self) -> &[Arc<dyn BodyProcessor>] {
         &self.response_chunk
     }

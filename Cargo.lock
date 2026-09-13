@@ -1175,6 +1175,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -1186,6 +1187,7 @@ dependencies = [
  "rustls",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

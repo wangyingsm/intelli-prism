@@ -2,11 +2,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::header::CONTENT_LENGTH;
 use http::header::{
     CONNECTION, HOST, HeaderName, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
     TRANSFER_ENCODING, UPGRADE,
 };
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::uri::{Authority as UriAuthority, Scheme};
 use http::{HeaderMap, HeaderValue, Request, Response, Uri};
 use http_body_util::BodyExt;
@@ -16,6 +16,7 @@ use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey};
 use crate::body::{GatewayBody, from_bytes};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{BodyProcessor, HeaderProcessor, ProcessorChain};
+use crate::sse::stream_chunks;
 use crate::stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
     ResponseHeadersProcessed, Routed, Stage, StageName,
@@ -271,6 +272,15 @@ impl Flow<ResponseHeadersProcessed> {
         mut self,
         processors: &ProcessorChain,
     ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
+        if is_event_stream(self.held.headers()) && !processors.response_chunk().is_empty() {
+            self.held.headers_mut().remove(CONTENT_LENGTH);
+            let body = std::mem::replace(self.held.body_mut(), crate::body::empty());
+            *self.held.body_mut() = stream_chunks(body, processors.response_chunk().to_vec());
+            return Ok(Flow {
+                context: self.context,
+                held: self.held,
+            });
+        }
         let body = run_body(
             ResponseBodyProcessed::NAME,
             processors.response_body(),
@@ -451,6 +461,15 @@ async fn run_headers(
             .map_err(|error| GatewayError::new(stage, error.into()))?;
     }
     Ok(())
+}
+
+/// Whether a response is a stream of server sent events.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 /// Makes `Content-Length` match a body a plugin rewrote, so the next hop reads all of it.
@@ -1025,6 +1044,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "4");
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_runs_each_event_through_the_chunk_chain() {
+        let upstream = FakeUpstream::answering_with_headers(
+            "data: a\n\ndata: b\n\n",
+            vec![
+                ("content-type", "text/event-stream; charset=utf-8"),
+                ("content-length", "18"),
+            ],
+        );
+        let processors = ProcessorChain::new().with_response_chunk(Marker::at(10, "-seen"));
+        let gateway = Gateway::new(table(), processors, upstream);
+        let response = gateway
+            .handle(context(granted()), request("/anthropic", ""))
+            .await
+            .unwrap();
+        assert!(response.headers().get(CONTENT_LENGTH).is_none());
+        assert_eq!(body_of(response).await, "data: a\n\n-seendata: b\n\n-seen");
+    }
+
+    #[tokio::test]
+    async fn a_response_that_is_not_an_event_stream_skips_the_chunk_chain() {
+        let upstream = FakeUpstream::answering_with_headers(
+            "pong",
+            vec![("content-type", "application/json")],
+        );
+        let processors = ProcessorChain::new().with_response_chunk(Marker::at(10, "-seen"));
+        let gateway = Gateway::new(table(), processors, upstream);
+        let response = gateway
+            .handle(context(granted()), request("/anthropic", ""))
+            .await
+            .unwrap();
+        assert_eq!(body_of(response).await, "pong");
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_with_no_chunk_plugins_passes_untouched() {
+        let upstream = FakeUpstream::answering_with_headers(
+            "data: a\n\n",
+            vec![
+                ("content-type", "text/event-stream"),
+                ("content-length", "9"),
+            ],
+        );
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream);
+        let response = gateway
+            .handle(context(granted()), request("/anthropic", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "9");
+        assert_eq!(body_of(response).await, "data: a\n\n");
     }
 
     #[tokio::test]

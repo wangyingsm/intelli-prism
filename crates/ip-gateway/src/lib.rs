@@ -5,6 +5,7 @@ pub mod error;
 pub mod flow;
 pub mod hyper_upstream;
 pub mod processor;
+mod sse;
 pub mod stage;
 pub mod table;
 pub mod upstream;
