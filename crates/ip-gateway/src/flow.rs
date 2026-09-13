@@ -15,7 +15,7 @@ use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey};
 
 use crate::body::{GatewayBody, from_bytes};
 use crate::error::{GatewayError, GatewayErrorKind};
-use crate::processor::{BodyProcessor, HeaderProcessor, ProcessorChain};
+use crate::processor::{BodyProcessor, ChainSource, FixedChains, HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
 use crate::stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
@@ -36,24 +36,35 @@ pub struct RequestContext {
 
 /// The request dataflow: the stages of `DESIGN.md` run in order.
 ///
-/// Authentication happens before a request reaches here, so the flow starts at the
-/// request header chain and carries the identity it was handed.
+/// Authentication happens before a request reaches here, so the flow starts at
+/// authorization and carries the identity it was handed.
 pub struct Gateway {
     table: RoutingTable,
-    processors: ProcessorChain,
+    chains: Arc<dyn ChainSource>,
     upstream: Arc<dyn Upstream>,
 }
 
 impl Gateway {
-    /// Builds the flow around a routing table, its plugin chains and an upstream.
+    /// Builds the flow around a routing table, one plugin chain every request runs, and an
+    /// upstream.
     pub fn new(
         table: RoutingTable,
         processors: ProcessorChain,
         upstream: Arc<dyn Upstream>,
     ) -> Self {
+        Self::with_chains(table, Arc::new(FixedChains::new(processors)), upstream)
+    }
+
+    /// Builds the flow around a routing table, a source of each request's plugin chains,
+    /// and an upstream.
+    pub fn with_chains(
+        table: RoutingTable,
+        chains: Arc<dyn ChainSource>,
+        upstream: Arc<dyn Upstream>,
+    ) -> Self {
         Self {
             table,
-            processors,
+            chains,
             upstream,
         }
     }
@@ -69,17 +80,21 @@ impl Gateway {
         context: RequestContext,
         request: Request<GatewayBody>,
     ) -> Result<Response<GatewayBody>, GatewayError> {
-        Flow::received(context, request)
-            .authorize(&self.table)?
-            .process_headers(self.processors.request_headers())
+        let authorized = Flow::received(context, request).authorize(&self.table)?;
+        let chains = self.chains.chains_for(
+            authorized.context().authority.identity(),
+            &authorized.resolution().rule().api,
+        );
+        authorized
+            .process_headers(chains.request_headers())
             .await?
-            .process_body(&self.processors)
+            .process_body(&chains)
             .await?
             .forward(self.upstream.as_ref())
             .await?
-            .process_response_headers(self.processors.response_headers())
+            .process_response_headers(chains.response_headers())
             .await?
-            .process_response_body(&self.processors)
+            .process_response_body(&chains)
             .await?
             .into_response()
     }
@@ -191,6 +206,11 @@ impl Flow<Received> {
 }
 
 impl Flow<Authorized> {
+    /// Where the request is going, and the rule that sent it there.
+    pub fn resolution(&self) -> &Resolution {
+        &self.held.resolution
+    }
+
     /// Runs the request header chain.
     pub async fn process_headers(
         mut self,
@@ -996,6 +1016,81 @@ mod tests {
                 "a plugin ran for {path}"
             );
         }
+    }
+
+    /// Marks one user's responses, and remembers every request it was asked about.
+    struct PerUser {
+        marked: UserId,
+        asked: Mutex<Vec<(UserId, ApiId)>>,
+    }
+
+    impl PerUser {
+        fn marking(user: &str) -> Arc<Self> {
+            Arc::new(Self {
+                marked: UserId::new(user).unwrap(),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ChainSource for PerUser {
+        fn chains_for(&self, identity: &Identity, api: &ApiId) -> Arc<ProcessorChain> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((identity.user.clone(), api.clone()));
+            let chain = if identity.user == self.marked {
+                ProcessorChain::new().with_response_body(Marker::at(10, "-marked"))
+            } else {
+                ProcessorChain::new()
+            };
+            Arc::new(chain)
+        }
+    }
+
+    #[tokio::test]
+    async fn each_request_runs_the_chains_its_source_picks() {
+        for (marked, expected) in [("alice", "pong-marked"), ("bob", "pong")] {
+            let gateway = Gateway::with_chains(
+                table(),
+                PerUser::marking(marked),
+                FakeUpstream::answering("pong"),
+            );
+            let response = gateway
+                .handle(context(granted()), request("/anthropic", ""))
+                .await
+                .unwrap();
+            assert_eq!(
+                body_of(response).await,
+                expected,
+                "chains marked for {marked}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_source_is_asked_about_the_caller_and_the_routed_api() {
+        let source = PerUser::marking("alice");
+        let gateway =
+            Gateway::with_chains(table(), source.clone(), FakeUpstream::answering("pong"));
+        gateway
+            .handle(context(granted()), request("/anthropic/messages", ""))
+            .await
+            .unwrap();
+        assert_eq!(source.asked.lock().unwrap().as_slice(), [(user(), api())]);
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_request_never_asks_for_chains() {
+        let source = PerUser::marking("alice");
+        let gateway =
+            Gateway::with_chains(table(), source.clone(), FakeUpstream::answering("pong"));
+        let error = gateway
+            .handle(context(ungranted()), request("/anthropic", ""))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        assert!(source.asked.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

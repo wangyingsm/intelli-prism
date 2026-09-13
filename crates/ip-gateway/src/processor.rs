@@ -3,9 +3,32 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
-use ip_core::PluginOrder;
+use ip_auth::Identity;
+use ip_core::{ApiId, PluginOrder};
 
 use crate::error::ProcessorError;
+
+/// Hands the dataflow the plugin chains one request should run.
+pub trait ChainSource: Send + Sync {
+    /// The chains for a request by this identity, routed to this api.
+    fn chains_for(&self, identity: &Identity, api: &ApiId) -> Arc<ProcessorChain>;
+}
+
+/// The same chains for every request, handed out without a copy.
+pub struct FixedChains(Arc<ProcessorChain>);
+
+impl FixedChains {
+    /// Serves this chain to every request.
+    pub fn new(chain: ProcessorChain) -> Self {
+        Self(Arc::new(chain))
+    }
+}
+
+impl ChainSource for FixedChains {
+    fn chains_for(&self, _: &Identity, _: &ApiId) -> Arc<ProcessorChain> {
+        Arc::clone(&self.0)
+    }
+}
 
 /// A plugin that rewrites headers.
 #[async_trait]
