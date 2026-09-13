@@ -2,12 +2,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use http::header::CONTENT_LENGTH;
 use http::header::{
     CONNECTION, HOST, HeaderName, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
     TRANSFER_ENCODING, UPGRADE,
 };
 use http::uri::{Authority as UriAuthority, Scheme};
-use http::{HeaderMap, Request, Response, Uri};
+use http::{HeaderMap, HeaderValue, Request, Response, Uri};
 use http_body_util::BodyExt;
 use ip_auth::Authority;
 use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey};
@@ -215,6 +216,7 @@ impl Flow<Authorized> {
         )
         .await?;
         if let Some(bytes) = body {
+            set_length(self.held.request.headers_mut(), bytes.len());
             *self.held.request.body_mut() = from_bytes(bytes);
         }
         Ok(Flow {
@@ -276,6 +278,7 @@ impl Flow<ResponseHeadersProcessed> {
         )
         .await?;
         if let Some(bytes) = body {
+            set_length(self.held.headers_mut(), bytes.len());
             *self.held.body_mut() = from_bytes(bytes);
         }
         Ok(Flow {
@@ -448,6 +451,11 @@ async fn run_headers(
             .map_err(|error| GatewayError::new(stage, error.into()))?;
     }
     Ok(())
+}
+
+/// Makes `Content-Length` match a body a plugin rewrote, so the next hop reads all of it.
+fn set_length(headers: &mut HeaderMap, length: usize) {
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
 }
 
 /// Runs a body chain, or hands back `None` when the body may pass through untouched.
@@ -978,6 +986,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_of(response).await, "pong");
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_request_body_carries_its_new_length() {
+        let upstream = FakeUpstream::answering("pong");
+        let processors = ProcessorChain::new().with_request_body(Marker::at(10, "-marked"));
+        let gateway = Gateway::new(table(), processors, upstream.clone());
+        let mut request = request("/anthropic", "payload");
+        request
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("7"));
+        gateway.handle(context(granted()), request).await.unwrap();
+        let sent = upstream.last();
+        assert_eq!(sent.body, Bytes::from("payload-marked"));
+        assert_eq!(sent.headers.get(CONTENT_LENGTH).unwrap(), "14");
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_response_body_carries_its_new_length() {
+        let upstream = FakeUpstream::answering_with_headers("pong", vec![("content-length", "4")]);
+        let processors = ProcessorChain::new().with_response_body(Marker::at(10, "-seen"));
+        let gateway = Gateway::new(table(), processors, upstream);
+        let response = gateway
+            .handle(context(granted()), request("/anthropic", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "9");
+        assert_eq!(body_of(response).await, "pong-seen");
+    }
+
+    #[tokio::test]
+    async fn an_untouched_body_keeps_its_length() {
+        let upstream = FakeUpstream::answering_with_headers("pong", vec![("content-length", "4")]);
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream);
+        let response = gateway
+            .handle(context(granted()), request("/anthropic", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "4");
     }
 
     #[tokio::test]
