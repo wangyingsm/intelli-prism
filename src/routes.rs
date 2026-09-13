@@ -72,7 +72,8 @@ fn into_gateway(request: Request<Body>) -> Request<GatewayBody> {
     request.map(|body| body.map_err(Into::into).boxed_unsync())
 }
 
-/// The caller is told the status and nothing else; the reason goes to the log.
+/// The caller is told the status, plus a plugin's own reason when it refused on purpose;
+/// every other reason goes to the log.
 fn refuse(error: GatewayError) -> Response<Body> {
     let status = error.status();
     if status.is_server_error() {
@@ -80,7 +81,10 @@ fn refuse(error: GatewayError) -> Response<Body> {
     } else {
         tracing::warn!(stage = %error.stage(), %error, "the gateway refused a request");
     }
-    (status, ()).into_response()
+    match error.public_reason() {
+        Some(reason) => (status, reason.to_owned()).into_response(),
+        None => (status, ()).into_response(),
+    }
 }
 
 impl From<Identity> for WhoAmI {
@@ -197,6 +201,13 @@ secret = "0123456789abcdef0123456789abcdef"
     }
 
     async fn fixture(granted: bool) -> (Router, TnKey, Arc<FakeUpstream>) {
+        fixture_with(granted, ProcessorChain::new()).await
+    }
+
+    async fn fixture_with(
+        granted: bool,
+        processors: ProcessorChain,
+    ) -> (Router, TnKey, Arc<FakeUpstream>) {
         let store = SqliteStore::in_memory().await.unwrap();
         let key = TnKey::generate().unwrap();
         store
@@ -242,7 +253,7 @@ secret = "0123456789abcdef0123456789abcdef"
         let config = Config::parse(CONFIG).unwrap();
         let table = RoutingTable::build(&config, vec![rule()]).unwrap();
         let upstream = Arc::new(FakeUpstream::default());
-        let gateway = Gateway::new(table, ProcessorChain::new(), upstream.clone());
+        let gateway = Gateway::new(table, processors, upstream.clone());
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let state = AppState::with_parts(Arc::new(store) as Arc<dyn Storage>, gateway, listen);
         (router(state), key, upstream)
@@ -362,6 +373,52 @@ secret = "0123456789abcdef0123456789abcdef"
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Stops every request with the error it was built with.
+    struct Stop(ip_gateway::ProcessorError);
+
+    #[async_trait::async_trait]
+    impl ip_gateway::HeaderProcessor for Stop {
+        fn order(&self) -> ip_core::PluginOrder {
+            ip_core::PluginOrder::new(100)
+        }
+
+        async fn process(
+            &self,
+            _: &mut axum::http::HeaderMap,
+        ) -> Result<(), ip_gateway::ProcessorError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plugin_refusal_reaches_the_caller_with_its_reason() {
+        let refusing = ProcessorChain::new().with_request_header(Arc::new(Stop(
+            ip_gateway::ProcessorError::refused("blocked by acme policy"),
+        )));
+        let (router, key, upstream) = fixture_with(true, refusing).await;
+        let response = router
+            .oneshot(request("/anthropic/messages", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_of(response).await, "blocked by acme policy");
+        assert!(upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_plugin_failure_tells_the_caller_nothing() {
+        let failing = ProcessorChain::new().with_request_header(Arc::new(Stop(
+            ip_gateway::ProcessorError::failed("wasm trapped at offset 0x2a"),
+        )));
+        let (router, key, _) = fixture_with(true, failing).await;
+        let response = router
+            .oneshot(request("/anthropic/messages", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_of(response).await.is_empty());
     }
 
     #[tokio::test]
