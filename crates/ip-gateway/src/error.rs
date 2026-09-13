@@ -3,9 +3,7 @@ use ip_config::ConfigError;
 use ip_core::{Capability, CoreError, Protocol, RouteKey};
 use ip_storage::StorageError;
 
-use crate::processor::ProcessorError;
 use crate::stage::StageName;
-use crate::upstream::UpstreamError;
 
 /// Every way the routing table can fail to be built.
 #[derive(Debug, thiserror::Error)]
@@ -129,4 +127,54 @@ pub enum GatewayErrorKind {
     /// The upstream refused or never answered.
     #[error(transparent)]
     Upstream(#[from] UpstreamError),
+}
+
+/// A plugin stopping the request it was given.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProcessorError {
+    /// The plugin failed. The caller learns only that the request could not be carried.
+    #[error("{detail}")]
+    Failed {
+        /// What went wrong, for the log.
+        detail: String,
+    },
+    /// The plugin refused the request on purpose, and its reason goes back to the caller.
+    #[error("refused: {reason}")]
+    Refused {
+        /// Why the plugin refused, as the caller will read it.
+        reason: String,
+    },
+}
+
+impl ProcessorError {
+    /// A plugin that failed.
+    pub fn failed(detail: impl Into<String>) -> Self {
+        Self::Failed {
+            detail: detail.into(),
+        }
+    }
+
+    /// A plugin that refused the request on purpose.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self::Refused {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// The upstream refused or never answered.
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+pub struct UpstreamError {
+    /// What went wrong reaching the upstream.
+    pub detail: String,
+}
+
+impl UpstreamError {
+    /// Reports a failure to reach the upstream.
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
 }

@@ -502,7 +502,7 @@ mod tests {
 
     use super::*;
     use crate::body::from_bytes;
-    use crate::processor::ProcessorError;
+    use crate::error::ProcessorError;
     use ip_core::PluginOrder;
 
     /// Records what it was sent, and answers with what it was built with.
@@ -565,9 +565,9 @@ mod tests {
         async fn send(
             &self,
             request: Request<GatewayBody>,
-        ) -> Result<Response<GatewayBody>, crate::upstream::UpstreamError> {
+        ) -> Result<Response<GatewayBody>, crate::error::UpstreamError> {
             if self.fail {
-                return Err(crate::upstream::UpstreamError::new("connection refused"));
+                return Err(crate::error::UpstreamError::new("connection refused"));
             }
             let uri = request.uri().to_string();
             let host = request

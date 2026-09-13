@@ -9,7 +9,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
 use crate::body::GatewayBody;
-use crate::upstream::{Upstream, UpstreamError};
+use crate::error::UpstreamError;
+use crate::upstream::Upstream;
 
 /// How the upstream connection pool behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

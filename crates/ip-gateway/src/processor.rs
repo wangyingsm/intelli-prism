@@ -5,38 +5,7 @@ use bytes::Bytes;
 use http::HeaderMap;
 use ip_core::PluginOrder;
 
-/// A plugin stopping the request it was given.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ProcessorError {
-    /// The plugin failed. The caller learns only that the request could not be carried.
-    #[error("{detail}")]
-    Failed {
-        /// What went wrong, for the log.
-        detail: String,
-    },
-    /// The plugin refused the request on purpose, and its reason goes back to the caller.
-    #[error("refused: {reason}")]
-    Refused {
-        /// Why the plugin refused, as the caller will read it.
-        reason: String,
-    },
-}
-
-impl ProcessorError {
-    /// A plugin that failed.
-    pub fn failed(detail: impl Into<String>) -> Self {
-        Self::Failed {
-            detail: detail.into(),
-        }
-    }
-
-    /// A plugin that refused the request on purpose.
-    pub fn refused(reason: impl Into<String>) -> Self {
-        Self::Refused {
-            reason: reason.into(),
-        }
-    }
-}
+use crate::error::ProcessorError;
 
 /// A plugin that rewrites headers.
 #[async_trait]

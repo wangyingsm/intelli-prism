@@ -10,13 +10,13 @@ pub mod table;
 pub mod upstream;
 
 pub use body::{BoxError, GatewayBody};
-pub use error::{GatewayError, GatewayErrorKind, RouteError};
+pub use error::{GatewayError, GatewayErrorKind, ProcessorError, RouteError, UpstreamError};
 pub use flow::{Flow, Gateway, RequestContext};
 pub use hyper_upstream::{HyperUpstream, UpstreamSettings};
-pub use processor::{BodyProcessor, HeaderProcessor, ProcessorChain, ProcessorError};
+pub use processor::{BodyProcessor, HeaderProcessor, ProcessorChain};
 pub use stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
     ResponseHeadersProcessed, Routed, Stage, StageName,
 };
 pub use table::{Resolution, RoutingTable, request_key};
-pub use upstream::{Upstream, UpstreamError};
+pub use upstream::Upstream;
