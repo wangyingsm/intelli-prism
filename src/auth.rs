@@ -29,6 +29,7 @@ impl FromRequestParts<AppState> for Authenticated {
             tracing::warn!("rejected a request whose signing headers are absent or malformed");
             StatusCode::UNAUTHORIZED
         })?;
+        consume_signing_headers(parts);
         let origin = origin(parts);
         let verifier = state.verifier();
         // Every reason collapses to one status: telling them apart enumerates tenants and users.
@@ -51,6 +52,14 @@ fn signed_request(parts: &Parts) -> Option<SignedRequest> {
         nonce: Nonce::new(header(parts, HEADER_NONCE)?).ok()?,
         signature: Signature::from_hex(header(parts, HEADER_SIGNATURE)?).ok()?,
     })
+}
+
+/// Removes the caller's credentials once they are read, so neither a plugin nor an
+/// upstream ever sees a signature it could replay.
+fn consume_signing_headers(parts: &mut Parts) {
+    for name in [HEADER_TENANT, HEADER_USER, HEADER_SIGNATURE, HEADER_NONCE] {
+        parts.headers.remove(name);
+    }
 }
 
 fn header<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {

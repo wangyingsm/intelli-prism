@@ -149,6 +149,7 @@ secret = "0123456789abcdef0123456789abcdef"
     #[derive(Default)]
     struct FakeUpstream {
         seen: Mutex<Vec<String>>,
+        headers: Mutex<Vec<axum::http::HeaderMap>>,
     }
 
     #[async_trait::async_trait]
@@ -158,6 +159,7 @@ secret = "0123456789abcdef0123456789abcdef"
             request: Request<ip_gateway::GatewayBody>,
         ) -> Result<Response<ip_gateway::GatewayBody>, UpstreamError> {
             self.seen.lock().unwrap().push(request.uri().to_string());
+            self.headers.lock().unwrap().push(request.headers().clone());
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .body(ip_gateway::body::from_bytes(Bytes::from_static(
@@ -341,6 +343,22 @@ secret = "0123456789abcdef0123456789abcdef"
             upstream.seen.lock().unwrap().as_slice(),
             ["http://upstream.local:80/v1/messages"]
         );
+    }
+
+    #[tokio::test]
+    async fn the_signing_headers_never_leave_the_gateway() {
+        let (router, key, upstream) = fixture(true).await;
+        let mut signed = request("/anthropic/messages", Some(&signature(&key)));
+        signed
+            .headers_mut()
+            .insert("x-app-trace", axum::http::HeaderValue::from_static("kept"));
+        let response = router.oneshot(signed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = upstream.headers.lock().unwrap();
+        for name in ["x-ip-tnid", "x-ip-userid", "x-ip-signature", "x-ip-nonce"] {
+            assert!(sent[0].get(name).is_none(), "{name} reached the upstream");
+        }
+        assert_eq!(sent[0].get("x-app-trace").unwrap(), "kept");
     }
 
     #[tokio::test]
