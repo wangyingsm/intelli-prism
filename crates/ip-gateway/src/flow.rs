@@ -589,16 +589,17 @@ mod tests {
         }
     }
 
-    struct Refusing;
+    /// Stops every request with the error it was built with.
+    struct Stop(ProcessorError);
 
     #[async_trait::async_trait]
-    impl HeaderProcessor for Refusing {
+    impl HeaderProcessor for Stop {
         fn order(&self) -> PluginOrder {
             PluginOrder::new(200)
         }
 
         async fn process(&self, _: &mut HeaderMap) -> Result<(), ProcessorError> {
-            Err(ProcessorError::new("refused by policy"))
+            Err(self.0.clone())
         }
     }
 
@@ -803,8 +804,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refusing_plugin_stops_the_flow_at_its_stage() {
-        let processors = ProcessorChain::new().with_request_header(Arc::new(Refusing));
+    async fn a_failing_plugin_stops_the_flow_at_its_stage() {
+        let processors = ProcessorChain::new()
+            .with_request_header(Arc::new(Stop(ProcessorError::failed("plugin crashed"))));
         let gateway = Gateway::new(table(), processors, FakeUpstream::answering("pong"));
         let error = gateway
             .handle(context(granted()), request("/anthropic", ""))
@@ -812,6 +814,22 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.stage(), StageName::HeaderProcess);
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.public_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn a_refusing_plugin_is_forbidden_with_its_reason() {
+        let upstream = FakeUpstream::answering("pong");
+        let processors = ProcessorChain::new()
+            .with_request_header(Arc::new(Stop(ProcessorError::refused("blocked by policy"))));
+        let gateway = Gateway::new(table(), processors, upstream.clone());
+        let error = gateway
+            .handle(context(granted()), request("/anthropic", ""))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        assert_eq!(error.public_reason(), Some("blocked by policy"));
+        assert!(upstream.seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

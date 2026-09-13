@@ -55,6 +55,15 @@ impl GatewayError {
         &self.kind
     }
 
+    /// What the caller may be told about why. Only a plugin's deliberate refusal supplies
+    /// one; every other failure stays in the log.
+    pub fn public_reason(&self) -> Option<&str> {
+        match &self.kind {
+            GatewayErrorKind::Processor(ProcessorError::Refused { reason }) => Some(reason),
+            _ => None,
+        }
+    }
+
     /// The status the caller is told.
     pub fn status(&self) -> StatusCode {
         match self.kind {
@@ -65,7 +74,10 @@ impl GatewayError {
             GatewayErrorKind::Malformed { .. } | GatewayErrorKind::Value(_) => {
                 StatusCode::BAD_REQUEST
             }
-            GatewayErrorKind::Processor(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            GatewayErrorKind::Processor(ProcessorError::Refused { .. }) => StatusCode::FORBIDDEN,
+            GatewayErrorKind::Processor(ProcessorError::Failed { .. }) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             GatewayErrorKind::Upstream(_) => StatusCode::BAD_GATEWAY,
         }
     }
