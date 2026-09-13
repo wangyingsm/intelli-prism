@@ -70,9 +70,9 @@ impl Gateway {
         request: Request<GatewayBody>,
     ) -> Result<Response<GatewayBody>, GatewayError> {
         Flow::received(context, request)
+            .authorize(&self.table)?
             .process_headers(self.processors.request_headers())
             .await?
-            .authorize(&self.table)?
             .process_body(&self.processors)
             .await?
             .forward(self.upstream.as_ref())
@@ -115,12 +115,12 @@ impl Gateway {
 /// # async fn run(table: &RoutingTable, chain: &ProcessorChain) {
 /// let request = Request::builder().uri("/x").body(empty()).unwrap();
 /// let flow = Flow::received(context(), request);
-/// let flow = flow.process_headers(chain.request_headers()).await.unwrap();
 /// let flow = flow.authorize(table).unwrap();
+/// let flow = flow.process_headers(chain.request_headers()).await.unwrap();
 /// # }
 /// ```
 ///
-/// Skipping one does not compile:
+/// Running a plugin before authorization does not compile:
 ///
 /// ```compile_fail
 /// # use ip_gateway::{Flow, ProcessorChain, RoutingTable, RequestContext};
@@ -145,8 +145,8 @@ impl Gateway {
 /// # async fn run(table: &RoutingTable, chain: &ProcessorChain) {
 /// let request = Request::builder().uri("/x").body(empty()).unwrap();
 /// let flow = Flow::received(context(), request);
-/// // authorize belongs to Flow<HeadersProcessed>, not Flow<Received>.
-/// let flow = flow.authorize(table).unwrap();
+/// // process_headers belongs to Flow<Authorized>, so no plugin runs before authorization.
+/// let flow = flow.process_headers(chain.request_headers()).await.unwrap();
 /// # }
 /// ```
 pub struct Flow<S: Stage> {
@@ -175,21 +175,7 @@ impl Flow<Received> {
         }
     }
 
-    /// Runs the request header chain.
-    pub async fn process_headers(
-        mut self,
-        chain: &[Arc<dyn HeaderProcessor>],
-    ) -> Result<Flow<HeadersProcessed>, GatewayError> {
-        run_headers(HeadersProcessed::NAME, chain, self.held.headers_mut()).await?;
-        Ok(Flow {
-            context: self.context,
-            held: self.held,
-        })
-    }
-}
-
-impl Flow<HeadersProcessed> {
-    /// Resolves the route and checks the caller may use it.
+    /// Resolves the route and checks the caller may use it, before any plugin runs.
     pub fn authorize(self, table: &RoutingTable) -> Result<Flow<Authorized>, GatewayError> {
         let key = key_of(&self.context, &self.held)?;
         let resolution = resolve(table, &key)?;
@@ -205,6 +191,25 @@ impl Flow<HeadersProcessed> {
 }
 
 impl Flow<Authorized> {
+    /// Runs the request header chain.
+    pub async fn process_headers(
+        mut self,
+        chain: &[Arc<dyn HeaderProcessor>],
+    ) -> Result<Flow<HeadersProcessed>, GatewayError> {
+        run_headers(
+            HeadersProcessed::NAME,
+            chain,
+            self.held.request.headers_mut(),
+        )
+        .await?;
+        Ok(Flow {
+            context: self.context,
+            held: self.held,
+        })
+    }
+}
+
+impl Flow<HeadersProcessed> {
     /// Runs the request body chain, or leaves the body untouched when there is none.
     pub async fn process_body(
         mut self,
@@ -518,6 +523,7 @@ async fn run_body(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
     use http::{HeaderName, HeaderValue, StatusCode};
@@ -954,6 +960,44 @@ mod tests {
         assert_eq!(response.headers().get("x-upstream-keep").unwrap(), "1");
     }
 
+    /// Counts the requests that reach it, and passes each on untouched.
+    #[derive(Default)]
+    struct Counter(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl HeaderProcessor for Counter {
+        fn order(&self) -> PluginOrder {
+            PluginOrder::new(100)
+        }
+
+        async fn process(&self, _: &mut HeaderMap) -> Result<(), ProcessorError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_that_fails_authorization_never_reaches_a_plugin() {
+        for (authority, path, status) in [
+            (ungranted(), "/anthropic", StatusCode::FORBIDDEN),
+            (granted(), "/elsewhere", StatusCode::NOT_FOUND),
+        ] {
+            let counter = Arc::new(Counter::default());
+            let processors = ProcessorChain::new().with_request_header(counter.clone());
+            let gateway = Gateway::new(table(), processors, FakeUpstream::answering("pong"));
+            let error = gateway
+                .handle(context(authority), request(path, ""))
+                .await
+                .unwrap_err();
+            assert_eq!(error.status(), status);
+            assert_eq!(
+                counter.0.load(Ordering::Relaxed),
+                0,
+                "a plugin ran for {path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_failing_plugin_stops_the_flow_at_its_stage() {
         let processors = ProcessorChain::new()
@@ -1142,14 +1186,14 @@ mod tests {
         let request = request("/anthropic", "");
         let flow = Flow::received(context(granted()), request);
         assert_eq!(flow.stage(), StageName::Receive);
+        let flow = flow.authorize(&table()).unwrap();
+        assert_eq!(flow.stage(), StageName::Authorization);
         let processors = ProcessorChain::new();
         let flow = flow
             .process_headers(processors.request_headers())
             .await
             .unwrap();
         assert_eq!(flow.stage(), StageName::HeaderProcess);
-        let flow = flow.authorize(&table()).unwrap();
-        assert_eq!(flow.stage(), StageName::Authorization);
         let flow = flow.process_body(&processors).await.unwrap();
         assert_eq!(flow.stage(), StageName::BodyProcess);
         let upstream = FakeUpstream::answering("pong");

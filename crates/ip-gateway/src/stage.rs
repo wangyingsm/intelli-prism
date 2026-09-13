@@ -96,7 +96,7 @@ impl Stage for Received {
 pub struct HeadersProcessed;
 
 impl Stage for HeadersProcessed {
-    type Held = Request<GatewayBody>;
+    type Held = Routed;
     const NAME: StageName = StageName::HeaderProcess;
 }
 

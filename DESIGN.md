@@ -143,9 +143,12 @@ within its tenant.
 
 #### Dataflows
 
-- State machine flow definition: receive(kernel side) -> authentication -> header read -> header processor(plugin chain) -> authorization
+- State machine flow definition: receive(kernel side) -> authentication -> header read -> authorization -> header processor(plugin chain)
 -> body read -> body processor(plugin chain) -> route(send to upstream) -> response header read -> response header processor(plugin chain)
 -> response body read -> response body processor(plugin chain) -> send(kernel side)
+- Authorization runs before any plugin, so a request the caller may not make never reaches tenant code and spends no plugin fuel.
+Resolving the route is part of authorization, because both the capability check and the plugin rules are scoped to the api the route
+names; it also means no header plugin can steer a request somewhere else.
 - Every errors in the flow should return gateway error to client(exception - may retry where network IO failed, then wait for
 final result).
 - When a rule has no request or response body plugin processor, body can be just passed from fan-in to fan-out with a zero-copy mode.
