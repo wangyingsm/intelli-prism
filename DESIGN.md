@@ -51,7 +51,10 @@ history and/or agent toolcalls, with embedding and reversed indexing.
 - Heavy workload(hybrid path): with a hot data(access timestamp expiration) through fast path, with a slow path(expired data)
 through slow path.
 - Light workload/standalone deployment: a sqlite backed, same stored data.
-- Feature flag gated compilation: as hybrid-storage: fast-storage + slow-storage, standalone-storage exclusive.
+- Feature flag gated compilation: `standalone-storage` compiles in the sqlite backend and `fast-storage` the
+postgres one; `hybrid-storage` will add `slow-storage` beside `fast-storage`. The features are additive, so one
+build may carry several backends, and the `[storage]` backend tag picks one at startup. A tag naming a backend
+the build does not carry stops startup with an error naming the feature to enable.
 - A worker thread compaction: when running in hybrid mode, a time interval task to compact fast path to slow path.
 - A set of storage traits: expose the capabilities of long term storage to high layers, unified interfaces.
 
@@ -82,6 +85,23 @@ rolled in the binary; refactor it to the `clap` crate before the CLI grows past 
 service nodes.
 - System agent run loop: run loop logs with both system agent side and LLM side, including LLM thinks if enabled.
 - Data above stored two in openobserve.
+
+#### Storage backends
+
+- Each backend writes idiomatic SQL for its own engine and keeps its own migrations (`migrations/sqlite`,
+`migrations/postgres`); the storage traits are the only surface the backends share.
+- Sqlite spellings postgres does not accept, and what the postgres schema uses instead:
+	- `INTEGER PRIMARY KEY` assigns row ids only in sqlite; postgres needs `BIGINT GENERATED ALWAYS AS IDENTITY`.
+	- `BLOB` is `BYTEA`.
+	- Every integer column is `BIGINT`, since the code binds and reads `i64`. A postgres `INTEGER` is 32 bits: it
+	rejects those binds, decodes as `i32`, and a unix timestamp stored in it overflows in 2038 with no test failing.
+	- A computed integer needs a cast as well: `length(wasm)` returns a 32 bit `INTEGER` in postgres, so its
+	queries select `length(wasm)::BIGINT AS size`.
+	- `IFNULL` in an index expression is `COALESCE`, parenthesised as postgres requires.
+	- Sqlite's `IS ?` for a null safe comparison is `IS NOT DISTINCT FROM $n`, and every placeholder is numbered.
+- Postgres tests run only when `DATABASE_URL` names a database; without it they return early and pass having
+checked nothing, so a plain `cargo test` needs no server. `docker run --rm -d -p 5432:5432 -e
+POSTGRES_PASSWORD=ip postgres:16-alpine` provides one. The coverage gate counts them only when run with it set.
 
 ### Tenants and Users
 
