@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 use ip_config::ConfigError;
 use ip_gateway::{RouteError, UpstreamError};
+use ip_plugin::{ChainError, PluginError};
 use ip_storage::StorageError;
 
 /// Every way the server can fail before it is listening.
@@ -23,6 +24,14 @@ pub enum StartupError {
     /// The upstream client could not be built.
     #[error(transparent)]
     Upstream(#[from] UpstreamError),
+
+    /// The plugin engine could not be started.
+    #[error(transparent)]
+    Plugin(#[from] PluginError),
+
+    /// The plugin chains could not be built from the stored rules.
+    #[error(transparent)]
+    Chains(#[from] ChainError),
 
     /// The configured backend is not compiled into this build.
     #[error("this build has no {backend} backend; rebuild with its feature enabled")]

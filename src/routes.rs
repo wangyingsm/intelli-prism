@@ -121,11 +121,14 @@ mod tests {
         Port, Protocol, RouteKey, RouteRule, RouteTarget, Signature, TenantId, TnKey, UserId,
         UtKey,
     };
+    use ip_core::{NewPluginRule, PluginKind, PluginOrder, PluginScope};
     use ip_gateway::{Gateway, ProcessorChain, RoutingTable, Upstream, UpstreamError};
+    use ip_plugin::{PluginChains, PluginHost, PluginLimits};
     use ip_storage::{
         AccountKind, GrantStore, Membership, MembershipStore, NewTenant, NewUser, SqliteStore,
         Standing, Storage, TenantStore, UserStore,
     };
+    use ip_storage::{NewPlugin, PluginRuleStore, PluginStore};
     use tower::ServiceExt;
 
     use super::*;
@@ -210,6 +213,14 @@ secret = "0123456789abcdef0123456789abcdef"
         granted: bool,
         processors: ProcessorChain,
     ) -> (Router, TnKey, Arc<FakeUpstream>) {
+        let (store, key) = seeded_store(granted).await;
+        let upstream = Arc::new(FakeUpstream::default());
+        let gateway = Gateway::new(table(), processors, upstream.clone());
+        (router(state_over(store, gateway)), key, upstream)
+    }
+
+    /// A store holding the tenant, the user and its membership, and the grant when asked for.
+    async fn seeded_store(granted: bool) -> (SqliteStore, TnKey) {
         let store = SqliteStore::in_memory().await.unwrap();
         let key = TnKey::generate().unwrap();
         store
@@ -252,13 +263,17 @@ secret = "0123456789abcdef0123456789abcdef"
                 .await
                 .unwrap();
         }
+        (store, key)
+    }
+
+    fn table() -> RoutingTable {
         let config = Config::parse(CONFIG).unwrap();
-        let table = RoutingTable::build(&config, vec![rule()]).unwrap();
-        let upstream = Arc::new(FakeUpstream::default());
-        let gateway = Gateway::new(table, processors, upstream.clone());
+        RoutingTable::build(&config, vec![rule()]).unwrap()
+    }
+
+    fn state_over(store: SqliteStore, gateway: Gateway) -> AppState {
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let state = AppState::with_parts(Arc::new(store) as Arc<dyn Storage>, gateway, listen);
-        (router(state), key, upstream)
+        AppState::with_parts(Arc::new(store) as Arc<dyn Storage>, gateway, listen)
     }
 
     fn signature(key: &TnKey) -> String {
@@ -437,6 +452,53 @@ secret = "0123456789abcdef0123456789abcdef"
             .unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body_of(response).await.is_empty());
+    }
+
+    /// Keeps to the plugin abi and answers every body with the same words.
+    const REWRITE: &str = r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 16) "rewritten by wasm")
+  (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "dealloc") (param i32 i32))
+  (func (export "transform") (param i32 i32) (result i64)
+    (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 17))))"#;
+
+    #[tokio::test]
+    async fn a_stored_wasm_plugin_rewrites_a_proxied_response() {
+        let (store, key) = seeded_store(true).await;
+        let plugin = store
+            .put_plugin(NewPlugin {
+                kind: PluginKind::RespBody,
+                wasm: wat::parse_str(REWRITE).unwrap(),
+            })
+            .await
+            .unwrap();
+        store
+            .put_rule(
+                NewPluginRule::new(
+                    plugin.checksum,
+                    PluginOrder::new(100),
+                    PluginScope::Tenant {
+                        tenant: tenant_id(),
+                        user: None,
+                        api: None,
+                    },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let host = Arc::new(PluginHost::new(PluginLimits::default()).unwrap());
+        let chains = PluginChains::load(host, &store, &store).await.unwrap();
+        let upstream = Arc::new(FakeUpstream::default());
+        let gateway = Gateway::with_chains(table(), Arc::new(chains), upstream.clone());
+        let response = router(state_over(store, gateway))
+            .oneshot(request("/anthropic/messages", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await, "rewritten by wasm");
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

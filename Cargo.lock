@@ -1117,6 +1117,7 @@ dependencies = [
  "ip-config",
  "ip-core",
  "ip-gateway",
+ "ip-plugin",
  "ip-storage",
  "serde",
  "serde_json",
@@ -1125,6 +1126,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "wat",
 ]
 
 [[package]]
