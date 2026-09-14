@@ -548,6 +548,33 @@ mod tests {
     }
 
     #[test]
+    fn an_on_demand_host_runs_a_plugin() {
+        let host = PluginHost::on_demand(PluginLimits::default()).unwrap();
+        let checksum = loaded(&host, &noop());
+        assert!(
+            host.instantiate(&checksum)
+                .unwrap()
+                .transform(b"in")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_call_that_finds_the_pool_exhausted_fails() {
+        let host = host();
+        let checksum = loaded(&host, &noop());
+        let held: Vec<Invocation> = (0..POOLED_CALLS)
+            .map(|_| host.instantiate(&checksum).unwrap())
+            .collect();
+        assert!(matches!(
+            host.instantiate(&checksum),
+            Err(PluginError::Instantiate { .. })
+        ));
+        drop(held);
+        assert!(host.instantiate(&checksum).is_ok());
+    }
+
+    #[test]
     fn a_trap_other_than_the_limits_is_reported_as_a_trap() {
         let host = host();
         let checksum = loaded(
