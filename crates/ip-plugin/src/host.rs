@@ -34,7 +34,10 @@ impl PluginHost {
             .total_tables(POOLED_CALLS)
             .max_memory_size(limits.memory_bytes);
         let mut config = Config::new();
-        config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+        // Each slot reserves this much address space, which wasmtime would otherwise set to 4 GiB.
+        config
+            .allocation_strategy(InstanceAllocationStrategy::Pooling(pool))
+            .memory_reservation(limits.memory_bytes as u64);
         Self::with_config(config, limits)
     }
 
@@ -535,6 +538,13 @@ mod tests {
             host.load(&checksum, &bytes),
             Err(PluginError::Compile { .. })
         ));
+    }
+
+    #[test]
+    fn many_pooled_hosts_fit_in_one_process() {
+        // Forty pools of 4 GiB slots would need more address space than a process has.
+        let hosts: Vec<PluginHost> = (0..40).map(|_| host()).collect();
+        assert_eq!(hosts.len(), 40);
     }
 
     #[test]

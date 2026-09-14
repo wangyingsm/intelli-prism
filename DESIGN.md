@@ -171,6 +171,11 @@ plugin call runs on; a call that finds the pool exhausted fails rather than wait
 at the per call memory limit, and what the pool reserves is address space, not resident memory. A
 plugin that declares more memory than that cap is refused when it is loaded rather than when it is
 first called, so an oversized global plugin stops startup and an oversized tenant one is dropped.
+- Each slot reserves exactly the memory limit plus a 32 MiB guard, about 94 GiB for the whole pool.
+Left at wasmtime's 4 GiB default a slot would reserve nearly 4 TiB per pool, and a process holding a
+few dozen hosts, as the test suite does, runs out of address space. The price is that guest memory
+accesses carry explicit bounds checks, which a 4 GiB reservation lets wasmtime leave out; memory
+protection keys could win them back on CPUs that have them. (todo)
 - On one developer laptop a whole call — instantiate, transform, drop — costs about 5.8us from the
 pool against about 13us without it, so the pool saves roughly 7us of every call. `cargo run --release
 -p ip-plugin --example plugin_cost` times both in a single process, alternating between them, because
