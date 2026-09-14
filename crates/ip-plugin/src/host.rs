@@ -406,6 +406,31 @@ mod tests {
     }
 
     #[test]
+    fn an_invocation_names_the_plugin_it_runs() {
+        let host = host();
+        let checksum = loaded(&host, &noop());
+        assert_eq!(host.instantiate(&checksum).unwrap().checksum(), &checksum);
+    }
+
+    #[test]
+    fn an_alloc_that_cannot_hold_the_input_breaks_the_abi() {
+        let host = host();
+        let checksum = loaded(
+            &host,
+            r#"(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) (i32.const 65500))
+  (func (export "dealloc") (param i32 i32))
+  (func (export "transform") (param i32 i32) (result i64) (i64.const 0)))"#,
+        );
+        let invocation = host.instantiate(&checksum).unwrap();
+        let Err(PluginError::Abi { detail, .. }) = invocation.transform(&[0_u8; 100]) else {
+            panic!("writing past the end of guest memory must break the abi");
+        };
+        assert!(detail.contains("does not fit"), "{detail}");
+    }
+
+    #[test]
     fn a_loop_is_stopped_when_its_fuel_runs_out() {
         let host = PluginHost::new(PluginLimits {
             fuel: 10_000,
