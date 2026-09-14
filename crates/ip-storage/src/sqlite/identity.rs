@@ -5,8 +5,8 @@ use ip_core::{
 };
 use sqlx::Row;
 
-use super::{SqliteStore, is_unique_violation};
-use crate::error::{Entity, StorageError};
+use super::SqliteStore;
+use crate::error::{Entity, StorageError, is_unique_violation};
 use crate::model::{
     AccountKind, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId, User, UserRowId,
 };

@@ -58,6 +58,18 @@ impl StorageError {
     }
 }
 
+/// Whether the database refused a write for breaking a foreign key.
+#[cfg(feature = "standalone-storage")]
+pub(crate) fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.is_foreign_key_violation())
+}
+
+/// Whether the database refused a write for breaking a unique constraint.
+#[cfg(feature = "standalone-storage")]
+pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.is_unique_violation())
+}
+
 /// What a storage error is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entity {

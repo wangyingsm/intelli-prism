@@ -5,8 +5,8 @@ use ip_core::{
 };
 use sqlx::Row;
 
-use super::{SqliteStore, is_foreign_key_violation, is_unique_violation};
-use crate::error::{Entity, StorageError};
+use super::SqliteStore;
+use crate::error::{Entity, StorageError, is_foreign_key_violation, is_unique_violation};
 use crate::plugin::{NewPlugin, Plugin, PluginRecord, PluginRowId, PluginRuleStore, PluginStore};
 
 fn plugin_record(row: &sqlx::sqlite::SqliteRow) -> Result<PluginRecord, StorageError> {

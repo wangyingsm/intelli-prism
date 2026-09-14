@@ -90,14 +90,6 @@ impl SqliteStore {
     }
 }
 
-fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(db) if db.is_foreign_key_violation())
-}
-
-fn is_unique_violation(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(db) if db.is_unique_violation())
-}
-
 /// The store the sqlite only tests build from, and the records every backend test shares.
 #[cfg(test)]
 mod fixture {
