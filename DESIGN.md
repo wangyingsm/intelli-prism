@@ -2,18 +2,18 @@
 
 ## Key design points
 
-- LLM proxy: the application provides multiple LLM upsteam access. network layers includes
+- LLM proxy: the application provides multiple LLM upstream access. network layers includes
 	1. Transport Layer - TCP/UDP
 	2. Application Layer - HTTP 1.1/HTTP 2/QUIC
 	3. Message Layer - OpenAI/Anthropic/Gemini
 	4. Data on fly - Response/SSE
 - Downstream proxy: downstream clients maybe a user or an agent. same network layers as upstream.
-- Cluster Proxing: a group deployment of this application will serve as one service in a high throughput enviorment.
+- Cluster Proxing: a group deployment of this application will serve as one service in a high throughput environment.
 - State Sharing: the cluster nodes share their states(eg, cache, configs).
 - Long Term Memory: a long term user/agent persist memory with a vector/NLP based memory retrieval mechanism.
 - Unified chat endpoint: all users can access this endpoint with any simple interface.
 - Unified agent endpoint: all agents can connect to this endpoint with hybrid purposes.
-- Intelligent Routing: A SMART mode to choose an appropiate upstream LLM according to their capabilities and the difficulty of the request.
+- Intelligent Routing: A SMART mode to choose an appropriate upstream LLM according to their capabilities and the difficulty of the request.
 - Graph Agent Run: application has its own agent system, which supports to run agent loop,  subagents, orchestration, cooperation through a graph system.
 - Tenants and Users: enterprise level AI proxy/gateway, with sophistic authentication/authorization.
 - Quotation and Audition: manage tenants/users tokens' quotation, audit the usages.
@@ -24,13 +24,13 @@
 
 - Provide an enterprise/multi-enterprise AI enabled proxy/gateway.
 - Support remote/local upstream service nodes. LLM/API/Websocket/GRPC protocols.
-- Support multi agent run on server enviorments to ease the normal/standard development of client agents.
+- Support multi agent run on server environments to ease the normal/standard development of client agents.
 - Provide extra cache level in service so that increase the hit rate and lower token usage.
 - Provide persistence of long term memory and knowledge base to provide more precise RAG and quicker AI solutions.
 - Provide tenant and/or user separation of their data/memories/knowledges/DAGs, etc.
 - Provide smart enough routing strategies to choose one or more upstream LLM(s) for different kinds of problems.
 - Provide a DAG based hedging LLM request strategy, then aggregate/select/loop to the final result. then the select path
-can be used to self-learn a more efficient router above, with a criterion composed by serveral factors, including qualities
+can be used to self-learn a more efficient router above, with a criterion composed by several factors, including qualities
 of the result, token usages, respond time, user bias(scores).
 - Provide a tenant/user management of quotas/rate limits/DAGs/audition rules.
 - Provide full observations of resources/LLM usages/logs/performance from all levels.
@@ -87,7 +87,7 @@ service nodes.
 #### Tenants
 
 - Tenants can be any organization form, eg, an enterprise, a department, a group, etc. create a tenant will always create
-a TO(Tenant Owner) user account(Tenant Owner). Tenant is not an entity account. TO is its representitive account for management.
+a TO(Tenant Owner) user account(Tenant Owner). Tenant is not an entity account. TO is its representative account for management.
 - Tenant has its tn_id which is unique in the application, a random 16 bytes key is generate to tenant, named tn_key. it can be represent
 as a 32 chars hex string and become a root key of the whole tenant roles.
 
