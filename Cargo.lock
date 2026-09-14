@@ -1197,10 +1197,13 @@ dependencies = [
  "async-trait",
  "bytes",
  "http",
+ "ip-auth",
  "ip-core",
  "ip-gateway",
+ "ip-storage",
  "thiserror",
  "tokio",
+ "tracing",
  "wasmtime",
  "wat",
 ]

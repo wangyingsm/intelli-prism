@@ -7,10 +7,13 @@ edition.workspace = true
 async-trait = "0.1.92"
 bytes = "1.12.1"
 http = "1.5.0"
+ip-auth = { version = "0.1.0", path = "../ip-auth" }
 ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-gateway = { version = "0.1.0", path = "../ip-gateway" }
+ip-storage = { version = "0.1.0", path = "../ip-storage" }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt"] }
+tracing = "0.1.44"
 wasmtime = { version = "48.0.2", default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [dev-dependencies]

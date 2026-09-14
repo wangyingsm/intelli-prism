@@ -1,4 +1,5 @@
 use ip_core::Checksum;
+use ip_storage::StorageError;
 use wasmtime::Trap;
 
 /// Every way loading or running a plugin can fail.
@@ -109,4 +110,21 @@ pub struct HeaderBlockError {
     pub line: usize,
     /// What is wrong with it.
     pub problem: &'static str,
+}
+
+/// Every way building the plugin chains at startup can fail.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainError {
+    /// The stored plugins or rules could not be read.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+
+    /// A global plugin will not load, and every flow runs the global chain.
+    #[error("global plugin {checksum} will not load: {detail}")]
+    GlobalPlugin {
+        /// The plugin that failed.
+        checksum: Checksum,
+        /// Why it will not load.
+        detail: String,
+    },
 }
