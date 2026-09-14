@@ -7,6 +7,7 @@
 	2. Application Layer - HTTP 1.1/HTTP 2/QUIC
 	3. Message Layer - OpenAI/Anthropic/Gemini
 	4. Data on fly - Response/SSE
+- Upstream proxy: upstream maybe a local or remote normal service. same network layers as LLM proxy.
 - Downstream proxy: downstream clients maybe a user or an agent. same network layers as upstream.
 - Cluster Proxing: a group deployment of this application will serve as one service in a high throughput environment.
 - State Sharing: the cluster nodes share their states(eg, cache, configs).
