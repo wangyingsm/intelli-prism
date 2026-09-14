@@ -6,9 +6,10 @@ edition.workspace = true
 [dependencies]
 argon2 = "0.6.0"
 ip-core = { version = "0.1.0", path = "../ip-core" }
-ip-storage = { version = "0.1.0", path = "../ip-storage" }
+ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }
 thiserror = "2.0.20"
 zeroize = "1.9.0"
 
 [dev-dependencies]
+ip-storage = { version = "0.1.0", path = "../ip-storage", features = ["standalone-storage"] }
 tokio = { version = "1.53.1", features = ["rt", "macros"] }
