@@ -134,7 +134,7 @@ to, named ut_key. compute by sha256(concat(user_id, tn_key)).
 - SysAdmin is authed to all capabilities on web and API call through localhost.
 - Tenant's API range is granted by SysAdmin, quota/limitation of tenant level is setup by SysAdmin too.
 - TO is authed to UserMgr, ApiAccess, ApiAdvMgr, LimitMgr, SysAgent, Observer within its tenant range.
-- User's ApiAcess, ApiAdvMgr, SysAgent is granted by TO within its tenant range. and TO set every users' quota/limitation
+- User's ApiAccess, ApiAdvMgr, SysAgent is granted by TO within its tenant range. and TO set every users' quota/limitation
 within its tenant.
 - User can choose an active tenant in web which the tenant is attached to the user.
 - User can never change its capabilities, they are all set by TO.
@@ -152,7 +152,7 @@ names; it also means no header plugin can steer a request somewhere else.
 - Every errors in the flow should return gateway error to client(exception - may retry where network IO failed, then wait for
 final result).
 - When a rule has no request or response body plugin processor, body can be just passed from fan-in to fan-out with a zero-copy mode.
-- SSE can have processors too, they will be a different plugin from normal body response. do the chunck processing jobs.
+- SSE can have processors too, they will be a different plugin from normal body response. do the chunk processing jobs.
 - A response chunk plugin sees one server sent event at a time. The gateway buffers a `text/event-stream`
 response up to each blank line, runs the chunk chain on that event and sends it on; every other response
 goes through the response body chain instead. A chunk plugin that refuses mid-stream cannot change a
