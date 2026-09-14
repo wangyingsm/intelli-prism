@@ -171,6 +171,10 @@ plugin call runs on; a call that finds the pool exhausted fails rather than wait
 at the per call memory limit, and what the pool reserves is address space, not resident memory. A
 plugin that declares more memory than that cap is refused when it is loaded rather than when it is
 first called, so an oversized global plugin stops startup and an oversized tenant one is dropped.
+- On one developer laptop a whole call — instantiate, transform, drop — costs about 5.8us from the
+pool against about 13us without it, so the pool saves roughly 7us of every call. `cargo run --release
+-p ip-plugin --example plugin_cost` times both in a single process, alternating between them, because
+this machine's clock settles differently in each process by more than the difference being measured.
 - Plugins are stored in Obj Stor engine(cloud S3/rustfs). they are loaded and compiled at startup or reload of the application.
 keyed by WASM file sha256 checksum. plugin types enum(ReqHeader, ReqBody, RespHeader, RespBody, RespChunk), and order as a u8 integer.
 - One request can be parsed an explicit tenant and an explicit user, then can load the plugin rule records from cache. those records
