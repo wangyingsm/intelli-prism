@@ -7,6 +7,8 @@ pub mod route;
 #[cfg(feature = "standalone-storage")]
 pub mod sqlite;
 pub mod store;
+#[cfg(all(test, feature = "standalone-storage"))]
+mod suite;
 
 pub use error::{Entity, StorageError};
 pub use model::{

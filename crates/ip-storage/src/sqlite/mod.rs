@@ -98,49 +98,24 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(db) if db.is_unique_violation())
 }
 
-/// The stores and records every backend test builds from.
+/// The store the sqlite only tests build from, and the records every backend test shares.
 #[cfg(test)]
 mod fixture {
-    use ip_core::{PassphraseHash, TenantId, TnKey, UserId};
+    pub(crate) use crate::suite::fixture::*;
 
     use super::SqliteStore;
-    use crate::model::{AccountKind, NewTenant, NewUser, Tenant, User};
-    use crate::store::{TenantStore, UserStore};
 
     pub(crate) async fn store() -> SqliteStore {
         SqliteStore::in_memory().await.unwrap()
     }
+}
 
-    pub(crate) fn tenant_id() -> TenantId {
-        TenantId::new("acme").unwrap()
+/// The shared backend tests, each against a private in-memory database.
+#[cfg(test)]
+mod suite {
+    async fn open() -> Option<super::SqliteStore> {
+        Some(super::SqliteStore::in_memory().await.unwrap())
     }
 
-    pub(crate) fn user_id() -> UserId {
-        UserId::new("alice").unwrap()
-    }
-
-    pub(crate) fn hash() -> PassphraseHash {
-        PassphraseHash::new("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA").unwrap()
-    }
-
-    pub(crate) fn new_tenant() -> NewTenant {
-        NewTenant {
-            id: tenant_id(),
-            key: TnKey::generate().unwrap(),
-        }
-    }
-
-    pub(crate) fn new_user() -> NewUser {
-        NewUser {
-            id: user_id(),
-            passphrase: hash(),
-            kind: AccountKind::Regular,
-        }
-    }
-
-    pub(crate) async fn tenant_with_user(store: &SqliteStore) -> (Tenant, User) {
-        let tenant = store.create_tenant(new_tenant()).await.unwrap();
-        let user = store.create_user(new_user()).await.unwrap();
-        (tenant, user)
-    }
+    crate::suite::backend_suite!(crate::sqlite::suite::open);
 }
