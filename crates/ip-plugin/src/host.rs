@@ -5,7 +5,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ip_core::Checksum;
-use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Config, Engine, Instance, InstancePre, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
+};
 
 use crate::abi::{self, ALLOC, DEALLOC, MEMORY, Packed, TRANSFORM, Transformed};
 use crate::error::PluginError;
@@ -14,7 +16,7 @@ use crate::limits::PluginLimits;
 /// Compiles plugins once, keeps them by checksum, and runs each call within its limits.
 pub struct PluginHost {
     engine: Engine,
-    modules: RwLock<HashMap<Checksum, Module>>,
+    modules: RwLock<HashMap<Checksum, InstancePre<CallState>>>,
     limits: PluginLimits,
     _clock: EpochClock,
 }
@@ -64,10 +66,16 @@ impl PluginHost {
             });
         }
         abi::check_exports(*checksum, &module)?;
+        let prepared = Linker::<CallState>::new(&self.engine)
+            .instantiate_pre(&module)
+            .map_err(|error| PluginError::Instantiate {
+                checksum: *checksum,
+                detail: error.to_string(),
+            })?;
         self.modules
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(*checksum, module);
+            .insert(*checksum, prepared);
         Ok(())
     }
 
@@ -103,7 +111,7 @@ impl PluginHost {
 
     /// Instantiates a loaded module in a fresh store that carries one call's limits.
     pub fn instantiate(&self, checksum: &Checksum) -> Result<Invocation, PluginError> {
-        let module = self
+        let prepared = self
             .modules
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -130,7 +138,7 @@ impl PluginHost {
             .map_err(|error| PluginError::Engine(error.to_string()))?;
         store.set_epoch_deadline(self.limits.deadline_ticks());
         store.epoch_deadline_trap();
-        let instance = Instance::new(&mut store, &module, &[]).map_err(|error| {
+        let instance = prepared.instantiate(&mut store).map_err(|error| {
             PluginError::trapped(*checksum, &error, |detail| PluginError::Instantiate {
                 checksum: *checksum,
                 detail,
