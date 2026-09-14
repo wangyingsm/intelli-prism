@@ -165,6 +165,12 @@ stream ends. A chunk plugin that fails ends the stream, and its reason stays in 
 - Plugins are WASM files, system provides some primary plugins, such as authing, logging, metrics sampling, quota/rate limit blocking,
 etc. tenants/users can upload their own UDW(User defined WASM) plugins, UDW can not use any WASI. they only do a input to output string
 transformation. and UDW has instruction and time run limit.
+- A call takes its instance from a pool reserved when the host starts, so no request pays to map and
+unmap guest memory. The pool holds room for 1000 calls at once, which covers the blocking pool every
+plugin call runs on; a call that finds the pool exhausted fails rather than waits. Each slot is capped
+at the per call memory limit, and what the pool reserves is address space, not resident memory. A
+plugin that declares more memory than that cap is refused when it is loaded rather than when it is
+first called, so an oversized global plugin stops startup and an oversized tenant one is dropped.
 - Plugins are stored in Obj Stor engine(cloud S3/rustfs). they are loaded and compiled at startup or reload of the application.
 keyed by WASM file sha256 checksum. plugin types enum(ReqHeader, ReqBody, RespHeader, RespBody, RespChunk), and order as a u8 integer.
 - One request can be parsed an explicit tenant and an explicit user, then can load the plugin rule records from cache. those records

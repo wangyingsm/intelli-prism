@@ -6,12 +6,16 @@ use std::time::Duration;
 
 use ip_core::Checksum;
 use wasmtime::{
-    Config, Engine, Instance, InstancePre, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
+    Config, Engine, Instance, InstanceAllocationStrategy, InstancePre, Linker, Module,
+    PoolingAllocationConfig, Store, StoreLimits, StoreLimitsBuilder,
 };
 
 use crate::abi::{self, ALLOC, DEALLOC, MEMORY, Packed, TRANSFORM, Transformed};
 use crate::error::PluginError;
 use crate::limits::PluginLimits;
+
+/// Calls that may run at once, which is what the pool reserves room for.
+const POOLED_CALLS: u32 = 1_000;
 
 /// Compiles plugins once, keeps them by checksum, and runs each call within its limits.
 pub struct PluginHost {
@@ -22,9 +26,25 @@ pub struct PluginHost {
 }
 
 impl PluginHost {
-    /// Builds an engine that meters fuel and honours deadlines, and starts its clock.
+    /// Builds a host that takes each instance from a pool reserved up front.
     pub fn new(limits: PluginLimits) -> Result<Self, PluginError> {
+        let mut pool = PoolingAllocationConfig::default();
+        pool.total_core_instances(POOLED_CALLS)
+            .total_memories(POOLED_CALLS)
+            .total_tables(POOLED_CALLS)
+            .max_memory_size(limits.memory_bytes);
         let mut config = Config::new();
+        config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+        Self::with_config(config, limits)
+    }
+
+    /// Builds a host that maps each instance as it goes, keeping no pool.
+    pub fn on_demand(limits: PluginLimits) -> Result<Self, PluginError> {
+        Self::with_config(Config::new(), limits)
+    }
+
+    /// Builds an engine that meters fuel and honours deadlines, and starts its clock.
+    fn with_config(mut config: Config, limits: PluginLimits) -> Result<Self, PluginError> {
         config.consume_fuel(true).epoch_interruption(true);
         let engine =
             Engine::new(&config).map_err(|error| PluginError::Engine(error.to_string()))?;
@@ -508,12 +528,12 @@ mod tests {
     }
 
     #[test]
-    fn a_module_that_starts_larger_than_the_limit_is_not_instantiated() {
+    fn a_module_that_wants_more_memory_than_the_limit_is_not_loaded() {
         let host = host();
-        let checksum = loaded(&host, &conforming(2000, ""));
+        let (checksum, bytes) = wasm(&conforming(2000, ""));
         assert!(matches!(
-            host.instantiate(&checksum),
-            Err(PluginError::Instantiate { .. })
+            host.load(&checksum, &bytes),
+            Err(PluginError::Compile { .. })
         ));
     }
 
