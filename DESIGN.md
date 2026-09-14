@@ -181,6 +181,12 @@ protection keys could win them back on CPUs that have them. (todo)
 pool against about 13us without it, so the pool saves roughly 7us of every call. `cargo run --release
 -p ip-plugin --example plugin_cost` times both in a single process, alternating between them, because
 this machine's clock settles differently in each process by more than the difference being measured.
+- A slot keeps none of its guest memory resident between calls, so every call faults its pages in again
+as fresh zeroed memory. Keeping some resident would save that, but each warm slot holds its share and up
+to 100 slots stay warm: at the 64 MiB cap that is 6.4 GiB resident. Size what stays resident from the
+memory real plugins touch, and bound the warm slots to match, once there are plugins to measure. The
+pool's roughly 94 GiB of reserved address space must also be checked against address space limits and
+strict overcommit settings before a deployment relies on it. (todo)
 - Plugins are stored in Obj Stor engine(cloud S3/rustfs). they are loaded and compiled at startup or reload of the application.
 keyed by WASM file sha256 checksum. plugin types enum(ReqHeader, ReqBody, RespHeader, RespBody, RespChunk), and order as a u8 integer.
 - One request can be parsed an explicit tenant and an explicit user, then can load the plugin rule records from cache. those records
