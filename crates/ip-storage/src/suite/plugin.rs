@@ -2,11 +2,16 @@ use ip_core::{
     ApiId, Checksum, NewPluginRule, PluginKind, PluginOrder, PluginScope, TenantId, TnKey,
 };
 
-use super::AnyStore;
 use super::fixture::*;
 use crate::error::{Entity, StorageError};
 use crate::model::NewTenant;
-use crate::plugin::NewPlugin;
+use crate::plugin::{NewPlugin, PluginRuleStore, PluginStore};
+use crate::store::Storage;
+
+/// What the plugin tests need: plugins, their rules, and the tenants and users rules name.
+pub(crate) trait PluginBackend: Storage + PluginStore + PluginRuleStore {}
+
+impl<T> PluginBackend for T where T: Storage + PluginStore + PluginRuleStore {}
 
 /// A plugin of `kind` whose wasm is `body`.
 pub(crate) fn plugin(kind: PluginKind, body: &[u8]) -> NewPlugin {
@@ -36,7 +41,7 @@ fn alice_only() -> PluginScope {
     }
 }
 
-pub(crate) async fn a_plugin_round_trips_with_its_wasm(store: &impl AnyStore) {
+pub(crate) async fn a_plugin_round_trips_with_its_wasm(store: &impl PluginBackend) {
     let record = store
         .put_plugin(plugin(PluginKind::ReqBody, b"\0asm module"))
         .await
@@ -48,7 +53,7 @@ pub(crate) async fn a_plugin_round_trips_with_its_wasm(store: &impl AnyStore) {
     assert_eq!(read.wasm, b"\0asm module");
 }
 
-pub(crate) async fn storing_the_same_plugin_twice_keeps_one_row(store: &impl AnyStore) {
+pub(crate) async fn storing_the_same_plugin_twice_keeps_one_row(store: &impl PluginBackend) {
     let first = store
         .put_plugin(plugin(PluginKind::ReqBody, b"module"))
         .await
@@ -61,7 +66,7 @@ pub(crate) async fn storing_the_same_plugin_twice_keeps_one_row(store: &impl Any
     assert_eq!(store.plugins().await.unwrap().len(), 1);
 }
 
-pub(crate) async fn listing_plugins_reports_their_size(store: &impl AnyStore) {
+pub(crate) async fn listing_plugins_reports_their_size(store: &impl PluginBackend) {
     store
         .put_plugin(plugin(PluginKind::ReqBody, b"123456"))
         .await
@@ -80,7 +85,9 @@ pub(crate) async fn listing_plugins_reports_their_size(store: &impl AnyStore) {
     assert_eq!(sizes, vec![6, 2]);
 }
 
-pub(crate) async fn removing_a_plugin_that_is_absent_reports_it_missing(store: &impl AnyStore) {
+pub(crate) async fn removing_a_plugin_that_is_absent_reports_it_missing(
+    store: &impl PluginBackend,
+) {
     assert!(matches!(
         store.remove_plugin(&Checksum::of(b"absent")).await,
         Err(StorageError::NotFound {
@@ -91,7 +98,7 @@ pub(crate) async fn removing_a_plugin_that_is_absent_reports_it_missing(store: &
 }
 
 pub(crate) async fn a_plugin_a_rule_still_uses_is_not_removed_until_the_rule_goes(
-    store: &impl AnyStore,
+    store: &impl PluginBackend,
 ) {
     tenant_with_user(store).await;
     let record = store
@@ -120,7 +127,7 @@ pub(crate) async fn a_plugin_a_rule_still_uses_is_not_removed_until_the_rule_goe
     store.remove_plugin(&record.checksum).await.unwrap();
 }
 
-pub(crate) async fn every_rule_scope_round_trips(store: &impl AnyStore) {
+pub(crate) async fn every_rule_scope_round_trips(store: &impl PluginBackend) {
     tenant_with_user(store).await;
     let record = store
         .put_plugin(plugin(PluginKind::ReqBody, b"module"))
@@ -164,7 +171,7 @@ pub(crate) async fn every_rule_scope_round_trips(store: &impl AnyStore) {
     }
 }
 
-pub(crate) async fn a_stored_rule_takes_its_kind_from_the_plugin(store: &impl AnyStore) {
+pub(crate) async fn a_stored_rule_takes_its_kind_from_the_plugin(store: &impl PluginBackend) {
     tenant_with_user(store).await;
     let record = store
         .put_plugin(plugin(PluginKind::RespHeader, b"module"))
@@ -181,7 +188,7 @@ pub(crate) async fn a_stored_rule_takes_its_kind_from_the_plugin(store: &impl An
     );
 }
 
-pub(crate) async fn a_rule_naming_an_absent_plugin_is_refused(store: &impl AnyStore) {
+pub(crate) async fn a_rule_naming_an_absent_plugin_is_refused(store: &impl PluginBackend) {
     tenant_with_user(store).await;
     assert!(matches!(
         store
@@ -194,7 +201,7 @@ pub(crate) async fn a_rule_naming_an_absent_plugin_is_refused(store: &impl AnySt
     ));
 }
 
-pub(crate) async fn a_rule_in_a_tenant_that_is_not_there_is_refused(store: &impl AnyStore) {
+pub(crate) async fn a_rule_in_a_tenant_that_is_not_there_is_refused(store: &impl PluginBackend) {
     let record = store
         .put_plugin(plugin(PluginKind::ReqBody, b"module"))
         .await
@@ -210,7 +217,9 @@ pub(crate) async fn a_rule_in_a_tenant_that_is_not_there_is_refused(store: &impl
     ));
 }
 
-pub(crate) async fn an_order_a_tenant_already_uses_for_that_kind_is_refused(store: &impl AnyStore) {
+pub(crate) async fn an_order_a_tenant_already_uses_for_that_kind_is_refused(
+    store: &impl PluginBackend,
+) {
     tenant_with_user(store).await;
     let first = store
         .put_plugin(plugin(PluginKind::ReqBody, b"one"))
@@ -235,7 +244,7 @@ pub(crate) async fn an_order_a_tenant_already_uses_for_that_kind_is_refused(stor
     ));
 }
 
-pub(crate) async fn the_same_order_under_another_kind_is_allowed(store: &impl AnyStore) {
+pub(crate) async fn the_same_order_under_another_kind_is_allowed(store: &impl PluginBackend) {
     tenant_with_user(store).await;
     let request = store
         .put_plugin(plugin(PluginKind::ReqBody, b"one"))
@@ -257,7 +266,7 @@ pub(crate) async fn the_same_order_under_another_kind_is_allowed(store: &impl An
     );
 }
 
-pub(crate) async fn a_tenant_reads_its_own_rules_and_the_global_ones(store: &impl AnyStore) {
+pub(crate) async fn a_tenant_reads_its_own_rules_and_the_global_ones(store: &impl PluginBackend) {
     tenant_with_user(store).await;
     let globex = TenantId::new("globex").unwrap();
     store
@@ -300,7 +309,7 @@ pub(crate) async fn a_tenant_reads_its_own_rules_and_the_global_ones(store: &imp
     }));
 }
 
-pub(crate) async fn rules_come_back_highest_order_first(store: &impl AnyStore) {
+pub(crate) async fn rules_come_back_highest_order_first(store: &impl PluginBackend) {
     tenant_with_user(store).await;
     let record = store
         .put_plugin(plugin(PluginKind::ReqBody, b"module"))
@@ -322,7 +331,7 @@ pub(crate) async fn rules_come_back_highest_order_first(store: &impl AnyStore) {
     assert_eq!(orders, vec![200, 150, 100]);
 }
 
-pub(crate) async fn deleting_a_tenant_takes_its_rules_with_it(store: &impl AnyStore) {
+pub(crate) async fn deleting_a_tenant_takes_its_rules_with_it(store: &impl PluginBackend) {
     tenant_with_user(store).await;
     let record = store
         .put_plugin(plugin(PluginKind::ReqBody, b"module"))
@@ -343,7 +352,7 @@ pub(crate) async fn deleting_a_tenant_takes_its_rules_with_it(store: &impl AnySt
 }
 
 pub(crate) async fn removing_a_global_rule_leaves_a_tenant_rule_at_the_same_kind(
-    store: &impl AnyStore,
+    store: &impl PluginBackend,
 ) {
     tenant_with_user(store).await;
     let record = store

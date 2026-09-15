@@ -4,15 +4,6 @@ pub(crate) mod identity;
 pub(crate) mod plugin;
 pub(crate) mod route;
 
-use crate::plugin::{PluginRuleStore, PluginStore};
-use crate::route::RouteStore;
-use crate::store::Storage;
-
-/// Everything a backend implements, so a shared test can run against any of them.
-pub(crate) trait AnyStore: Storage + RouteStore + PluginStore + PluginRuleStore {}
-
-impl<T> AnyStore for T where T: Storage + RouteStore + PluginStore + PluginRuleStore {}
-
 /// The records every backend test builds from.
 pub(crate) mod fixture {
     use ip_core::{PassphraseHash, TenantId, TnKey, UserId};
@@ -55,7 +46,7 @@ pub(crate) mod fixture {
 }
 
 /// Writes one `#[tokio::test]` per shared test, each on a fresh store from `$open`, an async fn
-/// that returns `None` when its backend cannot run here.
+/// that returns `None` when its backend cannot run here. Naming a module runs only its tests.
 macro_rules! backend_suite {
     (@module $module:ident, $open:path, [$($test:ident),* $(,)?]) => {
         mod $module {
@@ -70,7 +61,7 @@ macro_rules! backend_suite {
             )*
         }
     };
-    ($open:path) => {
+    (identity, $open:path) => {
         $crate::suite::backend_suite!(@module identity, $open, [
             a_fresh_database_is_migrated_and_empty,
             a_tenant_round_trips_with_its_key_intact,
@@ -90,6 +81,8 @@ macro_rules! backend_suite {
             revoking_what_is_not_held_reports_it_missing,
             revoking_removes_only_the_named_grant,
         ]);
+    };
+    (route, $open:path) => {
         $crate::suite::backend_suite!(@module route, $open, [
             a_route_round_trips,
             a_route_names_the_api_it_serves,
@@ -100,6 +93,8 @@ macro_rules! backend_suite {
             a_route_may_stand_for_several_endpoints,
             rewriting_a_route_replaces_its_whole_endpoint_list,
         ]);
+    };
+    (plugin, $open:path) => {
         $crate::suite::backend_suite!(@module plugin, $open, [
             a_plugin_round_trips_with_its_wasm,
             storing_the_same_plugin_twice_keeps_one_row,
@@ -117,6 +112,11 @@ macro_rules! backend_suite {
             deleting_a_tenant_takes_its_rules_with_it,
             removing_a_global_rule_leaves_a_tenant_rule_at_the_same_kind,
         ]);
+    };
+    ($open:path) => {
+        $crate::suite::backend_suite!(identity, $open);
+        $crate::suite::backend_suite!(route, $open);
+        $crate::suite::backend_suite!(plugin, $open);
     };
 }
 

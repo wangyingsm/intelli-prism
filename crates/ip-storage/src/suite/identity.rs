@@ -1,9 +1,9 @@
 use ip_core::{ApiId, Capability, CapabilityScope, Grant, PassphraseHash, TenantId, TnKey, UserId};
 
-use super::AnyStore;
 use super::fixture::*;
 use crate::error::{Entity, StorageError};
 use crate::model::{AccountKind, Membership, NewTenant, NewUser, Standing, TenantRowId};
+use crate::store::Storage;
 
 fn api_grant(user: &UserId, tenant: &TenantId, capability: Capability) -> Grant {
     Grant::new(
@@ -17,12 +17,12 @@ fn api_grant(user: &UserId, tenant: &TenantId, capability: Capability) -> Grant 
     .unwrap()
 }
 
-pub(crate) async fn a_fresh_database_is_migrated_and_empty(store: &impl AnyStore) {
+pub(crate) async fn a_fresh_database_is_migrated_and_empty(store: &impl Storage) {
     assert_eq!(store.tenant(&tenant_id()).await.unwrap(), None);
     assert_eq!(store.user(&user_id()).await.unwrap(), None);
 }
 
-pub(crate) async fn a_tenant_round_trips_with_its_key_intact(store: &impl AnyStore) {
+pub(crate) async fn a_tenant_round_trips_with_its_key_intact(store: &impl Storage) {
     let created = store.create_tenant(new_tenant()).await.unwrap();
     let read = store.tenant(&tenant_id()).await.unwrap().unwrap();
     assert_eq!(read.row_id, created.row_id);
@@ -30,7 +30,7 @@ pub(crate) async fn a_tenant_round_trips_with_its_key_intact(store: &impl AnySto
     assert_eq!(read.created_at, created.created_at);
 }
 
-pub(crate) async fn the_primary_key_is_an_integer_the_backend_assigns(store: &impl AnyStore) {
+pub(crate) async fn the_primary_key_is_an_integer_the_backend_assigns(store: &impl Storage) {
     let first = store.create_tenant(new_tenant()).await.unwrap();
     let second = store
         .create_tenant(NewTenant {
@@ -43,7 +43,7 @@ pub(crate) async fn the_primary_key_is_an_integer_the_backend_assigns(store: &im
     assert_eq!(second.row_id, TenantRowId::new(2));
 }
 
-pub(crate) async fn a_repeated_tenant_id_conflicts(store: &impl AnyStore) {
+pub(crate) async fn a_repeated_tenant_id_conflicts(store: &impl Storage) {
     store.create_tenant(new_tenant()).await.unwrap();
     assert!(matches!(
         store.create_tenant(new_tenant()).await,
@@ -54,7 +54,7 @@ pub(crate) async fn a_repeated_tenant_id_conflicts(store: &impl AnyStore) {
     ));
 }
 
-pub(crate) async fn a_repeated_user_id_conflicts(store: &impl AnyStore) {
+pub(crate) async fn a_repeated_user_id_conflicts(store: &impl Storage) {
     store.create_user(new_user()).await.unwrap();
     assert!(matches!(
         store.create_user(new_user()).await,
@@ -65,7 +65,7 @@ pub(crate) async fn a_repeated_user_id_conflicts(store: &impl AnyStore) {
     ));
 }
 
-pub(crate) async fn a_user_round_trips_and_its_passphrase_can_be_replaced(store: &impl AnyStore) {
+pub(crate) async fn a_user_round_trips_and_its_passphrase_can_be_replaced(store: &impl Storage) {
     let created = store.create_user(new_user()).await.unwrap();
     assert_eq!(store.user(&user_id()).await.unwrap(), Some(created));
     let replacement =
@@ -80,7 +80,7 @@ pub(crate) async fn a_user_round_trips_and_its_passphrase_can_be_replaced(store:
     );
 }
 
-pub(crate) async fn the_account_kind_survives_a_round_trip(store: &impl AnyStore) {
+pub(crate) async fn the_account_kind_survives_a_round_trip(store: &impl Storage) {
     store
         .create_user(NewUser {
             id: user_id(),
@@ -95,7 +95,7 @@ pub(crate) async fn the_account_kind_survives_a_round_trip(store: &impl AnyStore
     );
 }
 
-pub(crate) async fn deleting_what_is_absent_reports_it_missing(store: &impl AnyStore) {
+pub(crate) async fn deleting_what_is_absent_reports_it_missing(store: &impl Storage) {
     assert!(matches!(
         store.delete_tenant(&tenant_id()).await,
         Err(StorageError::NotFound {
@@ -112,7 +112,7 @@ pub(crate) async fn deleting_what_is_absent_reports_it_missing(store: &impl AnyS
     ));
 }
 
-pub(crate) async fn attaching_twice_replaces_the_standing(store: &impl AnyStore) {
+pub(crate) async fn attaching_twice_replaces_the_standing(store: &impl Storage) {
     tenant_with_user(store).await;
     for standing in [Standing::Owner, Standing::Member] {
         store
@@ -130,7 +130,7 @@ pub(crate) async fn attaching_twice_replaces_the_standing(store: &impl AnyStore)
 }
 
 pub(crate) async fn attaching_to_a_tenant_that_is_not_there_reports_it_missing(
-    store: &impl AnyStore,
+    store: &impl Storage,
 ) {
     store.create_user(new_user()).await.unwrap();
     assert!(matches!(
@@ -148,7 +148,7 @@ pub(crate) async fn attaching_to_a_tenant_that_is_not_there_reports_it_missing(
     ));
 }
 
-pub(crate) async fn a_tenant_is_listed_from_both_sides(store: &impl AnyStore) {
+pub(crate) async fn a_tenant_is_listed_from_both_sides(store: &impl Storage) {
     tenant_with_user(store).await;
     store
         .attach(Membership {
@@ -178,7 +178,7 @@ pub(crate) async fn a_tenant_is_listed_from_both_sides(store: &impl AnyStore) {
 }
 
 pub(crate) async fn deleting_a_tenant_takes_its_memberships_and_grants_with_it(
-    store: &impl AnyStore,
+    store: &impl Storage,
 ) {
     tenant_with_user(store).await;
     store
@@ -204,7 +204,7 @@ pub(crate) async fn deleting_a_tenant_takes_its_memberships_and_grants_with_it(
     assert!(store.grants_of(&user_id()).await.unwrap().is_empty());
 }
 
-pub(crate) async fn granting_the_same_capability_twice_changes_nothing(store: &impl AnyStore) {
+pub(crate) async fn granting_the_same_capability_twice_changes_nothing(store: &impl Storage) {
     tenant_with_user(store).await;
     let grant = api_grant(&user_id(), &tenant_id(), Capability::ApiAccess);
     store.grant(&grant).await.unwrap();
@@ -212,7 +212,7 @@ pub(crate) async fn granting_the_same_capability_twice_changes_nothing(store: &i
     assert_eq!(store.grants_of(&user_id()).await.unwrap().len(), 1);
 }
 
-pub(crate) async fn every_scope_shape_round_trips(store: &impl AnyStore) {
+pub(crate) async fn every_scope_shape_round_trips(store: &impl Storage) {
     tenant_with_user(store).await;
     let user_scoped = Grant::new(
         Capability::TenantMgr,
@@ -238,7 +238,7 @@ pub(crate) async fn every_scope_shape_round_trips(store: &impl AnyStore) {
     assert!(held.holds(Capability::ApiAccess, api_scoped.scope()));
 }
 
-pub(crate) async fn grants_in_a_tenant_exclude_the_user_scoped_ones(store: &impl AnyStore) {
+pub(crate) async fn grants_in_a_tenant_exclude_the_user_scoped_ones(store: &impl Storage) {
     tenant_with_user(store).await;
     store
         .grant(
@@ -260,7 +260,7 @@ pub(crate) async fn grants_in_a_tenant_exclude_the_user_scoped_ones(store: &impl
     assert!(held.holds(Capability::ApiAccess, api_scoped.scope()));
 }
 
-pub(crate) async fn revoking_what_is_not_held_reports_it_missing(store: &impl AnyStore) {
+pub(crate) async fn revoking_what_is_not_held_reports_it_missing(store: &impl Storage) {
     tenant_with_user(store).await;
     assert!(matches!(
         store
@@ -273,7 +273,7 @@ pub(crate) async fn revoking_what_is_not_held_reports_it_missing(store: &impl An
     ));
 }
 
-pub(crate) async fn revoking_removes_only_the_named_grant(store: &impl AnyStore) {
+pub(crate) async fn revoking_removes_only_the_named_grant(store: &impl Storage) {
     tenant_with_user(store).await;
     let access = api_grant(&user_id(), &tenant_id(), Capability::ApiAccess);
     let limits = api_grant(&user_id(), &tenant_id(), Capability::LimitMgr);
