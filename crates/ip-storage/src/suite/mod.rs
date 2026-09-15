@@ -3,7 +3,6 @@
 pub(crate) mod identity;
 #[cfg(feature = "standalone-storage")]
 pub(crate) mod plugin;
-#[cfg(feature = "standalone-storage")]
 pub(crate) mod route;
 
 /// The records every backend test builds from.
