@@ -1,56 +1,32 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Checksum, NewPluginRule, PluginKind, PluginOrder, PluginRule, PluginScope, TenantId,
-    Timestamp, UserId,
+    Checksum, NewPluginRule, PluginKind, PluginOrder, PluginRule, PluginScope, TenantId, Timestamp,
 };
 use sqlx::Row;
 
 use super::SqliteStore;
+use crate::codec::{plugin_order, plugin_scope, plugin_size};
 use crate::error::{Entity, StorageError, is_foreign_key_violation, is_unique_violation};
 use crate::plugin::{NewPlugin, Plugin, PluginRecord, PluginRowId, PluginRuleStore, PluginStore};
 
 fn plugin_record(row: &sqlx::sqlite::SqliteRow) -> Result<PluginRecord, StorageError> {
-    let size: i64 = row.get("size");
     Ok(PluginRecord {
         row_id: PluginRowId::new(row.get("row_id")),
         checksum: Checksum::from_hex(row.get("checksum"))?,
         kind: row.get::<String, _>("kind").parse()?,
-        size: usize::try_from(size).map_err(|_| StorageError::Malformed {
-            entity: Entity::Plugin,
-            detail: format!("size {size} is not a length"),
-        })?,
+        size: plugin_size(row.get("size"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })
 }
 
 /// Rebuilds a rule from its row, so a row the code could not have written is refused on read.
 fn plugin_rule(row: &sqlx::sqlite::SqliteRow) -> Result<PluginRule, StorageError> {
-    let position: i64 = row.get("position");
-    let order = u8::try_from(position).map_err(|_| StorageError::Malformed {
-        entity: Entity::PluginRule,
-        detail: format!("position {position} is not an order"),
-    })?;
-    let tenant: Option<String> = row.get("tenant_id");
-    let user: Option<String> = row.get("user_id");
-    let api: Option<String> = row.get("api_id");
-    let scope = match tenant {
-        None if user.is_some() || api.is_some() => {
-            return Err(StorageError::Malformed {
-                entity: Entity::PluginRule,
-                detail: "a global rule names a user or an api".to_owned(),
-            });
-        }
-        None => PluginScope::Global,
-        Some(tenant) => PluginScope::Tenant {
-            tenant: TenantId::new(&tenant)?,
-            user: user.as_deref().map(UserId::new).transpose()?,
-            api: api.as_deref().map(ApiId::new).transpose()?,
-        },
-    };
+    let order = plugin_order(row.get("position"))?;
+    let scope = plugin_scope(row.get("tenant_id"), row.get("user_id"), row.get("api_id"))?;
     Ok(PluginRule::new(
         Checksum::from_hex(row.get("checksum"))?,
         row.get::<String, _>("kind").parse()?,
-        PluginOrder::new(order),
+        order,
         scope,
     )?)
 }

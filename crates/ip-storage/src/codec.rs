@@ -1,4 +1,4 @@
-//! How identity values are spelled in the columns every sql backend stores them in.
+//! How identity and plugin values are spelled in the columns every sql backend stores them in.
 
 use ip_core::{ApiId, Capability, CapabilityScope, TenantId, TnKey, UserId};
 
@@ -111,4 +111,44 @@ pub(crate) fn scope(
             });
         }
     })
+}
+
+/// Reads a plugin's stored size back as a length.
+#[cfg(feature = "standalone-storage")]
+pub(crate) fn plugin_size(size: i64) -> Result<usize, StorageError> {
+    usize::try_from(size).map_err(|_| StorageError::Malformed {
+        entity: Entity::Plugin,
+        detail: format!("size {size} is not a length"),
+    })
+}
+
+/// Reads a rule's stored position back as an order.
+#[cfg(feature = "standalone-storage")]
+pub(crate) fn plugin_order(position: i64) -> Result<ip_core::PluginOrder, StorageError> {
+    let order = u8::try_from(position).map_err(|_| StorageError::Malformed {
+        entity: Entity::PluginRule,
+        detail: format!("position {position} is not an order"),
+    })?;
+    Ok(ip_core::PluginOrder::new(order))
+}
+
+/// Rebuilds the scope a rule row was written for, refusing a global row that names a user or api.
+#[cfg(feature = "standalone-storage")]
+pub(crate) fn plugin_scope(
+    tenant: Option<String>,
+    user: Option<String>,
+    api: Option<String>,
+) -> Result<ip_core::PluginScope, StorageError> {
+    match tenant {
+        None if user.is_some() || api.is_some() => Err(StorageError::Malformed {
+            entity: Entity::PluginRule,
+            detail: "a global rule names a user or an api".to_owned(),
+        }),
+        None => Ok(ip_core::PluginScope::Global),
+        Some(tenant) => Ok(ip_core::PluginScope::Tenant {
+            tenant: TenantId::new(&tenant)?,
+            user: user.as_deref().map(UserId::new).transpose()?,
+            api: api.as_deref().map(ApiId::new).transpose()?,
+        }),
+    }
 }
