@@ -99,9 +99,12 @@ service nodes.
 	queries select `length(wasm)::BIGINT AS size`.
 	- `IFNULL` in an index expression is `COALESCE`, parenthesised as postgres requires.
 	- Sqlite's `IS ?` for a null safe comparison is `IS NOT DISTINCT FROM $n`, and every placeholder is numbered.
-- Postgres tests run only when `DATABASE_URL` names a database; without it they return early and pass having
-checked nothing, so a plain `cargo test` needs no server. `docker run --rm -d -p 5432:5432 -e
-POSTGRES_PASSWORD=ip postgres:16-alpine` provides one. The coverage gate counts them only when run with it set.
+- Postgres code compiles only with `fast-storage`, and its tests run only when `DATABASE_URL` names a database;
+without it they return early and pass having checked nothing, so a plain `cargo test` needs neither. Each test
+works in a schema of its own, dropped with its store, so the database may be any one the user can create
+schemas in. `docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=ip postgres:16-alpine` provides one, and
+`DATABASE_URL=postgres://postgres:ip@localhost/postgres cargo test -p ip-storage --features fast-storage` runs
+them. The coverage gate counts them only when run that way.
 
 ### Tenants and Users
 
