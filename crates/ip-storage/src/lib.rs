@@ -1,5 +1,7 @@
 //! Storage traits and the backends that satisfy them.
 
+#[cfg(feature = "standalone-storage")]
+mod codec;
 pub mod error;
 pub mod model;
 pub mod plugin;
