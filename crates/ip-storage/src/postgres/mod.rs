@@ -1,9 +1,13 @@
+mod identity;
+
 use std::str::FromStr;
 
-use sqlx::PgPool;
+use ip_core::{TenantId, UserId};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{PgPool, Row};
 
-use crate::error::StorageError;
+use crate::error::{Entity, StorageError};
+use crate::model::{TenantRowId, UserRowId};
 
 const MAX_CONNECTIONS: u32 = 16;
 
@@ -42,6 +46,32 @@ impl PostgresStore {
     /// Closes every pooled connection.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    async fn tenant_row_id(&self, id: &TenantId) -> Result<TenantRowId, StorageError> {
+        sqlx::query("SELECT row_id FROM tenants WHERE id = $1")
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StorageError::backend)?
+            .map(|row| TenantRowId::new(row.get("row_id")))
+            .ok_or_else(|| StorageError::NotFound {
+                entity: Entity::Tenant,
+                id: id.to_string(),
+            })
+    }
+
+    async fn user_row_id(&self, id: &UserId) -> Result<UserRowId, StorageError> {
+        sqlx::query("SELECT row_id FROM users WHERE id = $1")
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StorageError::backend)?
+            .map(|row| UserRowId::new(row.get("row_id")))
+            .ok_or_else(|| StorageError::NotFound {
+                entity: Entity::User,
+                id: id.to_string(),
+            })
     }
 }
 
@@ -128,6 +158,12 @@ pub(crate) mod scratch {
         store.scratch = Some(Arc::new(Schema { name, server }));
         Some(store)
     }
+}
+
+/// The shared identity tests, each on a scratch schema of the database `DATABASE_URL` names.
+#[cfg(test)]
+mod suite {
+    crate::suite::backend_suite!(identity, crate::postgres::scratch::store);
 }
 
 #[cfg(test)]

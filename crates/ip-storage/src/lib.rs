@@ -1,6 +1,6 @@
 //! Storage traits and the backends that satisfy them.
 
-#[cfg(feature = "standalone-storage")]
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 mod codec;
 pub mod error;
 pub mod model;
@@ -11,7 +11,7 @@ pub mod route;
 #[cfg(feature = "standalone-storage")]
 pub mod sqlite;
 pub mod store;
-#[cfg(all(test, feature = "standalone-storage"))]
+#[cfg(all(test, any(feature = "standalone-storage", feature = "fast-storage")))]
 mod suite;
 
 pub use error::{Entity, StorageError};
