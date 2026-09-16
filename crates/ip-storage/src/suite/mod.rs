@@ -1,7 +1,6 @@
 //! Tests every storage backend must pass, written once and run against each backend.
 
 pub(crate) mod identity;
-#[cfg(feature = "standalone-storage")]
 pub(crate) mod plugin;
 pub(crate) mod route;
 

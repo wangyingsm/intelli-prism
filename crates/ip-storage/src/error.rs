@@ -59,7 +59,7 @@ impl StorageError {
 }
 
 /// Whether the database refused a write for breaking a foreign key.
-#[cfg(feature = "standalone-storage")]
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub(crate) fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(db) if db.is_foreign_key_violation())
 }

@@ -1,4 +1,5 @@
 mod identity;
+mod plugin;
 mod route;
 
 use std::str::FromStr;
@@ -161,11 +162,10 @@ pub(crate) mod scratch {
     }
 }
 
-/// The shared identity and route tests, each on a scratch schema of the `DATABASE_URL` database.
+/// The shared backend tests, each on a scratch schema of the `DATABASE_URL` database.
 #[cfg(test)]
 mod suite {
-    crate::suite::backend_suite!(identity, crate::postgres::scratch::store);
-    crate::suite::backend_suite!(route, crate::postgres::scratch::store);
+    crate::suite::backend_suite!(crate::postgres::scratch::store);
 }
 
 #[cfg(test)]
