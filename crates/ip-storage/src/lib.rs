@@ -24,4 +24,4 @@ pub use postgres::PostgresStore;
 pub use route::RouteStore;
 #[cfg(feature = "standalone-storage")]
 pub use sqlite::SqliteStore;
-pub use store::{GrantStore, MembershipStore, Storage, TenantStore, UserStore};
+pub use store::{Backend, GrantStore, MembershipStore, Storage, TenantStore, UserStore};

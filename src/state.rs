@@ -5,7 +5,11 @@ use ip_auth::RequestVerifier;
 use ip_config::{Config, StorageConfig};
 use ip_gateway::{Gateway, HyperUpstream, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
-use ip_storage::{SqliteStore, Storage};
+#[cfg(feature = "fast-storage")]
+use ip_storage::PostgresStore;
+#[cfg(feature = "standalone-storage")]
+use ip_storage::SqliteStore;
+use ip_storage::{Backend, Storage};
 
 use crate::error::StartupError;
 
@@ -60,11 +64,21 @@ impl AppState {
     }
 }
 
-async fn open_store(config: &StorageConfig) -> Result<Arc<SqliteStore>, StartupError> {
+async fn open_store(config: &StorageConfig) -> Result<Arc<dyn Backend>, StartupError> {
     match config {
+        #[cfg(feature = "standalone-storage")]
         StorageConfig::Sqlite { path } => Ok(Arc::new(SqliteStore::open(path).await?)),
+        #[cfg(not(feature = "standalone-storage"))]
+        StorageConfig::Sqlite { .. } => Err(StartupError::UnsupportedBackend {
+            backend: "sqlite",
+            feature: "standalone-storage",
+        }),
+        #[cfg(feature = "fast-storage")]
+        StorageConfig::Postgres { url } => Ok(Arc::new(PostgresStore::open(url.expose()).await?)),
+        #[cfg(not(feature = "fast-storage"))]
         StorageConfig::Postgres { .. } => Err(StartupError::UnsupportedBackend {
             backend: "postgres",
+            feature: "fast-storage",
         }),
     }
 }
@@ -91,17 +105,33 @@ secret = "0123456789abcdef0123456789abcdef"
         .unwrap()
     }
 
+    #[cfg(not(feature = "fast-storage"))]
     #[tokio::test]
     async fn a_backend_this_build_does_not_carry_stops_startup() {
         let config = config("[storage]\nbackend = \"postgres\"\nurl = \"postgres://ip@db/ip\"");
         assert!(matches!(
             AppState::open(&config).await,
             Err(StartupError::UnsupportedBackend {
-                backend: "postgres"
+                backend: "postgres",
+                feature: "fast-storage",
             })
         ));
     }
 
+    #[cfg(not(feature = "standalone-storage"))]
+    #[tokio::test]
+    async fn a_sqlite_backend_this_build_does_not_carry_stops_startup() {
+        let config = config("[storage]\nbackend = \"sqlite\"\npath = \"/nonexistent/ip.db\"");
+        assert!(matches!(
+            AppState::open(&config).await,
+            Err(StartupError::UnsupportedBackend {
+                backend: "sqlite",
+                feature: "standalone-storage",
+            })
+        ));
+    }
+
+    #[cfg(feature = "standalone-storage")]
     #[tokio::test]
     async fn opening_the_sqlite_backend_builds_a_routing_table() {
         let path = std::env::temp_dir().join(format!("ip-state-{}.db", std::process::id()));
@@ -116,6 +146,7 @@ secret = "0123456789abcdef0123456789abcdef"
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(feature = "standalone-storage")]
     #[tokio::test]
     async fn a_global_plugin_that_will_not_load_stops_startup() {
         use ip_core::{NewPluginRule, PluginKind, PluginOrder, PluginScope};

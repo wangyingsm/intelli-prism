@@ -12,7 +12,8 @@ listen = "127.0.0.1:8080"
 backend = "sqlite"
 path = "./intelli-prism.db"
 
-# Cluster deployment uses postgres instead, which this build does not yet serve:
+# Cluster deployment uses postgres instead, which only a build with the fast-storage
+# feature serves (cargo build --features fast-storage):
 # [storage]
 # backend = "postgres"
 # url = "postgres://intelli_prism:secret@localhost/intelli_prism"

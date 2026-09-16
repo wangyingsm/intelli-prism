@@ -3,6 +3,8 @@ use ip_core::{Grant, Grants, PassphraseHash, TenantId, UserId};
 
 use crate::error::StorageError;
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
+use crate::plugin::{PluginRuleStore, PluginStore};
+use crate::route::RouteStore;
 
 /// Reads and writes tenants.
 #[async_trait]
@@ -84,6 +86,11 @@ pub trait GrantStore: Send + Sync {
 pub trait Storage: TenantStore + UserStore + MembershipStore + GrantStore {}
 
 impl<T> Storage for T where T: TenantStore + UserStore + MembershipStore + GrantStore {}
+
+/// Everything a storage backend provides, behind one object.
+pub trait Backend: Storage + RouteStore + PluginStore + PluginRuleStore {}
+
+impl<T> Backend for T where T: Storage + RouteStore + PluginStore + PluginRuleStore {}
 
 #[cfg(test)]
 mod tests {

@@ -34,10 +34,12 @@ pub enum StartupError {
     Chains(#[from] ChainError),
 
     /// The configured backend is not compiled into this build.
-    #[error("this build has no {backend} backend; rebuild with its feature enabled")]
+    #[error("this build has no {backend} backend; rebuild with the `{feature}` feature")]
     UnsupportedBackend {
         /// The backend the configuration asked for.
         backend: &'static str,
+        /// The cargo feature that compiles it in.
+        feature: &'static str,
     },
 
     /// The listener could not take the configured address.
@@ -52,4 +54,21 @@ pub enum StartupError {
     /// The server stopped with an error.
     #[error("server failed")]
     Serve(#[source] io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_backend_names_the_feature_that_brings_it() {
+        let error = StartupError::UnsupportedBackend {
+            backend: "postgres",
+            feature: "fast-storage",
+        };
+        assert_eq!(
+            error.to_string(),
+            "this build has no postgres backend; rebuild with the `fast-storage` feature"
+        );
+    }
 }

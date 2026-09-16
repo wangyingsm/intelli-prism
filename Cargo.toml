@@ -11,7 +11,7 @@ ip-config = { version = "0.1.0", path = "crates/ip-config" }
 ip-core = { version = "0.1.0", path = "crates/ip-core" }
 ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
-ip-storage = { version = "0.1.0", path = "crates/ip-storage" }
+ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net"] }
@@ -33,6 +33,12 @@ ip-core = { path = "crates/ip-core" }
 async-trait = "0.1.92"
 bytes = "1.12.1"
 http-body-util = "0.1.5"
+ip-storage = { version = "0.1.0", path = "crates/ip-storage", features = ["standalone-storage"] }
 serde_json = "1.0.151"
 tower = "0.5.3"
 wat = "1.259.0"
+
+[features]
+default = ["standalone-storage"]
+standalone-storage = ["ip-storage/standalone-storage"]
+fast-storage = ["ip-storage/fast-storage"]
