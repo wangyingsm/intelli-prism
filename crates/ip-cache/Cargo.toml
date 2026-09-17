@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+redis = { version = "1.7.0", default-features = false, features = ["tokio-comp", "connection-manager"], optional = true }
 sled = { version = "0.34.7", optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
@@ -13,5 +14,6 @@ tokio = { workspace = true, optional = true }
 tokio.workspace = true
 
 [features]
-default = ["standalone-cache"]
+default = ["cluster-cache"]
 standalone-cache = ["dep:sled", "dep:tokio"]
+cluster-cache = ["dep:redis"]

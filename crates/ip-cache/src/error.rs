@@ -14,6 +14,13 @@ pub enum CacheError {
         id: String,
     },
 
+    /// A key prefix was built from characters a backend cannot carry, or from none at all.
+    #[error("cache key prefix {prefix:?} is empty or holds whitespace or control characters")]
+    UnusablePrefix {
+        /// The prefix that was refused.
+        prefix: String,
+    },
+
     /// A span of no time would drop the entry before anything could read it.
     #[error("a ttl must be longer than zero")]
     ZeroTtl,
