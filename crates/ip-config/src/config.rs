@@ -103,12 +103,27 @@ pub enum CacheConfig {
     Sled {
         /// Path of the database directory.
         path: PathBuf,
+        /// Seconds a cached response stays. Absent caches no response at all.
+        #[serde(default)]
+        response_ttl: Option<Seconds>,
     },
     /// Cluster deployment, backed by a server every node shares.
     Redis {
         /// Connection url, which carries the password.
         url: Secret,
+        /// Seconds a cached response stays. Absent caches no response at all.
+        #[serde(default)]
+        response_ttl: Option<Seconds>,
     },
+}
+
+impl CacheConfig {
+    /// How long a cached response stays, when responses are cached at all.
+    pub fn response_ttl(&self) -> Option<Seconds> {
+        match self {
+            Self::Sled { response_ttl, .. } | Self::Redis { response_ttl, .. } => *response_ttl,
+        }
+    }
 }
 
 /// How callers prove who they are.
@@ -229,6 +244,7 @@ path = "/var/lib/intelli-prism/state.db"
 [cache]
 backend = "sled"
 path = "/var/lib/intelli-prism/cache"
+response_ttl = 60
 
 [auth.jwt]
 issuer = "intelli-prism"
@@ -297,10 +313,19 @@ secret = "0123456789abcdef0123456789abcdef"
     #[test]
     fn selects_the_cache_backend_by_tag() {
         let config = Config::parse(MINIMAL).unwrap();
-        let CacheConfig::Redis { url } = &config.cache else {
+        let CacheConfig::Redis { url, .. } = &config.cache else {
             panic!("expected the redis backend");
         };
         assert_eq!(url.expose(), "redis://:pw@cache:6379");
+    }
+
+    #[test]
+    fn a_cache_that_names_no_response_ttl_caches_no_response() {
+        assert_eq!(Config::parse(MINIMAL).unwrap().cache.response_ttl(), None);
+        assert_eq!(
+            Config::parse(FULL).unwrap().cache.response_ttl(),
+            Some(Seconds::new(60))
+        );
     }
 
     #[test]
@@ -310,6 +335,7 @@ secret = "0123456789abcdef0123456789abcdef"
             config.cache,
             CacheConfig::Sled {
                 path: PathBuf::from("/var/lib/intelli-prism/cache"),
+                response_ttl: Some(Seconds::new(60)),
             }
         );
     }

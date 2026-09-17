@@ -273,6 +273,9 @@ redis:7-alpine` is all they need. Without the variable they return early, as the
 - LRU eviction: three cache levels have their own cache size limits, when the cache size exceeds the limit, the LRU eviction policy will be triggered to evict the least recently used cache entry.
 - An entry may be written with no ttl at all, and then stays until something removes or evicts it.
 That is what a value invalidated only by its own change needs, such as a tenant key in the system cache.
+- What is kept at all: only a response the upstream answered successfully, and never an event
+stream, which is answered as it arrives rather than held. A cache that cannot be read or written
+costs a round trip upstream and is logged, but never fails the request it was serving.
 - Cache updates/invalidations: the system cache will be updated/invalidated automatically when their values changed.
 - Where a level's size limit binds: the sled backend holds the whole store, so it enforces its own
 limits. Redis evicts by its server wide `maxmemory-policy` instead, so there the per level limits are

@@ -8,7 +8,7 @@ use ip_cache::RedisCache;
 use ip_cache::SledCache;
 use ip_cache::{Cache, Ttl};
 use ip_config::{CacheConfig, Config, StorageConfig};
-use ip_gateway::{Gateway, HyperUpstream, RoutingTable};
+use ip_gateway::{Gateway, HyperUpstream, ResponseCache, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
 use ip_storage::PostgresStore;
@@ -37,10 +37,19 @@ impl AppState {
         let chains = PluginChains::load(host, store.as_ref(), store.as_ref()).await?;
         tracing::info!(rules = chains.len(), "plugin chains built");
         let upstream = Arc::new(HyperUpstream::new()?);
+        let mut gateway = Gateway::with_chains(table, Arc::new(chains), upstream);
+        if let Some(ttl) = config.cache.response_ttl() {
+            let responses = ResponseCache::new(Arc::clone(&cache), Ttl::new(ttl.as_duration())?);
+            gateway = gateway.caching(responses);
+            tracing::info!(
+                seconds = ttl.get(),
+                "answering repeated requests from the cache"
+            );
+        }
         let nonce_ttl = Ttl::new(config.auth.nonce_ttl.as_duration())?;
         Ok(Self {
             verifier: RequestVerifier::new(store as Arc<dyn Storage>, cache, nonce_ttl),
-            gateway: Arc::new(Gateway::with_chains(table, Arc::new(chains), upstream)),
+            gateway: Arc::new(gateway),
             listen: config.server.listen,
         })
     }
@@ -94,14 +103,14 @@ async fn open_store(config: &StorageConfig) -> Result<Arc<dyn Backend>, StartupE
 async fn open_cache(config: &CacheConfig) -> Result<Arc<dyn Cache>, StartupError> {
     match config {
         #[cfg(feature = "standalone-cache")]
-        CacheConfig::Sled { path } => Ok(Arc::new(SledCache::open(path)?)),
+        CacheConfig::Sled { path, .. } => Ok(Arc::new(SledCache::open(path)?)),
         #[cfg(not(feature = "standalone-cache"))]
         CacheConfig::Sled { .. } => Err(StartupError::UnsupportedBackend {
             backend: "sled",
             feature: "standalone-cache",
         }),
         #[cfg(feature = "cluster-cache")]
-        CacheConfig::Redis { url } => Ok(Arc::new(RedisCache::connect(url.expose()).await?)),
+        CacheConfig::Redis { url, .. } => Ok(Arc::new(RedisCache::connect(url.expose()).await?)),
         #[cfg(not(feature = "cluster-cache"))]
         CacheConfig::Redis { .. } => Err(StartupError::UnsupportedBackend {
             backend: "redis",
@@ -144,7 +153,7 @@ secret = "0123456789abcdef0123456789abcdef"
         std::env::temp_dir().join(format!("ip-{tag}-{}", std::process::id()))
     }
 
-        /// A schema of this test's own on the database `DATABASE_URL` names, so a startup that
+    /// A schema of this test's own on the database `DATABASE_URL` names, so a startup that
     /// migrates cannot touch what anything else is using.
     #[cfg(feature = "fast-storage")]
     struct Schema {
@@ -225,7 +234,7 @@ secret = "0123456789abcdef0123456789abcdef"
         assert!(state.gateway().table().is_empty());
     }
 
-        #[cfg(not(feature = "fast-storage"))]
+    #[cfg(not(feature = "fast-storage"))]
     #[tokio::test]
     async fn a_backend_this_build_does_not_carry_stops_startup() {
         let config = config_with(

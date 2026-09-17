@@ -1,6 +1,7 @@
 //! The proxy gateway: routing and the request dataflow.
 
 pub mod body;
+pub mod cache;
 pub mod error;
 pub mod flow;
 pub mod hyper_upstream;
@@ -11,6 +12,7 @@ pub mod table;
 pub mod upstream;
 
 pub use body::{BoxError, GatewayBody};
+pub use cache::{CachedResponse, ResponseCache, response_key};
 pub use error::{GatewayError, GatewayErrorKind, ProcessorError, RouteError, UpstreamError};
 pub use flow::{Flow, Gateway, RequestContext};
 pub use hyper_upstream::{HyperUpstream, UpstreamSettings};

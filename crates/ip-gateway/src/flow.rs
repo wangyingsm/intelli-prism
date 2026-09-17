@@ -11,9 +11,11 @@ use http::uri::{Authority as UriAuthority, Scheme};
 use http::{HeaderMap, HeaderValue, Request, Response, Uri};
 use http_body_util::BodyExt;
 use ip_auth::Authority;
+use ip_cache::CacheKey;
 use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey};
 
 use crate::body::{GatewayBody, from_bytes};
+use crate::cache::{CachedResponse, ResponseCache, response_key};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{BodyProcessor, ChainSource, FixedChains, HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
@@ -42,6 +44,7 @@ pub struct Gateway {
     table: RoutingTable,
     chains: Arc<dyn ChainSource>,
     upstream: Arc<dyn Upstream>,
+    responses: Option<ResponseCache>,
 }
 
 impl Gateway {
@@ -66,7 +69,14 @@ impl Gateway {
             table,
             chains,
             upstream,
+            responses: None,
         }
+    }
+
+    /// Answers a request the cache already holds an answer for out of `responses`.
+    pub fn caching(mut self, responses: ResponseCache) -> Self {
+        self.responses = Some(responses);
+        self
     }
 
     /// The rules this flow routes by.
@@ -85,19 +95,55 @@ impl Gateway {
             authorized.context().authority.identity(),
             &authorized.resolution().rule().api,
         );
-        authorized
+        let mut processed = authorized
             .process_headers(chains.request_headers())
             .await?
             .process_body(&chains)
-            .await?
+            .await?;
+        let Some(responses) = &self.responses else {
+            return processed
+                .forward(self.upstream.as_ref())
+                .await?
+                .process_response_headers(chains.response_headers())
+                .await?
+                .process_response_body(&chains)
+                .await?
+                .into_response();
+        };
+        // A hit answers here, spending no tokens and running no response processor, as designed.
+        let key = processed.response_key().await?;
+        match responses.get(&key).await {
+            Ok(Some(hit)) => return Ok(answer_with(hit)),
+            Ok(None) => {}
+            // A cache that cannot answer costs a round trip upstream, never the request itself.
+            Err(error) => tracing::warn!(%error, "could not read the response cache"),
+        }
+        let mut done = processed
             .forward(self.upstream.as_ref())
             .await?
             .process_response_headers(chains.response_headers())
             .await?
             .process_response_body(&chains)
-            .await?
-            .into_response()
+            .await?;
+        if let Some(answer) = done.cacheable().await?
+            && let Err(error) = responses.put(&key, &answer).await
+        {
+            tracing::warn!(%error, "could not keep a response in the cache");
+        }
+        done.into_response()
     }
+}
+
+/// Answers from what the cache held, without any stage after the request body running.
+fn answer_with(hit: CachedResponse) -> Response<GatewayBody> {
+    let mut response = Response::new(from_bytes(hit.body().clone()));
+    if let Some(content_type) = hit.content_type() {
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, content_type.clone());
+    }
+    set_length(response.headers_mut(), hit.body().len());
+    response
 }
 
 /// A request part way through the dataflow, with the stage it reached in its type.
@@ -253,6 +299,17 @@ impl Flow<HeadersProcessed> {
 }
 
 impl Flow<BodyProcessed> {
+    /// Names this request in the response cache, buffering the body it is keyed by so the
+    /// request can still be forwarded.
+    pub async fn response_key(&mut self) -> Result<CacheKey, GatewayError> {
+        let route = key_of(&self.context, &self.held.request)?;
+        let body = std::mem::replace(self.held.request.body_mut(), crate::body::empty());
+        let bytes = collect(StageName::BodyRead, body).await?;
+        *self.held.request.body_mut() = from_bytes(bytes.clone());
+        response_key(&route, &self.context.authority.identity().tenant, &bytes)
+            .map_err(|error| GatewayError::new(BodyProcessed::NAME, error.into()))
+    }
+
     /// Sends the request to the endpoint the rule chose.
     pub async fn forward(self, upstream: &dyn Upstream) -> Result<Flow<Forwarded>, GatewayError> {
         let Routed {
@@ -324,6 +381,20 @@ impl Flow<ResponseHeadersProcessed> {
 }
 
 impl Flow<ResponseBodyProcessed> {
+    /// The answer to keep for a repeated request, buffering the body so it can still be sent,
+    /// or nothing when this response may not be kept at all.
+    pub async fn cacheable(&mut self) -> Result<Option<CachedResponse>, GatewayError> {
+        // A stream is answered as it arrives and an error is not an answer to repeat.
+        if !self.held.status().is_success() || is_event_stream(self.held.headers()) {
+            return Ok(None);
+        }
+        let body = std::mem::replace(self.held.body_mut(), crate::body::empty());
+        let bytes = collect(StageName::ResponseBodyRead, body).await?;
+        *self.held.body_mut() = from_bytes(bytes.clone());
+        let content_type = self.held.headers().get(CONTENT_TYPE).cloned();
+        Ok(Some(CachedResponse::new(content_type, bytes)))
+    }
+
     /// Hands the response back to the kernel.
     pub fn into_response(self) -> Result<Response<GatewayBody>, GatewayError> {
         Ok(self.held)
@@ -506,6 +577,22 @@ fn set_length(headers: &mut HeaderMap, length: usize) {
 ///
 /// Whether it passes is read from the chain itself, so a body can only be buffered when
 /// something is actually there to rewrite it.
+/// Reads a whole body, reporting a stream that failed part way as the stage that read it.
+async fn collect(stage: StageName, body: GatewayBody) -> Result<Bytes, GatewayError> {
+    Ok(body
+        .collect()
+        .await
+        .map_err(|error| {
+            GatewayError::new(
+                stage,
+                GatewayErrorKind::Malformed {
+                    detail: error.to_string(),
+                },
+            )
+        })?
+        .to_bytes())
+}
+
 async fn run_body(
     stage: StageName,
     chain: &[Arc<dyn BodyProcessor>],
@@ -556,6 +643,7 @@ mod tests {
     use super::*;
     use crate::body::from_bytes;
     use crate::error::ProcessorError;
+    use ip_cache::Ttl;
     use ip_core::PluginOrder;
 
     /// Records what it was sent, and answers with what it was built with.
@@ -798,6 +886,178 @@ mod tests {
     async fn body_of(response: Response<GatewayBody>) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A gateway that answers repeated requests out of a cache of its own.
+    fn caching_gateway(upstream: Arc<FakeUpstream>) -> Gateway {
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        Gateway::new(table(), ProcessorChain::new(), upstream)
+            .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
+    }
+
+    /// Another tenant asking the same route the same thing.
+    fn other_tenant() -> Authority {
+        let tenant = TenantId::new("other").unwrap();
+        let identity = Identity {
+            user: user(),
+            tenant: tenant.clone(),
+            role: Role::Member,
+        };
+        let scope = CapabilityScope::Api {
+            user: user(),
+            tenant,
+            api: api(),
+        };
+        let grants: Grants = [Grant::new(Capability::ApiAccess, scope).unwrap()]
+            .into_iter()
+            .collect();
+        Authority::new(identity, grants)
+    }
+
+    #[tokio::test]
+    async fn a_repeated_request_is_answered_without_the_upstream() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = caching_gateway(upstream.clone());
+        let first = gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(body_of(first).await, "pong");
+        let second = gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(body_of(second).await, "pong");
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            1,
+            "the upstream was called twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hit_runs_no_response_processor() {
+        let upstream = FakeUpstream::answering("pong");
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let processors =
+            ProcessorChain::new().with_response_header(SetHeader::new("x-processed", "yes"));
+        let gateway = Gateway::new(table(), processors, upstream.clone())
+            .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()));
+        let first = gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(first.headers()["x-processed"], "yes");
+        let hit = gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert!(
+            hit.headers().get("x-processed").is_none(),
+            "a hit ran the response header chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_answer_carries_the_content_type_it_was_kept_with() {
+        let upstream =
+            FakeUpstream::answering_with_headers("{}", vec![("content-type", "application/json")]);
+        let gateway = caching_gateway(upstream.clone());
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        let hit = gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(hit.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(hit.headers()[CONTENT_LENGTH], "2");
+        assert_eq!(body_of(hit).await, "{}");
+    }
+
+    #[tokio::test]
+    async fn another_body_is_not_answered_from_the_cache() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = caching_gateway(upstream.clone());
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask again"))
+            .await
+            .unwrap();
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn another_tenant_is_not_answered_from_the_cache() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = caching_gateway(upstream.clone());
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        gateway
+            .handle(context(other_tenant()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            2,
+            "one tenant read another's answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_still_reaches_the_upstream_whole_when_it_is_keyed() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = caching_gateway(upstream.clone());
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(upstream.last().body, Bytes::from_static(b"ask"));
+    }
+
+    #[tokio::test]
+    async fn a_response_that_failed_is_not_kept() {
+        let upstream = Arc::new(FakeUpstream {
+            seen: Mutex::new(Vec::new()),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: Bytes::from_static(b"boom"),
+            headers: Vec::new(),
+            fail: false,
+        });
+        let gateway = caching_gateway(upstream.clone());
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_is_not_kept() {
+        let upstream = FakeUpstream::answering_with_headers(
+            "data: one\n\n",
+            vec![("content-type", "text/event-stream")],
+        );
+        let gateway = caching_gateway(upstream.clone());
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

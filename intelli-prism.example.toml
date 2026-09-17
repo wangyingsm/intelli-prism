@@ -23,6 +23,9 @@ path = "./intelli-prism.db"
 [cache]
 backend = "redis"
 url = "redis://localhost:6379"
+# Seconds an answered request stays cached, so the same tenant asking the same route the
+# same thing is answered without calling the upstream. Absent caches no response at all.
+response_ttl = 60
 
 # Standalone deployment caches into a local directory instead, which only a build
 # with the standalone-cache feature serves (cargo build --features standalone-cache):

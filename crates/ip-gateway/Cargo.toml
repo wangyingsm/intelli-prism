@@ -9,13 +9,16 @@ bytes = "1.12.1"
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
+hex.workspace = true
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "ring", "webpki-roots", "tls12"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "tokio"] }
 ip-auth = { version = "0.1.0", path = "../ip-auth" }
+ip-cache = { version = "0.1.0", path = "../ip-cache", default-features = false }
 ip-config = { version = "0.1.0", path = "../ip-config" }
 ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }
+sha2.workspace = true
 rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
 thiserror.workspace = true
 tokio.workspace = true
@@ -23,3 +26,4 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 hyper = { version = "1.11.1", features = ["server"] }
+ip-cache = { version = "0.1.0", path = "../ip-cache", features = ["standalone-cache"] }

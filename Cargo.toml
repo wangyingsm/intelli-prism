@@ -28,7 +28,9 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+hex = "0.4.3"
 ip-core = { path = "crates/ip-core" }
+sha2 = "0.11.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 

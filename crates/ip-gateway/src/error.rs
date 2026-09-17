@@ -1,4 +1,5 @@
 use http::StatusCode;
+use ip_cache::CacheError;
 use ip_config::ConfigError;
 use ip_core::{Capability, CoreError, Protocol, RouteKey};
 use ip_storage::StorageError;
@@ -77,6 +78,7 @@ impl GatewayError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             GatewayErrorKind::Upstream(_) => StatusCode::BAD_GATEWAY,
+            GatewayErrorKind::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -127,6 +129,10 @@ pub enum GatewayErrorKind {
     /// The upstream refused or never answered.
     #[error(transparent)]
     Upstream(#[from] UpstreamError),
+
+    /// The cache could not be read or written.
+    #[error(transparent)]
+    Cache(#[from] CacheError),
 }
 
 /// A plugin stopping the request it was given.
