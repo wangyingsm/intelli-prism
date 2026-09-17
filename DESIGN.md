@@ -249,24 +249,153 @@ milliseconds per request. Replace the scan with a path trie before rule counts g
 
 ### Cache
 
-(todo)
+#### Backend
+
+- Redis in cluster(default) mode: a cluster of intelli-prism nodes share their caches with redis.
+- Sled in standalone mode: a fallback sled local storage for just single node local deployment.
+- Cache traits: expose the capabilities of cache to high layers, unified interfaces.
+
+#### Cache Levels
+
+- Request/Response cache: a cache for request/response pairs, with a TTL and LRU eviction policy. cache key is a sha256 of the request body, and the cache value is the response body. cache hit will return the cached response directly.
+- Syntax cache: a HNSW index and embedding vector based cache for semantic understanding of the request body, with a TTL and LRU eviction policy. cache key is a sha256 of the request body embedding. and this is only for LLM API request.
+- System cache: other system temporary data state, such as nonces, tn_key, ut_key, etc. with a TTL and LRU eviction policy.
+
+#### Cache Management
+
+- TTL eviction: a REQ/RESP cache entry has its own TTL each, can be set by three levels, system default, per rule and response header with their precedence order from low to high as above. all syntax caches and all system caches have their own TTL settings.
+- LRU eviction: three cache levels have their own cache size limits, when the cache size exceeds the limit, the LRU eviction policy will be triggered to evict the least recently used cache entry.
+- Cache updates/invalidations: the system cache will be updated/invalidated automatically when their values changed.
 
 ### Intelligent Routing and Self Learning
 
-(todo)
+#### Routing Strategies
+
+- Routing strategies are a group of routing methods the system provides, including round robin, least load, hedging, etc. and all rules can select one of them default to round robin.
+- Round robin: system keeps a counter for each rule, and each request will be routed to the next upstream in the list by modulo of the counter and the list length.
+- Least load: system keeps a load score for each upstream, and each request will be routed to the upstream with the least load score. load score is calculated by a combination of the number of active requests and the average response time of the upstream.
+- Ratio dispatch: every upstream has a ratio value, system rolls a random number and dispatch the request to the upstream according to the ratio value. for example, if there are three upstreams with ratio values of 1, 2, 3, then the first upstream will get 1/6 of the requests, the second will get 2/6 of the requests, and the third will get 3/6 of the requests.
+- Hedging: system keeps an additional hedging counts `N` of every rule, with one of the routing strategies above, system will send the request to `N` upstreams in parallel, and return the first response to the downstream. the other async reqeusts will be cancelled. this can reduce the latency of the request.
+
+#### LLM Endpoints Chosen by the Difficulty of the Request
+
+- Difficulty classes: when requests to LLM come in, the system will classify them into different difficulty classes {`easy`, `routine`, `median`, `hard`, `research`}. `easy` is a common-sense question for simple chat with upstream LLM. `routine` is a question driven by agents with simple tool calls, the agent-loop should expect within no more than 3 turns. `median` is a simple task request driven by agents, eg, a simple new function of a code project, a translation of a paper, etc. `hard` is a complex task request driven by agents, eg, a new feature of a code project, a new algorithm design, etc. `research` is a research level task request driven by agents, eg, a thorough analysis of a large codebase, a new research paper writing, etc.
+- LLM endpoint selection: every upstream LLM endpoint has its capabilities, it is defined by (provider, model, optional version or release date), with its corresponding difficulty classes it can handle. when a request comes in, the system will classify the request into a difficulty class, and then select a upstream LLM endpoint which is capable of handling the request and with the lowest capabilities, unless the request specifically requires one. in a case that no upstream LLM endpoint can handle the request, the system will dispatch the request to the most capable upstream LLM endpoint available.
+- Arbitor of difficulty classification: 2 levels of difficulty classification, if a request is pretty sure that it can be classified by a decision tree. eg, `need tool calls`, `may need several turns`, `need coding`, etc. the leaves of the decision tree should be a semantic similarity leads to final class. these are totally run locally within the system itself, named level 1. if the decision search final results into a less confidence score, say 50%. then a external LLM endpoint should be asked for. let the LLM to make the final decision.
+- Chat turn sticky: system groups the requests from a same user session into a chat turn, and records the unique chat turn ID together with the difficulty class. system should keep dispatching the requests from a same chat turn to the same upstream LLM endpoint. so only one difficulty classification is needed for one chat turn.
+
+#### Self Learning
+
+- If a request's difficulty classification is made by an external LLM arbitor, we should also ask the LLM to provide a summary of the request and a short reasoning of the classification. then we can insert a new leaf node into the decision tree with the summary and reasoning, so that next time a similar request comes in, we can classify it locally.
+- Best effort run: a special system endpoint to provide a best effort run of a request/chat turn. the request to this endpoint will not try to classify the difficulty, but sending the request to all available upstream LLM endpoints. then wait for all responses. two strategies to respond to downstream user {`aggr` for aggregation, `one` for choosing the best}, which can be aggregated or chosen by the arbitor LLM. if `one` is set, the choice can stored into the decision tree as a new leaf node, so that next time a similar request comes in, we can classify it locally.
 
 ### System Agents and Run Graph
 
-(todo)
+#### Agent Template
+
+- All system agents/subagents can be defined by editing a template. so a(n) agent/subagent can be initialized by this template. a well setup template is stored in postgresql or sqlite, and can be updated by system admin or TO. the template is a DB record with the following fields:
+  - agent_id: a unique id for the agent/subagent, auto-generated.
+  - agent_name: a name for the agent/subagent.
+  - sandbox: a json object for specifying the virtual environment of the agent/subagent running. it is a file tree structure composed of relative path as key and object storage file path as its value. eg,
+```json
+{
+  "root": {
+    "bin": {
+      "python": "s3://mybucket/bin/python",
+      "bash": "s3://mybucket/bin/bash"
+    },
+    "lib": {
+      "libc.so.6": "s3://mybucket/lib/libc.so.6",
+      "libm.so.6": "s3://mybucket/lib/libm.so.6"
+    },
+    "usr": {
+      "local": {
+        "bin": {
+          "mytool": "s3://mybucket/usr/local/bin/mytool"
+        }
+      }
+    }
+  }  
+}
+```
+  - agent_config: a json object for the agent/subagent's configuration. 
+- The json config contains:
+  - role: a string for the agent/subagent's role, eg, `system`, `user`, etc.
+  - propmt: a string for the agent/subagent's prompt, eg, `You are a helpful assistant.`, etc.
+  - tool_set: a list of system tools the agent/subagent can use, eg, [`python`, `bash`, `mytool`], etc.
+  - max_turns: an integer for the maximum number of turns the agent/subagent can take in a conversation, eg, 10, etc.
+  - time_limit: an integer for the maximum time limit in seconds the agent/subagent can run, eg, 60, etc.
+  - req_timeout: an integer for the maximum request timeout in seconds the agent/subagent can wait for a response from upstream LLM, eg, 10, etc.
+  - use_best_effort: a boolean for whether the agent/subagent should use the best effort run endpoint, eg, true, false.
+  - best_effort_strategy: an optional string of the best effort run strategy, eg, `aggr`, `one`.
+- The initialization of the template needs a init_chat_message string and an optional extra_prompt string. the latter is to provide additional messages for the LLM to a better understanding of the context. eg, to privide the data schema of a DB additional to system SQL tools.
+
+#### Sandboxing
+
+- Ip-VFS: all system agents/subagents should NEVER modify any files/data in the host. we manage our the files needed in a virtual file system, named ip-vfs. the ip-vfs' files are stored in system object storage. but all system tools operate them the same way as the host file system. eg, `cat /data/README.md` will actually read the corresponding file in the object storage.
+- Any mutation of the virtual file will create a new version of the file in the object storage. 
+- System should provide `file(s)/directory(s) recursive` sync up/down between user and ip-vfs. a CLI tool maybe more suitable for this purpose than a web UI. 
+
+#### Networking and Buffering
+
+- All requests from system agents/subagents should go through the system proxy/gateway, so that the requests can be authenticated, authorized, processors transform. and the requests can be routed to the appropriate upstream LLM endpoints. and the requests can be logged and monitored.
+- Since the agent loop runs on the same host, and the requests are send to localhost, so the response from the LLM can be move directly to the agent/subagent without copy overhead.
+
+#### System Tools
+
+- System tools are a preset of tools, eg, core-utils, awk, sed, grep, etc.
+- 3 scripting languages: python, js/ts, bash. they are all sandboxed in the ip-vfs.
+- Optional integrated MCP tools, eg, `sql` with read-only access to DB.
+
+#### Run Graph
+
+- A `dr-strange` stored graph plane to run multiple agents/subagents in a DAG mode. each node in the plane is a agent initialization setup. with the `agent_id` property as the DB key. 
+- Each edge between 2 nodes are dependency order of the 2 agents/subagents. the input of the dependentee is the output of the dependenter.
+- Invoking a graph run is just a API endpoint call, say `POST /_ip/graph_run/1` with init_message and option extra_prompt to the first node(main agent) of the graph.
 
 ### Web UI
 
-(todo)
+#### Login
+
+All unauthenticated page request will redirect here. successful login will setup a JWT and stored in cookies.
+
+#### Management
+
+- System management menu are on the top right of every page.
+- Menu items: `Tenants`(A), `Users`(A/TO), `Quota`(A/TO), `Authorities`(A/TO), `LLMs`(A), `MCPs`(A), `Tools`(A), `Account`(A/TO/U), A for system admin, TO for tenant owner, U for normal user.
+- `Tenants` is the managing page for system admin to create/disable/edit tenants.
+- `Users` is the managing page for A/TO to create/disable/edit users per the user data scope.
+- `Quota` is the managing page for A/TO to setup tenants/users token quotation and rate limits.
+- `LLMs` is the config page for managing the system global LLM settings.
+- `MCPs` is the config page for managing the system global MCP settings providing system agent usage.
+- `Tools` is the config page for managing the system global tools setting prviding system agent usage.
+- `Accounts` is the user account drop down menu for password changing, tenant application, log out.
+
+#### Gateway Functions
+
+- Gateway functions menu are on the left bar of every page.
+- Menu items: `Rules`(A/TO), `Processors`(A/TO), `Agents`(A/TO), `GraphRun`(A/TO), `Observe`(A/TO/U).
+- `Rules` is the managing page for A/TO to setup API mappings.
+- `Processors` is the managing page for A/TO to create/disable/update header or body processors.
+- `Agents` is the managing page for A/TO to create/disable/edit the system agent templates.
+- `GraphRun` is the managing page for A/TO to create/disable/edit the dr-strange graph plane for multiple agents flow.
+- `Observe` is the logging or statistics view page, logging view can link to external open-observe page.
+
+#### Dashboard
+
+Home page of the web UI. showing important latest system(cluster) stats in one page.
 
 ### Observability
 
-(todo)
+- All logs will send to open-observe in normal/cluster mode. logs write to local file in standalone mode.
+- System agents' chat histories are all stored in system's long term memory storage. can be viewed by authorized users.
+- Every request/response can be traced with a unique trace ID. and also at least 4 spans there: ingress request, egress request, ingress response, egress response.
+- All requests/responses within one LLM chat turn(agent run loop) should be grouped into one turn, keyed by turn_id.
+- Open-telemetry compatible, can output these data to any supported platforms.
 
 ### Security
 
-(todo)
+- Any tenants/users data SHOULD be strictly isolated.
+- All agents SHOULD run in a sandbox.
+- System provide builtin security processors to filter out any sensitive data in requests and/or responses to/from upstreams. eg, keys of any kind, passphase of any kind, personal sensitives, contacts, etc.
+- A optional DDOS proof network layer to limit TCP packages rate from one IP. installed as a XPath eBPF filter(only Linux).
