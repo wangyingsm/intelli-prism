@@ -43,7 +43,7 @@ tower = "0.5.3"
 wat = "1.259.0"
 
 [features]
-default = ["standalone-storage", "standalone-cache"]
+default = ["fast-storage", "cluster-cache"]
 standalone-storage = ["ip-storage/standalone-storage"]
 fast-storage = ["ip-storage/fast-storage"]
 standalone-cache = ["ip-cache/standalone-cache"]
