@@ -2,7 +2,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ip_auth::RequestVerifier;
-use ip_config::{Config, StorageConfig};
+#[cfg(feature = "cluster-cache")]
+use ip_cache::RedisCache;
+#[cfg(feature = "standalone-cache")]
+use ip_cache::SledCache;
+use ip_cache::{Cache, Ttl};
+use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_gateway::{Gateway, HyperUpstream, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
@@ -26,23 +31,26 @@ impl AppState {
     /// upstream client.
     pub async fn open(config: &Config) -> Result<Self, StartupError> {
         let store = open_store(&config.storage).await?;
+        let cache = open_cache(&config.cache).await?;
         let table = RoutingTable::load(config, store.as_ref()).await?;
         let host = Arc::new(PluginHost::new(PluginLimits::default())?);
         let chains = PluginChains::load(host, store.as_ref(), store.as_ref()).await?;
         tracing::info!(rules = chains.len(), "plugin chains built");
         let upstream = Arc::new(HyperUpstream::new()?);
+        let nonce_ttl = Ttl::new(config.auth.nonce_ttl.as_duration())?;
         Ok(Self {
-            verifier: RequestVerifier::new(store as Arc<dyn Storage>),
+            verifier: RequestVerifier::new(store as Arc<dyn Storage>, cache, nonce_ttl),
             gateway: Arc::new(Gateway::with_chains(table, Arc::new(chains), upstream)),
             listen: config.server.listen,
         })
     }
 
-    /// Builds state over a store and gateway that are already built.
+    /// Builds state over a store and gateway that are already built, on a cache of its own.
     #[cfg(test)]
     pub fn with_parts(store: Arc<dyn Storage>, gateway: Gateway, listen: SocketAddr) -> Self {
+        let cache = Arc::new(ip_cache::SledCache::temporary().expect("a temporary cache"));
         Self {
-            verifier: RequestVerifier::new(store),
+            verifier: RequestVerifier::new(store, cache, Ttl::seconds(300).expect("a nonce ttl")),
             gateway: Arc::new(gateway),
             listen,
         }
@@ -83,13 +91,32 @@ async fn open_store(config: &StorageConfig) -> Result<Arc<dyn Backend>, StartupE
     }
 }
 
+async fn open_cache(config: &CacheConfig) -> Result<Arc<dyn Cache>, StartupError> {
+    match config {
+        #[cfg(feature = "standalone-cache")]
+        CacheConfig::Sled { path } => Ok(Arc::new(SledCache::open(path)?)),
+        #[cfg(not(feature = "standalone-cache"))]
+        CacheConfig::Sled { .. } => Err(StartupError::UnsupportedBackend {
+            backend: "sled",
+            feature: "standalone-cache",
+        }),
+        #[cfg(feature = "cluster-cache")]
+        CacheConfig::Redis { url } => Ok(Arc::new(RedisCache::connect(url.expose()).await?)),
+        #[cfg(not(feature = "cluster-cache"))]
+        CacheConfig::Redis { .. } => Err(StartupError::UnsupportedBackend {
+            backend: "redis",
+            feature: "cluster-cache",
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ip_config::Config;
 
     use super::*;
 
-    fn config(storage: &str) -> Config {
+    fn config_with(storage: &str, cache: &str) -> Config {
         Config::parse(&format!(
             r#"
 [server]
@@ -97,9 +124,7 @@ listen = "127.0.0.1:8080"
 
 {storage}
 
-[cache]
-backend = "sled"
-path = "./test-cache"
+{cache}
 
 [auth.jwt]
 issuer = "intelli-prism"
@@ -109,10 +134,23 @@ secret = "0123456789abcdef0123456789abcdef"
         .unwrap()
     }
 
+    /// A cache block naming `path`, which sled creates when the cache is opened.
+    fn sled_cache(path: &std::path::Path) -> String {
+        format!("[cache]\nbackend = \"sled\"\npath = {:?}", path.display())
+    }
+
+    /// A path under the temporary directory, distinct per test and per process.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ip-{tag}-{}", std::process::id()))
+    }
+
     #[cfg(not(feature = "fast-storage"))]
     #[tokio::test]
     async fn a_backend_this_build_does_not_carry_stops_startup() {
-        let config = config("[storage]\nbackend = \"postgres\"\nurl = \"postgres://ip@db/ip\"");
+        let config = config_with(
+            "[storage]\nbackend = \"postgres\"\nurl = \"postgres://ip@db/ip\"",
+            &sled_cache(&scratch("unopened-cache")),
+        );
         assert!(matches!(
             AppState::open(&config).await,
             Err(StartupError::UnsupportedBackend {
@@ -125,7 +163,10 @@ secret = "0123456789abcdef0123456789abcdef"
     #[cfg(not(feature = "standalone-storage"))]
     #[tokio::test]
     async fn a_sqlite_backend_this_build_does_not_carry_stops_startup() {
-        let config = config("[storage]\nbackend = \"sqlite\"\npath = \"/nonexistent/ip.db\"");
+        let config = config_with(
+            "[storage]\nbackend = \"sqlite\"\npath = \"/nonexistent/ip.db\"",
+            &sled_cache(&scratch("unopened-cache")),
+        );
         assert!(matches!(
             AppState::open(&config).await,
             Err(StartupError::UnsupportedBackend {
@@ -135,22 +176,116 @@ secret = "0123456789abcdef0123456789abcdef"
         ));
     }
 
-    #[cfg(feature = "standalone-storage")]
+    #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]
     #[tokio::test]
     async fn opening_the_sqlite_backend_builds_a_routing_table() {
         let path = std::env::temp_dir().join(format!("ip-state-{}.db", std::process::id()));
+        let cache = scratch("state-cache");
         let _ = std::fs::remove_file(&path);
-        let config = config(&format!(
-            "[storage]\nbackend = \"sqlite\"\npath = {:?}",
-            path.display().to_string()
-        ));
+        let _ = std::fs::remove_dir_all(&cache);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &sled_cache(&cache),
+        );
         let state = AppState::open(&config).await.unwrap();
         assert_eq!(state.listen(), config.server.listen);
         assert!(state.gateway().table().is_empty());
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
-    #[cfg(feature = "standalone-storage")]
+    #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]
+    #[tokio::test]
+    async fn the_opened_cache_is_the_one_the_configuration_named() {
+        let path = std::env::temp_dir().join(format!("ip-cached-{}.db", std::process::id()));
+        let cache = scratch("named-cache");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &sled_cache(&cache),
+        );
+        let state = AppState::open(&config).await.unwrap();
+        assert_eq!(state.listen(), config.server.listen);
+        assert!(cache.is_dir(), "sled opened the directory the cache named");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[cfg(all(feature = "standalone-storage", feature = "cluster-cache"))]
+    #[tokio::test]
+    async fn opening_the_redis_cache_needs_only_the_url_it_was_given() {
+        let Ok(url) = std::env::var("REDIS_URL") else {
+            eprintln!("REDIS_URL is unset, so this redis test checks nothing");
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("ip-redis-state-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &format!("[cache]\nbackend = \"redis\"\nurl = {url:?}"),
+        );
+        let state = AppState::open(&config).await.unwrap();
+        assert_eq!(state.listen(), config.server.listen);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(all(feature = "standalone-storage", not(feature = "cluster-cache")))]
+    #[tokio::test]
+    async fn a_cache_backend_this_build_does_not_carry_stops_startup() {
+        let path = std::env::temp_dir().join(format!("ip-nocache-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            "[cache]\nbackend = \"redis\"\nurl = \"redis://cache:6379\"",
+        );
+        let outcome = AppState::open(&config).await;
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            outcome,
+            Err(StartupError::UnsupportedBackend {
+                backend: "redis",
+                feature: "cluster-cache",
+            })
+        ));
+    }
+
+    #[cfg(all(feature = "standalone-storage", not(feature = "standalone-cache")))]
+    #[tokio::test]
+    async fn a_sled_cache_this_build_does_not_carry_stops_startup() {
+        let path = std::env::temp_dir().join(format!("ip-nosled-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &sled_cache(&scratch("never-opened")),
+        );
+        let outcome = AppState::open(&config).await;
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            outcome,
+            Err(StartupError::UnsupportedBackend {
+                backend: "sled",
+                feature: "standalone-cache",
+            })
+        ));
+    }
+
+    #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]
     #[tokio::test]
     async fn a_global_plugin_that_will_not_load_stops_startup() {
         use ip_core::{NewPluginRule, PluginKind, PluginOrder, PluginScope};
@@ -175,12 +310,18 @@ secret = "0123456789abcdef0123456789abcdef"
             .await
             .unwrap();
         store.close().await;
-        let config = config(&format!(
-            "[storage]\nbackend = \"sqlite\"\npath = {:?}",
-            path.display().to_string()
-        ));
+        let cache = scratch("plugin-cache");
+        let _ = std::fs::remove_dir_all(&cache);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &sled_cache(&cache),
+        );
         let outcome = AppState::open(&config).await;
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
         assert!(matches!(
             outcome,
             Err(StartupError::Chains(ChainError::GlobalPlugin { .. }))

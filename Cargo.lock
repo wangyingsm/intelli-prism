@@ -1222,6 +1222,7 @@ dependencies = [
  "bytes",
  "http-body-util",
  "ip-auth",
+ "ip-cache",
  "ip-config",
  "ip-core",
  "ip-gateway",
@@ -1242,6 +1243,7 @@ name = "ip-auth"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "ip-cache",
  "ip-core",
  "ip-storage",
  "thiserror",

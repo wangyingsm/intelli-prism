@@ -1,4 +1,5 @@
-use ip_core::{CoreError, TenantId, UserId};
+use ip_cache::CacheError;
+use ip_core::{CoreError, Nonce, TenantId, UserId};
 use ip_storage::StorageError;
 
 /// Every way authentication can fail before an identity is established.
@@ -68,7 +69,18 @@ pub enum AuthError {
         origin: std::net::IpAddr,
     },
 
+    /// The nonce was spent by an earlier request, so this one is a replay.
+    #[error("nonce {nonce} was already spent")]
+    SpentNonce {
+        /// The nonce the request carried.
+        nonce: Nonce,
+    },
+
     /// Storage could not answer.
     #[error(transparent)]
     Storage(#[from] StorageError),
+
+    /// The cache could not answer.
+    #[error(transparent)]
+    Cache(#[from] CacheError),
 }

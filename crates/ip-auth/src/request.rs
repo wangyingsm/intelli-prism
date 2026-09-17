@@ -1,12 +1,23 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use ip_cache::{Cache, CacheKey, CacheLevel, Ttl};
 use ip_core::{
     Capability, CapabilityScope, Grants, Nonce, Role, Signature, TenantId, UserId, UtKey,
 };
 use ip_storage::{AccountKind, Standing, Storage};
 
 use crate::error::AuthError;
+
+/// The id a nonce is spent under, which keeps one caller's nonce from burning another's.
+fn nonce_id(request: &SignedRequest) -> String {
+    format!(
+        "nonce:{}:{}:{}",
+        request.tenant.as_str(),
+        request.user.as_str(),
+        request.nonce.as_str()
+    )
+}
 
 /// What the four `X-Ip-*` headers carry, once each has been read as its own type.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,12 +80,18 @@ impl Authority {
 #[derive(Clone)]
 pub struct RequestVerifier {
     store: Arc<dyn Storage>,
+    cache: Arc<dyn Cache>,
+    nonce_ttl: Ttl,
 }
 
 impl RequestVerifier {
-    /// Reads identities out of this store.
-    pub fn new(store: Arc<dyn Storage>) -> Self {
-        Self { store }
+    /// Reads identities out of this store, spending each nonce in this cache for `nonce_ttl`.
+    pub fn new(store: Arc<dyn Storage>, cache: Arc<dyn Cache>, nonce_ttl: Ttl) -> Self {
+        Self {
+            store,
+            cache,
+            nonce_ttl,
+        }
     }
 
     /// Establishes who a request is from, or refuses it.
@@ -117,12 +134,25 @@ impl RequestVerifier {
         if !(by_user | by_owner) {
             return Err(AuthError::BadSignature);
         }
+        // Spending comes after the signature checks out, so no stranger can burn a caller's nonce.
+        self.spend(request).await?;
 
         Ok(Identity {
             user: user.id,
             tenant: tenant.id,
             role: role_of(user.kind, membership.standing, request.tenant.clone()),
         })
+    }
+
+    /// Takes the nonce for this caller, refusing a request that spends it twice.
+    async fn spend(&self, request: &SignedRequest) -> Result<(), AuthError> {
+        let key = CacheKey::new(CacheLevel::System, &nonce_id(request))?;
+        if !self.cache.claim(&key, Some(self.nonce_ttl)).await? {
+            return Err(AuthError::SpentNonce {
+                nonce: request.nonce.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Reads what an established identity was granted.
@@ -142,6 +172,7 @@ fn role_of(kind: AccountKind, standing: Standing, tenant: TenantId) -> Role {
 
 #[cfg(test)]
 mod tests {
+    use ip_cache::SledCache;
     use ip_core::{ApiId, Grant, PassphraseHash, TnKey};
     use ip_storage::{
         Membership, MembershipStore, NewTenant, NewUser, SqliteStore, TenantStore, UserStore,
@@ -162,6 +193,10 @@ mod tests {
 
     fn nonce() -> Nonce {
         Nonce::new("0123456789abcdef").unwrap()
+    }
+
+    fn stolen_key() -> TnKey {
+        TnKey::generate().unwrap()
     }
 
     fn hash() -> PassphraseHash {
@@ -198,6 +233,15 @@ mod tests {
         (Arc::new(store), key)
     }
 
+    /// A verifier over `store`, spending nonces in a cache that goes when the test does.
+    fn verifier(store: Arc<dyn Storage>) -> RequestVerifier {
+        RequestVerifier::new(
+            store,
+            Arc::new(SledCache::temporary().unwrap()),
+            Ttl::seconds(300).unwrap(),
+        )
+    }
+
     fn signed_by_user(key: &TnKey) -> SignedRequest {
         let ut_key = UtKey::derive(&user_id(), key);
         SignedRequest {
@@ -220,7 +264,7 @@ mod tests {
     #[tokio::test]
     async fn a_correctly_signed_request_names_its_user() {
         let (store, key) = fixture(AccountKind::Regular, Standing::Member).await;
-        let identity = RequestVerifier::new(store)
+        let identity = verifier(store)
             .verify(&signed_by_user(&key), REMOTE)
             .await
             .unwrap();
@@ -235,12 +279,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_same_request_sent_twice_is_refused_the_second_time() {
+        let (store, key) = fixture(AccountKind::Regular, Standing::Member).await;
+        let verifier = verifier(store);
+        let request = signed_by_user(&key);
+        verifier.verify(&request, REMOTE).await.unwrap();
+        assert!(matches!(
+            verifier.verify(&request, REMOTE).await,
+            Err(AuthError::SpentNonce { nonce }) if nonce == request.nonce
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refused_signature_leaves_the_nonce_unspent() {
+        let (store, key) = fixture(AccountKind::Regular, Standing::Member).await;
+        let verifier = verifier(store);
+        let mut forged = signed_by_user(&key);
+        forged.signature = Signature::of_user(&UtKey::derive(&user_id(), &stolen_key()), &nonce());
+        assert!(matches!(
+            verifier.verify(&forged, REMOTE).await,
+            Err(AuthError::BadSignature)
+        ));
+        verifier
+            .verify(&signed_by_user(&key), REMOTE)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_nonce_one_caller_spent_is_still_free_for_another() {
+        let (store, key) = fixture(AccountKind::Regular, Standing::Member).await;
+        let bob = UserId::new("bob").unwrap();
+        store
+            .create_user(NewUser {
+                id: bob.clone(),
+                passphrase: hash(),
+                kind: AccountKind::Regular,
+            })
+            .await
+            .unwrap();
+        store
+            .attach(Membership {
+                user: bob.clone(),
+                tenant: tenant_id(),
+                standing: Standing::Member,
+            })
+            .await
+            .unwrap();
+        let verifier = verifier(store);
+        verifier
+            .verify(&signed_by_user(&key), REMOTE)
+            .await
+            .unwrap();
+        let by_bob = SignedRequest {
+            tenant: tenant_id(),
+            user: bob.clone(),
+            nonce: nonce(),
+            signature: Signature::of_user(&UtKey::derive(&bob, &key), &nonce()),
+        };
+        assert_eq!(verifier.verify(&by_bob, REMOTE).await.unwrap().user, bob);
+    }
+
+    #[tokio::test]
     async fn a_signature_over_another_nonce_is_refused() {
         let (store, key) = fixture(AccountKind::Regular, Standing::Member).await;
         let mut request = signed_by_user(&key);
         request.nonce = Nonce::new("fedcba9876543210").unwrap();
         assert!(matches!(
-            RequestVerifier::new(store).verify(&request, REMOTE).await,
+            verifier(store).verify(&request, REMOTE).await,
             Err(AuthError::BadSignature)
         ));
     }
@@ -250,7 +356,7 @@ mod tests {
         let (store, _) = fixture(AccountKind::Regular, Standing::Member).await;
         let stolen = TnKey::generate().unwrap();
         assert!(matches!(
-            RequestVerifier::new(store)
+            verifier(store)
                 .verify(&signed_by_user(&stolen), REMOTE)
                 .await,
             Err(AuthError::BadSignature)
@@ -260,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn a_tenant_owner_may_sign_with_the_tenant_key() {
         let (store, key) = fixture(AccountKind::Regular, Standing::Owner).await;
-        let identity = RequestVerifier::new(store)
+        let identity = verifier(store)
             .verify(&signed_by_tenant_key(&key), REMOTE)
             .await
             .unwrap();
@@ -271,7 +377,7 @@ mod tests {
     async fn an_ordinary_member_may_not_sign_with_the_tenant_key() {
         let (store, key) = fixture(AccountKind::Regular, Standing::Member).await;
         assert!(matches!(
-            RequestVerifier::new(store)
+            verifier(store)
                 .verify(&signed_by_tenant_key(&key), REMOTE)
                 .await,
             Err(AuthError::BadSignature)
@@ -298,7 +404,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            RequestVerifier::new(Arc::new(store))
+            verifier(Arc::new(store))
                 .verify(&signed_by_user(&key), REMOTE)
                 .await,
             Err(AuthError::NotAMember { .. })
@@ -308,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_tenant_or_user_is_refused() {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
-        let verifier = RequestVerifier::new(store.clone());
+        let verifier = verifier(store.clone());
         let key = TnKey::generate().unwrap();
         assert!(matches!(
             verifier.verify(&signed_by_user(&key), REMOTE).await,
@@ -330,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn the_system_administrator_is_confined_to_localhost() {
         let (store, key) = fixture(AccountKind::SystemAdministrator, Standing::Member).await;
-        let verifier = RequestVerifier::new(store);
+        let verifier = verifier(store);
         assert!(matches!(
             verifier.verify(&signed_by_user(&key), REMOTE).await,
             Err(AuthError::AdminOffLocalhost { .. })
@@ -357,7 +463,7 @@ mod tests {
             .grant(&Grant::new(Capability::ApiAccess, scope.clone()).unwrap())
             .await
             .unwrap();
-        let verifier = RequestVerifier::new(store);
+        let verifier = verifier(store);
         let identity = verifier
             .verify(&signed_by_user(&key), REMOTE)
             .await
@@ -370,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn an_authority_refuses_a_scope_belonging_to_someone_else() {
         let (store, key) = fixture(AccountKind::SystemAdministrator, Standing::Member).await;
-        let verifier = RequestVerifier::new(store);
+        let verifier = verifier(store);
         let identity = verifier.verify(&signed_by_user(&key), LOCAL).await.unwrap();
         let authority = verifier.authority(identity).await.unwrap();
         let elsewhere = CapabilityScope::Tenant {
@@ -383,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn an_authority_refuses_a_scope_in_another_tenant() {
         let (store, key) = fixture(AccountKind::SystemAdministrator, Standing::Member).await;
-        let verifier = RequestVerifier::new(store);
+        let verifier = verifier(store);
         let identity = verifier.verify(&signed_by_user(&key), LOCAL).await.unwrap();
         let authority = verifier.authority(identity).await.unwrap();
         let elsewhere = CapabilityScope::Tenant {
@@ -396,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn a_tenant_owner_needs_no_grant_inside_its_own_tenant() {
         let (store, key) = fixture(AccountKind::Regular, Standing::Owner).await;
-        let verifier = RequestVerifier::new(store);
+        let verifier = verifier(store);
         let identity = verifier
             .verify(&signed_by_user(&key), REMOTE)
             .await

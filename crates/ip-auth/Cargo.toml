@@ -5,11 +5,13 @@ edition.workspace = true
 
 [dependencies]
 argon2 = "0.6.0"
+ip-cache = { version = "0.1.0", path = "../ip-cache", default-features = false }
 ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }
 thiserror.workspace = true
 zeroize = "1.9.0"
 
 [dev-dependencies]
+ip-cache = { version = "0.1.0", path = "../ip-cache", features = ["standalone-cache"] }
 ip-storage = { version = "0.1.0", path = "../ip-storage", features = ["standalone-storage"] }
 tokio.workspace = true

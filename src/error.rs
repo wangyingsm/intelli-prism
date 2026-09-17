@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 
+use ip_cache::CacheError;
 use ip_config::ConfigError;
 use ip_gateway::{RouteError, UpstreamError};
 use ip_plugin::{ChainError, PluginError};
@@ -16,6 +17,10 @@ pub enum StartupError {
     /// The storage backend could not be opened.
     #[error(transparent)]
     Storage(#[from] StorageError),
+
+    /// The cache backend could not be opened.
+    #[error(transparent)]
+    Cache(#[from] CacheError),
 
     /// The routing table could not be built.
     #[error(transparent)]
