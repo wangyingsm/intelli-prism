@@ -12,11 +12,10 @@ ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-gateway = { version = "0.1.0", path = "../ip-gateway" }
 ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt"] }
+tokio.workspace = true
 tracing = "0.1.44"
 wasmtime = { version = "48.0.2", default-features = false, features = ["cranelift", "pooling-allocator", "runtime", "std"] }
 
 [dev-dependencies]
 ip-storage = { version = "0.1.0", path = "../ip-storage", features = ["standalone-storage"] }
-tokio = { version = "1.53.1", features = ["rt", "macros"] }
 wat = "1.259.0"

@@ -18,9 +18,8 @@ ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }
 rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt", "sync", "time"] }
+tokio.workspace = true
 tracing = "0.1.44"
 
 [dev-dependencies]
 hyper = { version = "1.11.1", features = ["server"] }
-tokio = { version = "1.53.1", features = ["rt", "macros", "rt-multi-thread", "net", "time"] }
