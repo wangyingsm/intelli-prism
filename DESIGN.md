@@ -271,6 +271,8 @@ redis:7-alpine` is all they need. Without the variable they return early, as the
 
 - TTL eviction: a REQ/RESP cache entry has its own TTL each, can be set by three levels, system default, per rule and response header with their precedence order from low to high as above. all syntax caches and all system caches have their own TTL settings.
 - LRU eviction: three cache levels have their own cache size limits, when the cache size exceeds the limit, the LRU eviction policy will be triggered to evict the least recently used cache entry.
+- An entry may be written with no ttl at all, and then stays until something removes or evicts it.
+That is what a value invalidated only by its own change needs, such as a tenant key in the system cache.
 - Cache updates/invalidations: the system cache will be updated/invalidated automatically when their values changed.
 - Where a level's size limit binds: the sled backend holds the whole store, so it enforces its own
 limits. Redis evicts by its server wide `maxmemory-policy` instead, so there the per level limits are
