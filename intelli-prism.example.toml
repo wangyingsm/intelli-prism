@@ -18,6 +18,18 @@ path = "./intelli-prism.db"
 # backend = "postgres"
 # url = "postgres://intelli_prism:secret@localhost/intelli_prism"
 
+# Cluster deployment. Every node shares one redis, which is what a nonce spent on
+# one node needs to be spent on all of them.
+[cache]
+backend = "redis"
+url = "redis://localhost:6379"
+
+# Standalone deployment caches into a local directory instead, which only a build
+# with the standalone-cache feature serves (cargo build --features standalone-cache):
+# [cache]
+# backend = "sled"
+# path = "./intelli-prism-cache"
+
 [auth]
 # Seconds a nonce stays spent. Default 300.
 nonce_ttl = 300

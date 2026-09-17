@@ -143,6 +143,10 @@ listen = "127.0.0.1:8080"
 backend = "sqlite"
 path = "./test.db"
 
+[cache]
+backend = "sled"
+path = "./test-cache"
+
 [auth.jwt]
 issuer = "intelli-prism"
 secret = "0123456789abcdef0123456789abcdef"

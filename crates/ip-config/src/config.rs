@@ -19,6 +19,8 @@ pub struct Config {
     pub server: ServerConfig,
     /// Which storage backend holds tenants, users and grants.
     pub storage: StorageConfig,
+    /// Which cache backend holds responses and the system's own short lived state.
+    pub cache: CacheConfig,
     /// How callers prove who they are.
     pub auth: AuthConfig,
     /// Logs, traces and metrics.
@@ -88,6 +90,22 @@ pub enum StorageConfig {
     },
     /// Cluster deployment, backed by a shared server.
     Postgres {
+        /// Connection url, which carries the password.
+        url: Secret,
+    },
+}
+
+/// Which cache backend holds responses and the system's own short lived state.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CacheConfig {
+    /// Standalone deployment, backed by a local database.
+    Sled {
+        /// Path of the database directory.
+        path: PathBuf,
+    },
+    /// Cluster deployment, backed by a server every node shares.
+    Redis {
         /// Connection url, which carries the password.
         url: Secret,
     },
@@ -208,6 +226,10 @@ listen = "127.0.0.1:8080"
 backend = "sqlite"
 path = "/var/lib/intelli-prism/state.db"
 
+[cache]
+backend = "sled"
+path = "/var/lib/intelli-prism/cache"
+
 [auth.jwt]
 issuer = "intelli-prism"
 secret = "0123456789abcdef0123456789abcdef"
@@ -232,6 +254,10 @@ listen = "0.0.0.0:443"
 [storage]
 backend = "postgres"
 url = "postgres://ip:pw@db/intelli_prism"
+
+[cache]
+backend = "redis"
+url = "redis://:pw@cache:6379"
 
 [auth.jwt]
 issuer = "intelli-prism"
@@ -266,6 +292,26 @@ secret = "0123456789abcdef0123456789abcdef"
         assert_eq!(config.auth.nonce_ttl, Seconds::new(300));
         assert_eq!(config.auth.jwt.ttl, Seconds::new(6 * 3600));
         assert!(config.upstreams.is_empty());
+    }
+
+    #[test]
+    fn selects_the_cache_backend_by_tag() {
+        let config = Config::parse(MINIMAL).unwrap();
+        let CacheConfig::Redis { url } = &config.cache else {
+            panic!("expected the redis backend");
+        };
+        assert_eq!(url.expose(), "redis://:pw@cache:6379");
+    }
+
+    #[test]
+    fn a_local_cache_is_named_by_path() {
+        let config = Config::parse(FULL).unwrap();
+        assert_eq!(
+            config.cache,
+            CacheConfig::Sled {
+                path: PathBuf::from("/var/lib/intelli-prism/cache"),
+            }
+        );
     }
 
     #[test]
