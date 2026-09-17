@@ -283,8 +283,12 @@ stream, which is answered as it arrives rather than held. A cache that cannot be
 costs a round trip upstream and is logged, but never fails the request it was serving.
 - Cache updates/invalidations: the system cache will be updated/invalidated automatically when their values changed.
 - Where a level's size limit binds: the sled backend holds the whole store, so it enforces its own
-limits. Redis evicts by its server wide `maxmemory-policy` instead, so there the per level limits are
-advisory and the TTLs do the real work.
+limits, and only it is configured with them. It weighs each entry as its key plus its value, keeps
+each level's total and an index of its keys ordered by last use, and drops from the oldest end until
+the level is inside its limit. A read counts as a use, but refreshes that record at most once a
+second, so a busy key does not write to the index on every read. Redis evicts by its server wide
+`maxmemory-policy` instead, so there the per level limits would be advisory and the TTLs do the real
+work.
 - The semantic cache waits for its own milestone, since it needs an embedding model and a live LLM
 endpoint. The system cache and the request/response cache come first.
 

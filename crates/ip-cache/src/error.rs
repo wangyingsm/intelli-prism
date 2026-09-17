@@ -21,6 +21,10 @@ pub enum CacheError {
         prefix: String,
     },
 
+    /// A level limit of no bytes would leave room for nothing.
+    #[error("a cache level limit must be more than zero bytes")]
+    ZeroLimit,
+
     /// A span of no time would drop the entry before anything could read it.
     #[error("a ttl must be longer than zero")]
     ZeroTtl,

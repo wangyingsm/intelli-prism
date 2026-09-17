@@ -106,6 +106,15 @@ pub enum CacheConfig {
         /// Seconds a cached response stays. Absent caches no response at all.
         #[serde(default)]
         response_ttl: Option<Seconds>,
+        /// Bytes the response cache may hold before its least recently used entries go.
+        #[serde(default)]
+        response_max_bytes: Option<u64>,
+        /// Bytes the semantic cache may hold before its least recently used entries go.
+        #[serde(default)]
+        semantic_max_bytes: Option<u64>,
+        /// Bytes the system cache may hold before its least recently used entries go.
+        #[serde(default)]
+        system_max_bytes: Option<u64>,
     },
     /// Cluster deployment, backed by a server every node shares.
     Redis {
@@ -245,6 +254,8 @@ path = "/var/lib/intelli-prism/state.db"
 backend = "sled"
 path = "/var/lib/intelli-prism/cache"
 response_ttl = 60
+response_max_bytes = 1048576
+system_max_bytes = 4096
 
 [auth.jwt]
 issuer = "intelli-prism"
@@ -336,6 +347,9 @@ secret = "0123456789abcdef0123456789abcdef"
             CacheConfig::Sled {
                 path: PathBuf::from("/var/lib/intelli-prism/cache"),
                 response_ttl: Some(Seconds::new(60)),
+                response_max_bytes: Some(1_048_576),
+                semantic_max_bytes: None,
+                system_max_bytes: Some(4_096),
             }
         );
     }

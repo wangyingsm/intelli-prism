@@ -34,6 +34,14 @@ response_ttl = 60
 # [cache]
 # backend = "sled"
 # path = "./intelli-prism-cache"
+# response_ttl = 60
+# Bytes each level may hold before its least recently used entries go. Absent limits
+# nothing, and only the ttls drop anything. Redis enforces no such limit of its own:
+# there the server's maxmemory-policy evicts and these would be advisory, so they are
+# named here alone.
+# response_max_bytes = 268435456
+# semantic_max_bytes = 67108864
+# system_max_bytes = 16777216
 
 [auth]
 # Seconds a nonce stays spent. Default 300.

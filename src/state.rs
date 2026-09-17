@@ -4,9 +4,9 @@ use std::sync::Arc;
 use ip_auth::RequestVerifier;
 #[cfg(feature = "cluster-cache")]
 use ip_cache::RedisCache;
-#[cfg(feature = "standalone-cache")]
-use ip_cache::SledCache;
 use ip_cache::{Cache, Ttl};
+#[cfg(feature = "standalone-cache")]
+use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_gateway::{Gateway, HyperUpstream, ResponseCache, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
@@ -103,7 +103,25 @@ async fn open_store(config: &StorageConfig) -> Result<Arc<dyn Backend>, StartupE
 async fn open_cache(config: &CacheConfig) -> Result<Arc<dyn Cache>, StartupError> {
     match config {
         #[cfg(feature = "standalone-cache")]
-        CacheConfig::Sled { path, .. } => Ok(Arc::new(SledCache::open(path)?)),
+        CacheConfig::Sled {
+            path,
+            response_max_bytes,
+            semantic_max_bytes,
+            system_max_bytes,
+            ..
+        } => {
+            let mut limits = LevelLimits::none();
+            if let Some(bytes) = response_max_bytes {
+                limits = limits.with_response(MaxBytes::new(*bytes)?);
+            }
+            if let Some(bytes) = semantic_max_bytes {
+                limits = limits.with_semantic(MaxBytes::new(*bytes)?);
+            }
+            if let Some(bytes) = system_max_bytes {
+                limits = limits.with_system(MaxBytes::new(*bytes)?);
+            }
+            Ok(Arc::new(SledCache::with_limits(path, limits)?))
+        }
         #[cfg(not(feature = "standalone-cache"))]
         CacheConfig::Sled { .. } => Err(StartupError::UnsupportedBackend {
             backend: "sled",
@@ -285,6 +303,31 @@ secret = "0123456789abcdef0123456789abcdef"
         assert!(state.gateway().table().is_empty());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]
+    #[tokio::test]
+    async fn a_level_limit_of_no_bytes_stops_startup() {
+        let path = std::env::temp_dir().join(format!("ip-nolimit-{}.db", std::process::id()));
+        let cache = scratch("nolimit-cache");
+        let _ = std::fs::remove_file(&path);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &format!(
+                "[cache]\nbackend = \"sled\"\npath = {:?}\nresponse_max_bytes = 0",
+                cache.display()
+            ),
+        );
+        let outcome = AppState::open(&config).await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
+        assert!(matches!(
+            outcome,
+            Err(StartupError::Cache(ip_cache::CacheError::ZeroLimit))
+        ));
     }
 
     #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]

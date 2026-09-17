@@ -32,7 +32,10 @@ impl fmt::Display for CacheLevel {
 
 /// A key in one cache level, spelled the same way for every backend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CacheKey(String);
+pub struct CacheKey {
+    key: String,
+    level: CacheLevel,
+}
 
 impl CacheKey {
     /// Names an entry in a level, refusing an id a backend could not carry.
@@ -43,18 +46,26 @@ impl CacheKey {
         if id.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err(CacheError::UnusableKey { id: id.to_owned() });
         }
-        Ok(Self(format!("ip:{level}:{id}")))
+        Ok(Self {
+            key: format!("ip:{level}:{id}"),
+            level,
+        })
     }
 
     /// The key as a backend stores it.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.key
+    }
+
+    /// Which cache this key belongs to.
+    pub fn level(&self) -> CacheLevel {
+        self.level
     }
 }
 
 impl fmt::Display for CacheKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.key)
     }
 }
 
@@ -66,6 +77,7 @@ mod tests {
     fn a_key_carries_its_level() {
         let key = CacheKey::new(CacheLevel::System, "nonce-abc").unwrap();
         assert_eq!(key.as_str(), "ip:sys:nonce-abc");
+        assert_eq!(key.level(), CacheLevel::System);
     }
 
     #[test]
