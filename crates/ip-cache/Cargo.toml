@@ -5,4 +5,13 @@ edition.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+sled = { version = "0.34.7", optional = true }
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+default = ["standalone-cache"]
+standalone-cache = ["dep:sled", "dep:tokio"]
