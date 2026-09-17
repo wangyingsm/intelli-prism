@@ -12,7 +12,7 @@ pub mod table;
 pub mod upstream;
 
 pub use body::{BoxError, GatewayBody};
-pub use cache::{CachedResponse, ResponseCache, response_key};
+pub use cache::{CachedResponse, Freshness, ResponseCache, freshness, response_key};
 pub use error::{GatewayError, GatewayErrorKind, ProcessorError, RouteError, UpstreamError};
 pub use flow::{Flow, Gateway, RequestContext};
 pub use hyper_upstream::{HyperUpstream, UpstreamSettings};

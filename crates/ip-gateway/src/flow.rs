@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::header::{
@@ -11,11 +12,11 @@ use http::uri::{Authority as UriAuthority, Scheme};
 use http::{HeaderMap, HeaderValue, Request, Response, Uri};
 use http_body_util::BodyExt;
 use ip_auth::Authority;
-use ip_cache::CacheKey;
+use ip_cache::{CacheKey, Ttl};
 use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey};
 
 use crate::body::{GatewayBody, from_bytes};
-use crate::cache::{CachedResponse, ResponseCache, response_key};
+use crate::cache::{CachedResponse, Freshness, ResponseCache, freshness, response_key};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{BodyProcessor, ChainSource, FixedChains, HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
@@ -125,8 +126,8 @@ impl Gateway {
             .await?
             .process_response_body(&chains)
             .await?;
-        if let Some(answer) = done.cacheable().await?
-            && let Err(error) = responses.put(&key, &answer).await
+        if let Some((answer, ttl)) = done.cacheable(responses.ttl()).await?
+            && let Err(error) = responses.put(&key, &answer, ttl).await
         {
             tracing::warn!(%error, "could not keep a response in the cache");
         }
@@ -381,18 +382,28 @@ impl Flow<ResponseHeadersProcessed> {
 }
 
 impl Flow<ResponseBodyProcessed> {
-    /// The answer to keep for a repeated request, buffering the body so it can still be sent,
+    /// The answer to keep and how long to keep it, buffering the body so it can still be sent,
     /// or nothing when this response may not be kept at all.
-    pub async fn cacheable(&mut self) -> Result<Option<CachedResponse>, GatewayError> {
+    ///
+    /// The response's own expiration headers outrank `default`, which stands when it names none.
+    pub async fn cacheable(
+        &mut self,
+        default: Ttl,
+    ) -> Result<Option<(CachedResponse, Ttl)>, GatewayError> {
         // A stream is answered as it arrives and an error is not an answer to repeat.
         if !self.held.status().is_success() || is_event_stream(self.held.headers()) {
             return Ok(None);
         }
+        let ttl = match freshness(self.held.headers(), SystemTime::now()) {
+            Freshness::For(ttl) => ttl,
+            Freshness::Unsaid => default,
+            Freshness::Never => return Ok(None),
+        };
         let body = std::mem::replace(self.held.body_mut(), crate::body::empty());
         let bytes = collect(StageName::ResponseBodyRead, body).await?;
         *self.held.body_mut() = from_bytes(bytes.clone());
         let content_type = self.held.headers().get(CONTENT_TYPE).cloned();
-        Ok(Some(CachedResponse::new(content_type, bytes)))
+        Ok(Some((CachedResponse::new(content_type, bytes), ttl)))
     }
 
     /// Hands the response back to the kernel.
@@ -933,6 +944,83 @@ mod tests {
             1,
             "the upstream was called twice"
         );
+    }
+
+    #[tokio::test]
+    async fn a_response_that_refuses_to_be_stored_is_not_kept() {
+        let upstream =
+            FakeUpstream::answering_with_headers("pong", vec![("cache-control", "no-store")]);
+        let gateway = caching_gateway(upstream.clone());
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            2,
+            "an upstream that said no-store was cached anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_max_age_shorter_than_the_default_expires_the_answer_sooner() {
+        let upstream =
+            FakeUpstream::answering_with_headers("pong", vec![("cache-control", "max-age=1")]);
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .caching(ResponseCache::new(cache, Ttl::seconds(600).unwrap()));
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_max_age_longer_than_the_default_keeps_the_answer_longer() {
+        let upstream =
+            FakeUpstream::answering_with_headers("pong", vec![("cache-control", "max-age=600")]);
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .caching(ResponseCache::new(cache, Ttl::seconds(1).unwrap()));
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_response_header_plugin_may_still_decide_what_is_kept() {
+        let upstream = FakeUpstream::answering("pong");
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let processors =
+            ProcessorChain::new().with_response_header(SetHeader::new("cache-control", "no-store"));
+        let gateway = Gateway::new(table(), processors, upstream.clone())
+            .caching(ResponseCache::new(cache, Ttl::seconds(600).unwrap()));
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        gateway
+            .handle(context(granted()), request("/anthropic", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

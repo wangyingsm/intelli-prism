@@ -269,7 +269,12 @@ redis:7-alpine` is all they need. Without the variable they return early, as the
 
 #### Cache Management
 
-- TTL eviction: a REQ/RESP cache entry has its own TTL each, can be set by three levels, system default, per rule and response header with their precedence order from low to high as above. all syntax caches and all system caches have their own TTL settings.
+- TTL eviction: a REQ/RESP cache entry has its own TTL each, can be set by two levels, the system
+default and the response's own expiration headers, with their precedence order from low to high as
+above. `Cache-Control: max-age` names the span, `Expires` names the moment, and `no-store`, `no-cache`
+or a span already past keeps nothing at all. A rule does not set a TTL of its own: the upstream
+answering knows how long its answer is good for, and the system default covers an upstream that says
+nothing. all syntax caches and all system caches have their own TTL settings.
 - LRU eviction: three cache levels have their own cache size limits, when the cache size exceeds the limit, the LRU eviction policy will be triggered to evict the least recently used cache entry.
 - An entry may be written with no ttl at all, and then stays until something removes or evicts it.
 That is what a value invalidated only by its own change needs, such as a tenant key in the system cache.

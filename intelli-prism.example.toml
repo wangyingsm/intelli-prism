@@ -25,6 +25,8 @@ backend = "redis"
 url = "redis://localhost:6379"
 # Seconds an answered request stays cached, so the same tenant asking the same route the
 # same thing is answered without calling the upstream. Absent caches no response at all.
+# A response that names its own expiry overrides this: Cache-Control max-age or Expires
+# sets the span, and no-store, no-cache or private keeps nothing.
 response_ttl = 60
 
 # Standalone deployment caches into a local directory instead, which only a build

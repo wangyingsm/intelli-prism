@@ -23,6 +23,7 @@ rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing = "0.1.44"
+httpdate = "1.0.3"
 
 [dev-dependencies]
 hyper = { version = "1.11.1", features = ["server"] }
