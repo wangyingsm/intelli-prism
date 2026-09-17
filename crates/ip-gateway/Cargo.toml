@@ -17,7 +17,7 @@ ip-config = { version = "0.1.0", path = "../ip-config" }
 ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }
 rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
-thiserror = "2.0.20"
+thiserror.workspace = true
 tokio.workspace = true
 tracing = "0.1.44"
 

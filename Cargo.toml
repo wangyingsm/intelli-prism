@@ -13,7 +13,7 @@ ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
-thiserror = "2.0.20"
+thiserror.workspace = true
 tokio.workspace = true
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
