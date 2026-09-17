@@ -144,7 +144,88 @@ secret = "0123456789abcdef0123456789abcdef"
         std::env::temp_dir().join(format!("ip-{tag}-{}", std::process::id()))
     }
 
-    #[cfg(not(feature = "fast-storage"))]
+        /// A schema of this test's own on the database `DATABASE_URL` names, so a startup that
+    /// migrates cannot touch what anything else is using.
+    #[cfg(feature = "fast-storage")]
+    struct Schema {
+        name: String,
+        url: String,
+        server: String,
+    }
+
+    #[cfg(feature = "fast-storage")]
+    impl Schema {
+        async fn create(url: &str) -> Self {
+            use sqlx::{AssertSqlSafe, Connection, PgConnection};
+
+            let name = format!("ip_startup_{}", std::process::id());
+            let mut connection = PgConnection::connect(url).await.expect("a postgres server");
+            sqlx::query(AssertSqlSafe(format!(
+                "DROP SCHEMA IF EXISTS {name} CASCADE"
+            )))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+            sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {name}")))
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            connection.close().await.unwrap();
+            Self {
+                url: format!("{url}?options=-c%20search_path%3D{name}"),
+                name,
+                server: url.to_owned(),
+            }
+        }
+    }
+
+    #[cfg(feature = "fast-storage")]
+    impl Drop for Schema {
+        fn drop(&mut self) {
+            use sqlx::{AssertSqlSafe, Connection, PgConnection};
+
+            let sql = format!("DROP SCHEMA {} CASCADE", self.name);
+            let server = self.server.clone();
+            // A drop inside the test's runtime cannot wait on that runtime, so it waits on its own.
+            let dropped = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime to drop a scratch schema")
+                    .block_on(async move {
+                        let mut connection = PgConnection::connect(&server).await?;
+                        sqlx::query(AssertSqlSafe(sql))
+                            .execute(&mut connection)
+                            .await?;
+                        connection.close().await
+                    })
+            })
+            .join();
+            if !matches!(dropped, Ok(Ok(()))) {
+                eprintln!("could not drop scratch schema {}", self.name);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "fast-storage", feature = "cluster-cache"))]
+    #[tokio::test]
+    async fn opening_the_cluster_backends_builds_a_routing_table() {
+        let (Ok(database), Ok(redis)) = (std::env::var("DATABASE_URL"), std::env::var("REDIS_URL"))
+        else {
+            eprintln!("DATABASE_URL and REDIS_URL are not both set, so this test checks nothing");
+            return;
+        };
+        let schema = Schema::create(&database).await;
+        let config = config_with(
+            &format!("[storage]\nbackend = \"postgres\"\nurl = {:?}", schema.url),
+            &format!("[cache]\nbackend = \"redis\"\nurl = {redis:?}"),
+        );
+        let state = AppState::open(&config).await.unwrap();
+        assert_eq!(state.listen(), config.server.listen);
+        assert!(state.gateway().table().is_empty());
+    }
+
+        #[cfg(not(feature = "fast-storage"))]
     #[tokio::test]
     async fn a_backend_this_build_does_not_carry_stops_startup() {
         let config = config_with(
