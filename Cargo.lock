@@ -1142,6 +1142,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-cache"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "thiserror",
+]
+
+[[package]]
 name = "ip-config"
 version = "0.1.0"
 dependencies = [

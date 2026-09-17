@@ -28,6 +28,7 @@ edition = "2024"
 
 [workspace.dependencies]
 ip-core = { path = "crates/ip-core" }
+thiserror = "2.0.20"
 
 [dev-dependencies]
 async-trait = "0.1.92"
