@@ -254,10 +254,16 @@ milliseconds per request. Replace the scan with a path trie before rule counts g
 - Redis in cluster(default) mode: a cluster of intelli-prism nodes share their caches with redis.
 - Sled in standalone mode: a fallback sled local storage for just single node local deployment.
 - Cache traits: expose the capabilities of cache to high layers, unified interfaces.
+- Feature flag gated compilation, as storage: `standalone-cache` compiles in the sled backend and
+`cluster-cache` the redis one. The features are additive, and the `[cache]` backend tag picks one at
+startup; a tag naming a backend the build does not carry stops startup with an error naming the feature.
+- Sled tests run against a temporary database. Redis tests run only when `REDIS_URL` names a server,
+each under a key prefix of its own that goes when its store does, so `docker run --rm -d -p 6379:6379
+redis:7-alpine` is all they need. Without the variable they return early, as the postgres tests do.
 
 #### Cache Levels
 
-- Request/Response cache: a cache for request/response pairs, with a TTL and LRU eviction policy. cache key is a sha256 of the request body, and the cache value is the response body. cache hit will return the cached response directly.
+- Request/Response cache: a cache for request/response pairs, with a TTL and LRU eviction policy. cache key is a sha256 over the route key, the tenant and the request body, so a hit can only ever be the same tenant asking the same route the same thing; the cache value is the response body. A hit answers from the cache and skips the upstream call and every stage after it, so it spends no tokens and runs no response processor. The request header processors, where logging belongs, have already run by then.
 - Syntax cache: a HNSW index and embedding vector based cache for semantic understanding of the request body, with a TTL and LRU eviction policy. cache key is a sha256 of the request body embedding. and this is only for LLM API request.
 - System cache: other system temporary data state, such as nonces, tn_key, ut_key, etc. with a TTL and LRU eviction policy.
 
@@ -266,6 +272,11 @@ milliseconds per request. Replace the scan with a path trie before rule counts g
 - TTL eviction: a REQ/RESP cache entry has its own TTL each, can be set by three levels, system default, per rule and response header with their precedence order from low to high as above. all syntax caches and all system caches have their own TTL settings.
 - LRU eviction: three cache levels have their own cache size limits, when the cache size exceeds the limit, the LRU eviction policy will be triggered to evict the least recently used cache entry.
 - Cache updates/invalidations: the system cache will be updated/invalidated automatically when their values changed.
+- Where a level's size limit binds: the sled backend holds the whole store, so it enforces its own
+limits. Redis evicts by its server wide `maxmemory-policy` instead, so there the per level limits are
+advisory and the TTLs do the real work.
+- The semantic cache waits for its own milestone, since it needs an embedding model and a live LLM
+endpoint. The system cache and the request/response cache come first.
 
 ### Intelligent Routing and Self Learning
 
