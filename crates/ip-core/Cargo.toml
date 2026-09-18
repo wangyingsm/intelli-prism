@@ -1,8 +1,11 @@
 [package]
 name = "ip-core"
+description = "Identifiers, keys and capabilities every intelli-prism crate shares"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }

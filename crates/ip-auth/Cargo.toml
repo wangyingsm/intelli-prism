@@ -1,8 +1,11 @@
 [package]
 name = "ip-auth"
+description = "Request signatures, nonces and what an identity is allowed"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [dependencies]
 argon2 = "0.6.0"

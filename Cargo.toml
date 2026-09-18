@@ -1,8 +1,14 @@
 [package]
 name = "intelli-prism"
+description = "An enterprise AI proxy and gateway"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["llm", "ai", "proxy", "gateway"]
+categories = ["network-programming", "web-programming::http-server"]
 
 [dependencies]
 axum = "0.8.9"
@@ -27,7 +33,9 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
+authors = ["wangy <yingge_gzb@qq.com>"]
 
 [workspace.dependencies]
 hex = "0.4.3"
