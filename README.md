@@ -48,3 +48,13 @@ Large parts of the design are unbuilt: there is no management api, no login endp
 quota or rate limiting, no agents, no semantic cache, and telemetry is not exported anywhere yet.
 The pieces that do exist are tested, but they have never run under real traffic, and no security
 review has been done. Read `ROADMAP.md` before assuming a feature is there.
+
+## License
+
+Dual licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you state otherwise, any contribution you deliberately submit for inclusion
+in this work shall be dual licensed as above, with no additional terms or conditions.
