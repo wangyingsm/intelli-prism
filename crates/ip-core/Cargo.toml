@@ -9,10 +9,10 @@ authors.workspace = true
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-getrandom = "0.4.3"
-hex = "0.4.3"
+getrandom.workspace = true
+hex.workspace = true
 serde.workspace = true
-sha2 = "0.11.0"
+sha2.workspace = true
 subtle = "2.6.1"
 thiserror.workspace = true
 zeroize = "1.9.0"
