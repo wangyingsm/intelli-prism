@@ -1335,6 +1335,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wat",
+ "zeroize",
 ]
 
 [[package]]

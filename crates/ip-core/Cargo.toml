@@ -15,7 +15,7 @@ serde.workspace = true
 sha2.workspace = true
 subtle = "2.6.1"
 thiserror.workspace = true
-zeroize = "1.9.0"
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
