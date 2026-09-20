@@ -1,180 +1,34 @@
 //! Creating a tenant together with the owner account that represents it.
 
-use sqlx::Database;
+use typestate_txn::transaction;
 
-use super::{IdentityDialect, sealed};
+use super::IdentityDialect;
 use crate::error::StorageError;
 use crate::model::{Membership, NewTenant, NewUser, Standing, Tenant, TenantWithOwner, User};
 
-/// How far a `UserCreateTxn` has got. Only the stages below are ones.
-pub trait UserCreateStage: sealed::Sealed {}
-
-/// Nothing is written yet.
-pub struct UserCreateBegun;
-
-/// The tenant is written.
-pub struct UserCreateTenantSaved {
-    tenant: Tenant,
-}
-
-/// The tenant and its owner account are written.
-pub struct UserCreateUserSaved {
-    tenant: Tenant,
-    user: User,
-}
-
-/// The owner is attached to the tenant, and only committing is left.
-pub struct UserCreateAttached {
-    tenant: Tenant,
-    user: User,
-    membership: Membership,
-}
-
-macro_rules! stages {
-    ($($stage:ty),* $(,)?) => {
-        $(
-            impl sealed::Sealed for $stage {}
-            impl UserCreateStage for $stage {}
-        )*
-    };
-}
-
-stages!(
-    UserCreateBegun,
-    UserCreateTenantSaved,
-    UserCreateUserSaved,
-    UserCreateAttached
-);
-
-/// Creating a tenant with its owner, as one transaction whose steps run in one order.
-///
-/// Each step is implemented only on the stage before it, so a step cannot be skipped or
-/// reordered: the call that would do so does not compile. Dropping the transaction before
-/// committing rolls back everything it wrote.
-///
-/// ```
-/// # use ip_storage::transaction::user_create::{UserCreateBegun, UserCreateTxn};
-/// # use ip_storage::{IdentityDialect, Membership, NewTenant, NewUser, Standing};
-/// # async fn run<DB: IdentityDialect>(txn: UserCreateTxn<DB, UserCreateBegun>, tenant: NewTenant, owner: NewUser) {
-/// let txn = txn.create_tenant(tenant).await.unwrap();
-/// let txn = txn.create_user(owner).await.unwrap();
-/// let txn = txn.attach(Standing::Owner).await.unwrap();
-/// let created = txn.commit().await.unwrap();
-/// # }
-/// ```
-///
-/// Attaching before there is anything to attach does not compile:
-///
-/// ```compile_fail
-/// # use ip_storage::transaction::user_create::{UserCreateBegun, UserCreateTxn};
-/// # use ip_storage::{IdentityDialect, Standing};
-/// # async fn run<DB: IdentityDialect>(txn: UserCreateTxn<DB, UserCreateBegun>) {
-/// // attach belongs to UserCreateTxn<DB, UserCreateUserSaved>, so no owner can be attached to nothing.
-/// let txn = txn.attach(Standing::Owner).await.unwrap();
-/// # }
-/// ```
-///
-/// Committing before the owner is attached does not compile either:
-///
-/// ```compile_fail
-/// # use ip_storage::transaction::user_create::{UserCreateBegun, UserCreateTxn};
-/// # use ip_storage::{IdentityDialect, NewTenant};
-/// # async fn run<DB: IdentityDialect>(txn: UserCreateTxn<DB, UserCreateBegun>, tenant: NewTenant) {
-/// let txn = txn.create_tenant(tenant).await.unwrap();
-/// let created = txn.commit().await.unwrap();
-/// # }
-/// ```
-pub struct UserCreateTxn<DB: Database, S: UserCreateStage> {
-    inner: sqlx::Transaction<'static, DB>,
-    stage: S,
-}
-
-impl<DB: IdentityDialect> UserCreateTxn<DB, UserCreateBegun> {
-    /// Takes over a transaction the backend opened.
-    pub fn new(inner: sqlx::Transaction<'static, DB>) -> Self {
-        Self {
-            inner,
-            stage: UserCreateBegun,
+transaction! {
+    name: UserCreate,
+    generics: <DB: IdentityDialect>,
+    carrier: sqlx::Transaction<'static, DB>,
+    error: StorageError,
+    record: TenantWithOwner,
+    finish: { carrier.commit().await.map_err(StorageError::backend)? },
+    steps: {
+        create_tenant(new: NewTenant) -> tenant: Tenant as TenantSaved {
+            DB::insert_tenant(carrier, new).await?
         }
-    }
-
-    /// Writes the tenant, or reports a conflict when the id is taken.
-    pub async fn create_tenant(
-        mut self,
-        new: NewTenant,
-    ) -> Result<UserCreateTxn<DB, UserCreateTenantSaved>, StorageError> {
-        let tenant = DB::insert_tenant(&mut self.inner, new).await?;
-        Ok(UserCreateTxn {
-            inner: self.inner,
-            stage: UserCreateTenantSaved { tenant },
-        })
-    }
-}
-
-impl<DB: IdentityDialect> UserCreateTxn<DB, UserCreateTenantSaved> {
-    /// The tenant written so far.
-    pub fn tenant(&self) -> &Tenant {
-        &self.stage.tenant
-    }
-
-    /// Writes the owner account, or reports a conflict when the id is taken.
-    pub async fn create_user(
-        mut self,
-        new: NewUser,
-    ) -> Result<UserCreateTxn<DB, UserCreateUserSaved>, StorageError> {
-        let user = DB::insert_user(&mut self.inner, new).await?;
-        Ok(UserCreateTxn {
-            inner: self.inner,
-            stage: UserCreateUserSaved {
-                tenant: self.stage.tenant,
-                user,
-            },
-        })
-    }
-}
-
-impl<DB: IdentityDialect> UserCreateTxn<DB, UserCreateUserSaved> {
-    /// The tenant written so far.
-    pub fn tenant(&self) -> &Tenant {
-        &self.stage.tenant
-    }
-
-    /// The user written so far.
-    pub fn user(&self) -> &User {
-        &self.stage.user
-    }
-
-    /// Attaches the user to the tenant this transaction wrote, and no other.
-    pub async fn attach(
-        mut self,
-        standing: Standing,
-    ) -> Result<UserCreateTxn<DB, UserCreateAttached>, StorageError> {
-        let membership = Membership {
-            user: self.stage.user.id.clone(),
-            tenant: self.stage.tenant.id.clone(),
-            standing,
-        };
-        DB::insert_membership(&mut self.inner, membership.clone()).await?;
-        Ok(UserCreateTxn {
-            inner: self.inner,
-            stage: UserCreateAttached {
-                tenant: self.stage.tenant,
-                user: self.stage.user,
-                membership,
-            },
-        })
-    }
-}
-
-impl<DB: IdentityDialect> UserCreateTxn<DB, UserCreateAttached> {
-    /// Lands the tenant, its owner and their attachment together.
-    pub async fn commit(self) -> Result<TenantWithOwner, StorageError> {
-        self.inner.commit().await.map_err(StorageError::backend)?;
-        Ok(TenantWithOwner {
-            tenant: self.stage.tenant,
-            owner: self.stage.user,
-            membership: self.stage.membership,
-        })
+        create_user(new: NewUser) -> owner: User as UserSaved {
+            DB::insert_user(carrier, new).await?
+        }
+        attach(standing: Standing) -> membership: Membership as Attached {
+            let membership = Membership {
+                user: owner.id.clone(),
+                tenant: tenant.id.clone(),
+                standing,
+            };
+            DB::insert_membership(carrier, membership.clone()).await?;
+            membership
+        }
     }
 }
 

@@ -13,10 +13,6 @@ use sqlx::Database;
 use crate::error::StorageError;
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 
-pub(crate) mod sealed {
-    pub trait Sealed {}
-}
-
 /// The identity writes one backend contributes, in its own dialect.
 ///
 /// Sqlite binds `?` and postgres binds `$1`, so the statements cannot be shared. What is

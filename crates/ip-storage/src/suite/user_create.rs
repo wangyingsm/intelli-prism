@@ -121,7 +121,7 @@ pub(crate) async fn a_transaction_reads_back_what_it_has_written(store: &impl Us
         .await
         .unwrap();
     assert_eq!(saved.tenant().id, tenant_id());
-    assert_eq!(saved.user().id, user_id());
+    assert_eq!(saved.owner().id, user_id());
     // Attaching looks up both row ids, which are only there for a transaction reading its own writes.
     saved
         .attach(Standing::Owner)
