@@ -13,6 +13,7 @@ pub mod sqlite;
 pub mod store;
 #[cfg(all(test, any(feature = "standalone-storage", feature = "fast-storage")))]
 mod suite;
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub mod transaction;
 
 pub use error::{Entity, StorageError};
@@ -27,6 +28,9 @@ pub use route::RouteStore;
 #[cfg(feature = "standalone-storage")]
 pub use sqlite::SqliteStore;
 pub use store::{Backend, GrantStore, MembershipStore, Storage, TenantStore, UserStore};
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::IdentityDialect;
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::member_add::{MemberAddTransactional, MemberAddTxn};
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::user_create::{UserCreateTransactional, UserCreateTxn};
