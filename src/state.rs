@@ -332,6 +332,55 @@ secret = "0123456789abcdef0123456789abcdef"
 
     #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]
     #[tokio::test]
+    async fn a_response_ttl_of_no_time_stops_startup() {
+        let path = std::env::temp_dir().join(format!("ip-nottl-{}.db", std::process::id()));
+        let cache = scratch("nottl-cache");
+        let _ = std::fs::remove_file(&path);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &format!(
+                "[cache]\nbackend = \"sled\"\npath = {:?}\nresponse_ttl = 0",
+                cache.display()
+            ),
+        );
+        let outcome = AppState::open(&config).await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
+        assert!(matches!(
+            outcome,
+            Err(StartupError::Cache(ip_cache::CacheError::ZeroTtl))
+        ));
+    }
+
+    #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]
+    #[tokio::test]
+    async fn a_cache_answering_responses_under_every_limit_opens() {
+        let path = std::env::temp_dir().join(format!("ip-limited-{}.db", std::process::id()));
+        let cache = scratch("limited-cache");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &format!(
+                "[cache]\nbackend = \"sled\"\npath = {:?}\nresponse_ttl = 60\n\
+                 response_max_bytes = 4096\nsemantic_max_bytes = 4096\nsystem_max_bytes = 4096",
+                cache.display()
+            ),
+        );
+        let state = AppState::open(&config).await.unwrap();
+        assert_eq!(state.listen(), config.server.listen);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]
+    #[tokio::test]
     async fn the_opened_cache_is_the_one_the_configuration_named() {
         let path = std::env::temp_dir().join(format!("ip-cached-{}.db", std::process::id()));
         let cache = scratch("named-cache");
