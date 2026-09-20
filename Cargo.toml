@@ -20,7 +20,7 @@ ip-core = { version = "0.1.0", path = "crates/ip-core" }
 ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }
-serde = { version = "1.0.229", features = ["derive"] }
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing = "0.1.44"
@@ -38,8 +38,11 @@ license = "MIT OR Apache-2.0"
 authors = ["wangy <yingge_gzb@qq.com>"]
 
 [workspace.dependencies]
+getrandom = "0.4.3"
 hex = "0.4.3"
 ip-core = { path = "crates/ip-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
@@ -50,7 +53,7 @@ bytes = "1.12.1"
 http-body-util = "0.1.5"
 ip-cache = { version = "0.1.0", path = "crates/ip-cache", features = ["standalone-cache"] }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", features = ["standalone-storage"] }
-serde_json = "1.0.151"
+serde_json.workspace = true
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
 tower = "0.5.3"
 wat = "1.259.0"

@@ -9,7 +9,7 @@ authors.workspace = true
 
 [dependencies]
 ip-core = { version = "0.1.0", path = "../ip-core" }
-serde = { version = "1.0.229", features = ["derive"] }
+serde.workspace = true
 subtle = "2.6.1"
 thiserror.workspace = true
 toml = "1.1.5"
