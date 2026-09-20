@@ -1,22 +1,38 @@
+mod admin;
 mod auth;
+mod cli;
 mod error;
 mod routes;
 mod state;
 mod telemetry;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::Path;
 
+use clap::Parser;
 use ip_config::Config;
 
+use crate::cli::{Cli, Command};
 use crate::error::StartupError;
 use crate::state::AppState;
 
-const DEFAULT_CONFIG_PATH: &str = "intelli-prism.toml";
+pub(crate) const DEFAULT_CONFIG_PATH: &str = "intelli-prism.toml";
 
 #[tokio::main]
 async fn main() -> Result<(), StartupError> {
-    let config = Config::load(config_path())?;
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Admin { command }) => {
+            let passphrase = admin::ask_passphrase()?;
+            admin::run(command, &cli.config, &passphrase).await
+        }
+        None => serve(&cli.config).await,
+    }
+}
+
+/// Opens everything the configuration names and serves until the kernel says to stop.
+async fn serve(config: &Path) -> Result<(), StartupError> {
+    let config = Config::load(config)?;
     telemetry::install(&config.telemetry);
 
     let state = AppState::open(&config).await?;
@@ -33,13 +49,6 @@ async fn main() -> Result<(), StartupError> {
     .with_graceful_shutdown(shutdown())
     .await
     .map_err(StartupError::Serve)
-}
-
-fn config_path() -> PathBuf {
-    std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
 }
 
 async fn shutdown() {

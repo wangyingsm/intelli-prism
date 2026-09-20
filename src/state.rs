@@ -81,7 +81,7 @@ impl AppState {
     }
 }
 
-async fn open_store(config: &StorageConfig) -> Result<Arc<dyn Backend>, StartupError> {
+pub(crate) async fn open_store(config: &StorageConfig) -> Result<Arc<dyn Backend>, StartupError> {
     match config {
         #[cfg(feature = "standalone-storage")]
         StorageConfig::Sqlite { path } => Ok(Arc::new(SqliteStore::open(path).await?)),

@@ -10,6 +10,17 @@ use ip_storage::StorageError;
 /// Every way the server can fail before it is listening.
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
+    /// The command line did not say what to do.
+    #[error("{detail}")]
+    Usage {
+        /// What was wrong with it.
+        detail: String,
+    },
+
+    /// A passphrase or an identity was refused.
+    #[error(transparent)]
+    Auth(#[from] ip_auth::AuthError),
+
     /// The configuration file could not be loaded.
     #[error(transparent)]
     Config(#[from] ConfigError),
