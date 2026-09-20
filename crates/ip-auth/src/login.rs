@@ -1,16 +1,19 @@
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ip_cache::{Cache, CacheKey, CacheLevel, Ttl};
 use ip_core::{PassphraseHash, UserId};
 use ip_storage::{Storage, User};
 
 use crate::error::AuthError;
 use crate::passphrase::{Passphrase, PassphraseHasher};
-use crate::session::{SessionId, SessionToken, SessionTokens};
+use crate::session::{Session, SessionId, SessionToken, SessionTokens};
 
 /// Logs a user in against the stored passphrase verifier, and hands back a session token.
 #[derive(Clone)]
 pub struct Logins {
     store: Arc<dyn Storage>,
+    cache: Arc<dyn Cache>,
     hasher: PassphraseHasher,
     tokens: SessionTokens,
     /// A verifier for a passphrase nobody knows, so a login for a user that does not exist
@@ -19,17 +22,52 @@ pub struct Logins {
 }
 
 impl Logins {
-    /// Reads users out of this store and issues tokens with these settings.
-    pub fn new(store: Arc<dyn Storage>, tokens: SessionTokens) -> Result<Self, AuthError> {
+    /// Reads users out of this store, issues tokens with these settings, and ends sessions
+    /// in this cache.
+    pub fn new(
+        store: Arc<dyn Storage>,
+        cache: Arc<dyn Cache>,
+        tokens: SessionTokens,
+    ) -> Result<Self, AuthError> {
         let hasher = PassphraseHasher::new();
         let unknowable = Passphrase::new(SessionId::generate()?.as_str())?;
         let absent = hasher.hash(&unknowable)?;
         Ok(Self {
             store,
+            cache,
             hasher,
             tokens,
             absent,
         })
+    }
+
+    /// Reads a token back, refusing one this server did not issue, one that has run out, and
+    /// one whose session was logged out.
+    pub async fn session(&self, token: &str) -> Result<Session, AuthError> {
+        let session = self.tokens.verify(token)?;
+        match self.is_ended(&session).await? {
+            true => Err(AuthError::SessionRejected),
+            false => Ok(session),
+        }
+    }
+
+    /// Ends a session, so the token stays refused until it would have run out anyway.
+    ///
+    /// A token cannot be taken back once it is issued, so the cache remembers the ones that
+    /// were given up. Remembering them past their own expiry would only waste room.
+    pub async fn end(&self, session: &Session) -> Result<(), AuthError> {
+        let Some(left) = remaining(session, SystemTime::now()) else {
+            return Ok(());
+        };
+        self.cache
+            .put(&ended_key(session.id())?, &[], Some(left))
+            .await?;
+        Ok(())
+    }
+
+    /// Whether this session was logged out before its token ran out.
+    pub async fn is_ended(&self, session: &Session) -> Result<bool, AuthError> {
+        Ok(self.cache.get(&ended_key(session.id())?).await?.is_some())
     }
 
     /// Checks a passphrase and issues a session, or refuses without saying which half was wrong.
@@ -53,6 +91,21 @@ impl Logins {
     fn verifier_of<'a>(&'a self, stored: Option<&'a User>) -> &'a PassphraseHash {
         stored.map_or(&self.absent, |user| &user.passphrase)
     }
+}
+
+/// How long a session has left, or nothing when its token has run out already.
+fn remaining(session: &Session, now: SystemTime) -> Option<Ttl> {
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let left = session.expires_at().checked_sub(now)?;
+    Ttl::new(Duration::from_secs(left)).ok()
+}
+
+/// Where a session that was logged out is remembered.
+fn ended_key(session: &SessionId) -> Result<CacheKey, AuthError> {
+    Ok(CacheKey::new(
+        CacheLevel::System,
+        &format!("session-ended:{session}"),
+    )?)
 }
 
 #[cfg(test)]
@@ -86,7 +139,8 @@ mod tests {
             .await
             .unwrap();
         let tokens = SessionTokens::new("intelli-prism", SECRET, Duration::from_secs(3600));
-        Logins::new(Arc::new(store), tokens).unwrap()
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        Logins::new(Arc::new(store), cache, tokens).unwrap()
     }
 
     #[tokio::test]
@@ -150,6 +204,56 @@ mod tests {
             logins.tokens.verify(first.as_str()).unwrap().id(),
             logins.tokens.verify(second.as_str()).unwrap().id()
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_reads_back_until_it_is_ended() {
+        let logins = logins(AccountKind::Regular).await;
+        let token = logins
+            .log_in(&alice(), &passphrase("correct horse staple"))
+            .await
+            .unwrap();
+        let session = logins.session(token.as_str()).await.unwrap();
+        assert_eq!(session.user(), &alice());
+
+        logins.end(&session).await.unwrap();
+        assert!(logins.is_ended(&session).await.unwrap());
+        assert!(matches!(
+            logins.session(token.as_str()).await,
+            Err(AuthError::SessionRejected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ending_one_session_leaves_another_alone() {
+        let logins = logins(AccountKind::Regular).await;
+        let ended = logins
+            .log_in(&alice(), &passphrase("correct horse staple"))
+            .await
+            .unwrap();
+        let kept = logins
+            .log_in(&alice(), &passphrase("correct horse staple"))
+            .await
+            .unwrap();
+        logins
+            .end(&logins.session(ended.as_str()).await.unwrap())
+            .await
+            .unwrap();
+        assert!(logins.session(kept.as_str()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_whose_token_has_run_out_writes_nothing() {
+        let logins = logins(AccountKind::Regular).await;
+        let token = logins
+            .log_in(&alice(), &passphrase("correct horse staple"))
+            .await
+            .unwrap();
+        let mut session = logins.session(token.as_str()).await.unwrap();
+        // A token that ran out an hour ago needs no remembering: it is refused on its own.
+        session = Session::for_test(session.user().clone(), session.id().clone(), 0);
+        logins.end(&session).await.unwrap();
+        assert!(!logins.is_ended(&session).await.unwrap());
     }
 
     #[tokio::test]

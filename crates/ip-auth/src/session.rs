@@ -51,6 +51,12 @@ impl SessionToken {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Wraps text as a token, for tests that need one without a server to issue it.
+    #[doc(hidden)]
+    pub fn from_str_for_test(raw: &str) -> Self {
+        Self(raw.to_owned())
+    }
 }
 
 impl fmt::Debug for SessionToken {
@@ -82,6 +88,16 @@ impl Session {
     /// Seconds since the unix epoch at which the token stops being accepted.
     pub fn expires_at(&self) -> u64 {
         self.expires_at
+    }
+
+    /// Builds a session with an expiry of its own, so a test can age one.
+    #[cfg(test)]
+    pub(crate) fn for_test(user: UserId, id: SessionId, expires_at: u64) -> Self {
+        Self {
+            user,
+            id,
+            expires_at,
+        }
     }
 }
 
