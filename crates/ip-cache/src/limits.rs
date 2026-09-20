@@ -95,6 +95,14 @@ mod tests {
     }
 
     #[test]
+    fn the_semantic_level_carries_its_own_limit() {
+        let limits = LevelLimits::none().with_semantic(MaxBytes::new(30).unwrap());
+        assert_eq!(limits.of(CacheLevel::Semantic), MaxBytes::new(30).ok());
+        assert_eq!(limits.of(CacheLevel::Response), None);
+        assert!(limits.any());
+    }
+
+    #[test]
     fn limiting_nothing_limits_no_level() {
         let limits = LevelLimits::none();
         assert!(!limits.any());
