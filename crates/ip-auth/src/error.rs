@@ -80,6 +80,10 @@ pub enum AuthError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 
+    /// The user or the passphrase was wrong, and which one is never said.
+    #[error("login refused")]
+    LoginRefused,
+
     /// A session token is not one this server issued, or it has run out.
     #[error("session token rejected")]
     SessionRejected,
