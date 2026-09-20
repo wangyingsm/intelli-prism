@@ -6,12 +6,14 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
 use ip_auth::{Identity, Passphrase};
-use ip_core::{Protocol, Role};
+use ip_core::{Capability, CapabilityScope, Protocol, Role};
 use ip_gateway::{GatewayBody, GatewayError, RequestContext};
+use ip_storage::Standing;
 use std::net::SocketAddr;
 
 use crate::auth::Authenticated;
 use crate::cookie;
+use crate::manage::{self, Manager};
 use crate::state::AppState;
 
 /// Every route the server serves.
@@ -23,6 +25,7 @@ pub fn router(state: AppState) -> Router {
         .route("/_ip/healthz", get(healthz))
         .route("/_ip/login", post(login))
         .route("/_ip/logout", post(logout))
+        .route("/_ip/session", get(session))
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))
@@ -87,6 +90,9 @@ async fn login(
 /// The token cannot be taken back, so the session is remembered as ended until the token
 /// would have run out anyway.
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+    if !headers.contains_key(manage::CSRF_HEADER) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(token) = cookie::token(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -100,6 +106,81 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response<B
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(SET_COOKIE, cookie::clear());
     response
+}
+
+/// Who the caller is, and what it may do where.
+#[derive(Debug, serde::Serialize)]
+pub struct Whose {
+    /// The account calling.
+    pub user: String,
+    /// Whether it holds every capability everywhere.
+    pub system_administrator: bool,
+    /// The tenants it is attached to, and what it may do inside each.
+    pub tenants: Vec<Reach>,
+}
+
+/// One tenant the caller reaches, and what it holds there.
+#[derive(Debug, serde::Serialize)]
+pub struct Reach {
+    /// Which tenant.
+    pub tenant: String,
+    /// What the caller is inside it.
+    pub standing: &'static str,
+    /// The capabilities it holds there, which is what a page draws its menu from.
+    pub capabilities: Vec<&'static str>,
+}
+
+/// What a caller may hold inside one tenant, as opposed to against one api.
+const TENANT_CAPABILITIES: [(Capability, &str); 3] = [
+    (Capability::UserMgr, "user_mgr"),
+    (Capability::SysAgent, "sys_agent"),
+    (Capability::Observer, "observer"),
+];
+
+/// Who the session belongs to, which is what a page asks for once it has logged in.
+async fn session(State(state): State<AppState>, manager: Manager) -> Response<Body> {
+    let store = state.store().as_ref();
+    let attached = match store.memberships_of_user(manager.user()).await {
+        Ok(attached) => attached,
+        Err(error) => {
+            tracing::error!(%error, "could not read what the caller is attached to");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut tenants = Vec::with_capacity(attached.len());
+    for membership in attached {
+        let mut capabilities = Vec::new();
+        for (capability, name) in TENANT_CAPABILITIES {
+            let scope = CapabilityScope::Tenant {
+                user: manager.user().clone(),
+                tenant: membership.tenant.clone(),
+            };
+            match manager.allows(store, capability, &scope).await {
+                Ok(true) => capabilities.push(name),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, "could not read what the caller holds");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+        tenants.push(Reach {
+            tenant: membership.tenant.to_string(),
+            standing: match membership.standing {
+                Standing::Owner => "owner",
+                Standing::Member => "member",
+            },
+            capabilities,
+        });
+    }
+
+    Json(Whose {
+        user: manager.user().to_string(),
+        system_administrator: manager.is_system_administrator(),
+        tenants,
+    })
+    .into_response()
 }
 
 /// Anything else under the reserved prefix belongs to no endpoint and is never proxied.
@@ -391,9 +472,16 @@ secret = "0123456789abcdef0123456789abcdef"
     }
 
     fn logout_request(cookie: Option<&str>) -> Request<Body> {
+        logout_request_with(cookie, true)
+    }
+
+    fn logout_request_with(cookie: Option<&str>, csrf: bool) -> Request<Body> {
         let mut builder = Request::builder().method("POST").uri("/_ip/logout");
         if let Some(cookie) = cookie {
             builder = builder.header("cookie", cookie);
+        }
+        if csrf {
+            builder = builder.header(manage::CSRF_HEADER, "1");
         }
         builder.body(Body::empty()).unwrap()
     }
@@ -496,6 +584,71 @@ secret = "0123456789abcdef0123456789abcdef"
         // The token still parses, so only the ending keeps it from being spent again.
         let again = router.oneshot(logout_request(Some(&cookie))).await.unwrap();
         assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_session_says_who_it_belongs_to() {
+        let router = fixture_that_can_log_in().await;
+        let opened = router
+            .clone()
+            .oneshot(login_request("alice", "correct horse staple"))
+            .await
+            .unwrap();
+        let cookie = session_cookie(&opened);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_ip/session")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_of(response).await;
+        assert!(body.contains(r#""user":"alice""#), "{body}");
+        assert!(body.contains(r#""system_administrator":false"#), "{body}");
+        assert!(body.contains(r#""tenant":"acme""#), "{body}");
+        assert!(body.contains(r#""standing":"member""#), "{body}");
+        assert!(body.contains(r#""capabilities":[]"#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_session_nobody_opened_says_nothing() {
+        let router = fixture_that_can_log_in().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_ip/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_logout_another_site_started_is_refused() {
+        let router = fixture_that_can_log_in().await;
+        let opened = router
+            .clone()
+            .oneshot(login_request("alice", "correct horse staple"))
+            .await
+            .unwrap();
+        let cookie = session_cookie(&opened);
+        // A page elsewhere can make the browser send the cookie, but not the header.
+        let forged = router
+            .clone()
+            .oneshot(logout_request_with(Some(&cookie), false))
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+        // And the session it tried to end still works.
+        let ended = router.oneshot(logout_request(Some(&cookie))).await.unwrap();
+        assert_eq!(ended.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

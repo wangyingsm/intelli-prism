@@ -21,6 +21,7 @@ use crate::error::StartupError;
 /// What every handler is given.
 #[derive(Clone)]
 pub struct AppState {
+    store: Arc<dyn Storage>,
     verifier: RequestVerifier,
     logins: Arc<Logins>,
     session_seconds: u64,
@@ -57,6 +58,7 @@ impl AppState {
         );
         let logins = Logins::new(Arc::clone(&store), Arc::clone(&cache), tokens)?;
         Ok(Self {
+            store: Arc::clone(&store),
             verifier: RequestVerifier::new(store, cache, nonce_ttl),
             logins: Arc::new(logins),
             session_seconds: config.auth.jwt.ttl.get(),
@@ -76,6 +78,7 @@ impl AppState {
         );
         let logins = Logins::new(Arc::clone(&store), cache.clone(), tokens).expect("logins");
         Self {
+            store: Arc::clone(&store),
             verifier: RequestVerifier::new(store, cache, Ttl::seconds(300).expect("a nonce ttl")),
             logins: Arc::new(logins),
             session_seconds: 3600,
@@ -87,6 +90,11 @@ impl AppState {
     /// Checks request signatures against the store.
     pub fn verifier(&self) -> &RequestVerifier {
         &self.verifier
+    }
+
+    /// Reads the tenants, users and grants the management api works on.
+    pub fn store(&self) -> &Arc<dyn Storage> {
+        &self.store
     }
 
     /// Opens and ends the sessions the web carries.

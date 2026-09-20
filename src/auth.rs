@@ -45,7 +45,7 @@ impl FromRequestParts<AppState> for Authenticated {
     }
 }
 
-fn signed_request(parts: &Parts) -> Option<SignedRequest> {
+pub(crate) fn signed_request(parts: &Parts) -> Option<SignedRequest> {
     Some(SignedRequest {
         tenant: TenantId::new(header(parts, HEADER_TENANT)?).ok()?,
         user: UserId::new(header(parts, HEADER_USER)?).ok()?,
@@ -56,7 +56,7 @@ fn signed_request(parts: &Parts) -> Option<SignedRequest> {
 
 /// Removes the caller's credentials once they are read, so neither a plugin nor an
 /// upstream ever sees a signature it could replay.
-fn consume_signing_headers(parts: &mut Parts) {
+pub(crate) fn consume_signing_headers(parts: &mut Parts) {
     for name in [HEADER_TENANT, HEADER_USER, HEADER_SIGNATURE, HEADER_NONCE] {
         parts.headers.remove(name);
     }
@@ -67,7 +67,7 @@ fn header<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
 }
 
 /// An absent peer address is treated as remote, so the admin rule can never be skipped.
-fn origin(parts: &Parts) -> IpAddr {
+pub(crate) fn origin(parts: &Parts) -> IpAddr {
     parts
         .extensions
         .get::<ConnectInfo<SocketAddr>>()

@@ -3,6 +3,7 @@ mod auth;
 mod cli;
 mod cookie;
 mod error;
+mod manage;
 mod routes;
 mod state;
 mod telemetry;
