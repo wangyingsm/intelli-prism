@@ -184,3 +184,94 @@ impl UpstreamError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use ip_core::{AbsPath, Endpoint, Host, Port};
+
+    use super::*;
+
+    fn status_of(kind: GatewayErrorKind) -> StatusCode {
+        GatewayError::new(StageName::Route, kind).status()
+    }
+
+    fn key() -> RouteKey {
+        RouteKey::new(Endpoint::new(
+            Protocol::Http,
+            Host::new("gateway.local").unwrap(),
+            Port::new(8080).unwrap(),
+            AbsPath::new("/nowhere").unwrap(),
+        ))
+    }
+
+    #[test]
+    fn every_kind_answers_with_the_status_it_is_meant_to() {
+        let cases = [
+            (GatewayErrorKind::Unauthenticated, StatusCode::UNAUTHORIZED),
+            (
+                GatewayErrorKind::Forbidden {
+                    capability: Capability::ApiAccess,
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                GatewayErrorKind::NoRoute { key: key() },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                GatewayErrorKind::ProtocolNotServed {
+                    protocol: Protocol::Ws,
+                },
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+            (
+                GatewayErrorKind::Malformed {
+                    detail: "no host".to_owned(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                GatewayErrorKind::Value(CoreError::ZeroPort),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                GatewayErrorKind::Processor(ProcessorError::Refused {
+                    reason: "no".to_owned(),
+                }),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                GatewayErrorKind::Processor(ProcessorError::failed("trapped")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                GatewayErrorKind::Upstream(UpstreamError::new("refused")),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                GatewayErrorKind::Cache(CacheError::ZeroTtl),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (kind, status) in cases {
+            let described = kind.to_string();
+            assert_eq!(status_of(kind), status, "{described}");
+        }
+    }
+
+    #[test]
+    fn only_a_deliberate_refusal_tells_the_caller_why() {
+        let refused = GatewayError::new(
+            StageName::BodyProcess,
+            GatewayErrorKind::Processor(ProcessorError::Refused {
+                reason: "too long".to_owned(),
+            }),
+        );
+        assert_eq!(refused.public_reason(), Some("too long"));
+        let failed = GatewayError::new(
+            StageName::BodyProcess,
+            GatewayErrorKind::Processor(ProcessorError::failed("trapped")),
+        );
+        assert_eq!(failed.public_reason(), None);
+    }
+}
