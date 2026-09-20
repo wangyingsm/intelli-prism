@@ -80,6 +80,18 @@ pub enum AuthError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 
+    /// A session token is not one this server issued, or it has run out.
+    #[error("session token rejected")]
+    SessionRejected,
+
+    /// A session token could not be built.
+    #[error("session token could not be issued")]
+    SessionIssue(#[source] serde_json::Error),
+
+    /// The system's random source failed.
+    #[error("could not draw random bytes")]
+    Random(#[source] getrandom::Error),
+
     /// The cache could not answer.
     #[error(transparent)]
     Cache(#[from] CacheError),

@@ -1244,9 +1244,16 @@ name = "ip-auth"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64",
+ "getrandom 0.4.3",
+ "hex",
+ "hmac",
  "ip-cache",
  "ip-core",
  "ip-storage",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "zeroize",
