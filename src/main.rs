@@ -1,6 +1,7 @@
 mod admin;
 mod auth;
 mod cli;
+mod cookie;
 mod error;
 mod routes;
 mod state;

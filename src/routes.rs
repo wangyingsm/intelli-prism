@@ -1,16 +1,17 @@
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{Request, Response, StatusCode};
+use axum::http::{HeaderMap, Request, Response, StatusCode, header::SET_COOKIE};
 use axum::response::IntoResponse;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
-use ip_auth::Identity;
+use ip_auth::{Identity, Passphrase};
 use ip_core::{Protocol, Role};
 use ip_gateway::{GatewayBody, GatewayError, RequestContext};
 use std::net::SocketAddr;
 
 use crate::auth::Authenticated;
+use crate::cookie;
 use crate::state::AppState;
 
 /// Every route the server serves.
@@ -20,6 +21,8 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/_ip/healthz", get(healthz))
+        .route("/_ip/login", post(login))
+        .route("/_ip/logout", post(logout))
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))
@@ -43,6 +46,60 @@ async fn healthz() -> &'static str {
 
 async fn whoami(Authenticated(authority): Authenticated) -> Json<WhoAmI> {
     Json(WhoAmI::from(authority.identity().clone()))
+}
+
+/// What a login is asked for.
+#[derive(serde::Deserialize)]
+pub struct Credentials {
+    /// Who is logging in.
+    user: String,
+    /// What they typed.
+    passphrase: String,
+}
+
+/// Opens a session for a caller that proves who it is, and hands back its cookie.
+///
+/// Every refusal is the same status: telling a wrong user from a wrong passphrase would
+/// say which accounts exist.
+async fn login(
+    State(state): State<AppState>,
+    Json(credentials): Json<Credentials>,
+) -> Response<Body> {
+    let opened = async {
+        let user = ip_core::UserId::new(&credentials.user).ok()?;
+        let passphrase = Passphrase::new(&credentials.passphrase).ok()?;
+        state.logins().log_in(&user, &passphrase).await.ok()
+    }
+    .await;
+    let Some(token) = opened else {
+        tracing::warn!(user = %credentials.user, "refused a login");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response
+        .headers_mut()
+        .insert(SET_COOKIE, cookie::set(&token, state.session_seconds()));
+    response
+}
+
+/// Ends the session the cookie carries, and clears the cookie.
+///
+/// The token cannot be taken back, so the session is remembered as ended until the token
+/// would have run out anyway.
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response<Body> {
+    let Some(token) = cookie::token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Ok(session) = state.logins().session(token).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if let Err(error) = state.logins().end(&session).await {
+        tracing::error!(%error, "could not end a session");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(SET_COOKIE, cookie::clear());
+    response
 }
 
 /// Anything else under the reserved prefix belongs to no endpoint and is never proxied.
@@ -305,6 +362,159 @@ secret = "0123456789abcdef0123456789abcdef"
     async fn body_of(response: Response<Body>) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A router over a store whose user really has the passphrase the login tests type.
+    async fn fixture_that_can_log_in() -> Router {
+        let (store, _) = seeded_store(true).await;
+        let hashed = ip_auth::PassphraseHasher::new()
+            .hash(&Passphrase::new("correct horse staple").unwrap())
+            .unwrap();
+        store.set_passphrase(&user_id(), &hashed).await.unwrap();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            Arc::new(FakeUpstream::default()),
+        );
+        router(state_over(store, gateway))
+    }
+
+    fn login_request(user: &str, passphrase: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/_ip/login")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"user":"{user}","passphrase":"{passphrase}"}}"#
+            )))
+            .unwrap()
+    }
+
+    fn logout_request(cookie: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method("POST").uri("/_ip/logout");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    /// The `ip_session=...` pair out of a response, ready to send back as a cookie.
+    fn session_cookie(response: &Response<Body>) -> String {
+        response
+            .headers()
+            .get(SET_COOKIE)
+            .expect("a session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn the_right_passphrase_opens_a_session() {
+        let router = fixture_that_can_log_in().await;
+        let response = router
+            .oneshot(login_request("alice", "correct horse staple"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cookie = response.headers()[SET_COOKIE].to_str().unwrap().to_owned();
+        for attribute in [
+            "ip_session=",
+            "HttpOnly",
+            "Secure",
+            "SameSite=Strict",
+            "Max-Age=3600",
+        ] {
+            assert!(
+                cookie.contains(attribute),
+                "{attribute} is missing from {cookie}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_wrong_passphrase_opens_nothing() {
+        let router = fixture_that_can_log_in().await;
+        let response = router
+            .oneshot(login_request("alice", "incorrect horse staple"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_user_that_does_not_exist_is_refused_the_same_way() {
+        let router = fixture_that_can_log_in().await;
+        let response = router
+            .oneshot(login_request("nobody", "correct horse staple"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_login_that_is_not_even_credentials_is_refused() {
+        let router = fixture_that_can_log_in().await;
+        let malformed = Request::builder()
+            .method("POST")
+            .uri("/_ip/login")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = router.oneshot(malformed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_logout_ends_the_session_and_clears_the_cookie() {
+        let router = fixture_that_can_log_in().await;
+        let opened = router
+            .clone()
+            .oneshot(login_request("alice", "correct horse staple"))
+            .await
+            .unwrap();
+        let cookie = session_cookie(&opened);
+
+        let ended = router
+            .clone()
+            .oneshot(logout_request(Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(ended.status(), StatusCode::NO_CONTENT);
+        assert!(
+            ended.headers()[SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+
+        // The token still parses, so only the ending keeps it from being spent again.
+        let again = router.oneshot(logout_request(Some(&cookie))).await.unwrap();
+        assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_logout_without_a_session_is_refused() {
+        let router = fixture_that_can_log_in().await;
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(logout_request(None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let forged = router
+            .oneshot(logout_request(Some("ip_session=a.b.c")))
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

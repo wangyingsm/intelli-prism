@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ip_auth::RequestVerifier;
+use ip_auth::{Logins, RequestVerifier, SessionTokens};
 #[cfg(feature = "cluster-cache")]
 use ip_cache::RedisCache;
 use ip_cache::{Cache, Ttl};
@@ -22,6 +22,8 @@ use crate::error::StartupError;
 #[derive(Clone)]
 pub struct AppState {
     verifier: RequestVerifier,
+    logins: Arc<Logins>,
+    session_seconds: u64,
     gateway: Arc<Gateway>,
     listen: SocketAddr,
 }
@@ -47,8 +49,17 @@ impl AppState {
             );
         }
         let nonce_ttl = Ttl::new(config.auth.nonce_ttl.as_duration())?;
+        let store = store as Arc<dyn Storage>;
+        let tokens = SessionTokens::new(
+            &config.auth.jwt.issuer,
+            config.auth.jwt.secret.expose().as_bytes(),
+            config.auth.jwt.ttl.as_duration(),
+        );
+        let logins = Logins::new(Arc::clone(&store), Arc::clone(&cache), tokens)?;
         Ok(Self {
-            verifier: RequestVerifier::new(store as Arc<dyn Storage>, cache, nonce_ttl),
+            verifier: RequestVerifier::new(store, cache, nonce_ttl),
+            logins: Arc::new(logins),
+            session_seconds: config.auth.jwt.ttl.get(),
             gateway: Arc::new(gateway),
             listen: config.server.listen,
         })
@@ -58,8 +69,16 @@ impl AppState {
     #[cfg(test)]
     pub fn with_parts(store: Arc<dyn Storage>, gateway: Gateway, listen: SocketAddr) -> Self {
         let cache = Arc::new(ip_cache::SledCache::temporary().expect("a temporary cache"));
+        let tokens = SessionTokens::new(
+            "intelli-prism",
+            b"0123456789abcdef0123456789abcdef",
+            std::time::Duration::from_secs(3600),
+        );
+        let logins = Logins::new(Arc::clone(&store), cache.clone(), tokens).expect("logins");
         Self {
             verifier: RequestVerifier::new(store, cache, Ttl::seconds(300).expect("a nonce ttl")),
+            logins: Arc::new(logins),
+            session_seconds: 3600,
             gateway: Arc::new(gateway),
             listen,
         }
@@ -68,6 +87,16 @@ impl AppState {
     /// Checks request signatures against the store.
     pub fn verifier(&self) -> &RequestVerifier {
         &self.verifier
+    }
+
+    /// Opens and ends the sessions the web carries.
+    pub fn logins(&self) -> &Logins {
+        &self.logins
+    }
+
+    /// How long a session cookie is kept, which is how long its token is good for.
+    pub fn session_seconds(&self) -> u64 {
+        self.session_seconds
     }
 
     /// Carries proxied requests through the dataflow.
