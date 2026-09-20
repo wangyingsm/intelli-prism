@@ -10,9 +10,9 @@ use crate::codec::{
 use crate::error::{Entity, StorageError, is_unique_violation};
 use crate::model::{Membership, NewTenant, NewUser, Tenant, TenantRowId, User, UserRowId};
 use crate::store::{GrantStore, MembershipStore, TenantStore, UserStore};
-use crate::transaction::{
-    UserCreateBegun, UserCreateDialect, UserCreateTransactional, UserCreateTxn,
-};
+use crate::transaction::IdentityDialect;
+use crate::transaction::member_add::{MemberAddBegun, MemberAddTransactional, MemberAddTxn};
+use crate::transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
 
 /// Writes a tenant row over whichever connection it is given, so a transaction and the pool
 /// run the same statement.
@@ -424,7 +424,7 @@ impl GrantStore for SqliteStore {
 }
 
 #[async_trait]
-impl UserCreateDialect for sqlx::Sqlite {
+impl IdentityDialect for sqlx::Sqlite {
     async fn insert_tenant(
         connection: &mut SqliteConnection,
         new: NewTenant,
@@ -455,6 +455,17 @@ impl UserCreateTransactional for SqliteStore {
     ) -> Result<UserCreateTxn<Self::Db, UserCreateBegun>, StorageError> {
         let inner = self.pool.begin().await.map_err(StorageError::backend)?;
         Ok(UserCreateTxn::new(inner))
+    }
+}
+
+impl MemberAddTransactional for SqliteStore {
+    type Db = sqlx::Sqlite;
+
+    async fn begin_member_add(
+        &self,
+    ) -> Result<MemberAddTxn<Self::Db, MemberAddBegun>, StorageError> {
+        let inner = self.pool.begin().await.map_err(StorageError::backend)?;
+        Ok(MemberAddTxn::new(inner))
     }
 }
 

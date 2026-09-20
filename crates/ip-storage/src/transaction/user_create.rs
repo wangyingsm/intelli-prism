@@ -1,37 +1,10 @@
-use async_trait::async_trait;
+//! Creating a tenant together with the owner account that represents it.
+
 use sqlx::Database;
 
+use super::{IdentityDialect, sealed};
 use crate::error::StorageError;
 use crate::model::{Membership, NewTenant, NewUser, Standing, Tenant, TenantWithOwner, User};
-
-/// The writes one backend contributes to a transaction, in its own dialect.
-///
-/// Sqlite binds `?` and postgres binds `$1`, so the statements cannot be shared. What is
-/// shared is the order they run in, which `UserCreateTxn` fixes at compile time.
-#[async_trait]
-pub trait UserCreateDialect: Database {
-    /// Writes a tenant row.
-    async fn insert_tenant(
-        connection: &mut Self::Connection,
-        new: NewTenant,
-    ) -> Result<Tenant, StorageError>;
-
-    /// Writes a user row.
-    async fn insert_user(
-        connection: &mut Self::Connection,
-        new: NewUser,
-    ) -> Result<User, StorageError>;
-
-    /// Attaches a user to a tenant.
-    async fn insert_membership(
-        connection: &mut Self::Connection,
-        membership: Membership,
-    ) -> Result<(), StorageError>;
-}
-
-mod sealed {
-    pub trait Sealed {}
-}
 
 /// How far a `UserCreateTxn` has got. Only the stages below are ones.
 pub trait UserCreateStage: sealed::Sealed {}
@@ -80,9 +53,9 @@ stages!(
 /// committing rolls back everything it wrote.
 ///
 /// ```
-/// # use ip_storage::transaction::{UserCreateBegun, UserCreateTxn};
-/// # use ip_storage::{UserCreateDialect, Membership, NewTenant, NewUser, Standing};
-/// # async fn run<DB: UserCreateDialect>(txn: UserCreateTxn<DB, UserCreateBegun>, tenant: NewTenant, owner: NewUser) {
+/// # use ip_storage::transaction::user_create::{UserCreateBegun, UserCreateTxn};
+/// # use ip_storage::{IdentityDialect, Membership, NewTenant, NewUser, Standing};
+/// # async fn run<DB: IdentityDialect>(txn: UserCreateTxn<DB, UserCreateBegun>, tenant: NewTenant, owner: NewUser) {
 /// let txn = txn.create_tenant(tenant).await.unwrap();
 /// let txn = txn.create_user(owner).await.unwrap();
 /// let txn = txn.attach(Standing::Owner).await.unwrap();
@@ -93,9 +66,9 @@ stages!(
 /// Attaching before there is anything to attach does not compile:
 ///
 /// ```compile_fail
-/// # use ip_storage::transaction::{UserCreateBegun, UserCreateTxn};
-/// # use ip_storage::{UserCreateDialect, Standing};
-/// # async fn run<DB: UserCreateDialect>(txn: UserCreateTxn<DB, UserCreateBegun>) {
+/// # use ip_storage::transaction::user_create::{UserCreateBegun, UserCreateTxn};
+/// # use ip_storage::{IdentityDialect, Standing};
+/// # async fn run<DB: IdentityDialect>(txn: UserCreateTxn<DB, UserCreateBegun>) {
 /// // attach belongs to UserCreateTxn<DB, UserCreateUserSaved>, so no owner can be attached to nothing.
 /// let txn = txn.attach(Standing::Owner).await.unwrap();
 /// # }
@@ -104,9 +77,9 @@ stages!(
 /// Committing before the owner is attached does not compile either:
 ///
 /// ```compile_fail
-/// # use ip_storage::transaction::{UserCreateBegun, UserCreateTxn};
-/// # use ip_storage::{UserCreateDialect, NewTenant};
-/// # async fn run<DB: UserCreateDialect>(txn: UserCreateTxn<DB, UserCreateBegun>, tenant: NewTenant) {
+/// # use ip_storage::transaction::user_create::{UserCreateBegun, UserCreateTxn};
+/// # use ip_storage::{IdentityDialect, NewTenant};
+/// # async fn run<DB: IdentityDialect>(txn: UserCreateTxn<DB, UserCreateBegun>, tenant: NewTenant) {
 /// let txn = txn.create_tenant(tenant).await.unwrap();
 /// let created = txn.commit().await.unwrap();
 /// # }
@@ -116,7 +89,7 @@ pub struct UserCreateTxn<DB: Database, S: UserCreateStage> {
     stage: S,
 }
 
-impl<DB: UserCreateDialect> UserCreateTxn<DB, UserCreateBegun> {
+impl<DB: IdentityDialect> UserCreateTxn<DB, UserCreateBegun> {
     /// Takes over a transaction the backend opened.
     pub fn new(inner: sqlx::Transaction<'static, DB>) -> Self {
         Self {
@@ -138,7 +111,7 @@ impl<DB: UserCreateDialect> UserCreateTxn<DB, UserCreateBegun> {
     }
 }
 
-impl<DB: UserCreateDialect> UserCreateTxn<DB, UserCreateTenantSaved> {
+impl<DB: IdentityDialect> UserCreateTxn<DB, UserCreateTenantSaved> {
     /// The tenant written so far.
     pub fn tenant(&self) -> &Tenant {
         &self.stage.tenant
@@ -160,7 +133,7 @@ impl<DB: UserCreateDialect> UserCreateTxn<DB, UserCreateTenantSaved> {
     }
 }
 
-impl<DB: UserCreateDialect> UserCreateTxn<DB, UserCreateUserSaved> {
+impl<DB: IdentityDialect> UserCreateTxn<DB, UserCreateUserSaved> {
     /// The tenant written so far.
     pub fn tenant(&self) -> &Tenant {
         &self.stage.tenant
@@ -193,7 +166,7 @@ impl<DB: UserCreateDialect> UserCreateTxn<DB, UserCreateUserSaved> {
     }
 }
 
-impl<DB: UserCreateDialect> UserCreateTxn<DB, UserCreateAttached> {
+impl<DB: IdentityDialect> UserCreateTxn<DB, UserCreateAttached> {
     /// Lands the tenant, its owner and their attachment together.
     pub async fn commit(self) -> Result<TenantWithOwner, StorageError> {
         self.inner.commit().await.map_err(StorageError::backend)?;
@@ -208,7 +181,7 @@ impl<DB: UserCreateDialect> UserCreateTxn<DB, UserCreateAttached> {
 /// A store that can open a transaction creating a tenant with its owner.
 pub trait UserCreateTransactional: Send + Sync {
     /// The backend whose dialect the transaction writes in.
-    type Db: UserCreateDialect;
+    type Db: IdentityDialect;
 
     /// Opens the transaction. Dropping it before committing rolls it back.
     fn begin_user_create(

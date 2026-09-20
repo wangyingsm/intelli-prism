@@ -3,7 +3,7 @@ use ip_core::UserId;
 use super::fixture::{hash, new_tenant, new_user, tenant_id, user_id};
 use crate::model::{AccountKind, NewUser, Standing};
 use crate::store::{MembershipStore, TenantStore, UserStore};
-use crate::transaction::UserCreateTransactional;
+use crate::transaction::user_create::UserCreateTransactional;
 
 /// Everything a transaction test needs from a backend.
 pub(crate) trait UserCreateStore:

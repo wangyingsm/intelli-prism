@@ -112,6 +112,15 @@ pub struct TenantWithOwner {
     pub membership: Membership,
 }
 
+/// A user and the attachment created with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserWithMembership {
+    /// The account that was created.
+    pub user: User,
+    /// How it is attached to its tenant.
+    pub membership: Membership,
+}
+
 /// What a user is within one tenant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Standing {

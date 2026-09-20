@@ -1,9 +1,10 @@
 //! Tests every storage backend must pass, written once and run against each backend.
 
 pub(crate) mod identity;
+pub(crate) mod member_add;
 pub(crate) mod plugin;
 pub(crate) mod route;
-pub(crate) mod transaction;
+pub(crate) mod user_create;
 
 /// The records every backend test builds from.
 pub(crate) mod fixture {
@@ -86,8 +87,17 @@ macro_rules! backend_suite {
             revoking_removes_only_the_named_grant,
         ]);
     };
-    (transaction, $open:path) => {
-        $crate::suite::backend_suite!(@module transaction, $open, [
+    (member_add, $open:path) => {
+        $crate::suite::backend_suite!(@module member_add, $open, [
+            a_member_lands_with_its_attachment,
+            a_member_nobody_commits_leaves_no_user_behind,
+            a_tenant_that_is_not_there_takes_the_user_with_it,
+            a_member_may_be_added_as_the_owner,
+            a_user_id_that_is_taken_conflicts,
+        ]);
+    };
+    (user_create, $open:path) => {
+        $crate::suite::backend_suite!(@module user_create, $open, [
             a_committed_transaction_lands_every_write,
             a_transaction_nobody_commits_leaves_nothing,
             a_write_that_fails_part_way_undoes_the_ones_before_it,
@@ -131,7 +141,8 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(identity, $open);
         $crate::suite::backend_suite!(route, $open);
         $crate::suite::backend_suite!(plugin, $open);
-        $crate::suite::backend_suite!(transaction, $open);
+        $crate::suite::backend_suite!(user_create, $open);
+        $crate::suite::backend_suite!(member_add, $open);
     };
 }
 
