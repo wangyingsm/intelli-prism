@@ -344,6 +344,18 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_control_that_names_no_span_leaves_the_expires_in_force() {
+        let expires = httpdate::fmt_http_date(now() + Duration::from_secs(90));
+        assert_eq!(
+            freshness(
+                &headers(&[("cache-control", "public"), ("expires", &expires)]),
+                now()
+            ),
+            Freshness::For(Ttl::new(Duration::from_secs(90)).unwrap())
+        );
+    }
+
+    #[test]
     fn a_cache_control_outranks_an_expires() {
         let expires = httpdate::fmt_http_date(now() + Duration::from_secs(900));
         assert_eq!(
