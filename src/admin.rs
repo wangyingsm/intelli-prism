@@ -5,6 +5,7 @@ use ip_auth::{Passphrase, PassphraseHasher};
 use ip_config::Config;
 use ip_core::UserId;
 use ip_storage::{AccountKind, NewUser};
+use zeroize::Zeroizing;
 
 use crate::cli::AdminCommand;
 use crate::error::StartupError;
@@ -28,22 +29,27 @@ pub async fn run(
 /// same value twice has confirmed nothing.
 pub fn ask_passphrase() -> Result<Passphrase, StartupError> {
     match std::io::stdin().is_terminal() {
-        true => confirmed(
-            rpassword::prompt_password("Passphrase: ").map_err(unreadable)?,
-            rpassword::prompt_password("Repeat passphrase: ").map_err(unreadable)?,
-        ),
+        true => {
+            // The prompt hands its buffer over rather than copying it, so wiping ours wipes it.
+            let first =
+                Zeroizing::new(rpassword::prompt_password("Passphrase: ").map_err(unreadable)?);
+            let again = Zeroizing::new(
+                rpassword::prompt_password("Repeat passphrase: ").map_err(unreadable)?,
+            );
+            confirmed(&first, &again)
+        }
         false => read_passphrase(std::io::stdin()),
     }
 }
 
 /// Takes a passphrase only when it was typed the same way twice.
-fn confirmed(first: String, again: String) -> Result<Passphrase, StartupError> {
+fn confirmed(first: &str, again: &str) -> Result<Passphrase, StartupError> {
     if first != again {
         return Err(StartupError::Usage {
             detail: "the passphrases do not match".to_owned(),
         });
     }
-    Ok(Passphrase::new(&first)?)
+    Ok(Passphrase::new(first)?)
 }
 
 fn unreadable(source: std::io::Error) -> StartupError {
@@ -73,7 +79,7 @@ async fn create_sysadmin(
 
 /// Reads a piped passphrase, which never sits in a shell history.
 fn read_passphrase(mut source: impl Read) -> Result<Passphrase, StartupError> {
-    let mut raw = String::new();
+    let mut raw = Zeroizing::new(String::new());
     source.read_to_string(&mut raw).map_err(unreadable)?;
     Ok(Passphrase::new(raw.trim_end_matches(['\r', '\n']))?)
 }
@@ -98,11 +104,7 @@ mod tests {
 
     #[test]
     fn a_passphrase_typed_twice_the_same_way_is_taken() {
-        let taken = confirmed(
-            "correct horse staple".to_owned(),
-            "correct horse staple".to_owned(),
-        )
-        .unwrap();
+        let taken = confirmed("correct horse staple", "correct horse staple").unwrap();
         let hashed = PassphraseHasher::new().hash(&taken).unwrap();
         assert!(
             PassphraseHasher::new()
@@ -113,10 +115,7 @@ mod tests {
 
     #[test]
     fn a_passphrase_typed_differently_the_second_time_is_refused() {
-        let refused = confirmed(
-            "correct horse staple".to_owned(),
-            "correct horse stapler".to_owned(),
-        );
+        let refused = confirmed("correct horse staple", "correct horse stapler");
         assert!(matches!(
             refused,
             Err(StartupError::Usage { ref detail }) if detail.contains("do not match")
@@ -126,7 +125,7 @@ mod tests {
     #[test]
     fn a_confirmed_passphrase_the_policy_refuses_is_still_refused() {
         assert!(matches!(
-            confirmed("short".to_owned(), "short".to_owned()),
+            confirmed("short", "short"),
             Err(StartupError::Auth(_))
         ));
     }
