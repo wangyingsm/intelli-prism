@@ -7,10 +7,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use ip_core::{TenantId, UserId};
+use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
 
-use crate::error::{Entity, StorageError};
+use crate::error::StorageError;
 use crate::model::{TenantRowId, UserRowId};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,29 +64,16 @@ impl SqliteStore {
     }
 
     async fn tenant_row_id(&self, id: &TenantId) -> Result<TenantRowId, StorageError> {
-        sqlx::query("SELECT row_id FROM tenants WHERE id = ?")
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-            .map(|row| TenantRowId::new(row.get("row_id")))
-            .ok_or_else(|| StorageError::NotFound {
-                entity: Entity::Tenant,
-                id: id.to_string(),
-            })
+        identity::tenant_row_id(&mut *self.connection().await?, id).await
     }
 
     async fn user_row_id(&self, id: &UserId) -> Result<UserRowId, StorageError> {
-        sqlx::query("SELECT row_id FROM users WHERE id = ?")
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-            .map(|row| UserRowId::new(row.get("row_id")))
-            .ok_or_else(|| StorageError::NotFound {
-                entity: Entity::User,
-                id: id.to_string(),
-            })
+        identity::user_row_id(&mut *self.connection().await?, id).await
+    }
+
+    /// One connection out of the pool, for the writes a transaction also runs.
+    async fn connection(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, StorageError> {
+        self.pool.acquire().await.map_err(StorageError::backend)
     }
 }
 

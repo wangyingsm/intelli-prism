@@ -5,10 +5,10 @@ mod route;
 use std::str::FromStr;
 
 use ip_core::{TenantId, UserId};
+use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{PgPool, Row};
 
-use crate::error::{Entity, StorageError};
+use crate::error::StorageError;
 use crate::model::{TenantRowId, UserRowId};
 
 const MAX_CONNECTIONS: u32 = 16;
@@ -51,29 +51,16 @@ impl PostgresStore {
     }
 
     async fn tenant_row_id(&self, id: &TenantId) -> Result<TenantRowId, StorageError> {
-        sqlx::query("SELECT row_id FROM tenants WHERE id = $1")
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-            .map(|row| TenantRowId::new(row.get("row_id")))
-            .ok_or_else(|| StorageError::NotFound {
-                entity: Entity::Tenant,
-                id: id.to_string(),
-            })
+        identity::tenant_row_id(&mut *self.connection().await?, id).await
     }
 
     async fn user_row_id(&self, id: &UserId) -> Result<UserRowId, StorageError> {
-        sqlx::query("SELECT row_id FROM users WHERE id = $1")
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-            .map(|row| UserRowId::new(row.get("row_id")))
-            .ok_or_else(|| StorageError::NotFound {
-                entity: Entity::User,
-                id: id.to_string(),
-            })
+        identity::user_row_id(&mut *self.connection().await?, id).await
+    }
+
+    /// One connection out of the pool, for the writes a transaction also runs.
+    async fn connection(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, StorageError> {
+        self.pool.acquire().await.map_err(StorageError::backend)
     }
 }
 

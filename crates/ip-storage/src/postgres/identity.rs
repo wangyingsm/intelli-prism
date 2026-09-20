@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use ip_core::{Grant, Grants, PassphraseHash, TenantId, Timestamp, UserId};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use super::PostgresStore;
 use crate::codec::{
@@ -10,32 +10,165 @@ use crate::codec::{
 use crate::error::{Entity, StorageError, is_unique_violation};
 use crate::model::{Membership, NewTenant, NewUser, Tenant, TenantRowId, User, UserRowId};
 use crate::store::{GrantStore, MembershipStore, TenantStore, UserStore};
+use crate::transaction::{
+    UserCreateBegun, UserCreateDialect, UserCreateTransactional, UserCreateTxn,
+};
+
+/// Writes a tenant row over whichever connection it is given, so a transaction and the pool
+/// run the same statement.
+pub(super) async fn insert_tenant(
+    connection: &mut PgConnection,
+    new: NewTenant,
+) -> Result<Tenant, StorageError> {
+    let created_at = Timestamp::now();
+    let result = sqlx::query(
+        "INSERT INTO tenants (id, key, created_at) VALUES ($1, $2, $3) RETURNING row_id",
+    )
+    .bind(new.id.as_str())
+    .bind(new.key.as_bytes().as_slice())
+    .bind(created_at.unix_seconds())
+    .fetch_one(connection)
+    .await;
+    match result {
+        Ok(row) => Ok(Tenant {
+            row_id: TenantRowId::new(row.get("row_id")),
+            id: new.id,
+            key: new.key,
+            created_at,
+        }),
+        Err(error) if is_unique_violation(&error) => Err(StorageError::Conflict {
+            entity: Entity::Tenant,
+            id: new.id.to_string(),
+        }),
+        Err(error) => Err(StorageError::backend(error)),
+    }
+}
+
+/// Writes a user row over whichever connection it is given.
+pub(super) async fn insert_user(
+    connection: &mut PgConnection,
+    new: NewUser,
+) -> Result<User, StorageError> {
+    let created_at = Timestamp::now();
+    let result = sqlx::query(
+        "INSERT INTO users (id, passphrase, kind, created_at) VALUES ($1, $2, $3, $4) \
+         RETURNING row_id",
+    )
+    .bind(new.id.as_str())
+    .bind(new.passphrase.as_str())
+    .bind(account_kind_name(new.kind))
+    .bind(created_at.unix_seconds())
+    .fetch_one(connection)
+    .await;
+    match result {
+        Ok(row) => Ok(User {
+            row_id: UserRowId::new(row.get("row_id")),
+            id: new.id,
+            passphrase: new.passphrase,
+            kind: new.kind,
+            created_at,
+        }),
+        Err(error) if is_unique_violation(&error) => Err(StorageError::Conflict {
+            entity: Entity::User,
+            id: new.id.to_string(),
+        }),
+        Err(error) => Err(StorageError::backend(error)),
+    }
+}
+
+/// Attaches a user to a tenant over whichever connection it is given.
+pub(super) async fn insert_membership(
+    connection: &mut PgConnection,
+    membership: Membership,
+) -> Result<(), StorageError> {
+    let tenant_row_id = tenant_row_id(&mut *connection, &membership.tenant).await?;
+    let user_row_id = user_row_id(&mut *connection, &membership.user).await?;
+    sqlx::query(
+        "INSERT INTO memberships (tenant_row_id, user_row_id, standing) VALUES ($1, $2, $3) \
+         ON CONFLICT (tenant_row_id, user_row_id) DO UPDATE SET standing = excluded.standing",
+    )
+    .bind(tenant_row_id.get())
+    .bind(user_row_id.get())
+    .bind(standing_name(membership.standing))
+    .execute(connection)
+    .await
+    .map_err(StorageError::backend)?;
+    Ok(())
+}
+
+/// The primary key of a tenant row, or a report that there is none.
+pub(super) async fn tenant_row_id(
+    connection: &mut PgConnection,
+    id: &TenantId,
+) -> Result<TenantRowId, StorageError> {
+    sqlx::query("SELECT row_id FROM tenants WHERE id = $1")
+        .bind(id.as_str())
+        .fetch_optional(connection)
+        .await
+        .map_err(StorageError::backend)?
+        .map(|row| TenantRowId::new(row.get("row_id")))
+        .ok_or_else(|| StorageError::NotFound {
+            entity: Entity::Tenant,
+            id: id.to_string(),
+        })
+}
+
+/// The primary key of a user row, or a report that there is none.
+pub(super) async fn user_row_id(
+    connection: &mut PgConnection,
+    id: &UserId,
+) -> Result<UserRowId, StorageError> {
+    sqlx::query("SELECT row_id FROM users WHERE id = $1")
+        .bind(id.as_str())
+        .fetch_optional(connection)
+        .await
+        .map_err(StorageError::backend)?
+        .map(|row| UserRowId::new(row.get("row_id")))
+        .ok_or_else(|| StorageError::NotFound {
+            entity: Entity::User,
+            id: id.to_string(),
+        })
+}
+
+#[async_trait]
+impl UserCreateDialect for sqlx::Postgres {
+    async fn insert_tenant(
+        connection: &mut PgConnection,
+        new: NewTenant,
+    ) -> Result<Tenant, StorageError> {
+        insert_tenant(connection, new).await
+    }
+
+    async fn insert_user(
+        connection: &mut PgConnection,
+        new: NewUser,
+    ) -> Result<User, StorageError> {
+        insert_user(connection, new).await
+    }
+
+    async fn insert_membership(
+        connection: &mut PgConnection,
+        membership: Membership,
+    ) -> Result<(), StorageError> {
+        insert_membership(connection, membership).await
+    }
+}
+
+impl UserCreateTransactional for PostgresStore {
+    type Db = sqlx::Postgres;
+
+    async fn begin_user_create(
+        &self,
+    ) -> Result<UserCreateTxn<Self::Db, UserCreateBegun>, StorageError> {
+        let inner = self.pool.begin().await.map_err(StorageError::backend)?;
+        Ok(UserCreateTxn::new(inner))
+    }
+}
 
 #[async_trait]
 impl TenantStore for PostgresStore {
     async fn create_tenant(&self, new: NewTenant) -> Result<Tenant, StorageError> {
-        let created_at = Timestamp::now();
-        let result = sqlx::query(
-            "INSERT INTO tenants (id, key, created_at) VALUES ($1, $2, $3) RETURNING row_id",
-        )
-        .bind(new.id.as_str())
-        .bind(new.key.as_bytes().as_slice())
-        .bind(created_at.unix_seconds())
-        .fetch_one(&self.pool)
-        .await;
-        match result {
-            Ok(row) => Ok(Tenant {
-                row_id: TenantRowId::new(row.get("row_id")),
-                id: new.id,
-                key: new.key,
-                created_at,
-            }),
-            Err(error) if is_unique_violation(&error) => Err(StorageError::Conflict {
-                entity: Entity::Tenant,
-                id: new.id.to_string(),
-            }),
-            Err(error) => Err(StorageError::backend(error)),
-        }
+        insert_tenant(&mut *self.connection().await?, new).await
     }
 
     async fn tenant(&self, id: &TenantId) -> Result<Option<Tenant>, StorageError> {
@@ -75,31 +208,7 @@ impl TenantStore for PostgresStore {
 #[async_trait]
 impl UserStore for PostgresStore {
     async fn create_user(&self, new: NewUser) -> Result<User, StorageError> {
-        let created_at = Timestamp::now();
-        let result = sqlx::query(
-            "INSERT INTO users (id, passphrase, kind, created_at) VALUES ($1, $2, $3, $4) \
-             RETURNING row_id",
-        )
-        .bind(new.id.as_str())
-        .bind(new.passphrase.as_str())
-        .bind(account_kind_name(new.kind))
-        .bind(created_at.unix_seconds())
-        .fetch_one(&self.pool)
-        .await;
-        match result {
-            Ok(row) => Ok(User {
-                row_id: UserRowId::new(row.get("row_id")),
-                id: new.id,
-                passphrase: new.passphrase,
-                kind: new.kind,
-                created_at,
-            }),
-            Err(error) if is_unique_violation(&error) => Err(StorageError::Conflict {
-                entity: Entity::User,
-                id: new.id.to_string(),
-            }),
-            Err(error) => Err(StorageError::backend(error)),
-        }
+        insert_user(&mut *self.connection().await?, new).await
     }
 
     async fn user(&self, id: &UserId) -> Result<Option<User>, StorageError> {
@@ -162,19 +271,7 @@ impl UserStore for PostgresStore {
 #[async_trait]
 impl MembershipStore for PostgresStore {
     async fn attach(&self, membership: Membership) -> Result<(), StorageError> {
-        let tenant_row_id = self.tenant_row_id(&membership.tenant).await?;
-        let user_row_id = self.user_row_id(&membership.user).await?;
-        sqlx::query(
-            "INSERT INTO memberships (tenant_row_id, user_row_id, standing) VALUES ($1, $2, $3) \
-             ON CONFLICT (tenant_row_id, user_row_id) DO UPDATE SET standing = excluded.standing",
-        )
-        .bind(tenant_row_id.get())
-        .bind(user_row_id.get())
-        .bind(standing_name(membership.standing))
-        .execute(&self.pool)
-        .await
-        .map_err(StorageError::backend)?;
-        Ok(())
+        insert_membership(&mut *self.connection().await?, membership).await
     }
 
     async fn detach(&self, user: &UserId, tenant: &TenantId) -> Result<(), StorageError> {

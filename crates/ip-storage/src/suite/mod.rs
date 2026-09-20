@@ -3,6 +3,7 @@
 pub(crate) mod identity;
 pub(crate) mod plugin;
 pub(crate) mod route;
+pub(crate) mod transaction;
 
 /// The records every backend test builds from.
 pub(crate) mod fixture {
@@ -85,6 +86,16 @@ macro_rules! backend_suite {
             revoking_removes_only_the_named_grant,
         ]);
     };
+    (transaction, $open:path) => {
+        $crate::suite::backend_suite!(@module transaction, $open, [
+            a_committed_transaction_lands_every_write,
+            a_transaction_nobody_commits_leaves_nothing,
+            a_write_that_fails_part_way_undoes_the_ones_before_it,
+            a_transaction_reads_back_what_it_has_written,
+            an_owner_is_attached_to_the_tenant_the_transaction_wrote,
+            writes_outside_a_transaction_are_not_rolled_back,
+        ]);
+    };
     (route, $open:path) => {
         $crate::suite::backend_suite!(@module route, $open, [
             a_route_round_trips,
@@ -120,6 +131,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(identity, $open);
         $crate::suite::backend_suite!(route, $open);
         $crate::suite::backend_suite!(plugin, $open);
+        $crate::suite::backend_suite!(transaction, $open);
     };
 }
 

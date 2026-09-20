@@ -13,10 +13,12 @@ pub mod sqlite;
 pub mod store;
 #[cfg(all(test, any(feature = "standalone-storage", feature = "fast-storage")))]
 mod suite;
+pub mod transaction;
 
 pub use error::{Entity, StorageError};
 pub use model::{
-    AccountKind, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId, User, UserRowId,
+    AccountKind, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId, TenantWithOwner,
+    User, UserRowId,
 };
 pub use plugin::{NewPlugin, Plugin, PluginRecord, PluginRowId, PluginRuleStore, PluginStore};
 #[cfg(feature = "fast-storage")]
@@ -25,3 +27,4 @@ pub use route::RouteStore;
 #[cfg(feature = "standalone-storage")]
 pub use sqlite::SqliteStore;
 pub use store::{Backend, GrantStore, MembershipStore, Storage, TenantStore, UserStore};
+pub use transaction::{UserCreateDialect, UserCreateTransactional, UserCreateTxn};
