@@ -270,6 +270,14 @@ mod tests {
     }
 
     #[test]
+    fn a_capability_asked_about_at_the_wrong_kind_of_scope_is_not_held() {
+        let grants: Grants = [Grant::new(Capability::ApiAccess, api_scope()).unwrap()]
+            .into_iter()
+            .collect();
+        assert!(!grants.holds(Capability::ApiAccess, &tenant_scope()));
+    }
+
+    #[test]
     fn a_grant_does_not_reach_another_tenant() {
         let grants: Grants = [Grant::new(Capability::UserMgr, tenant_scope()).unwrap()]
             .into_iter()
