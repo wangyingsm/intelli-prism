@@ -1,0 +1,19 @@
+[package]
+name = "typestate-txn"
+description = "A macro for transactions whose steps run in one order, fixed at compile time"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = { version = "3.0.6", features = ["full", "extra-traits"] }
+
+[dev-dependencies]
+tokio.workspace = true
