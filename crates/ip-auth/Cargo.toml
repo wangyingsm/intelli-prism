@@ -20,9 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 ip-cache = { version = "0.1.0", path = "../ip-cache", features = ["standalone-cache"] }
 ip-storage = { version = "0.1.0", path = "../ip-storage", features = ["standalone-storage"] }
-tokio.workspace = true

@@ -100,13 +100,8 @@ impl RequestVerifier {
         request: &SignedRequest,
         origin: IpAddr,
     ) -> Result<Identity, AuthError> {
-        let tenant =
-            self.store
-                .tenant(&request.tenant)
-                .await?
-                .ok_or_else(|| AuthError::UnknownTenant {
-                    tenant: request.tenant.clone(),
-                })?;
+        // The user comes first so an administrator calling from anywhere but the machine it
+        // runs on is refused before anything else is read for it.
         let user = self
             .store
             .user(&request.user)
@@ -114,18 +109,22 @@ impl RequestVerifier {
             .ok_or_else(|| AuthError::UnknownUser {
                 user: request.user.clone(),
             })?;
-        let membership = self
-            .store
-            .membership(&request.user, &request.tenant)
-            .await?
-            .ok_or_else(|| AuthError::NotAMember {
-                user: request.user.clone(),
-                tenant: request.tenant.clone(),
-            })?;
-
         if user.kind == AccountKind::SystemAdministrator && !origin.is_loopback() {
             return Err(AuthError::AdminOffLocalhost { origin });
         }
+
+        // Neither of these reads needs the other, so they wait together rather than in turn.
+        let (tenant, membership) = tokio::join!(
+            self.store.tenant(&request.tenant),
+            self.store.membership(&request.user, &request.tenant),
+        );
+        let tenant = tenant?.ok_or_else(|| AuthError::UnknownTenant {
+            tenant: request.tenant.clone(),
+        })?;
+        let membership = membership?.ok_or_else(|| AuthError::NotAMember {
+            user: request.user.clone(),
+            tenant: request.tenant.clone(),
+        })?;
 
         let ut_key = UtKey::derive(&user.id, &tenant.key);
         let by_user = Signature::of_user(&ut_key, &request.nonce).verify(&request.signature);
@@ -162,7 +161,8 @@ impl RequestVerifier {
     }
 }
 
-fn role_of(kind: AccountKind, standing: Standing, tenant: TenantId) -> Role {
+/// The role an account kind and a standing add up to inside one tenant.
+pub fn role_of(kind: AccountKind, standing: Standing, tenant: TenantId) -> Role {
     match (kind, standing) {
         (AccountKind::SystemAdministrator, _) => Role::SysAdmin,
         (AccountKind::Regular, Standing::Owner) => Role::TenantAdmin(tenant),
@@ -412,24 +412,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_tenant_or_user_is_refused() {
+    async fn an_unknown_user_or_tenant_is_refused() {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         let verifier = verifier(store.clone());
         let key = TnKey::generate().unwrap();
+        // The user is read first, so an empty store reports the user rather than the tenant.
         assert!(matches!(
             verifier.verify(&signed_by_user(&key), REMOTE).await,
-            Err(AuthError::UnknownTenant { .. })
+            Err(AuthError::UnknownUser { .. })
         ));
         store
-            .create_tenant(NewTenant {
-                id: tenant_id(),
-                key: key.clone(),
+            .create_user(NewUser {
+                id: user_id(),
+                passphrase: hash(),
+                kind: AccountKind::Regular,
             })
             .await
             .unwrap();
         assert!(matches!(
             verifier.verify(&signed_by_user(&key), REMOTE).await,
-            Err(AuthError::UnknownUser { .. })
+            Err(AuthError::UnknownTenant { .. })
         ));
     }
 
