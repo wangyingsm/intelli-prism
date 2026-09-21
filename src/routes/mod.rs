@@ -10,7 +10,7 @@ use http_body_util::BodyExt;
 use ip_auth::{Identity, Passphrase};
 use ip_core::{Capability, CapabilityScope, Protocol, Role};
 use ip_gateway::{GatewayBody, GatewayError, RequestContext};
-use ip_storage::Standing;
+use ip_storage::{Standing, StorageError};
 use std::net::SocketAddr;
 
 use crate::auth::Authenticated;
@@ -184,6 +184,21 @@ async fn session(State(state): State<AppState>, manager: Manager) -> Response<Bo
         tenants,
     })
     .into_response()
+}
+
+/// What a caller is told when the store refused a management request. Only the reasons it
+/// can act on carry one; everything else is the server's own problem and goes to the log.
+fn store_refusal(error: StorageError) -> Response<Body> {
+    match error {
+        StorageError::Conflict { .. } | StorageError::InUse { .. } => {
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
+        StorageError::NotFound { .. } => StatusCode::NOT_FOUND.into_response(),
+        error => {
+            tracing::error!(%error, "the store could not carry a management request");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Anything else under the reserved prefix belongs to no endpoint and is never proxied.

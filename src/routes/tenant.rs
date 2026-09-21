@@ -12,6 +12,7 @@ use ip_storage::{
     TenantWithOwner, UserCreateBegun, UserCreateTransactional, UserCreateTxn,
 };
 
+use super::store_refusal;
 use crate::manage::Manager;
 use crate::state::{AppState, Stores};
 
@@ -102,7 +103,7 @@ async fn create(
     };
     match create_with_owner(state.stores(), new).await {
         Ok(created) => (StatusCode::CREATED, Json(CreatedTenant::from(created))).into_response(),
-        Err(error) => refuse(error),
+        Err(error) => store_refusal(error),
     }
 }
 
@@ -119,12 +120,12 @@ async fn read(
     match reaches(&manager, store, &tenant).await {
         Ok(true) => {}
         Ok(false) => return StatusCode::FORBIDDEN.into_response(),
-        Err(error) => return refuse(error),
+        Err(error) => return store_refusal(error),
     }
     match store.tenant(&tenant).await {
         Ok(Some(tenant)) => Json(TenantView::from(tenant)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => refuse(error),
+        Err(error) => store_refusal(error),
     }
 }
 
@@ -144,7 +145,7 @@ async fn remove(
     };
     match store.delete_tenant(&tenant).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => refuse(error),
+        Err(error) => store_refusal(error),
     }
 }
 
@@ -156,7 +157,7 @@ async fn tenant_mgr_refusal(manager: &Manager, store: &dyn Storage) -> Option<Re
     {
         Ok(true) => None,
         Ok(false) => Some(StatusCode::FORBIDDEN.into_response()),
-        Err(error) => Some(refuse(error)),
+        Err(error) => Some(store_refusal(error)),
     }
 }
 
@@ -217,20 +218,6 @@ async fn in_one_transaction<DB: IdentityDialect>(
         .await?
         .commit()
         .await
-}
-
-/// What a caller is told when the store refused. Only the reasons it can act on carry a
-/// reason; everything else is the server's own problem and goes to the log.
-fn refuse(error: StorageError) -> Response<Body> {
-    match error {
-        StorageError::Conflict { .. } => (StatusCode::CONFLICT, error.to_string()).into_response(),
-        StorageError::InUse { .. } => (StatusCode::CONFLICT, error.to_string()).into_response(),
-        StorageError::NotFound { .. } => StatusCode::NOT_FOUND.into_response(),
-        error => {
-            tracing::error!(%error, "the store could not carry a tenant request");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
 }
 
 impl From<Tenant> for TenantView {
