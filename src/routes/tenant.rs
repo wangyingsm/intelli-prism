@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ip_auth::{Passphrase, PassphraseHasher};
-use ip_core::{Capability, CapabilityScope, PassphraseHash, TenantId, TnKey, UserId};
+use ip_core::{Capability, CapabilityScope, PassphraseHash, TenantId, Timestamp, TnKey, UserId};
 use ip_storage::{
     AccountKind, IdentityDialect, NewTenant, NewUser, Standing, Storage, StorageError, Tenant,
     TenantWithOwner, UserCreateBegun, UserCreateTransactional, UserCreateTxn,
@@ -42,8 +42,8 @@ pub struct NewTenantRequest {
 pub struct TenantView {
     /// The tenant.
     pub tenant: String,
-    /// When it was created.
-    pub created_at: String,
+    /// When it was created, in seconds since the unix epoch.
+    pub created_at: Timestamp,
 }
 
 /// A tenant and the account created to own it.
@@ -53,8 +53,8 @@ pub struct CreatedTenant {
     pub tenant: String,
     /// The account that owns it.
     pub owner: String,
-    /// When the tenant was created.
-    pub created_at: String,
+    /// When the tenant was created, in seconds since the unix epoch.
+    pub created_at: Timestamp,
 }
 
 /// Everything the three writes need, so the service takes one argument.
@@ -224,7 +224,7 @@ impl From<Tenant> for TenantView {
     fn from(tenant: Tenant) -> Self {
         Self {
             tenant: tenant.id.to_string(),
-            created_at: tenant.created_at.to_string(),
+            created_at: tenant.created_at,
         }
     }
 }
@@ -234,7 +234,7 @@ impl From<TenantWithOwner> for CreatedTenant {
         Self {
             tenant: created.tenant.id.to_string(),
             owner: created.owner.id.to_string(),
-            created_at: created.tenant.created_at.to_string(),
+            created_at: created.tenant.created_at,
         }
     }
 }
@@ -317,9 +317,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
-        let body = body_of(response).await;
-        assert!(body.contains("globex"), "{body}");
-        assert!(body.contains("hank"), "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body_of(response).await).unwrap();
+        assert_eq!(body["tenant"], "globex");
+        assert_eq!(body["owner"], "hank");
+        assert!(body["created_at"].is_i64(), "{body}");
 
         let store = state.store();
         let tenant = TenantId::new("globex").unwrap();
