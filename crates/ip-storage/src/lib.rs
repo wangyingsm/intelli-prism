@@ -33,4 +33,4 @@ pub use transaction::IdentityDialect;
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::member_add::{MemberAddTransactional, MemberAddTxn};
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
-pub use transaction::user_create::{UserCreateTransactional, UserCreateTxn};
+pub use transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};

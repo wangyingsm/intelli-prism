@@ -1,3 +1,5 @@
+mod tenant;
+
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Request, Response, StatusCode, header::SET_COOKIE};
@@ -26,6 +28,7 @@ pub fn router(state: AppState) -> Router {
         .route("/_ip/login", post(login))
         .route("/_ip/logout", post(logout))
         .route("/_ip/session", get(session))
+        .nest("/_ip/tenants", tenant::router())
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))
