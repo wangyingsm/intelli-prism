@@ -241,53 +241,13 @@ impl From<TenantWithOwner> for CreatedTenant {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-
-    use axum::http::{Request, StatusCode};
-    use ip_config::Config;
+    use axum::http::StatusCode;
     use ip_core::Grant;
-    use ip_gateway::body::GatewayBody;
-    use ip_gateway::upstream::Upstream;
-    use ip_gateway::{Gateway, ProcessorChain, RoutingTable, UpstreamError};
     use ip_storage::{Membership, MembershipStore, SqliteStore, TenantStore, UserStore};
     use tower::ServiceExt;
 
+    use super::super::harness::{PASSPHRASE, body_of, cookie_of, hashed, request, state_over};
     use super::*;
-    use crate::manage::CSRF_HEADER;
-
-    const PASSPHRASE: &str = "correct horse staple";
-
-    /// The configuration the fixture builds its empty routing table from.
-    const CONFIG: &str = r#"
-[server]
-listen = "127.0.0.1:8080"
-
-[storage]
-backend = "sqlite"
-path = "./unopened.db"
-
-[cache]
-backend = "sled"
-path = "./unopened"
-
-[auth.jwt]
-issuer = "intelli-prism"
-secret = "0123456789abcdef0123456789abcdef"
-"#;
-
-    /// An upstream nothing in these tests reaches.
-    struct Unreachable;
-
-    #[async_trait::async_trait]
-    impl Upstream for Unreachable {
-        async fn send(
-            &self,
-            _request: Request<GatewayBody>,
-        ) -> Result<axum::http::Response<GatewayBody>, UpstreamError> {
-            Err(UpstreamError::new("nothing is sent upstream here"))
-        }
-    }
 
     fn tenant_id() -> TenantId {
         TenantId::new("acme").unwrap()
@@ -299,12 +259,6 @@ secret = "0123456789abcdef0123456789abcdef"
 
     fn member_id() -> UserId {
         UserId::new("alice").unwrap()
-    }
-
-    fn hashed() -> PassphraseHash {
-        PassphraseHasher::new()
-            .hash(&Passphrase::new(PASSPHRASE).unwrap())
-            .unwrap()
     }
 
     /// The server's own router over a store holding one tenant, its member, and a system
@@ -341,48 +295,12 @@ secret = "0123456789abcdef0123456789abcdef"
             .await
             .unwrap();
 
-        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let table = RoutingTable::build(&Config::parse(CONFIG).unwrap(), Vec::new()).unwrap();
-        let gateway = Gateway::new(table, ProcessorChain::new(), Arc::new(Unreachable));
-        let state = AppState::with_parts(Stores::Sqlite(Arc::new(store)), gateway, listen);
-        let router = crate::routes::router(state.clone());
-        (router, state)
-    }
-
-    /// The cookie a real login hands back.
-    async fn cookie_of(state: &AppState, user: &UserId) -> String {
-        let token = state
-            .logins()
-            .log_in(user, &Passphrase::new(PASSPHRASE).unwrap())
-            .await
-            .unwrap();
-        format!("ip_session={}", token.as_str())
-    }
-
-    fn request(method: &str, uri: &str, cookie: &str, body: Option<&str>) -> Request<Body> {
-        let builder = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("cookie", cookie)
-            .header(CSRF_HEADER, "1");
-        match body {
-            Some(body) => builder
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_owned()))
-                .unwrap(),
-            None => builder.body(Body::empty()).unwrap(),
-        }
+        let state = state_over(store);
+        (crate::routes::router(state.clone()), state)
     }
 
     fn creating(tenant: &str, owner: &str, passphrase: &str) -> String {
         format!(r#"{{"tenant":"{tenant}","owner":"{owner}","passphrase":"{passphrase}"}}"#)
-    }
-
-    async fn body_of(response: axum::http::Response<Body>) -> String {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     #[tokio::test]

@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod harness;
 mod tenant;
 
 use axum::body::Body;
