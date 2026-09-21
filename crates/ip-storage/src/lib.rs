@@ -31,6 +31,6 @@ pub use store::{Backend, GrantStore, MembershipStore, Storage, TenantStore, User
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::IdentityDialect;
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
-pub use transaction::member_add::{MemberAddTransactional, MemberAddTxn};
+pub use transaction::member_add::{MemberAddBegun, MemberAddTransactional, MemberAddTxn};
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
