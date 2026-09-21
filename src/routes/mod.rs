@@ -264,12 +264,13 @@ mod tests {
     use ip_plugin::{PluginChains, PluginHost, PluginLimits};
     use ip_storage::{
         AccountKind, GrantStore, Membership, MembershipStore, NewTenant, NewUser, SqliteStore,
-        Standing, Storage, TenantStore, UserStore,
+        Standing, TenantStore, UserStore,
     };
     use ip_storage::{NewPlugin, PluginRuleStore, PluginStore};
     use tower::ServiceExt;
 
     use super::*;
+    use crate::state::Stores;
 
     const REMOTE: [u8; 4] = [203, 0, 113, 7];
 
@@ -415,7 +416,7 @@ secret = "0123456789abcdef0123456789abcdef"
 
     fn state_over(store: SqliteStore, gateway: Gateway) -> AppState {
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        AppState::with_parts(Arc::new(store) as Arc<dyn Storage>, gateway, listen)
+        AppState::with_parts(Stores::Sqlite(Arc::new(store)), gateway, listen)
     }
 
     fn signature(key: &TnKey) -> String {

@@ -12,15 +12,43 @@ use ip_gateway::{Gateway, HyperUpstream, ResponseCache, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
 use ip_storage::PostgresStore;
-#[cfg(feature = "standalone-storage")]
+#[cfg(any(feature = "standalone-storage", test))]
 use ip_storage::SqliteStore;
 use ip_storage::{Backend, Storage};
 
 use crate::error::StartupError;
 
+/// The store that was opened, in the shape its own backend has.
+///
+/// A transaction is a type of its backend's own, so it cannot come out of a trait object.
+/// This keeps the concrete store beside the one every other caller reads through.
+#[derive(Clone)]
+pub enum Stores {
+    /// The standalone backend, which a test build always has: the tests open sqlite
+    /// whichever backend the binary was compiled for.
+    #[cfg(any(feature = "standalone-storage", test))]
+    Sqlite(Arc<SqliteStore>),
+    /// The cluster backend.
+    #[cfg(feature = "fast-storage")]
+    Postgres(Arc<PostgresStore>),
+}
+
+impl Stores {
+    /// The same store, behind the trait object everything else uses.
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        match self {
+            #[cfg(any(feature = "standalone-storage", test))]
+            Self::Sqlite(store) => Arc::clone(store) as Arc<dyn Backend>,
+            #[cfg(feature = "fast-storage")]
+            Self::Postgres(store) => Arc::clone(store) as Arc<dyn Backend>,
+        }
+    }
+}
+
 /// What every handler is given.
 #[derive(Clone)]
 pub struct AppState {
+    stores: Stores,
     store: Arc<dyn Storage>,
     verifier: RequestVerifier,
     logins: Arc<Logins>,
@@ -33,7 +61,8 @@ impl AppState {
     /// Opens the configured backend, then builds the routing table, the plugin chains and the
     /// upstream client.
     pub async fn open(config: &Config) -> Result<Self, StartupError> {
-        let store = open_store(&config.storage).await?;
+        let stores = open_store(&config.storage).await?;
+        let store = stores.backend();
         let cache = open_cache(&config.cache).await?;
         let table = RoutingTable::load(config, store.as_ref()).await?;
         let host = Arc::new(PluginHost::new(PluginLimits::default())?);
@@ -58,7 +87,8 @@ impl AppState {
         );
         let logins = Logins::new(Arc::clone(&store), Arc::clone(&cache), tokens)?;
         Ok(Self {
-            store: Arc::clone(&store),
+            stores,
+            store: Arc::clone(&store) as Arc<dyn Storage>,
             verifier: RequestVerifier::new(store, cache, nonce_ttl),
             logins: Arc::new(logins),
             session_seconds: config.auth.jwt.ttl.get(),
@@ -69,7 +99,8 @@ impl AppState {
 
     /// Builds state over a store and gateway that are already built, on a cache of its own.
     #[cfg(test)]
-    pub fn with_parts(store: Arc<dyn Storage>, gateway: Gateway, listen: SocketAddr) -> Self {
+    pub fn with_parts(stores: Stores, gateway: Gateway, listen: SocketAddr) -> Self {
+        let store = stores.backend() as Arc<dyn Storage>;
         let cache = Arc::new(ip_cache::SledCache::temporary().expect("a temporary cache"));
         let tokens = SessionTokens::new(
             "intelli-prism",
@@ -78,6 +109,7 @@ impl AppState {
         );
         let logins = Logins::new(Arc::clone(&store), cache.clone(), tokens).expect("logins");
         Self {
+            stores,
             store: Arc::clone(&store),
             verifier: RequestVerifier::new(store, cache, Ttl::seconds(300).expect("a nonce ttl")),
             logins: Arc::new(logins),
@@ -90,6 +122,11 @@ impl AppState {
     /// Checks request signatures against the store.
     pub fn verifier(&self) -> &RequestVerifier {
         &self.verifier
+    }
+
+    /// The store in the shape its backend has, for the transactions that need it.
+    pub fn stores(&self) -> &Stores {
+        &self.stores
     }
 
     /// Reads the tenants, users and grants the management api works on.
@@ -118,17 +155,21 @@ impl AppState {
     }
 }
 
-pub(crate) async fn open_store(config: &StorageConfig) -> Result<Arc<dyn Backend>, StartupError> {
+pub(crate) async fn open_store(config: &StorageConfig) -> Result<Stores, StartupError> {
     match config {
         #[cfg(feature = "standalone-storage")]
-        StorageConfig::Sqlite { path } => Ok(Arc::new(SqliteStore::open(path).await?)),
+        StorageConfig::Sqlite { path } => {
+            Ok(Stores::Sqlite(Arc::new(SqliteStore::open(path).await?)))
+        }
         #[cfg(not(feature = "standalone-storage"))]
         StorageConfig::Sqlite { .. } => Err(StartupError::UnsupportedBackend {
             backend: "sqlite",
             feature: "standalone-storage",
         }),
         #[cfg(feature = "fast-storage")]
-        StorageConfig::Postgres { url } => Ok(Arc::new(PostgresStore::open(url.expose()).await?)),
+        StorageConfig::Postgres { url } => Ok(Stores::Postgres(Arc::new(
+            PostgresStore::open(url.expose()).await?,
+        ))),
         #[cfg(not(feature = "fast-storage"))]
         StorageConfig::Postgres { .. } => Err(StartupError::UnsupportedBackend {
             backend: "postgres",

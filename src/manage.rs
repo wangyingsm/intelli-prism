@@ -169,6 +169,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::state::Stores;
 
     const PASSPHRASE: &str = "correct horse staple";
 
@@ -267,7 +268,7 @@ secret = "0123456789abcdef0123456789abcdef"
 
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let gateway = Gateway::new(empty_table(), ProcessorChain::new(), Arc::new(Unreachable));
-        let state = AppState::with_parts(Arc::new(store) as Arc<dyn Storage>, gateway, listen);
+        let state = AppState::with_parts(Stores::Sqlite(Arc::new(store)), gateway, listen);
         let router = Router::new()
             .route("/who", get(who).post(who))
             .route("/may", get(may))

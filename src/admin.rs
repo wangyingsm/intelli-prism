@@ -64,7 +64,7 @@ async fn create_sysadmin(
     user: UserId,
     passphrase: &Passphrase,
 ) -> Result<(), StartupError> {
-    let store = open_store(&config.storage).await?;
+    let store = open_store(&config.storage).await?.backend();
     let hashed = PassphraseHasher::new().hash(passphrase)?;
     store
         .create_user(NewUser {
