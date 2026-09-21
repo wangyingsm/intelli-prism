@@ -170,10 +170,7 @@ async fn session(State(state): State<AppState>, manager: Manager) -> Response<Bo
         }
         tenants.push(Reach {
             tenant: membership.tenant.to_string(),
-            standing: match membership.standing {
-                Standing::Owner => "owner",
-                Standing::Member => "member",
-            },
+            standing: standing_name(membership.standing),
             capabilities,
         });
     }
@@ -184,6 +181,14 @@ async fn session(State(state): State<AppState>, manager: Manager) -> Response<Bo
         tenants,
     })
     .into_response()
+}
+
+/// The name a standing is shown under.
+fn standing_name(standing: Standing) -> &'static str {
+    match standing {
+        Standing::Owner => "owner",
+        Standing::Member => "member",
+    }
 }
 
 /// What a caller is told when the store refused a management request. Only the reasons it
