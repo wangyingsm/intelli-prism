@@ -5,9 +5,12 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
-use ip_core::{Checksum, PluginKind, Timestamp};
+use ip_core::{
+    ApiId, Checksum, NewPluginRule, PluginKind, PluginOrder, PluginRule, PluginScope, Timestamp,
+    UserId,
+};
 use ip_plugin::{PluginHost, PluginLimits};
-use ip_storage::{Listed, NewPlugin, PluginOwner, PluginRecord, Standing};
+use ip_storage::{Entity, Listed, NewPlugin, PluginOwner, PluginRecord, Standing, StorageError};
 
 use super::{Paged, store_refusal};
 use crate::manage::Manager;
@@ -17,11 +20,22 @@ use crate::state::AppState;
 ///
 /// Who calls decides whose plugins these are: the system administrator's are the global
 /// chain's, and a tenant owner's are its tenant's. Wasm is stored once however many own it,
-/// but each owner sees and lets go of only its own.
+/// but each owner sees, places and lets go of only its own.
 pub fn store_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_plugins).post(upload))
         .route("/{checksum}", delete(disown))
+}
+
+/// The chain the caller manages, under the prefix the router nests it at.
+///
+/// Who calls decides which chain: the system administrator manages the global chain and
+/// only that, and a tenant's owner manages its own tenant's chain. Nobody else places
+/// plugins.
+pub fn rules_router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(list_rules).post(place_rule))
+        .route("/{kind}/{order}", delete(remove_rule))
 }
 
 /// A plugin as its owner sees it.
@@ -37,6 +51,26 @@ pub struct PluginView {
     pub created_at: Timestamp,
 }
 
+/// A plugin placed in a chain, as the management api shows it.
+#[derive(Debug, serde::Serialize)]
+pub struct RuleView {
+    /// The plugin, by checksum.
+    pub checksum: String,
+    /// The chain it joins.
+    pub kind: &'static str,
+    /// Where it sits in that chain; higher runs first.
+    pub order: u8,
+    /// The one user it applies to, when it is narrowed to one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The one api it applies to, when it is narrowed to one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// When it was placed, in seconds since the unix epoch, as a list reads it back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
+}
+
 /// A response turned away early, boxed so it passes back up a `Result` cheaply.
 type Refusal = Box<Response<Body>>;
 
@@ -45,6 +79,19 @@ type Refusal = Box<Response<Body>>;
 pub struct UploadQuery {
     /// The plugin's kind, as `req_body` and the rest spell it.
     kind: Option<String>,
+}
+
+/// Where a plugin is placed in the caller's chain.
+#[derive(Debug, serde::Deserialize)]
+pub struct Placement {
+    /// The plugin, by checksum.
+    checksum: String,
+    /// Where it sits: 0 to 63 in the global chain, above that in a tenant's.
+    order: u8,
+    /// Narrows a tenant's rule to one member.
+    user: Option<String>,
+    /// Narrows a tenant's rule to one api.
+    api: Option<String>,
 }
 
 /// The plugins the caller's chain owns, newest first.
@@ -124,6 +171,127 @@ async fn disown(
     }
 }
 
+/// Every rule in the caller's chain, newest first.
+async fn list_rules(
+    State(state): State<AppState>,
+    manager: Manager,
+    Paged(page): Paged,
+) -> Response<Body> {
+    let owner = match owner_of(&state, &manager).await {
+        Ok(owner) => owner,
+        Err(refusal) => return *refusal,
+    };
+    match state
+        .stores()
+        .backend()
+        .list_rules(owner.tenant(), page)
+        .await
+    {
+        Ok(listed) => {
+            Json(listed.into_iter().map(RuleView::from).collect::<Vec<_>>()).into_response()
+        }
+        Err(error) => store_refusal(error),
+    }
+}
+
+/// Places one of the caller's plugins in the caller's chain.
+async fn place_rule(
+    State(state): State<AppState>,
+    manager: Manager,
+    body: Bytes,
+) -> Response<Body> {
+    let owner = match owner_of(&state, &manager).await {
+        Ok(owner) => owner,
+        Err(refusal) => return *refusal,
+    };
+    let Json(placement) = match Json::<Placement>::from_bytes(&body) {
+        Ok(placement) => placement,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let scope = match owner {
+        PluginOwner::Global if placement.user.is_some() || placement.api.is_some() => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a global rule runs for every flow, so it names no user and no api",
+            )
+                .into_response();
+        }
+        PluginOwner::Global => PluginScope::Global,
+        PluginOwner::Tenant(tenant) => {
+            let (user, api) = match (
+                placement.user.as_deref().map(UserId::new).transpose(),
+                placement.api.as_deref().map(ApiId::new).transpose(),
+            ) {
+                (Ok(user), Ok(api)) => (user, api),
+                _ => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+            };
+            if let Some(user) = &user {
+                match state.store().membership(user, &tenant).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!("{user} is not in {tenant}"),
+                        )
+                            .into_response();
+                    }
+                    Err(error) => return store_refusal(error),
+                }
+            }
+            PluginScope::Tenant { tenant, user, api }
+        }
+    };
+    let Ok(checksum) = Checksum::from_hex(&placement.checksum) else {
+        return unknown_plugin();
+    };
+    let rule = match NewPluginRule::new(checksum, PluginOrder::new(placement.order), scope) {
+        Ok(rule) => rule,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    match state.stores().backend().put_rule(rule).await {
+        Ok(placed) => (StatusCode::CREATED, Json(RuleView::from(&placed))).into_response(),
+        Err(StorageError::NotFound {
+            entity: Entity::Plugin,
+            ..
+        }) => unknown_plugin(),
+        Err(error) => store_refusal(error),
+    }
+}
+
+/// Removes the rule at one kind and order from the caller's chain.
+async fn remove_rule(
+    State(state): State<AppState>,
+    manager: Manager,
+    Path((kind, order)): Path<(String, u8)>,
+) -> Response<Body> {
+    let owner = match owner_of(&state, &manager).await {
+        Ok(owner) => owner,
+        Err(refusal) => return *refusal,
+    };
+    let Ok(kind) = kind.parse::<PluginKind>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match state
+        .stores()
+        .backend()
+        .remove_rule(owner.tenant(), kind, PluginOrder::new(order))
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => store_refusal(error),
+    }
+}
+
+/// A plugin the caller's chain does not own reads as one that is not there, so no chain
+/// learns what another has stored.
+fn unknown_plugin() -> Response<Body> {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "your chain holds no plugin under that checksum",
+    )
+        .into_response()
+}
+
 /// Whose plugins the caller manages, or what it is told when it manages none.
 async fn owner_of(state: &AppState, manager: &Manager) -> Result<PluginOwner, Refusal> {
     if manager.is_system_administrator() {
@@ -182,10 +350,39 @@ impl From<PluginRecord> for PluginView {
     }
 }
 
+impl From<Listed<PluginRule>> for RuleView {
+    fn from(listed: Listed<PluginRule>) -> Self {
+        Self {
+            created_at: Some(listed.created_at),
+            ..Self::from(&listed.item)
+        }
+    }
+}
+
+impl From<&PluginRule> for RuleView {
+    fn from(rule: &PluginRule) -> Self {
+        let (user, api) = match rule.scope() {
+            PluginScope::Global => (None, None),
+            PluginScope::Tenant { user, api, .. } => (
+                user.as_ref().map(ToString::to_string),
+                api.as_ref().map(ToString::to_string),
+            ),
+        };
+        Self {
+            checksum: rule.checksum().to_hex(),
+            kind: rule.kind().name(),
+            order: rule.order().get(),
+            user,
+            api,
+            created_at: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::Request;
-    use ip_core::{ApiId, Capability, CapabilityScope, Grant, TenantId, TnKey, UserId};
+    use ip_core::{ApiId, Capability, CapabilityScope, Grant, TenantId, TnKey};
     use ip_storage::{
         AccountKind, GrantStore, Membership, MembershipStore, NewTenant, NewUser, SqliteStore,
         TenantStore, UserStore,
@@ -329,6 +526,12 @@ mod tests {
             .to_owned()
     }
 
+    fn placing(checksum: &str, order: u8) -> String {
+        serde_json::json!({"checksum": checksum, "order": order}).to_string()
+    }
+
+    const RULES: &str = "/_ip/plugin-rules";
+
     #[tokio::test]
     async fn an_owner_uploads_a_plugin_named_by_its_own_checksum() {
         let (router, state) = fixture().await;
@@ -380,7 +583,12 @@ mod tests {
         for caller in ["bob", "carol"] {
             let upload = upload(&router, &state, caller, "resp_body", wasm("one")).await;
             assert_eq!(upload.status(), StatusCode::FORBIDDEN, "{caller}");
-            for (method, uri, body) in [("GET", "/_ip/plugins", None)] {
+            for (method, uri, body) in [
+                ("GET", "/_ip/plugins", None),
+                ("GET", RULES, None),
+                ("POST", RULES, Some("{}")),
+                ("DELETE", "/_ip/plugin-rules/resp_body/100", None),
+            ] {
                 let response = call(&router, &state, caller, method, uri, body).await;
                 assert_eq!(
                     response.status(),
@@ -392,7 +600,210 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_owner_sees_only_its_own_plugins() {
+    async fn a_plugin_goes_only_once_no_rule_runs_it() {
+        let (router, state) = fixture().await;
+        let checksum = stored(&router, &state, "root", "one").await;
+        let placed = call(
+            &router,
+            &state,
+            "root",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 10)),
+        )
+        .await;
+        assert_eq!(placed.status(), StatusCode::CREATED);
+
+        let path = format!("/_ip/plugins/{checksum}");
+        let not_hers = call(&router, &state, "alice", "DELETE", &path, None).await;
+        assert_eq!(not_hers.status(), StatusCode::NOT_FOUND);
+        let in_use = call(&router, &state, "root", "DELETE", &path, None).await;
+        assert_eq!(in_use.status(), StatusCode::CONFLICT);
+
+        call(
+            &router,
+            &state,
+            "root",
+            "DELETE",
+            "/_ip/plugin-rules/resp_body/10",
+            None,
+        )
+        .await;
+        let removed = call(&router, &state, "root", "DELETE", &path, None).await;
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        assert!(state.stores().backend().plugins().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_administrator_places_in_the_global_chain_at_primary_orders() {
+        let (router, state) = fixture().await;
+        let checksum = stored(&router, &state, "root", "one").await;
+
+        let placed = call(
+            &router,
+            &state,
+            "root",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 10)),
+        )
+        .await;
+        assert_eq!(placed.status(), StatusCode::CREATED);
+        let placed = json(placed).await;
+        assert_eq!(placed["kind"], "resp_body");
+        assert_eq!(placed["order"], 10);
+
+        let tenant_order = call(
+            &router,
+            &state,
+            "root",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 100)),
+        )
+        .await;
+        assert_eq!(tenant_order.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let narrowed =
+            serde_json::json!({"checksum": checksum, "order": 11, "api": "chat"}).to_string();
+        let narrowed = call(&router, &state, "root", "POST", RULES, Some(&narrowed)).await;
+        assert_eq!(narrowed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let unknown = placing(&Checksum::of(b"never stored").to_hex(), 12);
+        let missing = call(&router, &state, "root", "POST", RULES, Some(&unknown)).await;
+        assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn an_owner_places_in_its_tenant_s_chain_above_the_primary_orders() {
+        let (router, state) = fixture().await;
+        let checksum = stored(&router, &state, "alice", "one").await;
+
+        let placed = call(
+            &router,
+            &state,
+            "alice",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 100)),
+        )
+        .await;
+        assert_eq!(placed.status(), StatusCode::CREATED);
+        let rules = state
+            .stores()
+            .backend()
+            .rules_for_tenant(&acme())
+            .await
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].scope().tenant(), Some(&acme()));
+
+        let taken = call(
+            &router,
+            &state,
+            "alice",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 100)),
+        )
+        .await;
+        assert_eq!(taken.status(), StatusCode::CONFLICT);
+
+        let primary = call(
+            &router,
+            &state,
+            "alice",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 10)),
+        )
+        .await;
+        assert_eq!(primary.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let narrowed =
+            serde_json::json!({"checksum": checksum, "order": 101, "user": "bob", "api": "chat"})
+                .to_string();
+        let narrowed = call(&router, &state, "alice", "POST", RULES, Some(&narrowed)).await;
+        assert_eq!(narrowed.status(), StatusCode::CREATED);
+        let narrowed = json(narrowed).await;
+        assert_eq!(narrowed["user"], "bob");
+        assert_eq!(narrowed["api"], "chat");
+    }
+
+    #[tokio::test]
+    async fn each_caller_reads_only_the_chain_it_manages() {
+        let (router, state) = fixture().await;
+        let checksum = stored(&router, &state, "root", "one").await;
+        stored(&router, &state, "alice", "one").await;
+        call(
+            &router,
+            &state,
+            "root",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 10)),
+        )
+        .await;
+        call(
+            &router,
+            &state,
+            "alice",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 100)),
+        )
+        .await;
+
+        for (caller, order) in [("root", 10), ("alice", 100)] {
+            let listed = json(call(&router, &state, caller, "GET", RULES, None).await).await;
+            assert_eq!(listed.as_array().unwrap().len(), 1, "{caller}");
+            assert_eq!(listed[0]["order"], order, "{caller}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_narrowed_to_someone_outside_the_tenant_is_refused() {
+        let (router, state) = fixture().await;
+        let checksum = stored(&router, &state, "alice", "one").await;
+        let body =
+            serde_json::json!({"checksum": checksum, "order": 100, "user": "root"}).to_string();
+        let response = call(&router, &state, "alice", "POST", RULES, Some(&body)).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_rule_is_removed_only_from_the_chain_the_caller_manages() {
+        let (router, state) = fixture().await;
+        let checksum = stored(&router, &state, "alice", "one").await;
+        call(
+            &router,
+            &state,
+            "alice",
+            "POST",
+            RULES,
+            Some(&placing(&checksum, 100)),
+        )
+        .await;
+        let path = "/_ip/plugin-rules/resp_body/100";
+
+        let not_global = call(&router, &state, "root", "DELETE", path, None).await;
+        assert_eq!(not_global.status(), StatusCode::NOT_FOUND);
+
+        let removed = call(&router, &state, "alice", "DELETE", path, None).await;
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .stores()
+                .backend()
+                .rules_for_tenant(&acme())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn each_owner_sees_and_places_only_its_own_plugins() {
         let (router, state) = fixture().await;
         let alices = stored(&router, &state, "alice", "alice's").await;
         let roots = stored(&router, &state, "root", "root's").await;
@@ -405,6 +816,27 @@ mod tests {
         }
         let daves = json(call(&router, &state, "dave", "GET", "/_ip/plugins", None).await).await;
         assert!(daves.as_array().unwrap().is_empty());
+
+        let not_hers = call(
+            &router,
+            &state,
+            "alice",
+            "POST",
+            RULES,
+            Some(&placing(&roots, 100)),
+        )
+        .await;
+        assert_eq!(not_hers.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let not_his = call(
+            &router,
+            &state,
+            "dave",
+            "POST",
+            RULES,
+            Some(&placing(&alices, 100)),
+        )
+        .await;
+        assert_eq!(not_his.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -443,11 +875,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugins_are_listed_newest_first_a_page_at_a_time() {
+    async fn plugins_and_rules_are_listed_newest_first_a_page_at_a_time() {
         let (router, state) = fixture().await;
         let mut checksums = Vec::new();
         for tag in ["first", "second", "third"] {
             checksums.push(stored(&router, &state, "alice", tag).await);
+        }
+        for (order, checksum) in [100, 101, 102].into_iter().zip(&checksums) {
+            call(
+                &router,
+                &state,
+                "alice",
+                "POST",
+                RULES,
+                Some(&placing(checksum, order)),
+            )
+            .await;
         }
 
         let page = json(
@@ -469,6 +912,22 @@ mod tests {
             .map(|plugin| plugin["checksum"].as_str().unwrap())
             .collect();
         assert_eq!(listed, [checksums[1].as_str(), checksums[0].as_str()]);
+
+        let rules = json(
+            call(
+                &router,
+                &state,
+                "alice",
+                "GET",
+                "/_ip/plugin-rules?limit=1",
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(rules.as_array().unwrap().len(), 1);
+        assert_eq!(rules[0]["order"], 102);
+        assert!(rules[0]["created_at"].is_i64());
 
         let later = json(
             call(
