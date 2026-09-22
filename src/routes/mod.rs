@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod harness;
+mod member;
 mod tenant;
 mod user;
 
@@ -32,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/_ip/logout", post(logout))
         .route("/_ip/session", get(session))
         .nest("/_ip/tenants", tenant::router())
+        .nest("/_ip/tenants/{tenant}/members", member::router())
         .nest("/_ip/users", user::router())
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
