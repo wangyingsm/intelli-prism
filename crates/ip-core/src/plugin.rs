@@ -11,7 +11,7 @@ use crate::key::{DIGEST_BYTES, decode_hex};
 #[derive(
     Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
-#[serde(try_from = "String")]
+#[serde(try_from = "String", into = "String")]
 pub struct Checksum([u8; DIGEST_BYTES]);
 
 impl Checksum {
@@ -69,6 +69,12 @@ impl TryFrom<String> for Checksum {
 
     fn try_from(raw: String) -> Result<Self, Self::Error> {
         Self::from_hex(&raw)
+    }
+}
+
+impl From<Checksum> for String {
+    fn from(checksum: Checksum) -> Self {
+        checksum.to_hex()
     }
 }
 
@@ -331,6 +337,17 @@ impl PluginRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checksum_survives_its_own_round_trip_as_the_hex_it_is_read_from() {
+        let checksum = Checksum::of(b"module");
+        let written = serde_json::to_string(&checksum).unwrap();
+        assert_eq!(written, format!("\"{}\"", checksum.to_hex()));
+        assert_eq!(
+            serde_json::from_str::<Checksum>(&written).unwrap(),
+            checksum
+        );
+    }
 
     #[test]
     fn a_checksum_is_the_sha256_of_the_wasm() {
