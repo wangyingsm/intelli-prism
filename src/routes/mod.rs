@@ -1,3 +1,4 @@
+mod grant;
 #[cfg(test)]
 mod harness;
 mod member;
@@ -34,7 +35,12 @@ pub fn router(state: AppState) -> Router {
         .route("/_ip/session", get(session))
         .nest("/_ip/tenants", tenant::router())
         .nest("/_ip/tenants/{tenant}/members", member::router())
+        .nest(
+            "/_ip/tenants/{tenant}/members/{user}/grants",
+            grant::member_router(),
+        )
         .nest("/_ip/users", user::router())
+        .nest("/_ip/users/{user}/grants", grant::account_router())
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))
@@ -146,6 +152,17 @@ const TENANT_CAPABILITIES: [Capability; 3] = [
     Capability::Observer,
 ];
 
+/// Every capability, so a name can be read back into one.
+const CAPABILITIES: [Capability; 7] = [
+    Capability::TenantMgr,
+    Capability::UserMgr,
+    Capability::ApiAccess,
+    Capability::ApiAdvMgr,
+    Capability::LimitMgr,
+    Capability::SysAgent,
+    Capability::Observer,
+];
+
 /// The name the api spells a capability with.
 fn capability_name(capability: Capability) -> &'static str {
     match capability {
@@ -157,6 +174,13 @@ fn capability_name(capability: Capability) -> &'static str {
         Capability::SysAgent => "sys_agent",
         Capability::Observer => "observer",
     }
+}
+
+/// The capability a name spells, if it spells one.
+fn capability_named(name: &str) -> Option<Capability> {
+    CAPABILITIES
+        .into_iter()
+        .find(|capability| capability_name(*capability) == name)
 }
 
 /// Who the session belongs to, which is what a page asks for once it has logged in.
@@ -541,6 +565,17 @@ secret = "0123456789abcdef0123456789abcdef"
             .next()
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn every_capability_reads_back_from_its_own_name() {
+        for capability in CAPABILITIES {
+            assert_eq!(
+                capability_named(capability_name(capability)),
+                Some(capability)
+            );
+        }
+        assert_eq!(capability_named("root"), None);
     }
 
     #[tokio::test]
