@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -9,6 +10,44 @@ use crate::error::AuthError;
 use crate::passphrase::{Passphrase, PassphraseHasher};
 use crate::session::{Session, SessionId, SessionToken, SessionTokens};
 
+/// The most wrong passphrases a logged in user may give before asking again is locked,
+/// whatever a limit is built with.
+pub const MIN_RECHECK_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(2).expect("three is not zero");
+pub const MAX_RECHECK_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(5).expect("three is not zero");
+
+/// How many wrong passphrases a logged in user may give before asking again is locked, and
+/// how long each one counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecheckLimit {
+    attempts: NonZeroUsize,
+    window: Ttl,
+}
+
+impl RecheckLimit {
+    /// Locks after `attempts` wrong passphrases, each counting for `window`, and never after
+    /// more than [`MAX_RECHECK_ATTEMPTS`].
+    pub fn new(attempts: NonZeroUsize, window: Ttl) -> Self {
+        Self {
+            attempts: attempts.min(MAX_RECHECK_ATTEMPTS).max(MIN_RECHECK_ATTEMPTS),
+            window,
+        }
+    }
+
+    /// How long each wrong passphrase counts, which is the longest a lock can last.
+    pub fn window(self) -> Ttl {
+        self.window
+    }
+}
+
+impl Default for RecheckLimit {
+    fn default() -> Self {
+        Self::new(
+            MAX_RECHECK_ATTEMPTS,
+            Ttl::seconds(15 * 60).expect("a quarter hour is a ttl"),
+        )
+    }
+}
+
 /// Logs a user in against the stored passphrase verifier, and hands back a session token.
 #[derive(Clone)]
 pub struct Logins {
@@ -19,6 +58,7 @@ pub struct Logins {
     /// A verifier for a passphrase nobody knows, so a login for a user that does not exist
     /// costs the same work as one for a user that does.
     absent: PassphraseHash,
+    recheck: RecheckLimit,
 }
 
 impl Logins {
@@ -38,7 +78,19 @@ impl Logins {
             hasher,
             tokens,
             absent,
+            recheck: RecheckLimit::default(),
         })
+    }
+
+    /// How wrong passphrases given again are limited.
+    pub fn recheck_limit(&self) -> RecheckLimit {
+        self.recheck
+    }
+
+    /// The same logins, limiting wrong passphrases given again by `limit` instead.
+    pub fn limiting_rechecks(mut self, limit: RecheckLimit) -> Self {
+        self.recheck = limit;
+        self
     }
 
     /// Reads a token back, refusing one this server did not issue, one that has run out, and
@@ -86,6 +138,53 @@ impl Logins {
         }
     }
 
+    /// Asks a user who is logged in already for its passphrase again, before something as
+    /// sensitive as a key is shown.
+    ///
+    /// Each wrong passphrase counts against the user for the limit's window. Once the limit
+    /// counts, every passphrase is refused unchecked, the right one included, until the oldest
+    /// ages out: guessing on cannot tell when it hit. The right one clears the count.
+    pub async fn recheck(&self, user: &UserId, passphrase: &Passphrase) -> Result<(), AuthError> {
+        if self.failed_rechecks(user).await? >= self.recheck.attempts.get() {
+            return Err(AuthError::RecheckLocked);
+        }
+        let stored = self.store.user(user).await?;
+        let matched = self
+            .hasher
+            .verify(passphrase, self.verifier_of(stored.as_ref()))?;
+        if stored.is_some() && matched {
+            for slot in 0..self.recheck.attempts.get() {
+                self.cache.remove(&recheck_key(user, slot)?).await?;
+            }
+            return Ok(());
+        }
+        // Each failure takes a slot of its own, so failures that race are all counted.
+        for slot in 0..self.recheck.attempts.get() {
+            if self
+                .cache
+                .claim(&recheck_key(user, slot)?, Some(self.recheck.window))
+                .await?
+            {
+                break;
+            }
+        }
+        match self.failed_rechecks(user).await? >= self.recheck.attempts.get() {
+            true => Err(AuthError::RecheckLocked),
+            false => Err(AuthError::RecheckRefused),
+        }
+    }
+
+    /// How many wrong passphrases still count against a user.
+    async fn failed_rechecks(&self, user: &UserId) -> Result<usize, AuthError> {
+        let mut failed = 0;
+        for slot in 0..self.recheck.attempts.get() {
+            if self.cache.get(&recheck_key(user, slot)?).await?.is_some() {
+                failed += 1;
+            }
+        }
+        Ok(failed)
+    }
+
     /// What a login checks against: the stored verifier, or the unknowable one when no such
     /// user exists, so that answering a login costs the same either way.
     fn verifier_of<'a>(&'a self, stored: Option<&'a User>) -> &'a PassphraseHash {
@@ -98,6 +197,14 @@ fn remaining(session: &Session, now: SystemTime) -> Option<Ttl> {
     let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
     let left = session.expires_at().checked_sub(now)?;
     Ttl::new(Duration::from_secs(left)).ok()
+}
+
+/// Where one wrong passphrase given again is remembered while it counts.
+fn recheck_key(user: &UserId, slot: usize) -> Result<CacheKey, AuthError> {
+    Ok(CacheKey::new(
+        CacheLevel::System,
+        &format!("recheck-failed:{user}:{slot}"),
+    )?)
 }
 
 /// Where a session that was logged out is remembered.
@@ -266,6 +373,112 @@ mod tests {
         assert_eq!(
             logins.tokens.verify(token.as_str()).unwrap().user(),
             &alice()
+        );
+    }
+
+    fn limit(attempts: usize, seconds: u64) -> RecheckLimit {
+        RecheckLimit::new(
+            NonZeroUsize::new(attempts).unwrap(),
+            Ttl::seconds(seconds).unwrap(),
+        )
+    }
+
+    #[test]
+    fn no_limit_allows_more_than_the_most_there_can_be() {
+        assert_eq!(limit(50, 60), limit(3, 60));
+        assert_eq!(limit(2, 60).attempts.get(), 2);
+        assert_eq!(RecheckLimit::default().attempts, MAX_RECHECK_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn the_right_passphrase_given_again_is_accepted() {
+        let logins = logins(AccountKind::Regular).await;
+        assert!(
+            logins
+                .recheck(&alice(), &passphrase("correct horse staple"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_passphrase_given_again_is_refused_until_too_many_lock_it() {
+        let logins = logins(AccountKind::Regular)
+            .await
+            .limiting_rechecks(limit(3, 60));
+        let wrong = passphrase("incorrect horse staple");
+        for _ in 0..2 {
+            assert!(matches!(
+                logins.recheck(&alice(), &wrong).await,
+                Err(AuthError::RecheckRefused)
+            ));
+        }
+        assert!(matches!(
+            logins.recheck(&alice(), &wrong).await,
+            Err(AuthError::RecheckLocked)
+        ));
+        assert!(matches!(
+            logins
+                .recheck(&alice(), &passphrase("correct horse staple"))
+                .await,
+            Err(AuthError::RecheckLocked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_right_passphrase_clears_what_counted_against_it() {
+        let logins = logins(AccountKind::Regular)
+            .await
+            .limiting_rechecks(limit(3, 60));
+        let wrong = passphrase("incorrect horse staple");
+        for _ in 0..2 {
+            logins.recheck(&alice(), &wrong).await.unwrap_err();
+        }
+        logins
+            .recheck(&alice(), &passphrase("correct horse staple"))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                logins.recheck(&alice(), &wrong).await,
+                Err(AuthError::RecheckRefused)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lock_lifts_once_the_wrong_passphrases_age_out() {
+        let logins = logins(AccountKind::Regular)
+            .await
+            .limiting_rechecks(limit(1, 1));
+        logins
+            .recheck(&alice(), &passphrase("incorrect horse staple"))
+            .await
+            .unwrap_err();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            logins
+                .recheck(&alice(), &passphrase("correct horse staple"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_user_s_wrong_passphrases_do_not_lock_another() {
+        let logins = logins(AccountKind::Regular)
+            .await
+            .limiting_rechecks(limit(1, 60));
+        let bob = UserId::new("bob").unwrap();
+        logins
+            .recheck(&bob, &passphrase("incorrect horse staple"))
+            .await
+            .unwrap_err();
+        assert!(
+            logins
+                .recheck(&alice(), &passphrase("correct horse staple"))
+                .await
+                .is_ok()
         );
     }
 }

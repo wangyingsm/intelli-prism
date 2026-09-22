@@ -88,6 +88,14 @@ pub enum AuthError {
     #[error("session token rejected")]
     SessionRejected,
 
+    /// A logged in user gave the wrong passphrase when asked for it again.
+    #[error("passphrase does not match")]
+    RecheckRefused,
+
+    /// Too many wrong passphrases were given lately, so none is checked until they age out.
+    #[error("too many wrong passphrases; asking again is locked for now")]
+    RecheckLocked,
+
     /// A session token could not be built.
     #[error("session token could not be issued")]
     SessionIssue(#[source] serde_json::Error),
