@@ -5,10 +5,10 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
-use ip_core::{ApiId, CapabilityScope, Grant, Grants, ScopeKind, TenantId, UserId};
-use ip_storage::{AccountKind, Standing, Storage, StorageError};
+use ip_core::{ApiId, CapabilityScope, Grant, Grants, TenantId, Timestamp, UserId};
+use ip_storage::{AccountKind, Listed, Standing, Storage, StorageError};
 
-use super::{capability_name, capability_named, store_refusal};
+use super::{Paged, capability_name, capability_named, store_refusal};
 use crate::manage::Manager;
 use crate::state::AppState;
 
@@ -47,6 +47,9 @@ pub struct GrantView {
     /// The api it is held against, when it is held against one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
+    /// When it was granted, in seconds since the unix epoch, as a list reads it back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
 }
 
 /// A response turned away early, boxed so it passes back up a `Result` cheaply.
@@ -62,12 +65,13 @@ struct Named {
     grant: Grant,
 }
 
-/// Every grant a member holds inside a tenant, shown to the tenant's administrators and to
-/// the member itself.
+/// Every grant a member holds inside a tenant, newest first, shown to the tenant's
+/// administrators and to the member itself.
 async fn list_in_tenant(
     State(state): State<AppState>,
     manager: Manager,
     Path((tenant, user)): Path<(String, String)>,
+    Paged(page): Paged,
 ) -> Response<Body> {
     let (Ok(tenant), Ok(user)) = (TenantId::new(&tenant), UserId::new(&user)) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -80,8 +84,13 @@ async fn list_in_tenant(
             Err(error) => return store_refusal(error),
         }
     }
-    match store.grants_in_tenant(&user, &tenant).await {
-        Ok(grants) => Json(views(&grants)).into_response(),
+    match state
+        .stores()
+        .backend()
+        .list_tenant_grants(&user, &tenant, page)
+        .await
+    {
+        Ok(grants) => Json(listed_views(grants)).into_response(),
         Err(error) => store_refusal(error),
     }
 }
@@ -260,12 +269,13 @@ async fn administers(
         .is_some_and(|held| held.standing == Standing::Owner))
 }
 
-/// The grants held against an account itself, shown to the system administrator and to the
-/// account.
+/// The grants held against an account itself, newest first, shown to the system
+/// administrator and to the account.
 async fn list_on_account(
     State(state): State<AppState>,
     manager: Manager,
     Path(user): Path<String>,
+    Paged(page): Paged,
 ) -> Response<Body> {
     let Ok(user) = UserId::new(&user) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -273,15 +283,13 @@ async fn list_on_account(
     if !manager.is_system_administrator() && manager.user() != &user {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match state.store().grants_of(&user).await {
-        Ok(grants) => {
-            let own: Grants = grants
-                .iter()
-                .filter(|grant| grant.scope().kind() == ScopeKind::User)
-                .cloned()
-                .collect();
-            Json(views(&own)).into_response()
-        }
+    match state
+        .stores()
+        .backend()
+        .list_account_grants(&user, page)
+        .await
+    {
+        Ok(grants) => Json(listed_views(grants)).into_response(),
         Err(error) => store_refusal(error),
     }
 }
@@ -350,17 +358,25 @@ async fn account_grant(
     }
 }
 
-/// Grants as the api shows them, in an order that does not change between reads.
-fn views(grants: &Grants) -> Vec<GrantView> {
-    let mut views: Vec<GrantView> = grants
-        .iter()
-        .map(|grant| GrantView {
+/// Grants as a list shows them, in the order the store read them.
+fn listed_views(grants: Vec<Listed<Grant>>) -> Vec<GrantView> {
+    grants
+        .into_iter()
+        .map(|listed| GrantView {
+            created_at: Some(listed.created_at),
+            ..GrantView::from(&listed.item)
+        })
+        .collect()
+}
+
+impl From<&Grant> for GrantView {
+    fn from(grant: &Grant) -> Self {
+        Self {
             capability: capability_name(grant.capability()),
             api: grant.scope().api().map(ToString::to_string),
-        })
-        .collect();
-    views.sort_by(|left, right| (left.capability, &left.api).cmp(&(right.capability, &right.api)));
-    views
+            created_at: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -467,22 +483,36 @@ mod tests {
             .unwrap()
     }
 
-    /// What bob holds inside acme, as the api names it.
+    /// What bob holds inside acme, as the api names it, in an order that does not change.
     async fn bob_holds(state: &AppState) -> Vec<GrantView> {
-        views(
-            &state
-                .store()
-                .grants_in_tenant(&id("bob"), &tenant("acme"))
-                .await
-                .unwrap(),
-        )
+        let held = state
+            .store()
+            .grants_in_tenant(&id("bob"), &tenant("acme"))
+            .await
+            .unwrap();
+        let mut views: Vec<GrantView> = held.iter().map(GrantView::from).collect();
+        views.sort_by(|left, right| {
+            (left.capability, &left.api).cmp(&(right.capability, &right.api))
+        });
+        views
     }
 
     fn view(capability: &'static str, api: Option<&str>) -> GrantView {
         GrantView {
             capability,
             api: api.map(ToOwned::to_owned),
+            created_at: None,
         }
+    }
+
+    /// A listed grant without the moment it was made, which a test cannot know in advance.
+    fn untimed(listed: &serde_json::Value) -> serde_json::Value {
+        let mut grants = listed.clone();
+        for grant in grants.as_array_mut().unwrap() {
+            assert!(grant["created_at"].is_i64(), "{grant}");
+            grant.as_object_mut().unwrap().remove("created_at");
+        }
+        grants
     }
 
     const BOB: &str = "/_ip/tenants/acme/members/bob/grants";
@@ -633,7 +663,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{caller}");
             let body: serde_json::Value = serde_json::from_str(&body_of(response).await).unwrap();
             assert_eq!(
-                body,
+                untimed(&body),
                 serde_json::json!([
                     {"capability": "api_access", "api": "chat"},
                     {"capability": "observer"},
@@ -674,7 +704,10 @@ mod tests {
 
         let listed = call(&router, &state, "carol", "GET", "/_ip/users/carol/grants").await;
         let body: serde_json::Value = serde_json::from_str(&body_of(listed).await).unwrap();
-        assert_eq!(body, serde_json::json!([{"capability": "tenant_mgr"}]));
+        assert_eq!(
+            untimed(&body),
+            serde_json::json!([{"capability": "tenant_mgr"}])
+        );
 
         let revoked = call(
             &router,
@@ -747,6 +780,27 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn grants_are_listed_newest_first_a_page_at_a_time() {
+        let (router, state) = fixture().await;
+        for path in ["observer", "sys_agent", "user_mgr"] {
+            call(&router, &state, "alice", "PUT", &format!("{BOB}/{path}")).await;
+        }
+        let page = call(
+            &router,
+            &state,
+            "alice",
+            "GET",
+            &format!("{BOB}?limit=2&offset=1"),
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&body_of(page).await).unwrap();
+        assert_eq!(
+            untimed(&body),
+            serde_json::json!([{"capability": "sys_agent"}, {"capability": "observer"}])
         );
     }
 }

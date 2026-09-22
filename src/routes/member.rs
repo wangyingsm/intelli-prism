@@ -5,13 +5,13 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
-use ip_core::{Capability, CapabilityScope, TenantId, UserId};
+use ip_core::{Capability, CapabilityScope, TenantId, Timestamp, UserId};
 use ip_storage::{
-    AccountKind, IdentityDialect, MemberRemoveBegun, MemberRemoveTransactional, MemberRemoveTxn,
-    MemberRemoved, Membership, Standing, StorageError,
+    AccountKind, IdentityDialect, Listed, MemberRemoveBegun, MemberRemoveTransactional,
+    MemberRemoveTxn, MemberRemoved, Membership, Standing, StorageError,
 };
 
-use super::{standing_name, store_refusal};
+use super::{Paged, standing_name, store_refusal};
 use crate::manage::Manager;
 use crate::state::{AppState, Stores};
 
@@ -29,6 +29,9 @@ pub struct MemberView {
     pub user: String,
     /// What it is inside the tenant.
     pub standing: &'static str,
+    /// When it joined, in seconds since the unix epoch, as a list reads it back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
 }
 
 /// An account that left a tenant, and how much it held there.
@@ -42,11 +45,12 @@ pub struct DetachedView {
     pub revoked: u64,
 }
 
-/// Everyone in a tenant.
+/// Everyone in a tenant, newest first.
 async fn list(
     State(state): State<AppState>,
     manager: Manager,
     Path(tenant): Path<String>,
+    Paged(page): Paged,
 ) -> Response<Body> {
     let Ok(tenant) = TenantId::new(&tenant) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -54,7 +58,7 @@ async fn list(
     if let Some(refusal) = user_mgr_refusal(&state, &manager, &tenant).await {
         return refusal;
     }
-    match state.store().members_of_tenant(&tenant).await {
+    match state.stores().backend().list_members(&tenant, page).await {
         Ok(members) => Json(
             members
                 .into_iter()
@@ -201,6 +205,16 @@ impl From<Membership> for MemberView {
         Self {
             user: membership.user.to_string(),
             standing: standing_name(membership.standing),
+            created_at: None,
+        }
+    }
+}
+
+impl From<Listed<Membership>> for MemberView {
+    fn from(listed: Listed<Membership>) -> Self {
+        Self {
+            created_at: Some(listed.created_at),
+            ..Self::from(listed.item)
         }
     }
 }
@@ -590,5 +604,63 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn members_are_listed_newest_first_a_page_at_a_time() {
+        let (router, state) = fixture().await;
+        let page = call(
+            &router,
+            &state,
+            "alice",
+            "GET",
+            "/_ip/tenants/acme/members?limit=2",
+        )
+        .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_of(page).await).unwrap();
+        let users: Vec<&str> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["user"].as_str().unwrap())
+            .collect();
+        assert_eq!(users, ["erin", "bob"]);
+        assert!(body[0]["created_at"].is_i64());
+
+        let rest = call(
+            &router,
+            &state,
+            "alice",
+            "GET",
+            "/_ip/tenants/acme/members?offset=2",
+        )
+        .await;
+        let rest: serde_json::Value = serde_json::from_str(&body_of(rest).await).unwrap();
+        assert_eq!(rest.as_array().unwrap().len(), 1);
+        assert_eq!(rest[0]["user"], "alice");
+    }
+
+    #[tokio::test]
+    async fn a_page_that_is_not_one_is_refused() {
+        let (router, state) = fixture().await;
+        let bad_moment = call(
+            &router,
+            &state,
+            "alice",
+            "GET",
+            "/_ip/tenants/acme/members?after=99999999999999",
+        )
+        .await;
+        assert_eq!(bad_moment.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bad_limit = call(
+            &router,
+            &state,
+            "alice",
+            "GET",
+            "/_ip/tenants/acme/members?limit=many",
+        )
+        .await;
+        assert_eq!(bad_limit.status(), StatusCode::BAD_REQUEST);
     }
 }

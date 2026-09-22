@@ -102,6 +102,10 @@ Roughly in dependency order. Each entry names what it waits on.
 - Admin endpoints for tenants, users, memberships, grants, rules and plugins, at the authority the
 capability model already describes. Everything below that a person has to configure needs this.
 - Quota and rate limits per tenant and user — no representation for either exists yet.
+- Syncing a list by `after`. Every list is newest first and takes `?after=<unix seconds>`, so a
+client that records the newest `created_at` it has seen can ask for only what came since. Times
+are whole seconds and `after` is strict, so a record made in the same second as the last one seen
+is skipped; syncing on it needs a tie-breaker, such as the row id, carried beside the time.
 - Wasm a deleted tenant owned alone is left in the store with no owner. Nothing lists it or runs
 it, but nothing removes it either until a sweep of unowned plugins exists.
 

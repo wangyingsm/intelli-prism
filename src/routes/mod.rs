@@ -7,16 +7,17 @@ mod tenant;
 mod user;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, Request, Response, StatusCode, header::SET_COOKIE};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
 use ip_auth::{Identity, Passphrase};
-use ip_core::{Capability, CapabilityScope, Protocol, Role};
+use ip_core::{Capability, CapabilityScope, Protocol, Role, Timestamp};
 use ip_gateway::{GatewayBody, GatewayError, RequestContext};
-use ip_storage::{Standing, StorageError};
+use ip_storage::{DEFAULT_PAGE_LIMIT, Page, Standing, StorageError};
 use std::net::SocketAddr;
 
 use crate::auth::Authenticated;
@@ -248,6 +249,42 @@ fn store_refusal(error: StorageError) -> Response<Body> {
             tracing::error!(%error, "the store could not carry a management request");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+/// Which page of a list a request asks for. Every part may be left out.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct PageQuery {
+    /// How many records at most; 20 when left out, and never more than 100.
+    limit: Option<u32>,
+    /// How many to skip first; none when left out.
+    offset: Option<u32>,
+    /// Only records created after this moment, in unix seconds; every record when left out.
+    after: Option<i64>,
+}
+
+/// The page of a list a request asks for, newest first.
+#[derive(Debug, Clone, Copy)]
+pub struct Paged(pub Page);
+
+impl<S: Send + Sync> FromRequestParts<S> for Paged {
+    type Rejection = Response<Body>;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Query(query) = Query::<PageQuery>::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let after = match query.after {
+            Some(seconds) => Some(Timestamp::from_unix_seconds(seconds).map_err(|error| {
+                (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+            })?),
+            None => None,
+        };
+        Ok(Self(Page::new(
+            query.limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+            query.offset.unwrap_or(0),
+            after,
+        )))
     }
 }
 

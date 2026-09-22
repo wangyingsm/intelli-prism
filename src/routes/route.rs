@@ -5,9 +5,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use ip_core::{RouteKey, RouteRule};
+use ip_core::{RouteKey, RouteRule, Timestamp};
+use ip_storage::Page;
 
-use super::store_refusal;
+use super::{Paged, store_refusal};
 use crate::manage::Manager;
 use crate::state::AppState;
 
@@ -27,33 +28,66 @@ pub struct RouteView<'a> {
     pub source: &'static str,
     /// Whether a configured rule claims the same key, which leaves a stored rule unused.
     pub shadowed: bool,
+    /// When a stored rule was stored, in seconds since the unix epoch; a configured rule has
+    /// no such moment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
     /// The rule itself.
     #[serde(flatten)]
     pub rule: &'a RouteRule,
 }
 
-/// Every rule, configured and stored.
-async fn list(State(state): State<AppState>, manager: Manager) -> Response<Body> {
+/// Every rule in force: the configured ones first, since they have no time to order them
+/// by, then the stored ones newest first. A page that names a moment holds stored rules only,
+/// since no configured rule was created after anything.
+async fn list(
+    State(state): State<AppState>,
+    manager: Manager,
+    Paged(page): Paged,
+) -> Response<Body> {
     if !manager.is_system_administrator() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let stored = match state.stores().backend().routes().await {
-        Ok(stored) => stored,
-        Err(error) => return store_refusal(error),
-    };
     let configured = state.configured();
-    let mut views: Vec<RouteView<'_>> = configured
+    let listed_configured = match page.after() {
+        Some(_) => &[][..],
+        None => configured,
+    };
+    let offset = page.offset() as usize;
+    let limit = page.limit() as usize;
+    let mut views: Vec<RouteView<'_>> = listed_configured
         .iter()
+        .skip(offset)
+        .take(limit)
         .map(|rule| RouteView {
             source: "config",
             shadowed: false,
+            created_at: None,
             rule,
         })
         .collect();
-    views.extend(stored.iter().map(|rule| RouteView {
+
+    let room = limit - views.len();
+    let stored = match room {
+        0 => Vec::new(),
+        room => {
+            let skipped = offset.saturating_sub(listed_configured.len());
+            let stored_page = Page::new(
+                u32::try_from(room).unwrap_or(u32::MAX),
+                u32::try_from(skipped).unwrap_or(u32::MAX),
+                page.after(),
+            );
+            match state.stores().backend().list_routes(stored_page).await {
+                Ok(stored) => stored,
+                Err(error) => return store_refusal(error),
+            }
+        }
+    };
+    views.extend(stored.iter().map(|listed| RouteView {
         source: "stored",
-        shadowed: claims(configured, &rule.key),
-        rule,
+        shadowed: claims(configured, &listed.item.key),
+        created_at: Some(listed.created_at),
+        rule: &listed.item,
     }));
     Json(views).into_response()
 }
@@ -361,5 +395,60 @@ mod tests {
 
         let again = call(&router, &state, "root", "DELETE", Some(&key)).await;
         assert_eq!(again.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn configured_rules_come_first_then_stored_ones_newest_first() {
+        let store = store().await;
+        for path in ["/stored-old", "/stored-new"] {
+            store
+                .put_route(rule(path, "api.example.com"))
+                .await
+                .unwrap();
+        }
+        let state = state_over(store).configuring(vec![rule("/configured", "api.example.com")]);
+        let router = crate::routes::router(state.clone());
+        let paths = |listed: serde_json::Value| -> Vec<String> {
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|view| view["key"]["path"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let page = |query: &'static str| {
+            let router = router.clone();
+            let state = state.clone();
+            async move {
+                let response = router
+                    .oneshot(request(
+                        "GET",
+                        &format!("/_ip/routes{query}"),
+                        &cookie_of(&state, &id("root")).await,
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&body_of(response).await).unwrap()
+            }
+        };
+
+        assert_eq!(
+            paths(page("?limit=2").await),
+            ["/configured", "/stored-new"]
+        );
+        assert_eq!(
+            paths(page("?offset=1").await),
+            ["/stored-new", "/stored-old"]
+        );
+        assert_eq!(paths(page("?offset=2&limit=5").await), ["/stored-old"]);
+        assert_eq!(
+            paths(page("?after=0").await),
+            ["/stored-new", "/stored-old"]
+        );
+
+        let listed = page("").await;
+        assert!(listed[0].get("created_at").is_none());
+        assert!(listed[1]["created_at"].is_i64());
     }
 }
