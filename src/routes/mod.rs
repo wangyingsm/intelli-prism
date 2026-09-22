@@ -138,11 +138,24 @@ pub struct Reach {
 }
 
 /// What a caller may hold inside one tenant, as opposed to against one api.
-const TENANT_CAPABILITIES: [(Capability, &str); 3] = [
-    (Capability::UserMgr, "user_mgr"),
-    (Capability::SysAgent, "sys_agent"),
-    (Capability::Observer, "observer"),
+const TENANT_CAPABILITIES: [Capability; 3] = [
+    Capability::UserMgr,
+    Capability::SysAgent,
+    Capability::Observer,
 ];
+
+/// The name the api spells a capability with.
+fn capability_name(capability: Capability) -> &'static str {
+    match capability {
+        Capability::TenantMgr => "tenant_mgr",
+        Capability::UserMgr => "user_mgr",
+        Capability::ApiAccess => "api_access",
+        Capability::ApiAdvMgr => "api_adv_mgr",
+        Capability::LimitMgr => "limit_mgr",
+        Capability::SysAgent => "sys_agent",
+        Capability::Observer => "observer",
+    }
+}
 
 /// Who the session belongs to, which is what a page asks for once it has logged in.
 async fn session(State(state): State<AppState>, manager: Manager) -> Response<Body> {
@@ -158,13 +171,13 @@ async fn session(State(state): State<AppState>, manager: Manager) -> Response<Bo
     let mut tenants = Vec::with_capacity(attached.len());
     for membership in attached {
         let mut capabilities = Vec::new();
-        for (capability, name) in TENANT_CAPABILITIES {
+        for capability in TENANT_CAPABILITIES {
             let scope = CapabilityScope::Tenant {
                 user: manager.user().clone(),
                 tenant: membership.tenant.clone(),
             };
             match manager.allows(store, capability, &scope).await {
-                Ok(true) => capabilities.push(name),
+                Ok(true) => capabilities.push(capability_name(capability)),
                 Ok(false) => {}
                 Err(error) => {
                     tracing::error!(%error, "could not read what the caller holds");
