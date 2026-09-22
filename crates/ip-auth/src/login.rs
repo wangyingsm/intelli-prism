@@ -10,10 +10,12 @@ use crate::error::AuthError;
 use crate::passphrase::{Passphrase, PassphraseHasher};
 use crate::session::{Session, SessionId, SessionToken, SessionTokens};
 
+/// The fewest wrong passphrases a limit allows before it locks, so one slip locks nobody out.
+pub const MIN_RECHECK_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(2).expect("two is not zero");
+
 /// The most wrong passphrases a logged in user may give before asking again is locked,
 /// whatever a limit is built with.
-pub const MIN_RECHECK_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(2).expect("three is not zero");
-pub const MAX_RECHECK_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(5).expect("three is not zero");
+pub const MAX_RECHECK_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(5).expect("five is not zero");
 
 /// How many wrong passphrases a logged in user may give before asking again is locked, and
 /// how long each one counts.
@@ -25,7 +27,7 @@ pub struct RecheckLimit {
 
 impl RecheckLimit {
     /// Locks after `attempts` wrong passphrases, each counting for `window`, and never after
-    /// more than [`MAX_RECHECK_ATTEMPTS`].
+    /// fewer than [`MIN_RECHECK_ATTEMPTS`] or more than [`MAX_RECHECK_ATTEMPTS`].
     pub fn new(attempts: NonZeroUsize, window: Ttl) -> Self {
         Self {
             attempts: attempts.min(MAX_RECHECK_ATTEMPTS).max(MIN_RECHECK_ATTEMPTS),
@@ -384,9 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn no_limit_allows_more_than_the_most_there_can_be() {
-        assert_eq!(limit(50, 60), limit(3, 60));
-        assert_eq!(limit(2, 60).attempts.get(), 2);
+    fn a_limit_is_held_between_the_fewest_and_the_most_there_can_be() {
+        assert_eq!(limit(50, 60), limit(MAX_RECHECK_ATTEMPTS.get(), 60));
+        assert_eq!(limit(1, 60).attempts, MIN_RECHECK_ATTEMPTS);
+        assert_eq!(limit(3, 60).attempts.get(), 3);
         assert_eq!(RecheckLimit::default().attempts, MAX_RECHECK_ATTEMPTS);
     }
 
@@ -446,16 +449,24 @@ mod tests {
         }
     }
 
+    /// The window outlasts a passphrase check on a loaded machine, so the first failure still
+    /// counts when the second is made.
     #[tokio::test]
     async fn a_lock_lifts_once_the_wrong_passphrases_age_out() {
         let logins = logins(AccountKind::Regular)
             .await
-            .limiting_rechecks(limit(1, 1));
-        logins
-            .recheck(&alice(), &passphrase("incorrect horse staple"))
-            .await
-            .unwrap_err();
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
+            .limiting_rechecks(limit(MIN_RECHECK_ATTEMPTS.get(), 4));
+        let wrong = passphrase("incorrect horse staple");
+        for _ in 0..MIN_RECHECK_ATTEMPTS.get() {
+            logins.recheck(&alice(), &wrong).await.unwrap_err();
+        }
+        assert!(matches!(
+            logins
+                .recheck(&alice(), &passphrase("correct horse staple"))
+                .await,
+            Err(AuthError::RecheckLocked)
+        ));
+        tokio::time::sleep(Duration::from_millis(4_100)).await;
         assert!(
             logins
                 .recheck(&alice(), &passphrase("correct horse staple"))
@@ -468,12 +479,16 @@ mod tests {
     async fn one_user_s_wrong_passphrases_do_not_lock_another() {
         let logins = logins(AccountKind::Regular)
             .await
-            .limiting_rechecks(limit(1, 60));
+            .limiting_rechecks(limit(MIN_RECHECK_ATTEMPTS.get(), 60));
         let bob = UserId::new("bob").unwrap();
-        logins
-            .recheck(&bob, &passphrase("incorrect horse staple"))
-            .await
-            .unwrap_err();
+        let wrong = passphrase("incorrect horse staple");
+        for _ in 0..MIN_RECHECK_ATTEMPTS.get() {
+            logins.recheck(&bob, &wrong).await.unwrap_err();
+        }
+        assert!(matches!(
+            logins.recheck(&bob, &wrong).await,
+            Err(AuthError::RecheckLocked)
+        ));
         assert!(
             logins
                 .recheck(&alice(), &passphrase("correct horse staple"))
