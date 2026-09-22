@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -42,10 +44,19 @@ pub struct RequestContext {
 /// Authentication happens before a request reaches here, so the flow starts at
 /// authorization and carries the identity it was handed.
 pub struct Gateway {
-    table: RoutingTable,
-    chains: Arc<dyn ChainSource>,
+    /// What a request is routed and processed by, replaced whole when the rules change.
+    routing: ArcSwap<Routing>,
     upstream: Arc<dyn Upstream>,
     responses: Option<ResponseCache>,
+}
+
+/// The rules in force: the table a request is routed by and the chains it is processed by.
+///
+/// The two are held together and replaced together, so no request is ever routed by one set
+/// of rules and processed by another.
+struct Routing {
+    table: Arc<RoutingTable>,
+    chains: Arc<dyn ChainSource>,
 }
 
 impl Gateway {
@@ -67,11 +78,24 @@ impl Gateway {
         upstream: Arc<dyn Upstream>,
     ) -> Self {
         Self {
-            table,
-            chains,
+            routing: ArcSwap::from_pointee(Routing {
+                table: Arc::new(table),
+                chains,
+            }),
             upstream,
             responses: None,
         }
+    }
+
+    /// Puts a new table and new chains in force, for every request that starts after this.
+    ///
+    /// Readers never wait for this: a request in flight finishes on the rules it started
+    /// with, and the next one picks up the new ones.
+    pub fn replace(&self, table: RoutingTable, chains: Arc<dyn ChainSource>) {
+        self.routing.store(Arc::new(Routing {
+            table: Arc::new(table),
+            chains,
+        }));
     }
 
     /// Answers a request the cache already holds an answer for out of `responses`.
@@ -80,9 +104,9 @@ impl Gateway {
         self
     }
 
-    /// The rules this flow routes by.
-    pub fn table(&self) -> &RoutingTable {
-        &self.table
+    /// The rules this flow routes by, as they stand now.
+    pub fn table(&self) -> Arc<RoutingTable> {
+        Arc::clone(&self.routing.load().table)
     }
 
     /// Carries one request through every stage, in the order the types allow.
@@ -91,8 +115,10 @@ impl Gateway {
         context: RequestContext,
         request: Request<GatewayBody>,
     ) -> Result<Response<GatewayBody>, GatewayError> {
-        let authorized = Flow::received(context, request).authorize(&self.table)?;
-        let chains = self.chains.chains_for(
+        // One load, so the request is routed and processed by the same rules throughout.
+        let routing = self.routing.load();
+        let authorized = Flow::received(context, request).authorize(&routing.table)?;
+        let chains = routing.chains.chains_for(
             authorized.context().authority.identity(),
             &authorized.resolution().rule().api,
         );

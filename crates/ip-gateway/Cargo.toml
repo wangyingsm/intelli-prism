@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+arc-swap = "1.9.2"
 async-trait = "0.1.92"
 bytes = "1.12.1"
 http = "1.5.0"
