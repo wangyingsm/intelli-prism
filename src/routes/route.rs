@@ -485,4 +485,27 @@ mod tests {
             state.stores().backend().rule_revision().await.unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn a_rule_stored_over_the_api_reaches_the_table_this_node_routes_by() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        assert!(state.gateway().table().is_empty());
+
+        call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&json(&rule("/v1", "api.example.com"))),
+        )
+        .await;
+        state.reload_rules().await.unwrap();
+        assert_eq!(state.gateway().table().len(), 1);
+
+        let key = serde_json::to_string(&rule("/v1", "api.example.com").key).unwrap();
+        call(&router, &state, "root", "DELETE", Some(&key)).await;
+        state.reload_rules().await.unwrap();
+        assert!(state.gateway().table().is_empty());
+    }
 }

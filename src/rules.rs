@@ -8,9 +8,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ip_gateway::{Gateway, RoutingTable};
+use ip_plugin::{PluginChains, PluginHost};
+use tokio::sync::watch;
+
 use ip_cache::{CacheBackend, CacheKey, CacheLevel};
 use ip_core::{Checksum, PluginKind, PluginOrder, PluginRule, PluginScope, RouteRule};
-#[cfg(test)]
 use ip_storage::RuleSet;
 use ip_storage::{Backend, RuleRevision};
 use tokio::task::JoinHandle;
@@ -22,6 +25,16 @@ const HEAL_EVERY: Duration = Duration::from_secs(30);
 
 /// The most a node adds to that, so nodes started together do not check together.
 const HEAL_JITTER: Duration = Duration::from_secs(10);
+
+/// The most a node waits before acting on a change, so a change never sends every node to
+/// rebuild at the same instant.
+const RELOAD_SPREAD: Duration = Duration::from_secs(2);
+
+/// How long a node waits before trying a reload that failed again.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest it waits between those attempts.
+const RETRY_MOST: Duration = Duration::from_secs(60);
 
 /// The rules as the cache carries them, without the revision the publication already holds.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -80,7 +93,6 @@ impl RuleFeed {
     }
 
     /// The rules published now, or none when nothing has been.
-    #[cfg(test)]
     pub async fn published(&self) -> Result<Option<RuleSet>, FeedError> {
         let Some(published) = self.cache.published(&self.topic).await? else {
             return Ok(None);
@@ -97,6 +109,18 @@ impl RuleFeed {
             routes: snapshot.routes,
             rules,
         }))
+    }
+
+    /// The cache the rules are published in, for a test that publishes something this feed
+    /// would never write.
+    #[cfg(test)]
+    pub fn cache(&self) -> &Arc<dyn CacheBackend> {
+        &self.cache
+    }
+
+    /// Follows the published revision, which moves on whenever the rules do.
+    pub async fn follow(&self) -> Result<watch::Receiver<u64>, FeedError> {
+        Ok(self.cache.follow(&self.topic).await?)
     }
 
     /// Publishes again when the cache holds nothing or is behind storage, reporting whether it
@@ -136,6 +160,103 @@ pub fn jitter(most: Duration) -> Duration {
     }
     let most = u64::try_from(most.as_millis()).unwrap_or(u64::MAX).max(1);
     Duration::from_millis(u64::from_le_bytes(bytes) % most)
+}
+
+/// Keeps this node's routing table and plugin chains in step with what is published.
+///
+/// The rules are built before anything is replaced, so a set that cannot be built leaves the
+/// node serving the one it already has.
+pub struct Reloader {
+    feed: Arc<RuleFeed>,
+    store: Arc<dyn Backend>,
+    host: Arc<PluginHost>,
+    gateway: Arc<Gateway>,
+    configured: Arc<[RouteRule]>,
+}
+
+impl Reloader {
+    /// A reloader that puts what `feed` publishes in force in `gateway`.
+    pub fn new(
+        feed: Arc<RuleFeed>,
+        store: Arc<dyn Backend>,
+        host: Arc<PluginHost>,
+        gateway: Arc<Gateway>,
+        configured: Arc<[RouteRule]>,
+    ) -> Self {
+        Self {
+            feed,
+            store,
+            host,
+            gateway,
+            configured,
+        }
+    }
+
+    /// Builds the rules published now and puts them in force, reporting the revision that is
+    /// now serving. Answers nothing when nothing is published yet.
+    pub async fn reload(&self) -> Result<Option<RuleRevision>, FeedError> {
+        let Some(set) = self.feed.published().await? else {
+            return Ok(None);
+        };
+        let table = RoutingTable::assemble(&self.configured, set.routes)?;
+        let chains =
+            PluginChains::from_rules(Arc::clone(&self.host), self.store.as_ref(), set.rules)
+                .await?;
+        self.gateway.replace(table, Arc::new(chains));
+        Ok(Some(set.revision))
+    }
+
+    /// Follows the published rules from `applied`, reloading whenever they move past it, for
+    /// as long as the server runs.
+    pub fn keep_following(self: Arc<Self>, applied: RuleRevision) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut following = match self.feed.follow().await {
+                Ok(following) => following,
+                Err(error) => {
+                    tracing::error!(%error, "could not follow the rules; this node keeps the rules it started with");
+                    return;
+                }
+            };
+            let mut applied = applied;
+            while following.changed().await.is_ok() {
+                if *following.borrow_and_update() <= applied.get() {
+                    continue;
+                }
+                tokio::time::sleep(jitter(RELOAD_SPREAD)).await;
+                applied = self.reload_until_it_lands(applied, &mut following).await;
+            }
+        })
+    }
+
+    /// Reloads, waiting longer after each failure, until it lands or the feed is gone.
+    async fn reload_until_it_lands(
+        &self,
+        applied: RuleRevision,
+        following: &mut watch::Receiver<u64>,
+    ) -> RuleRevision {
+        let mut wait = RETRY_FIRST;
+        loop {
+            match self.reload().await {
+                Ok(Some(revision)) => {
+                    tracing::info!(%revision, "the rules this node serves moved on");
+                    return revision;
+                }
+                Ok(None) => return applied,
+                Err(error) => {
+                    tracing::error!(%error, "could not put the published rules in force; keeping the ones in hand");
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {}
+                        changed = following.changed() => {
+                            if changed.is_err() {
+                                return applied;
+                            }
+                        }
+                    }
+                    wait = (wait * 2).min(RETRY_MOST);
+                }
+            }
+        }
+    }
 }
 
 impl From<&PluginRule> for Placed {
@@ -281,6 +402,118 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(feed.published().await, Err(FeedError::Rule(_))));
+    }
+
+    /// A node whose gateway serves whatever the reloader puts in force, over a store and a
+    /// cache of its own.
+    async fn node() -> (crate::state::AppState, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+        let state = crate::routes::harness::state_over_shared(Arc::clone(&store));
+        (state, store)
+    }
+
+    /// Waits for the gateway to serve `rules`, or gives up.
+    async fn serves(state: &crate::state::AppState, rules: usize) -> bool {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while state.gateway().table().len() != rules {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn what_is_published_becomes_what_this_node_serves() {
+        let (state, store) = node().await;
+        assert!(state.gateway().table().is_empty());
+        store.put_route(route("/v1")).await.unwrap();
+        state.feed().publish().await.unwrap();
+
+        let revision = state.reload_rules().await.unwrap().unwrap();
+        assert_eq!(revision, store.rule_revision().await.unwrap());
+        assert_eq!(state.gateway().table().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rules_that_cannot_be_built_leave_the_ones_in_hand_serving() {
+        let (state, store) = node().await;
+        store.put_route(route("/v1")).await.unwrap();
+        state.feed().publish().await.unwrap();
+        state.reload_rules().await.unwrap();
+
+        // A rule on the gateway's own prefix, which the table refuses and the api never stores.
+        let refused = serde_json::json!({
+            "routes": [{
+                "api": "chat",
+                "key": {"protocol": "https", "host": "gateway.local", "port": 443, "path": "/_ip/own"},
+                "target": [{"protocol": "https", "host": "api.example.com", "port": 443, "path": "/v1"}],
+            }],
+            "rules": [],
+        });
+        let topic = CacheKey::new(CacheLevel::System, "rules").unwrap();
+        state
+            .feed()
+            .cache()
+            .publish(&topic, 9_999, refused.to_string().as_bytes())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            state.reload_rules().await,
+            Err(FeedError::Table(_))
+        ));
+        assert_eq!(state.gateway().table().len(), 1, "the node stopped serving");
+    }
+
+    #[tokio::test]
+    async fn a_global_plugin_that_will_not_load_leaves_the_rules_in_hand_serving() {
+        let (state, store) = node().await;
+        store.put_route(route("/v1")).await.unwrap();
+        state.feed().publish().await.unwrap();
+        state.reload_rules().await.unwrap();
+
+        let plugin = store
+            .put_plugin(NewPlugin {
+                kind: PluginKind::ReqBody,
+                wasm: b"not wasm at all".to_vec(),
+                owner: PluginOwner::Global,
+            })
+            .await
+            .unwrap();
+        store
+            .put_rule(
+                NewPluginRule::new(plugin.checksum, PluginOrder::new(10), PluginScope::Global)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        state.feed().publish().await.unwrap();
+
+        assert!(matches!(
+            state.reload_rules().await,
+            Err(FeedError::Chains(_))
+        ));
+        assert_eq!(state.gateway().table().len(), 1, "the node stopped serving");
+    }
+
+    #[tokio::test]
+    async fn following_puts_a_change_in_force_of_its_own_accord() {
+        let (state, store) = node().await;
+        let following = state.keep_rules_in_step();
+        store.put_route(route("/v1")).await.unwrap();
+        state.feed().publish().await.unwrap();
+        assert!(
+            serves(&state, 1).await,
+            "the change never reached the table"
+        );
+
+        for path in ["/v2", "/v3"] {
+            store.put_route(route(path)).await.unwrap();
+            state.feed().publish().await.unwrap();
+        }
+        assert!(serves(&state, 3).await, "the newest change never landed");
+        following.abort();
     }
 
     #[test]

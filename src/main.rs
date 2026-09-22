@@ -40,6 +40,7 @@ async fn serve(config: &Path) -> Result<(), StartupError> {
 
     let state = AppState::open(&config).await?;
     let _healing = std::sync::Arc::clone(state.feed()).keep_healing();
+    let _following = state.keep_rules_in_step();
     let address = config.server.listen;
     let listener = tokio::net::TcpListener::bind(address)
         .await

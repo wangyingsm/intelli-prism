@@ -60,10 +60,15 @@ pub fn hashed() -> PassphraseHash {
 /// The server's own state, over a store the test has filled and a gateway that proxies
 /// nothing.
 pub fn state_over(store: SqliteStore) -> AppState {
+    state_over_shared(Arc::new(store))
+}
+
+/// The same, over a store the test keeps a handle on.
+pub fn state_over_shared(store: Arc<SqliteStore>) -> AppState {
     let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let table = RoutingTable::build(&Config::parse(CONFIG).unwrap(), Vec::new()).unwrap();
     let gateway = Gateway::new(table, ProcessorChain::new(), Arc::new(Unreachable));
-    AppState::with_parts(Stores::Sqlite(Arc::new(store)), gateway, listen)
+    AppState::with_parts(Stores::Sqlite(store), gateway, listen)
 }
 
 /// The cookie a real login hands back.

@@ -1,6 +1,6 @@
 mod grant;
 #[cfg(test)]
-mod harness;
+pub(crate) mod harness;
 mod key;
 mod member;
 mod plugin;

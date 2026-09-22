@@ -112,6 +112,14 @@ pub enum FeedError {
     #[error("the published rules could not be decoded: {0}")]
     Decode(#[source] serde_json::Error),
 
+    /// The routing table could not be built from the published rules.
+    #[error(transparent)]
+    Table(#[from] RouteError),
+
+    /// The plugin chains could not be built from the published rules.
+    #[error(transparent)]
+    Chains(#[from] ChainError),
+
     /// A published rule is one its own type refuses.
     #[error(transparent)]
     Rule(#[from] ip_core::CoreError),

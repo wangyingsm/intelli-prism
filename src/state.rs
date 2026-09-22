@@ -15,10 +15,10 @@ use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 use ip_storage::PostgresStore;
 #[cfg(any(feature = "standalone-storage", test))]
 use ip_storage::SqliteStore;
-use ip_storage::{Backend, Storage};
+use ip_storage::{Backend, RuleRevision, Storage};
 
 use crate::error::StartupError;
-use crate::rules::RuleFeed;
+use crate::rules::{Reloader, RuleFeed};
 
 /// The store that was opened, in the shape its own backend has.
 ///
@@ -59,6 +59,9 @@ pub struct AppState {
     listen: SocketAddr,
     configured: Arc<[RouteRule]>,
     feed: Arc<RuleFeed>,
+    reloader: Arc<Reloader>,
+    /// The revision this node's rules were built from, which is where following starts.
+    started_at: RuleRevision,
 }
 
 impl AppState {
@@ -67,6 +70,7 @@ impl AppState {
     pub async fn open(config: &Config) -> Result<Self, StartupError> {
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
+        let backend = Arc::clone(&store);
         let published = open_cache(&config.cache).await?;
         let feed = Arc::new(RuleFeed::new(Arc::clone(&store), Arc::clone(&published))?);
         // A cache that cannot take the rules yet leaves this node serving what storage holds.
@@ -74,6 +78,9 @@ impl AppState {
             tracing::warn!(%error, "could not publish the rules at startup; healing will");
         }
         let cache = published as Arc<dyn Cache>;
+        // The revision is read first, so a change that lands while the table is read is
+        // followed rather than missed.
+        let started_at = ip_storage::RevisionStore::rule_revision(store.as_ref()).await?;
         let table = RoutingTable::load(config, store.as_ref()).await?;
         let configured = config
             .upstreams
@@ -82,7 +89,7 @@ impl AppState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(RouteError::from)?;
         let host = Arc::new(PluginHost::new(PluginLimits::default())?);
-        let chains = PluginChains::load(host, store.as_ref(), store.as_ref()).await?;
+        let chains = PluginChains::load(Arc::clone(&host), store.as_ref(), store.as_ref()).await?;
         tracing::info!(rules = chains.len(), "plugin chains built");
         let upstream = Arc::new(HyperUpstream::new()?);
         let mut gateway = Gateway::with_chains(table, Arc::new(chains), upstream);
@@ -102,16 +109,27 @@ impl AppState {
             config.auth.jwt.ttl.as_duration(),
         );
         let logins = Logins::new(Arc::clone(&store), Arc::clone(&cache), tokens)?;
+        let gateway = Arc::new(gateway);
+        let configured: Arc<[RouteRule]> = configured.into();
+        let reloader = Arc::new(Reloader::new(
+            Arc::clone(&feed),
+            backend,
+            host,
+            Arc::clone(&gateway),
+            Arc::clone(&configured),
+        ));
         Ok(Self {
             stores,
             store: Arc::clone(&store) as Arc<dyn Storage>,
             verifier: RequestVerifier::new(store, cache, nonce_ttl),
             logins: Arc::new(logins),
             session_seconds: config.auth.jwt.ttl.get(),
-            gateway: Arc::new(gateway),
+            gateway,
             listen: config.server.listen,
-            configured: configured.into(),
+            configured,
             feed,
+            reloader,
+            started_at,
         })
     }
 
@@ -122,6 +140,17 @@ impl AppState {
             Arc::new(ip_cache::SledCache::temporary().expect("a temporary cache"));
         let feed =
             Arc::new(RuleFeed::new(stores.backend(), Arc::clone(&published)).expect("a feed"));
+        let gateway = Arc::new(gateway);
+        let host = Arc::new(
+            ip_plugin::PluginHost::on_demand(PluginLimits::default()).expect("a plugin host"),
+        );
+        let reloader = Arc::new(Reloader::new(
+            Arc::clone(&feed),
+            stores.backend(),
+            host,
+            Arc::clone(&gateway),
+            Arc::new([]),
+        ));
         let store = stores.backend() as Arc<dyn Storage>;
         let cache = published as Arc<dyn Cache>;
         let tokens = SessionTokens::new(
@@ -136,10 +165,12 @@ impl AppState {
             verifier: RequestVerifier::new(store, cache, Ttl::seconds(300).expect("a nonce ttl")),
             logins: Arc::new(logins),
             session_seconds: 3600,
-            gateway: Arc::new(gateway),
+            gateway,
             listen,
             configured: Arc::new([]),
             feed,
+            reloader,
+            started_at: RuleRevision::new(0),
         }
     }
 
@@ -188,6 +219,18 @@ impl AppState {
     /// Publishes the rules for every node, and follows what is published.
     pub fn feed(&self) -> &Arc<RuleFeed> {
         &self.feed
+    }
+
+    /// Follows the published rules from the revision this node started at, putting each
+    /// change in force as it lands.
+    pub fn keep_rules_in_step(&self) -> tokio::task::JoinHandle<()> {
+        Arc::clone(&self.reloader).keep_following(self.started_at)
+    }
+
+    /// Puts the rules published now in force, which is what a change leads to.
+    #[cfg(test)]
+    pub async fn reload_rules(&self) -> Result<Option<RuleRevision>, crate::error::FeedError> {
+        self.reloader.reload().await
     }
 
     /// The rules the configuration file contributes, which no stored rule can displace.
