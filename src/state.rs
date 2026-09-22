@@ -8,7 +8,8 @@ use ip_cache::{Cache, Ttl};
 #[cfg(feature = "standalone-cache")]
 use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
-use ip_gateway::{Gateway, HyperUpstream, ResponseCache, RoutingTable};
+use ip_core::RouteRule;
+use ip_gateway::{Gateway, HyperUpstream, ResponseCache, RouteError, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
 use ip_storage::PostgresStore;
@@ -55,6 +56,7 @@ pub struct AppState {
     session_seconds: u64,
     gateway: Arc<Gateway>,
     listen: SocketAddr,
+    configured: Arc<[RouteRule]>,
 }
 
 impl AppState {
@@ -65,6 +67,12 @@ impl AppState {
         let store = stores.backend();
         let cache = open_cache(&config.cache).await?;
         let table = RoutingTable::load(config, store.as_ref()).await?;
+        let configured = config
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.route_rule(config.server.listen))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RouteError::from)?;
         let host = Arc::new(PluginHost::new(PluginLimits::default())?);
         let chains = PluginChains::load(host, store.as_ref(), store.as_ref()).await?;
         tracing::info!(rules = chains.len(), "plugin chains built");
@@ -94,6 +102,7 @@ impl AppState {
             session_seconds: config.auth.jwt.ttl.get(),
             gateway: Arc::new(gateway),
             listen: config.server.listen,
+            configured: configured.into(),
         })
     }
 
@@ -116,7 +125,15 @@ impl AppState {
             session_seconds: 3600,
             gateway: Arc::new(gateway),
             listen,
+            configured: Arc::new([]),
         }
+    }
+
+    /// The same state, as though the configuration file had contributed these rules.
+    #[cfg(test)]
+    pub fn configuring(mut self, rules: Vec<RouteRule>) -> Self {
+        self.configured = rules.into();
+        self
     }
 
     /// Checks request signatures against the store.
@@ -152,6 +169,11 @@ impl AppState {
     /// Where the gateway listens, supplying the port a `Host` header omits.
     pub fn listen(&self) -> SocketAddr {
         self.listen
+    }
+
+    /// The rules the configuration file contributes, which no stored rule can displace.
+    pub fn configured(&self) -> &[RouteRule] {
+        &self.configured
     }
 }
 
@@ -379,6 +401,30 @@ secret = "0123456789abcdef0123456789abcdef"
         let state = AppState::open(&config).await.unwrap();
         assert_eq!(state.listen(), config.server.listen);
         assert!(state.gateway().table().is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[cfg(all(feature = "standalone-storage", feature = "standalone-cache"))]
+    #[tokio::test]
+    async fn opening_remembers_the_rules_the_configuration_contributes() {
+        let path = std::env::temp_dir().join(format!("ip-configured-{}.db", std::process::id()));
+        let cache = scratch("configured-cache");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&cache);
+        let upstream = "[[upstream]]\nid = \"anthropic\"\nbase_url = \"https://api.anthropic.com/\"\n\
+                        api_key = \"sk-test\"\nmodel = \"claude-opus-5\"";
+        let config = config_with(
+            &format!(
+                "[storage]\nbackend = \"sqlite\"\npath = {:?}",
+                path.display().to_string()
+            ),
+            &format!("{}\n\n{upstream}", sled_cache(&cache)),
+        );
+        let state = AppState::open(&config).await.unwrap();
+        assert_eq!(state.configured().len(), 1);
+        assert_eq!(state.configured()[0].api.as_str(), "anthropic");
+        assert_eq!(state.gateway().table().len(), 1);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&cache);
     }
