@@ -39,6 +39,11 @@ impl Manager {
         &self.user
     }
 
+    /// Whether the caller proved itself with a session cookie, which only the web ui holds.
+    pub fn is_session(&self) -> bool {
+        self.proof == Proof::Session
+    }
+
     /// Whether this is the system administrator, which holds every capability.
     pub fn is_system_administrator(&self) -> bool {
         self.kind == AccountKind::SystemAdministrator

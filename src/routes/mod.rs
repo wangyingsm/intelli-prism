@@ -1,6 +1,7 @@
 mod grant;
 #[cfg(test)]
 mod harness;
+mod key;
 mod member;
 mod plugin;
 mod route;
@@ -45,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/_ip/users", user::router())
         .nest("/_ip/users/{user}/grants", grant::account_router())
         .nest("/_ip/routes", route::router())
+        .nest("/_ip/keys", key::router())
         .nest("/_ip/plugins", plugin::store_router())
         .nest("/_ip/plugin-rules", plugin::rules_router())
         .route("/_ip/whoami", get(whoami))
