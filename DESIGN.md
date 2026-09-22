@@ -242,6 +242,14 @@ path root. An `[upstream.route]` block overrides any part of that key, which is 
 a proxy or serving several hostnames needs.
 - The gateway keeps the `/_ip` path prefix for its own endpoints. A rule whose key path lies inside it
 is refused when the routing table is built, so no rule can shadow health or identity.
+- The table and the plugin chains are held behind one pointer and replaced together, so a reload never
+routes a request by one set of rules and processes it by another. Readers never wait for the writer: on
+one developer laptop, with 1000 rules and 8 threads resolving, a writer swapping every 200us (about
+5000 swaps a second, hundreds of times what a reload does) moved the median resolve from 5107ns to
+5148ns and left the 99.9th percentile inside the noise. The swap itself costs about 667ns. Building the
+replacement costs about 3.5ms for 1000 rules, and compiling wasm costs far more, which is why a reload
+builds off the request path and only then swaps. `cargo run --release -p ip-gateway --example
+swap_cost` measures it, alternating the quiet and swapping arms each round.
 - Lookup is a hash on (protocol, host, port), then a linear scan of that group's rules ordered longest
 path first, so it costs O(n) in the size of one authority group. That is acceptable at the tens of
 rules a deployment starts with and is not acceptable at a million, where it would cost tens of
