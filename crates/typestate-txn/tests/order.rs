@@ -1,13 +1,18 @@
 //! A workflow over a carrier that is not a database, to show the macro cares about order
 //! rather than about sqlx.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use typestate_txn::transaction;
 
-/// Stands in for a transaction: it records what was written and whether it landed.
+/// Stands in for a transaction: it records what was written, whether it landed, and, where
+/// the test can still see it, whether it was undone.
 #[derive(Default)]
 pub struct Ledger {
     written: Vec<String>,
     landed: bool,
+    undone: Arc<AtomicBool>,
 }
 
 impl Ledger {
@@ -39,6 +44,7 @@ transaction! {
     error: OrderError,
     record: Placed,
     finish: { let _ = carrier.land(); },
+    abort: { carrier.undone.store(true, Ordering::SeqCst); },
     steps: {
         fill(item: &str) -> basket: String as Filled {
             if item.is_empty() {
@@ -88,10 +94,36 @@ async fn a_step_carries_what_the_step_before_it_produced() {
 }
 
 #[tokio::test]
-async fn a_step_that_fails_stops_the_transaction() {
-    let refused = OrderTxn::new(Ledger::default()).fill("").await;
+async fn a_step_that_fails_undoes_the_carrier_before_it_answers() {
+    let undone = Arc::new(AtomicBool::new(false));
+    let ledger = Ledger {
+        undone: undone.clone(),
+        ..Ledger::default()
+    };
+    let refused = OrderTxn::new(ledger).fill("").await;
     assert_eq!(
         refused.err(),
         Some(OrderError("nothing to put in the basket".to_owned()))
     );
+    assert!(undone.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_transaction_that_lands_is_never_undone() {
+    let undone = Arc::new(AtomicBool::new(false));
+    let ledger = Ledger {
+        undone: undone.clone(),
+        ..Ledger::default()
+    };
+    OrderTxn::new(ledger)
+        .fill("apples")
+        .await
+        .unwrap()
+        .pay(3)
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+    assert!(!undone.load(Ordering::SeqCst));
 }

@@ -20,6 +20,7 @@ mod keyword {
     syn::custom_keyword!(error);
     syn::custom_keyword!(record);
     syn::custom_keyword!(finish);
+    syn::custom_keyword!(abort);
     syn::custom_keyword!(steps);
 }
 
@@ -80,6 +81,7 @@ struct Workflow {
     error: Type,
     record: Type,
     finish: Block,
+    abort: Block,
     steps: Vec<Step>,
 }
 
@@ -115,6 +117,11 @@ impl Parse for Workflow {
         let finish: Block = input.parse()?;
         input.parse::<Token![,]>()?;
 
+        input.parse::<keyword::abort>()?;
+        input.parse::<Token![:]>()?;
+        let abort: Block = input.parse()?;
+        input.parse::<Token![,]>()?;
+
         input.parse::<keyword::steps>()?;
         input.parse::<Token![:]>()?;
         let listed;
@@ -136,6 +143,7 @@ impl Parse for Workflow {
             error,
             record,
             finish,
+            abort,
             steps,
         })
     }
@@ -149,8 +157,13 @@ impl Parse for Workflow {
 ///
 /// Inside a step body, `carrier` is `&mut` the carrier, the step's inputs are in scope by
 /// name, and so is every value an earlier step produced. The body evaluates to this step's
-/// output. Inside `finish`, `carrier` is the carrier itself, by value, since committing it
-/// usually consumes it.
+/// output, and `?` in it fails the step. Inside `finish`, `carrier` is the carrier itself, by
+/// value, since committing it usually consumes it.
+///
+/// `abort` runs the moment a step fails, with `carrier` by value, before the error is handed
+/// back. It is where the carrier is undone at once, rather than whenever dropping it gets
+/// round to it: a database transaction left to its drop keeps its locks until the pool next
+/// hands its connection out.
 ///
 /// ```
 /// use typestate_txn::transaction;
@@ -166,6 +179,7 @@ impl Parse for Workflow {
 ///     error: OrderError,
 ///     record: Placed,
 ///     finish: { let Ledger = carrier; },
+///     abort: { let Ledger = carrier; },
 ///     steps: {
 ///         fill(item: &str) -> basket: String as Filled {
 ///             let _ = &carrier;
@@ -187,6 +201,54 @@ impl Parse for Workflow {
 /// # fn main() {}
 /// ```
 ///
+/// A step that fails hands its carrier to `abort` before the error comes back:
+///
+/// ```
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicBool, Ordering};
+///
+/// use typestate_txn::transaction;
+///
+/// pub struct Ledger { undone: Arc<AtomicBool> }
+/// pub struct Placed { basket: String }
+/// #[derive(Debug)] pub struct OrderError;
+///
+/// transaction! {
+///     name: Order,
+///     generics: <>,
+///     carrier: Ledger,
+///     error: OrderError,
+///     record: Placed,
+///     finish: { let _ = carrier; },
+///     abort: { carrier.undone.store(true, Ordering::SeqCst); },
+///     steps: {
+///         fill(item: &str) -> basket: String as Filled {
+///             let _ = &carrier;
+///             if item.is_empty() {
+///                 return Err(OrderError);
+///             }
+///             item.to_owned()
+///         }
+///     }
+/// }
+///
+/// # async fn run() {
+/// let undone = Arc::new(AtomicBool::new(false));
+/// let failed = OrderTxn::new(Ledger { undone: undone.clone() }).fill("").await;
+/// assert!(failed.is_err());
+/// assert!(undone.load(Ordering::SeqCst));
+///
+/// let kept = Arc::new(AtomicBool::new(false));
+/// let placed = OrderTxn::new(Ledger { undone: kept.clone() })
+///     .fill("apples").await.unwrap()
+///     .commit().await.unwrap();
+/// assert_eq!(placed.basket, "apples");
+/// assert!(!kept.load(Ordering::SeqCst));
+/// # }
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() { run().await }
+/// ```
+///
 /// Paying before there is anything to pay for does not compile:
 ///
 /// ```compile_fail
@@ -203,6 +265,7 @@ impl Parse for Workflow {
 ///     error: OrderError,
 ///     record: Placed,
 ///     finish: { let Ledger = carrier; },
+///     abort: { let Ledger = carrier; },
 ///     steps: {
 ///         fill(item: &str) -> basket: String as Filled {
 ///             let _ = &carrier;
@@ -238,6 +301,7 @@ impl Parse for Workflow {
 ///     error: OrderError,
 ///     record: Placed,
 ///     finish: { let Ledger = carrier; },
+///     abort: { let Ledger = carrier; },
 ///     steps: {
 ///         fill(item: &str) -> basket: String as Filled {
 ///             let _ = &carrier;
@@ -269,6 +333,7 @@ fn expand(workflow: &Workflow) -> proc_macro2::TokenStream {
         error,
         record,
         finish,
+        abort,
         steps,
     } = workflow;
 
@@ -361,19 +426,27 @@ fn expand(workflow: &Workflow) -> proc_macro2::TokenStream {
             #impl_head #txn<#(#type_arguments,)* #previous_stage> #where_clause {
                 #[doc = #doc]
                 pub async fn #step_name(
-                    mut self,
+                    self,
                     #(#parameter_list),*
                 ) -> ::core::result::Result<#txn<#(#type_arguments,)* #stage>, #error> {
                     let #previous_stage { #(#previous_fields),* } = self.stage;
+                    let mut carrier = self.carrier;
                     #(let _ = &#parameter_names;)*
-                    let #output: #output_type = {
-                        let carrier = &mut self.carrier;
-                        #body
-                    };
-                    ::core::result::Result::Ok(#txn {
-                        carrier: self.carrier,
-                        stage: #stage { #(#all_fields),* },
-                    })
+                    let outcome: ::core::result::Result<#output_type, #error> = async {
+                        let carrier = &mut carrier;
+                        ::core::result::Result::Ok(#body)
+                    }
+                    .await;
+                    match outcome {
+                        ::core::result::Result::Ok(#output) => ::core::result::Result::Ok(#txn {
+                            carrier,
+                            stage: #stage { #(#all_fields),* },
+                        }),
+                        ::core::result::Result::Err(error) => {
+                            #abort
+                            ::core::result::Result::Err(error)
+                        }
+                    }
                 }
             }
 

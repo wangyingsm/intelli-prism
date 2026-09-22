@@ -14,6 +14,7 @@ transaction! {
     error: StorageError,
     record: MemberRemoved,
     finish: { carrier.commit().await.map_err(StorageError::backend)? },
+    abort: { let _ = carrier.rollback().await; },
     steps: {
         detach(user: UserId, tenant: TenantId) -> membership: Membership as Detached {
             DB::delete_membership(carrier, &user, &tenant).await?

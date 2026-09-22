@@ -13,6 +13,7 @@ transaction! {
     error: StorageError,
     record: TenantWithOwner,
     finish: { carrier.commit().await.map_err(StorageError::backend)? },
+    abort: { let _ = carrier.rollback().await; },
     steps: {
         create_tenant(new: NewTenant) -> tenant: Tenant as TenantSaved {
             DB::insert_tenant(carrier, new).await?

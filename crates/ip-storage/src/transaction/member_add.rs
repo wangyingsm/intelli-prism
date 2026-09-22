@@ -14,6 +14,7 @@ transaction! {
     error: StorageError,
     record: UserWithMembership,
     finish: { carrier.commit().await.map_err(StorageError::backend)? },
+    abort: { let _ = carrier.rollback().await; },
     steps: {
         create_user(new: NewUser) -> user: User as UserSaved {
             DB::insert_user(carrier, new).await?
