@@ -1,6 +1,7 @@
 mod identity;
 mod list;
 mod plugin;
+mod revision;
 mod route;
 
 use std::path::Path;

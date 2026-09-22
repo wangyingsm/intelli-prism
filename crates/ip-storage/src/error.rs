@@ -87,6 +87,8 @@ pub enum Entity {
     Plugin,
     /// A plugin placed in a chain.
     PluginRule,
+    /// How far the rules have moved on.
+    RuleRevision,
 }
 
 impl fmt::Display for Entity {
@@ -99,6 +101,7 @@ impl fmt::Display for Entity {
             Self::Route => "route",
             Self::Plugin => "plugin",
             Self::PluginRule => "plugin rule",
+            Self::RuleRevision => "rule revision",
         })
     }
 }
@@ -119,6 +122,7 @@ mod tests {
             (Entity::Route, "route"),
             (Entity::Plugin, "plugin"),
             (Entity::PluginRule, "plugin rule"),
+            (Entity::RuleRevision, "rule revision"),
         ] {
             assert_eq!(entity.to_string(), name);
         }

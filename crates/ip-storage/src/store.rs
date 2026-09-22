@@ -5,6 +5,7 @@ use crate::error::StorageError;
 use crate::list::ListStore;
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{PluginRuleStore, PluginStore};
+use crate::revision::RevisionStore;
 use crate::route::RouteStore;
 
 /// Reads and writes tenants.
@@ -89,9 +90,15 @@ pub trait Storage: TenantStore + UserStore + MembershipStore + GrantStore {}
 impl<T> Storage for T where T: TenantStore + UserStore + MembershipStore + GrantStore {}
 
 /// Everything a storage backend provides, behind one object.
-pub trait Backend: Storage + RouteStore + PluginStore + PluginRuleStore + ListStore {}
+pub trait Backend:
+    Storage + RouteStore + PluginStore + PluginRuleStore + ListStore + RevisionStore
+{
+}
 
-impl<T> Backend for T where T: Storage + RouteStore + PluginStore + PluginRuleStore + ListStore {}
+impl<T> Backend for T where
+    T: Storage + RouteStore + PluginStore + PluginRuleStore + ListStore + RevisionStore
+{
+}
 
 #[cfg(test)]
 mod tests {

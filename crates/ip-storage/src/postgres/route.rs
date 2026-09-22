@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use ip_core::{ApiId, Endpoint, RouteKey, RouteRule, RouteTarget, Timestamp};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use super::PostgresStore;
 use crate::error::{Entity, StorageError};
@@ -105,43 +105,50 @@ impl RouteStore for PostgresStore {
     }
 
     async fn routes(&self) -> Result<Vec<RouteRule>, StorageError> {
-        let rows = sqlx::query(
-            "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-             t.protocol, t.host, t.port, t.path FROM routes r \
-             JOIN route_targets t ON t.route_row_id = r.row_id \
-             ORDER BY r.key_host, r.key_path, r.key_protocol, r.key_port, t.position",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(StorageError::backend)?;
-
-        let mut rules: Vec<RouteRule> = Vec::new();
-        let mut current: Option<i64> = None;
-        for row in &rows {
-            let route_row_id: i64 = row.get("row_id");
-            let endpoint = target_of(row)?;
-            if current == Some(route_row_id)
-                && let Some(rule) = rules.last_mut()
-            {
-                let mut endpoints = rule.target.endpoints().to_vec();
-                endpoints.push(endpoint);
-                rule.target = RouteTarget::from_endpoints(endpoints)?;
-                continue;
-            }
-            current = Some(route_row_id);
-            rules.push(RouteRule {
-                api: ApiId::new(row.get("api_id"))?,
-                key: RouteKey::new(Endpoint::from_parts(
-                    row.get("key_protocol"),
-                    row.get("key_host"),
-                    row.get("key_port"),
-                    row.get("key_path"),
-                )?),
-                target: RouteTarget::new(endpoint),
-            });
-        }
-        Ok(rules)
+        read_routes(&mut *self.connection().await?).await
     }
+}
+
+/// Every stored routing rule, over whichever connection it is given.
+pub(super) async fn read_routes(
+    connection: &mut PgConnection,
+) -> Result<Vec<RouteRule>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
+         t.protocol, t.host, t.port, t.path FROM routes r \
+         JOIN route_targets t ON t.route_row_id = r.row_id \
+         ORDER BY r.key_host, r.key_path, r.key_protocol, r.key_port, t.position",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?;
+
+    let mut rules: Vec<RouteRule> = Vec::new();
+    let mut current: Option<i64> = None;
+    for row in &rows {
+        let route_row_id: i64 = row.get("row_id");
+        let endpoint = target_of(row)?;
+        if current == Some(route_row_id)
+            && let Some(rule) = rules.last_mut()
+        {
+            let mut endpoints = rule.target.endpoints().to_vec();
+            endpoints.push(endpoint);
+            rule.target = RouteTarget::from_endpoints(endpoints)?;
+            continue;
+        }
+        current = Some(route_row_id);
+        rules.push(RouteRule {
+            api: ApiId::new(row.get("api_id"))?,
+            key: RouteKey::new(Endpoint::from_parts(
+                row.get("key_protocol"),
+                row.get("key_host"),
+                row.get("key_port"),
+                row.get("key_path"),
+            )?),
+            target: RouteTarget::new(endpoint),
+        });
+    }
+    Ok(rules)
 }
 
 fn target_of(row: &sqlx::postgres::PgRow) -> Result<Endpoint, StorageError> {

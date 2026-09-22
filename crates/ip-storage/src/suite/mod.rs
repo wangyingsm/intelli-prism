@@ -5,6 +5,7 @@ pub(crate) mod list;
 pub(crate) mod member_add;
 pub(crate) mod member_remove;
 pub(crate) mod plugin;
+pub(crate) mod revision;
 pub(crate) mod route;
 pub(crate) mod user_create;
 
@@ -107,6 +108,16 @@ macro_rules! backend_suite {
             plugins_are_listed_to_the_chain_that_owns_them,
         ]);
     };
+    (revision, $open:path) => {
+        $crate::suite::backend_suite!(@module revision, $open, [
+            every_change_to_a_route_moves_the_revision_on,
+            every_change_to_a_plugin_rule_moves_the_revision_on,
+            rules_a_deleted_tenant_takes_with_it_move_the_revision_on,
+            rules_a_deleted_user_takes_with_it_move_the_revision_on,
+            changes_to_nothing_a_node_holds_leave_the_revision_alone,
+            the_rule_set_is_read_at_the_revision_it_names,
+        ]);
+    };
     (member_remove, $open:path) => {
         $crate::suite::backend_suite!(@module member_remove, $open, [
             a_member_leaves_with_every_grant_it_held_inside,
@@ -167,6 +178,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(member_add, $open);
         $crate::suite::backend_suite!(member_remove, $open);
         $crate::suite::backend_suite!(list, $open);
+        $crate::suite::backend_suite!(revision, $open);
     };
 }
 

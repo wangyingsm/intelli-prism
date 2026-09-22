@@ -210,19 +210,26 @@ impl PluginRuleStore for SqliteStore {
     }
 
     async fn rules(&self) -> Result<Vec<PluginRule>, StorageError> {
-        let rows = sqlx::query(
-            "SELECT p.checksum, r.kind, r.position, t.id AS tenant_id, u.id AS user_id, \
-             r.api_id FROM plugin_rules r \
-             JOIN plugins p ON p.row_id = r.plugin_row_id \
-             LEFT JOIN tenants t ON t.row_id = r.tenant_row_id \
-             LEFT JOIN users u ON u.row_id = r.user_row_id \
-             ORDER BY r.kind, r.position DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(StorageError::backend)?;
-        rows.iter().map(plugin_rule).collect()
+        read_rules(&mut *self.connection().await?).await
     }
+}
+
+/// Every plugin rule, over whichever connection it is given.
+pub(super) async fn read_rules(
+    connection: &mut SqliteConnection,
+) -> Result<Vec<PluginRule>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT p.checksum, r.kind, r.position, t.id AS tenant_id, u.id AS user_id, \
+         r.api_id FROM plugin_rules r \
+         JOIN plugins p ON p.row_id = r.plugin_row_id \
+         LEFT JOIN tenants t ON t.row_id = r.tenant_row_id \
+         LEFT JOIN users u ON u.row_id = r.user_row_id \
+         ORDER BY r.kind, r.position DESC",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?;
+    rows.iter().map(plugin_rule).collect()
 }
 
 /// Stores wasm once under its checksum over whichever connection it is given, refusing wasm
