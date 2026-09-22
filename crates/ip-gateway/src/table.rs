@@ -48,10 +48,19 @@ impl RoutingTable {
     /// a stored rule under a key an upstream already claims is ignored.
     pub fn build(config: &Config, dynamic: Vec<RouteRule>) -> Result<Self, RouteError> {
         let listen = config.server.listen;
-        let mut rules = Vec::with_capacity(config.upstreams.len() + dynamic.len());
-        for upstream in &config.upstreams {
-            rules.push(upstream.route_rule(listen)?);
-        }
+        let configured = config
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.route_rule(listen))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::assemble(&configured, dynamic)
+    }
+
+    /// Builds the table from rules the configuration already contributed and stored ones, as
+    /// a reload does when it has both in hand. Config wins, the same way.
+    pub fn assemble(configured: &[RouteRule], dynamic: Vec<RouteRule>) -> Result<Self, RouteError> {
+        let mut rules = Vec::with_capacity(configured.len() + dynamic.len());
+        rules.extend(configured.iter().cloned());
         for rule in dynamic {
             if !rules.iter().any(|configured| configured.key == rule.key) {
                 rules.push(rule);

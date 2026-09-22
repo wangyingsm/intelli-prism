@@ -68,8 +68,18 @@ impl PluginChains {
         plugins: &dyn PluginStore,
         rules: &dyn PluginRuleStore,
     ) -> Result<Self, ChainError> {
+        Self::from_rules(host, plugins, rules.rules().await?).await
+    }
+
+    /// Builds the chains from rules already in hand, as a reload does when it has them from
+    /// the cache rather than from the database.
+    pub async fn from_rules(
+        host: Arc<PluginHost>,
+        plugins: &dyn PluginStore,
+        rules: Vec<PluginRule>,
+    ) -> Result<Self, ChainError> {
         let mut by_plugin: BTreeMap<Checksum, Vec<PluginRule>> = BTreeMap::new();
-        for rule in rules.rules().await? {
+        for rule in rules {
             by_plugin.entry(*rule.checksum()).or_default().push(rule);
         }
         let mut chains = Self {
