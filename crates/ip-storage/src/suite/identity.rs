@@ -165,33 +165,6 @@ pub(crate) async fn attaching_a_user_that_is_not_there_reports_it_missing(store:
     ));
 }
 
-pub(crate) async fn detaching_removes_the_membership(store: &impl Storage) {
-    tenant_with_user(store).await;
-    store
-        .attach(Membership {
-            user: user_id(),
-            tenant: tenant_id(),
-            standing: Standing::Member,
-        })
-        .await
-        .unwrap();
-    store.detach(&user_id(), &tenant_id()).await.unwrap();
-    assert!(
-        store
-            .memberships_of_user(&user_id())
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(matches!(
-        store.detach(&user_id(), &tenant_id()).await,
-        Err(StorageError::NotFound {
-            entity: Entity::Membership,
-            ..
-        })
-    ));
-}
-
 pub(crate) async fn deleting_a_user_takes_its_memberships_with_it(store: &impl Storage) {
     tenant_with_user(store).await;
     store

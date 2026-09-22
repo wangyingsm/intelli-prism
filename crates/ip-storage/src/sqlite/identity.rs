@@ -290,26 +290,6 @@ impl MembershipStore for SqliteStore {
         insert_membership(&mut *self.connection().await?, membership).await
     }
 
-    async fn detach(&self, user: &UserId, tenant: &TenantId) -> Result<(), StorageError> {
-        let deleted = sqlx::query(
-            "DELETE FROM memberships WHERE tenant_row_id = (SELECT row_id FROM tenants WHERE id = ?) \
-             AND user_row_id = (SELECT row_id FROM users WHERE id = ?)",
-        )
-        .bind(tenant.as_str())
-        .bind(user.as_str())
-        .execute(&self.pool)
-        .await
-        .map_err(StorageError::backend)?
-        .rows_affected();
-        if deleted == 0 {
-            return Err(StorageError::NotFound {
-                entity: Entity::Membership,
-                id: format!("{user}@{tenant}"),
-            });
-        }
-        Ok(())
-    }
-
     async fn membership(
         &self,
         user: &UserId,

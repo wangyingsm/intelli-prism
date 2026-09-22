@@ -40,13 +40,13 @@ pub trait UserStore: Send + Sync {
 }
 
 /// Reads and writes the many to many attachment of users to tenants.
+///
+/// Detaching is not here: it must revoke what the user held inside the tenant in the same
+/// transaction, so it is `MemberRemoveTransactional`'s alone.
 #[async_trait]
 pub trait MembershipStore: Send + Sync {
     /// Attaches a user to a tenant, replacing any standing it already had there.
     async fn attach(&self, membership: Membership) -> Result<(), StorageError>;
-
-    /// Detaches a user from a tenant, or reports it missing.
-    async fn detach(&self, user: &UserId, tenant: &TenantId) -> Result<(), StorageError>;
 
     /// Reads one user's standing inside one tenant.
     async fn membership(
@@ -218,19 +218,6 @@ mod tests {
             memberships
                 .retain(|held| held.user != membership.user || held.tenant != membership.tenant);
             memberships.push(membership);
-            Ok(())
-        }
-
-        async fn detach(&self, user: &UserId, tenant: &TenantId) -> Result<(), StorageError> {
-            let mut memberships = self.memberships.lock().unwrap();
-            let before = memberships.len();
-            memberships.retain(|held| &held.user != user || &held.tenant != tenant);
-            if memberships.len() == before {
-                return Err(StorageError::NotFound {
-                    entity: Entity::Membership,
-                    id: format!("{user}@{tenant}"),
-                });
-            }
             Ok(())
         }
 

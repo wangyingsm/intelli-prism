@@ -77,7 +77,6 @@ macro_rules! backend_suite {
             attaching_twice_replaces_the_standing,
             attaching_to_a_tenant_that_is_not_there_reports_it_missing,
             attaching_a_user_that_is_not_there_reports_it_missing,
-            detaching_removes_the_membership,
             deleting_a_user_takes_its_memberships_with_it,
             a_tenant_is_listed_from_both_sides,
             deleting_a_tenant_takes_its_memberships_and_grants_with_it,
