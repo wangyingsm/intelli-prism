@@ -23,7 +23,10 @@ pub use model::{
     AccountKind, MemberRemoved, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId,
     TenantWithOwner, User, UserRowId, UserWithMembership,
 };
-pub use plugin::{NewPlugin, Plugin, PluginRecord, PluginRowId, PluginRuleStore, PluginStore};
+pub use plugin::{
+    NewPlugin, Plugin, PluginDisowned, PluginOwner, PluginRecord, PluginRowId, PluginRuleStore,
+    PluginStore, PluginUploaded,
+};
 #[cfg(feature = "fast-storage")]
 pub use postgres::PostgresStore;
 pub use route::RouteStore;
@@ -31,12 +34,20 @@ pub use route::RouteStore;
 pub use sqlite::SqliteStore;
 pub use store::{Backend, GrantStore, MembershipStore, Storage, TenantStore, UserStore};
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
-pub use transaction::IdentityDialect;
-#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::member_add::{MemberAddBegun, MemberAddTransactional, MemberAddTxn};
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::member_remove::{
     MemberRemoveBegun, MemberRemoveTransactional, MemberRemoveTxn,
 };
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
+pub use transaction::plugin_disown::{
+    PluginDisownBegun, PluginDisownTransactional, PluginDisownTxn,
+};
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
+pub use transaction::plugin_upload::{
+    PluginUploadBegun, PluginUploadTransactional, PluginUploadTxn,
+};
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
+pub use transaction::{IdentityDialect, PluginDialect};

@@ -6,14 +6,17 @@
 
 pub mod member_add;
 pub mod member_remove;
+pub mod plugin_disown;
+pub mod plugin_upload;
 pub mod user_create;
 
 use async_trait::async_trait;
-use ip_core::{TenantId, UserId};
+use ip_core::{Checksum, PluginKind, TenantId, Timestamp, UserId};
 use sqlx::Database;
 
 use crate::error::StorageError;
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
+use crate::plugin::{PluginOwner, PluginRecord};
 
 /// The identity writes one backend contributes, in its own dialect.
 ///
@@ -53,4 +56,37 @@ pub trait IdentityDialect: Database {
         user: &UserId,
         tenant: &TenantId,
     ) -> Result<u64, StorageError>;
+}
+
+/// The plugin writes one backend contributes, in its own dialect.
+#[async_trait]
+pub trait PluginDialect: Database {
+    /// Stores wasm once under its checksum and hands back what is stored there, refusing wasm
+    /// stored already as another kind.
+    async fn insert_wasm(
+        connection: &mut Self::Connection,
+        kind: PluginKind,
+        wasm: Vec<u8>,
+    ) -> Result<PluginRecord, StorageError>;
+
+    /// Records an owner's hold on a stored plugin, handing back since when it has held it.
+    async fn insert_owner(
+        connection: &mut Self::Connection,
+        plugin: &PluginRecord,
+        owner: &PluginOwner,
+    ) -> Result<Timestamp, StorageError>;
+
+    /// Ends an owner's hold, refusing while a rule in its chain runs the plugin, and hands
+    /// back the plugin it held.
+    async fn delete_owner(
+        connection: &mut Self::Connection,
+        checksum: &Checksum,
+        owner: &PluginOwner,
+    ) -> Result<PluginRecord, StorageError>;
+
+    /// Removes a plugin's wasm once nobody owns it, reporting whether it went.
+    async fn delete_unowned(
+        connection: &mut Self::Connection,
+        plugin: &PluginRecord,
+    ) -> Result<bool, StorageError>;
 }

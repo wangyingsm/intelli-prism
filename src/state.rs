@@ -596,7 +596,7 @@ secret = "0123456789abcdef0123456789abcdef"
     async fn a_global_plugin_that_will_not_load_stops_startup() {
         use ip_core::{NewPluginRule, PluginKind, PluginOrder, PluginScope};
         use ip_plugin::ChainError;
-        use ip_storage::{NewPlugin, PluginRuleStore, PluginStore};
+        use ip_storage::{NewPlugin, PluginOwner, PluginRuleStore, PluginStore};
 
         let path = std::env::temp_dir().join(format!("ip-broken-plugin-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -605,6 +605,7 @@ secret = "0123456789abcdef0123456789abcdef"
             .put_plugin(NewPlugin {
                 kind: PluginKind::ReqBody,
                 wasm: wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap(),
+                owner: PluginOwner::Global,
             })
             .await
             .unwrap();

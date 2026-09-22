@@ -155,7 +155,8 @@ mod tests {
     use bytes::Bytes;
     use ip_core::{NewPluginRule, PassphraseHash, PluginOrder, Role, TnKey, UserId};
     use ip_storage::{
-        AccountKind, NewPlugin, NewTenant, NewUser, SqliteStore, TenantStore, UserStore,
+        AccountKind, NewPlugin, NewTenant, NewUser, PluginOwner, SqliteStore, TenantStore,
+        UserStore,
     };
 
     use super::*;
@@ -194,15 +195,26 @@ mod tests {
         guest(&format!(r#"{BANG} (data (i32.const 8) "{marker}")"#))
     }
 
+    /// Stores wasm for the global chain and both tenants, so any test can place it anywhere.
     async fn stored(store: &SqliteStore, kind: PluginKind, text: &str) -> Checksum {
-        store
-            .put_plugin(NewPlugin {
-                kind,
-                wasm: wat::parse_str(text).unwrap(),
-            })
-            .await
-            .unwrap()
-            .checksum
+        let owners = [
+            PluginOwner::Global,
+            PluginOwner::Tenant(TenantId::new("acme").unwrap()),
+            PluginOwner::Tenant(TenantId::new("globex").unwrap()),
+        ];
+        let mut checksum = None;
+        for owner in owners {
+            let record = store
+                .put_plugin(NewPlugin {
+                    kind,
+                    wasm: wat::parse_str(text).unwrap(),
+                    owner,
+                })
+                .await
+                .unwrap();
+            checksum = Some(record.checksum);
+        }
+        checksum.expect("stored for at least one owner")
     }
 
     async fn place(store: &SqliteStore, checksum: Checksum, order: u8, scope: PluginScope) {

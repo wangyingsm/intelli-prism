@@ -104,6 +104,7 @@ macro_rules! backend_suite {
             grants_are_listed_newest_first_by_where_they_are_held,
             routes_are_listed_newest_first_with_every_target,
             rules_are_listed_by_chain_newest_first,
+            plugins_are_listed_to_the_chain_that_owns_them,
         ]);
     };
     (member_remove, $open:path) => {
@@ -152,6 +153,10 @@ macro_rules! backend_suite {
             rules_come_back_highest_order_first,
             deleting_a_tenant_takes_its_rules_with_it,
             removing_a_global_rule_leaves_a_tenant_rule_at_the_same_kind,
+            the_same_wasm_is_stored_once_and_goes_with_its_last_owner,
+            wasm_stored_as_another_kind_is_refused,
+            a_chain_places_only_the_plugins_it_owns,
+            an_owner_that_is_not_there_leaves_no_wasm_behind,
         ]);
     };
     ($open:path) => {

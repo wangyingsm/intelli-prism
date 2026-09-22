@@ -102,6 +102,8 @@ Roughly in dependency order. Each entry names what it waits on.
 - Admin endpoints for tenants, users, memberships, grants, rules and plugins, at the authority the
 capability model already describes. Everything below that a person has to configure needs this.
 - Quota and rate limits per tenant and user — no representation for either exists yet.
+- Wasm a deleted tenant owned alone is left in the store with no owner. Nothing lists it or runs
+it, but nothing removes it either until a sweep of unowned plugins exists.
 
 ### Intelligent routing
 

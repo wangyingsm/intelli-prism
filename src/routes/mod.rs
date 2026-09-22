@@ -334,7 +334,7 @@ mod tests {
         AccountKind, GrantStore, Membership, MembershipStore, NewTenant, NewUser, SqliteStore,
         Standing, TenantStore, UserStore,
     };
-    use ip_storage::{NewPlugin, PluginRuleStore, PluginStore};
+    use ip_storage::{NewPlugin, PluginOwner, PluginRuleStore, PluginStore};
     use tower::ServiceExt;
 
     use super::*;
@@ -917,6 +917,7 @@ secret = "0123456789abcdef0123456789abcdef"
             .put_plugin(NewPlugin {
                 kind: PluginKind::RespBody,
                 wasm: wat::parse_str(REWRITE).unwrap(),
+                owner: PluginOwner::Tenant(tenant_id()),
             })
             .await
             .unwrap();

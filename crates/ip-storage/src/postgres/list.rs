@@ -7,11 +7,13 @@ use sqlx::Row;
 use sqlx::postgres::PgRow;
 
 use super::PostgresStore;
-use super::plugin::plugin_rule;
+use super::identity::tenant_row_id;
+use super::plugin::{plugin_record, plugin_rule};
 use crate::codec::{capability, scope, standing};
 use crate::error::StorageError;
 use crate::list::{ListStore, Listed, Page};
 use crate::model::Membership;
+use crate::plugin::{PluginOwner, PluginRecord};
 
 fn created_at(row: &PgRow) -> Result<Timestamp, StorageError> {
     Ok(Timestamp::from_unix_seconds(row.get("created_at"))?)
@@ -162,6 +164,43 @@ impl ListStore for PostgresStore {
             });
         }
         Ok(listed)
+    }
+
+    async fn list_plugins(
+        &self,
+        owner: &PluginOwner,
+        page: Page,
+    ) -> Result<Vec<Listed<PluginRecord>>, StorageError> {
+        let tenant_row_id = match owner.tenant() {
+            Some(tenant) => Some(
+                tenant_row_id(&mut *self.connection().await?, tenant)
+                    .await?
+                    .get(),
+            ),
+            None => None,
+        };
+        let rows = sqlx::query(
+            "SELECT p.row_id, p.checksum, p.kind, length(p.wasm)::BIGINT AS size, o.created_at FROM plugin_owners o \
+             JOIN plugins p ON p.row_id = o.plugin_row_id \
+             WHERE o.tenant_row_id IS NOT DISTINCT FROM $1 AND o.created_at > $2 \
+             ORDER BY o.created_at DESC, p.row_id DESC LIMIT $3 OFFSET $4",
+        )
+        .bind(tenant_row_id)
+        .bind(page.after_seconds())
+        .bind(i64::from(page.limit()))
+        .bind(i64::from(page.offset()))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StorageError::backend)?;
+        rows.iter()
+            .map(|row| {
+                let record = plugin_record(row)?;
+                Ok(Listed {
+                    created_at: record.created_at,
+                    item: record,
+                })
+            })
+            .collect()
     }
 
     async fn list_rules(

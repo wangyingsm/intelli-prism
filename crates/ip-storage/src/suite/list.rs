@@ -4,10 +4,11 @@ use ip_core::{
 };
 
 use super::fixture::*;
-use super::plugin::plugin;
+use super::plugin::{owned_by, stored_for};
 use super::route::rule;
 use crate::list::{Listed, Page};
 use crate::model::{AccountKind, Membership, NewTenant, NewUser, Standing};
+use crate::plugin::PluginOwner;
 use crate::store::Backend;
 
 fn user(raw: &str) -> UserId {
@@ -183,10 +184,13 @@ pub(crate) async fn routes_are_listed_newest_first_with_every_target(store: &imp
 
 pub(crate) async fn rules_are_listed_by_chain_newest_first(store: &impl Backend) {
     tenant_with_user(store).await;
-    let record = store
-        .put_plugin(plugin(PluginKind::RespBody, b"module"))
-        .await
-        .unwrap();
+    let record = stored_for(
+        store,
+        PluginKind::RespBody,
+        b"module",
+        &[PluginOwner::Global, PluginOwner::Tenant(tenant_id())],
+    )
+    .await;
     let placements = [
         (10, PluginScope::Global),
         (11, PluginScope::Global),
@@ -229,4 +233,54 @@ pub(crate) async fn rules_are_listed_by_chain_newest_first(store: &impl Backend)
             .unwrap()
             .is_empty()
     );
+}
+
+pub(crate) async fn plugins_are_listed_to_the_chain_that_owns_them(store: &impl Backend) {
+    tenant_with_user(store).await;
+    store
+        .create_tenant(NewTenant {
+            id: globex(),
+            key: TnKey::generate().unwrap(),
+        })
+        .await
+        .unwrap();
+    let acme = PluginOwner::Tenant(tenant_id());
+    for (body, owner) in [
+        (&b"one"[..], acme.clone()),
+        (&b"two"[..], acme.clone()),
+        (&b"three"[..], PluginOwner::Global),
+    ] {
+        store
+            .put_plugin(owned_by(PluginKind::ReqBody, body, owner))
+            .await
+            .unwrap();
+    }
+    let sizes = |listed: Vec<Listed<crate::plugin::PluginRecord>>| -> Vec<usize> {
+        listed.iter().map(|plugin| plugin.item.size).collect()
+    };
+
+    assert_eq!(
+        sizes(store.list_plugins(&acme, Page::default()).await.unwrap()),
+        [3, 3]
+    );
+    assert_eq!(
+        sizes(
+            store
+                .list_plugins(&PluginOwner::Global, Page::default())
+                .await
+                .unwrap()
+        ),
+        [5]
+    );
+    let globex = PluginOwner::Tenant(globex());
+    assert!(
+        store
+            .list_plugins(&globex, Page::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let newest = store.list_plugins(&acme, page(1, 0)).await.unwrap();
+    assert_eq!(newest[0].item.checksum, ip_core::Checksum::of(b"two"));
 }

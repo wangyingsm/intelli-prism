@@ -5,6 +5,7 @@ use ip_core::{Grant, PluginRule, RouteRule, TenantId, Timestamp, UserId};
 
 use crate::error::StorageError;
 use crate::model::Membership;
+use crate::plugin::{PluginOwner, PluginRecord};
 
 /// How many records a page holds when the caller names no size.
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
@@ -95,6 +96,14 @@ pub trait ListStore: Send + Sync {
 
     /// The stored routing rules.
     async fn list_routes(&self, page: Page) -> Result<Vec<Listed<RouteRule>>, StorageError>;
+
+    /// The plugins one owner holds, each dated by when that owner stored it rather than when
+    /// anyone first did, which would tell one tenant what another uploads.
+    async fn list_plugins(
+        &self,
+        owner: &PluginOwner,
+        page: Page,
+    ) -> Result<Vec<Listed<PluginRecord>>, StorageError>;
 
     /// The rules in one chain: a tenant's, or the global chain when none is named.
     async fn list_rules(

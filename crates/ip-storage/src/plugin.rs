@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use ip_core::{Checksum, NewPluginRule, PluginKind, PluginOrder, PluginRule, TenantId, Timestamp};
+use ip_core::{
+    Checksum, NewPluginRule, PluginKind, PluginOrder, PluginRule, PluginScope, TenantId, Timestamp,
+};
 
 use crate::error::StorageError;
 
@@ -43,6 +45,36 @@ pub struct Plugin {
     pub wasm: Vec<u8>,
 }
 
+/// Whose a stored plugin is: the global chain's, or one tenant's.
+///
+/// Wasm is stored once however many own it, so a plugin is shown to, and placed by, only the
+/// chains that own it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PluginOwner {
+    /// The chain every flow runs, which the system administrator manages.
+    Global,
+    /// One tenant's chain.
+    Tenant(TenantId),
+}
+
+impl PluginOwner {
+    /// The tenant that owns the plugin, when a tenant does.
+    pub fn tenant(&self) -> Option<&TenantId> {
+        match self {
+            Self::Global => None,
+            Self::Tenant(tenant) => Some(tenant),
+        }
+    }
+
+    /// The chain a rule in this scope belongs to, which must own the plugin it places.
+    pub fn of_scope(scope: &PluginScope) -> Self {
+        match scope.tenant() {
+            Some(tenant) => Self::Tenant(tenant.clone()),
+            None => Self::Global,
+        }
+    }
+}
+
 /// Wasm about to be stored, which is named by its own checksum once written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewPlugin {
@@ -50,30 +82,56 @@ pub struct NewPlugin {
     pub kind: PluginKind,
     /// The module itself.
     pub wasm: Vec<u8>,
+    /// Who stores it, and so who may see and place it.
+    pub owner: PluginOwner,
+}
+
+/// A plugin stored for one owner, and since when that owner has held it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginUploaded {
+    /// What is stored under the wasm's checksum.
+    pub plugin: PluginRecord,
+    /// When the owner first stored it, which is not when anyone else did.
+    pub owned_at: Timestamp,
+}
+
+/// One owner's hold on a plugin that ended, and whether the wasm went with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDisowned {
+    /// The plugin that was held.
+    pub plugin: PluginRecord,
+    /// Whether nobody owned it any more, so its wasm was removed.
+    pub swept: bool,
 }
 
 /// Holds the wasm of every plugin, addressed by the checksum of its own bytes.
 #[async_trait]
 pub trait PluginStore: Send + Sync {
-    /// Stores wasm under the checksum of its bytes. Storing the same wasm twice
-    /// changes nothing, because the name is derived from the content.
+    /// Stores wasm under the checksum of its bytes and records its owner, in one transaction.
+    /// Storing the same wasm again only adds an owner, because the name is derived from the
+    /// content; storing it as another kind is refused.
     async fn put_plugin(&self, new: NewPlugin) -> Result<PluginRecord, StorageError>;
 
     /// Reads one plugin, wasm included.
     async fn plugin(&self, checksum: &Checksum) -> Result<Option<Plugin>, StorageError>;
 
-    /// What is stored, without reading any wasm.
+    /// Every stored plugin whoever owns it, without reading any wasm. The api lists by owner.
     async fn plugins(&self) -> Result<Vec<PluginRecord>, StorageError>;
 
-    /// Removes a plugin, refusing one a rule still uses, or reports it missing.
-    async fn remove_plugin(&self, checksum: &Checksum) -> Result<(), StorageError>;
+    /// Ends one owner's hold on a plugin, refusing while a rule in its chain still runs it,
+    /// and removes the wasm once nobody owns it. Reports whether the wasm went.
+    async fn disown_plugin(
+        &self,
+        checksum: &Checksum,
+        owner: &PluginOwner,
+    ) -> Result<bool, StorageError>;
 }
 
 /// Places stored plugins in chains, and reads back which run for whom.
 #[async_trait]
 pub trait PluginRuleStore: Send + Sync {
-    /// Places a stored plugin, taking its kind from the plugin itself. Refuses a plugin
-    /// that is not stored, and an order its tenant already uses for that kind.
+    /// Places a stored plugin, taking its kind from the plugin itself. Refuses a plugin the
+    /// rule's chain does not own, and an order its tenant already uses for that kind.
     async fn put_rule(&self, rule: NewPluginRule) -> Result<PluginRule, StorageError>;
 
     /// Removes the rule at one kind and order, in a tenant or in the global chain.
@@ -101,6 +159,7 @@ mod tests {
     #[derive(Default)]
     struct MemoryPlugins {
         held: Mutex<Vec<Plugin>>,
+        owners: Mutex<Vec<(Checksum, PluginOwner)>>,
         next_row_id: Mutex<i64>,
         rules: Mutex<Vec<PluginRule>>,
     }
@@ -109,11 +168,21 @@ mod tests {
     impl PluginStore for MemoryPlugins {
         async fn put_plugin(&self, new: NewPlugin) -> Result<PluginRecord, StorageError> {
             let checksum = Checksum::of(&new.wasm);
+            let mut owners = self.owners.lock().unwrap();
+            if !owners.contains(&(checksum, new.owner.clone())) {
+                owners.push((checksum, new.owner.clone()));
+            }
             let mut held = self.held.lock().unwrap();
             if let Some(plugin) = held
                 .iter()
                 .find(|plugin| plugin.record.checksum == checksum)
             {
+                if plugin.record.kind != new.kind {
+                    return Err(StorageError::Conflict {
+                        entity: Entity::Plugin,
+                        id: format!("{checksum} as a {} plugin", plugin.record.kind),
+                    });
+                }
                 return Ok(plugin.record.clone());
             }
             let mut next = self.next_row_id.lock().unwrap();
@@ -152,41 +221,54 @@ mod tests {
                 .collect())
         }
 
-        async fn remove_plugin(&self, checksum: &Checksum) -> Result<(), StorageError> {
-            if self
-                .rules
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|rule| rule.checksum() == checksum)
-            {
+        async fn disown_plugin(
+            &self,
+            checksum: &Checksum,
+            owner: &PluginOwner,
+        ) -> Result<bool, StorageError> {
+            if self.rules.lock().unwrap().iter().any(|rule| {
+                rule.checksum() == checksum && &PluginOwner::of_scope(rule.scope()) == owner
+            }) {
                 return Err(StorageError::InUse {
                     entity: Entity::Plugin,
                     id: checksum.to_string(),
                 });
             }
-            let mut held = self.held.lock().unwrap();
-            let before = held.len();
-            held.retain(|plugin| &plugin.record.checksum != checksum);
-            if held.len() == before {
+            let mut owners = self.owners.lock().unwrap();
+            let before = owners.len();
+            owners.retain(|held| held != &(*checksum, owner.clone()));
+            if owners.len() == before {
                 return Err(StorageError::NotFound {
                     entity: Entity::Plugin,
                     id: checksum.to_string(),
                 });
             }
-            Ok(())
+            if owners.iter().any(|(held, _)| held == checksum) {
+                return Ok(false);
+            }
+            self.held
+                .lock()
+                .unwrap()
+                .retain(|plugin| &plugin.record.checksum != checksum);
+            Ok(true)
         }
     }
 
     #[async_trait]
     impl PluginRuleStore for MemoryPlugins {
         async fn put_rule(&self, rule: NewPluginRule) -> Result<PluginRule, StorageError> {
+            let owner = PluginOwner::of_scope(rule.scope());
+            let owned = self
+                .owners
+                .lock()
+                .unwrap()
+                .contains(&(*rule.checksum(), owner));
             let kind = self
                 .held
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|plugin| &plugin.record.checksum == rule.checksum())
+                .find(|plugin| owned && &plugin.record.checksum == rule.checksum())
                 .map(|plugin| plugin.record.kind)
                 .ok_or_else(|| StorageError::NotFound {
                     entity: Entity::Plugin,
@@ -271,10 +353,16 @@ mod tests {
         NewPluginRule::new(checksum, PluginOrder::new(order), scope).unwrap()
     }
 
+    /// Wasm acme stores, which is the chain most of these tests place in.
     fn wasm(body: &[u8]) -> NewPlugin {
+        owned_by(body, PluginOwner::Tenant(acme()))
+    }
+
+    fn owned_by(body: &[u8], owner: PluginOwner) -> NewPlugin {
         NewPlugin {
             kind: PluginKind::ReqBody,
             wasm: body.to_vec(),
+            owner,
         }
     }
 
@@ -285,7 +373,8 @@ mod tests {
         let plugin = store.plugin(&record.checksum).await.unwrap().unwrap();
         assert_eq!(plugin.wasm, b"\0asm\x01\0\0\0");
         assert_eq!(store.plugins().await.unwrap(), vec![record.clone()]);
-        store.remove_plugin(&record.checksum).await.unwrap();
+        let owner = PluginOwner::Tenant(acme());
+        assert!(store.disown_plugin(&record.checksum, &owner).await.unwrap());
         assert_eq!(store.plugin(&record.checksum).await.unwrap(), None);
     }
 
@@ -348,6 +437,7 @@ mod tests {
             .put_plugin(NewPlugin {
                 kind: PluginKind::RespHeader,
                 wasm: b"module".to_vec(),
+                owner: PluginOwner::Tenant(acme()),
             })
             .await
             .unwrap();
@@ -401,6 +491,9 @@ mod tests {
             .await
             .unwrap();
         let globex = TenantId::new("globex").unwrap();
+        held.put_plugin(owned_by(b"module", PluginOwner::Tenant(globex.clone())))
+            .await
+            .unwrap();
         assert!(
             held.put_rule(rule(record.checksum, 100, tenant_wide(globex)))
                 .await
@@ -413,6 +506,9 @@ mod tests {
         let held = both();
         let record = held.put_plugin(wasm(b"module")).await.unwrap();
         let globex = TenantId::new("globex").unwrap();
+        for owner in [PluginOwner::Global, PluginOwner::Tenant(globex.clone())] {
+            held.put_plugin(owned_by(b"module", owner)).await.unwrap();
+        }
         held.put_rule(rule(record.checksum, 10, ip_core::PluginScope::Global))
             .await
             .unwrap();
@@ -438,12 +534,29 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            held.remove_plugin(&record.checksum).await,
+            held.disown_plugin(&record.checksum, &PluginOwner::Tenant(acme()))
+                .await,
             Err(StorageError::InUse {
                 entity: Entity::Plugin,
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_chain_places_only_the_plugins_it_owns() {
+        let held = both();
+        let record = held.put_plugin(wasm(b"module")).await.unwrap();
+        let globex = tenant_wide(TenantId::new("globex").unwrap());
+        for (order, scope) in [(10, ip_core::PluginScope::Global), (100, globex)] {
+            assert!(matches!(
+                held.put_rule(rule(record.checksum, order, scope)).await,
+                Err(StorageError::NotFound {
+                    entity: Entity::Plugin,
+                    ..
+                })
+            ));
+        }
     }
 
     #[tokio::test]
@@ -463,7 +576,9 @@ mod tests {
     async fn removing_what_is_absent_reports_it_missing() {
         let store = store();
         assert!(matches!(
-            store.remove_plugin(&Checksum::of(b"absent")).await,
+            store
+                .disown_plugin(&Checksum::of(b"absent"), &PluginOwner::Global)
+                .await,
             Err(StorageError::NotFound {
                 entity: Entity::Plugin,
                 ..
