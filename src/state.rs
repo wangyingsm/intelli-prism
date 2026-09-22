@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ip_auth::{Logins, RequestVerifier, SessionTokens};
 #[cfg(feature = "cluster-cache")]
 use ip_cache::RedisCache;
-use ip_cache::{Cache, Ttl};
+use ip_cache::{Cache, CacheBackend, Ttl};
 #[cfg(feature = "standalone-cache")]
 use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
@@ -18,6 +18,7 @@ use ip_storage::SqliteStore;
 use ip_storage::{Backend, Storage};
 
 use crate::error::StartupError;
+use crate::rules::RuleFeed;
 
 /// The store that was opened, in the shape its own backend has.
 ///
@@ -57,6 +58,7 @@ pub struct AppState {
     gateway: Arc<Gateway>,
     listen: SocketAddr,
     configured: Arc<[RouteRule]>,
+    feed: Arc<RuleFeed>,
 }
 
 impl AppState {
@@ -65,7 +67,13 @@ impl AppState {
     pub async fn open(config: &Config) -> Result<Self, StartupError> {
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
-        let cache = open_cache(&config.cache).await?;
+        let published = open_cache(&config.cache).await?;
+        let feed = Arc::new(RuleFeed::new(Arc::clone(&store), Arc::clone(&published))?);
+        // A cache that cannot take the rules yet leaves this node serving what storage holds.
+        if let Err(error) = feed.heal().await {
+            tracing::warn!(%error, "could not publish the rules at startup; healing will");
+        }
+        let cache = published as Arc<dyn Cache>;
         let table = RoutingTable::load(config, store.as_ref()).await?;
         let configured = config
             .upstreams
@@ -103,14 +111,19 @@ impl AppState {
             gateway: Arc::new(gateway),
             listen: config.server.listen,
             configured: configured.into(),
+            feed,
         })
     }
 
     /// Builds state over a store and gateway that are already built, on a cache of its own.
     #[cfg(test)]
     pub fn with_parts(stores: Stores, gateway: Gateway, listen: SocketAddr) -> Self {
+        let published: Arc<dyn CacheBackend> =
+            Arc::new(ip_cache::SledCache::temporary().expect("a temporary cache"));
+        let feed =
+            Arc::new(RuleFeed::new(stores.backend(), Arc::clone(&published)).expect("a feed"));
         let store = stores.backend() as Arc<dyn Storage>;
-        let cache = Arc::new(ip_cache::SledCache::temporary().expect("a temporary cache"));
+        let cache = published as Arc<dyn Cache>;
         let tokens = SessionTokens::new(
             "intelli-prism",
             b"0123456789abcdef0123456789abcdef",
@@ -126,6 +139,7 @@ impl AppState {
             gateway: Arc::new(gateway),
             listen,
             configured: Arc::new([]),
+            feed,
         }
     }
 
@@ -171,6 +185,11 @@ impl AppState {
         self.listen
     }
 
+    /// Publishes the rules for every node, and follows what is published.
+    pub fn feed(&self) -> &Arc<RuleFeed> {
+        &self.feed
+    }
+
     /// The rules the configuration file contributes, which no stored rule can displace.
     pub fn configured(&self) -> &[RouteRule] {
         &self.configured
@@ -200,7 +219,7 @@ pub(crate) async fn open_store(config: &StorageConfig) -> Result<Stores, Startup
     }
 }
 
-async fn open_cache(config: &CacheConfig) -> Result<Arc<dyn Cache>, StartupError> {
+async fn open_cache(config: &CacheConfig) -> Result<Arc<dyn CacheBackend>, StartupError> {
     match config {
         #[cfg(feature = "standalone-cache")]
         CacheConfig::Sled {

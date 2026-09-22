@@ -49,6 +49,10 @@ pub enum StartupError {
     #[error(transparent)]
     Chains(#[from] ChainError),
 
+    /// Publishing the rules could not be set up.
+    #[error(transparent)]
+    Feed(#[from] FeedError),
+
     /// The configured backend is not compiled into this build.
     #[error("this build has no {backend} backend; rebuild with the `{feature}` feature")]
     UnsupportedBackend {
@@ -87,4 +91,28 @@ mod tests {
             "this build has no postgres backend; rebuild with the `fast-storage` feature"
         );
     }
+}
+
+/// Every way publishing the rules for the other nodes can fail.
+#[derive(Debug, thiserror::Error)]
+pub enum FeedError {
+    /// Storage could not say what the rules are.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+
+    /// The cache could not carry them.
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+
+    /// The rules could not be written out for the cache.
+    #[error("the rules could not be encoded: {0}")]
+    Encode(#[source] serde_json::Error),
+
+    /// What the cache carries could not be read back as rules.
+    #[error("the published rules could not be decoded: {0}")]
+    Decode(#[source] serde_json::Error),
+
+    /// A published rule is one its own type refuses.
+    #[error(transparent)]
+    Rule(#[from] ip_core::CoreError),
 }

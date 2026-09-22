@@ -249,7 +249,10 @@ async fn place_rule(
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
     match state.stores().backend().put_rule(rule).await {
-        Ok(placed) => (StatusCode::CREATED, Json(RuleView::from(&placed))).into_response(),
+        Ok(placed) => {
+            state.feed().after_change().await;
+            (StatusCode::CREATED, Json(RuleView::from(&placed))).into_response()
+        }
         Err(StorageError::NotFound {
             entity: Entity::Plugin,
             ..
@@ -277,7 +280,10 @@ async fn remove_rule(
         .remove_rule(owner.tenant(), kind, PluginOrder::new(order))
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.feed().after_change().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => store_refusal(error),
     }
 }

@@ -144,7 +144,10 @@ async fn remove(
         return StatusCode::NOT_FOUND.into_response();
     };
     match store.delete_tenant(&tenant).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.feed().after_change().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => store_refusal(error),
     }
 }

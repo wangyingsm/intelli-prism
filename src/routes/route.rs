@@ -121,7 +121,10 @@ async fn put(State(state): State<AppState>, manager: Manager, body: Bytes) -> Re
             .into_response();
     }
     match state.stores().backend().put_route(rule).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.feed().after_change().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => store_refusal(error),
     }
 }
@@ -136,7 +139,10 @@ async fn remove(State(state): State<AppState>, manager: Manager, body: Bytes) ->
         Err(rejection) => return rejection.into_response(),
     };
     match state.stores().backend().remove_route(&key).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.feed().after_change().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => store_refusal(error),
     }
 }
@@ -450,5 +456,33 @@ mod tests {
         let listed = page("").await;
         assert!(listed[0].get("created_at").is_none());
         assert!(listed[1]["created_at"].is_i64());
+    }
+
+    #[tokio::test]
+    async fn a_stored_rule_is_published_for_every_node() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&json(&rule("/v1", "api.example.com"))),
+        )
+        .await;
+
+        let published = state.feed().published().await.unwrap().unwrap();
+        let stored = state.stores().backend().rule_revision().await.unwrap();
+        assert_eq!(published.revision, stored);
+        assert_eq!(published.routes, [rule("/v1", "api.example.com")]);
+
+        let key = serde_json::to_string(&rule("/v1", "api.example.com").key).unwrap();
+        call(&router, &state, "root", "DELETE", Some(&key)).await;
+        let published = state.feed().published().await.unwrap().unwrap();
+        assert!(published.routes.is_empty());
+        assert_eq!(
+            published.revision,
+            state.stores().backend().rule_revision().await.unwrap()
+        );
     }
 }

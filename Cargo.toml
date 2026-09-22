@@ -13,6 +13,7 @@ categories = ["network-programming", "web-programming::http-server"]
 [dependencies]
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
+getrandom.workspace = true
 http-body-util = "0.1.5"
 ip-auth = { version = "0.1.0", path = "crates/ip-auth" }
 ip-cache = { version = "0.1.0", path = "crates/ip-cache", default-features = false }
@@ -23,6 +24,7 @@ ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }
 rpassword = "7.5.4"
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing = "0.1.44"
