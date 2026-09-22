@@ -85,12 +85,14 @@ pub(super) async fn insert_membership(
     let tenant_row_id = tenant_row_id(&mut *connection, &membership.tenant).await?;
     let user_row_id = user_row_id(&mut *connection, &membership.user).await?;
     sqlx::query(
-        "INSERT INTO memberships (tenant_row_id, user_row_id, standing) VALUES (?, ?, ?) \
+        "INSERT INTO memberships (tenant_row_id, user_row_id, standing, created_at) \
+         VALUES (?, ?, ?, ?) \
          ON CONFLICT (tenant_row_id, user_row_id) DO UPDATE SET standing = excluded.standing",
     )
     .bind(tenant_row_id.get())
     .bind(user_row_id.get())
     .bind(standing_name(membership.standing))
+    .bind(Timestamp::now().unix_seconds())
     .execute(connection)
     .await
     .map_err(StorageError::backend)?;
@@ -370,12 +372,14 @@ impl GrantStore for SqliteStore {
             None => None,
         };
         let result = sqlx::query(
-            "INSERT INTO grants (user_row_id, tenant_row_id, api_id, capability) VALUES (?, ?, ?, ?)",
+            "INSERT INTO grants (user_row_id, tenant_row_id, api_id, capability, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(user_row_id.get())
         .bind(tenant_row_id)
         .bind(grant.scope().api().map(|api| api.as_str()))
         .bind(capability_name(grant.capability()))
+        .bind(Timestamp::now().unix_seconds())
         .execute(&self.pool)
         .await;
         match result {

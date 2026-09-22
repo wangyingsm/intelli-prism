@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ip_core::{ApiId, Endpoint, RouteKey, RouteRule, RouteTarget};
+use ip_core::{ApiId, Endpoint, RouteKey, RouteRule, RouteTarget, Timestamp};
 use sqlx::Row;
 
 use super::PostgresStore;
@@ -12,8 +12,8 @@ impl RouteStore for PostgresStore {
         let key = rule.key.endpoint();
         let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
         let route_row_id: i64 = sqlx::query_scalar(
-            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path) \
-             VALUES ($1, $2, $3, $4, $5) \
+            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
              api_id = excluded.api_id \
              RETURNING row_id",
@@ -23,6 +23,7 @@ impl RouteStore for PostgresStore {
         .bind(key.host.as_str())
         .bind(i64::from(key.port.get()))
         .bind(key.path.as_str())
+        .bind(Timestamp::now().unix_seconds())
         .fetch_one(&mut *transaction)
         .await
         .map_err(StorageError::backend)?;
@@ -161,8 +162,8 @@ mod tests {
     /// Writes a route around the driver, so a row the code could not have written is read back.
     async fn broken_route(store: &PostgresStore, key_protocol: &str, protocol: &str, port: i64) {
         let route_row_id: i64 = sqlx::query_scalar(
-            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path) \
-             VALUES ('anthropic', $1, 'gateway.local', 443, '/v1') RETURNING row_id",
+            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path, created_at) \
+             VALUES ('anthropic', $1, 'gateway.local', 443, '/v1', 0) RETURNING row_id",
         )
         .bind(key_protocol)
         .fetch_one(&store.pool)

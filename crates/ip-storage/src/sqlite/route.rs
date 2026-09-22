@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ip_core::{ApiId, Endpoint, RouteKey, RouteRule, RouteTarget};
+use ip_core::{ApiId, Endpoint, RouteKey, RouteRule, RouteTarget, Timestamp};
 use sqlx::Row;
 
 use super::SqliteStore;
@@ -12,8 +12,8 @@ impl RouteStore for SqliteStore {
         let key = rule.key.endpoint();
         let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
         let route_row_id: i64 = sqlx::query_scalar(
-            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path) \
-             VALUES (?, ?, ?, ?, ?) \
+            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
              ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
              api_id = excluded.api_id \
              RETURNING row_id",
@@ -23,6 +23,7 @@ impl RouteStore for SqliteStore {
         .bind(key.host.as_str())
         .bind(i64::from(key.port.get()))
         .bind(key.path.as_str())
+        .bind(Timestamp::now().unix_seconds())
         .fetch_one(&mut *transaction)
         .await
         .map_err(StorageError::backend)?;

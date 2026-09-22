@@ -140,8 +140,8 @@ impl PluginRuleStore for PostgresStore {
 
         let result = sqlx::query(
             "INSERT INTO plugin_rules \
-             (plugin_row_id, tenant_row_id, user_row_id, api_id, kind, position) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (plugin_row_id, tenant_row_id, user_row_id, api_id, kind, position, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(plugin_row_id)
         .bind(tenant_row_id)
@@ -149,6 +149,7 @@ impl PluginRuleStore for PostgresStore {
         .bind(api.as_ref().map(|api| api.as_str()))
         .bind(kind.name())
         .bind(i64::from(rule.order().get()))
+        .bind(Timestamp::now().unix_seconds())
         .execute(&self.pool)
         .await;
         match result {
@@ -246,8 +247,9 @@ mod tests {
             .await
             .unwrap();
         let written = sqlx::query(
-            "INSERT INTO plugin_rules (plugin_row_id, tenant_row_id, user_row_id, kind, position) \
-             VALUES ($1, NULL, $2, 'req_body', 10)",
+            "INSERT INTO plugin_rules \
+             (plugin_row_id, tenant_row_id, user_row_id, kind, position, created_at) \
+             VALUES ($1, NULL, $2, 'req_body', 10, 0)",
         )
         .bind(record.row_id.get())
         .bind(user.row_id.get())
@@ -267,8 +269,8 @@ mod tests {
             .await
             .unwrap();
         let written = sqlx::query(
-            "INSERT INTO plugin_rules (plugin_row_id, tenant_row_id, kind, position) \
-             VALUES ($1, $2, 'req_body', 10)",
+            "INSERT INTO plugin_rules (plugin_row_id, tenant_row_id, kind, position, created_at) \
+             VALUES ($1, $2, 'req_body', 10, 0)",
         )
         .bind(record.row_id.get())
         .bind(tenant.row_id.get())

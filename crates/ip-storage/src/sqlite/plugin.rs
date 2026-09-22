@@ -140,8 +140,8 @@ impl PluginRuleStore for SqliteStore {
 
         let result = sqlx::query(
             "INSERT INTO plugin_rules \
-             (plugin_row_id, tenant_row_id, user_row_id, api_id, kind, position) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (plugin_row_id, tenant_row_id, user_row_id, api_id, kind, position, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(plugin_row_id)
         .bind(tenant_row_id)
@@ -149,6 +149,7 @@ impl PluginRuleStore for SqliteStore {
         .bind(api.as_ref().map(|api| api.as_str()))
         .bind(kind.name())
         .bind(i64::from(rule.order().get()))
+        .bind(Timestamp::now().unix_seconds())
         .execute(&self.pool)
         .await;
         match result {
