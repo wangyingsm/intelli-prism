@@ -6,6 +6,8 @@ pub mod cluster;
 pub mod error;
 pub mod key;
 pub mod limits;
+#[cfg(any(feature = "standalone-cache", feature = "cluster-cache"))]
+pub mod publication;
 #[cfg(feature = "standalone-cache")]
 pub mod standalone;
 #[cfg(all(test, any(feature = "standalone-cache", feature = "cluster-cache")))]
@@ -18,6 +20,8 @@ pub use cluster::{Prefix, RedisCache};
 pub use error::CacheError;
 pub use key::{CacheKey, CacheLevel};
 pub use limits::{LevelLimits, MaxBytes};
+#[cfg(any(feature = "standalone-cache", feature = "cluster-cache"))]
+pub use publication::{CacheBackend, Publication, Published};
 #[cfg(feature = "standalone-cache")]
 pub use standalone::SledCache;
 pub use ttl::Ttl;

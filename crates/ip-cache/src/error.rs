@@ -29,6 +29,13 @@ pub enum CacheError {
     #[error("a ttl must be longer than zero")]
     ZeroTtl,
 
+    /// A published value was not written the way this crate writes one.
+    #[error("a published value is malformed: {detail}")]
+    MalformedPublication {
+        /// What was wrong with it.
+        detail: String,
+    },
+
     /// The backend itself failed.
     #[error("cache backend failed")]
     Backend(#[source] Box<dyn Error + Send + Sync>),

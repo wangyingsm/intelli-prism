@@ -1,10 +1,15 @@
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use redis::aio::{ConnectionManager, PubSub};
 use redis::{Client, cmd};
+use tokio::sync::watch;
 
 use crate::cache::Cache;
 use crate::error::CacheError;
 use crate::key::CacheKey;
+use crate::publication::{Publication, Published, announce};
 use crate::ttl::Ttl;
 
 /// A word every key of one cache carries, which is what deployments sharing a redis need.
@@ -31,6 +36,7 @@ impl Prefix {
 /// The cluster backend: the redis every node shares.
 #[derive(Debug, Clone)]
 pub struct RedisCache {
+    client: Client,
     connection: ConnectionManager,
     prefix: Option<Prefix>,
 }
@@ -52,7 +58,11 @@ impl RedisCache {
             .get_connection_manager()
             .await
             .map_err(CacheError::backend)?;
-        Ok(Self { connection, prefix })
+        Ok(Self {
+            client,
+            connection,
+            prefix,
+        })
     }
 
     /// The key as this cache stores it, under its prefix when it has one.
@@ -113,6 +123,140 @@ impl Cache for RedisCache {
     }
 }
 
+/// Checks the revision, writes and announces in one step, so no writer lands between the check
+/// and the write. The hash holds the revision and the value side by side.
+const PUBLISH: &str = r"
+local current = redis.call('HGET', KEYS[1], 'revision')
+if current and tonumber(current) >= tonumber(ARGV[1]) then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'revision', ARGV[1], 'value', ARGV[2])
+redis.call('PUBLISH', KEYS[2], ARGV[1])
+return 1
+";
+
+/// How long a follower waits before subscribing again after losing its connection.
+const RESUBSCRIBE_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest a follower waits between attempts to subscribe again.
+const RESUBSCRIBE_MOST: Duration = Duration::from_secs(30);
+
+impl RedisCache {
+    /// The channel a topic's changes are announced on.
+    fn channel(&self, topic: &CacheKey) -> String {
+        format!("{}:published", self.scoped(topic))
+    }
+
+    /// A connection of its own, subscribed to one channel.
+    async fn subscribed(&self, channel: &str) -> Result<PubSub, CacheError> {
+        let mut pubsub = self
+            .client
+            .get_async_pubsub()
+            .await
+            .map_err(CacheError::backend)?;
+        pubsub
+            .subscribe(channel)
+            .await
+            .map_err(CacheError::backend)?;
+        Ok(pubsub)
+    }
+
+    /// Hands every announcement on to the follower until it lets go, subscribing again after a
+    /// lost connection and catching up on whatever was published while it was gone.
+    async fn keep_following(
+        self,
+        mut pubsub: PubSub,
+        channel: String,
+        topic: CacheKey,
+        follower: watch::Sender<u64>,
+    ) {
+        loop {
+            let mut announcements = pubsub.into_on_message();
+            loop {
+                tokio::select! {
+                    announcement = announcements.next() => match announcement {
+                        Some(announcement) => {
+                            if let Ok(revision) = announcement.get_payload::<u64>() {
+                                announce(&follower, revision);
+                            }
+                        }
+                        None => break,
+                    },
+                    () = follower.closed() => return,
+                }
+            }
+            let mut wait = RESUBSCRIBE_FIRST;
+            pubsub = loop {
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = follower.closed() => return,
+                }
+                if let Ok(pubsub) = self.subscribed(&channel).await {
+                    break pubsub;
+                }
+                wait = (wait * 2).min(RESUBSCRIBE_MOST);
+            };
+            if let Ok(Some(published)) = self.published(&topic).await {
+                announce(&follower, published.revision);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Publication for RedisCache {
+    async fn publish(
+        &self,
+        topic: &CacheKey,
+        revision: u64,
+        value: &[u8],
+    ) -> Result<bool, CacheError> {
+        let mut connection = self.connection.clone();
+        let landed: i64 = cmd("EVAL")
+            .arg(PUBLISH)
+            .arg(2)
+            .arg(self.scoped(topic))
+            .arg(self.channel(topic))
+            .arg(revision)
+            .arg(value)
+            .query_async(&mut connection)
+            .await
+            .map_err(CacheError::backend)?;
+        Ok(landed == 1)
+    }
+
+    async fn published(&self, topic: &CacheKey) -> Result<Option<Published>, CacheError> {
+        let mut connection = self.connection.clone();
+        let (revision, value): (Option<u64>, Option<Vec<u8>>) = cmd("HMGET")
+            .arg(self.scoped(topic))
+            .arg("revision")
+            .arg("value")
+            .query_async(&mut connection)
+            .await
+            .map_err(CacheError::backend)?;
+        Ok(match (revision, value) {
+            (Some(revision), Some(value)) => Some(Published { revision, value }),
+            _ => None,
+        })
+    }
+
+    async fn follow(&self, topic: &CacheKey) -> Result<watch::Receiver<u64>, CacheError> {
+        let channel = self.channel(topic);
+        // Subscribing comes before the read, so nothing published between the two is missed.
+        let pubsub = self.subscribed(&channel).await?;
+        let now = self
+            .published(topic)
+            .await?
+            .map_or(0, |published| published.revision);
+        let (follower, following) = watch::channel(now);
+        tokio::spawn(
+            self.clone()
+                .keep_following(pubsub, channel, topic.clone(), follower),
+        );
+        Ok(following)
+    }
+}
+
 /// A ttl in the milliseconds redis counts, capped at what its `PX` argument holds.
 fn millis(ttl: Ttl) -> i64 {
     i64::try_from(ttl.get().as_millis()).unwrap_or(i64::MAX)
@@ -160,6 +304,26 @@ pub(crate) mod scratch {
         }
     }
 
+    #[async_trait]
+    impl Publication for ScratchCache {
+        async fn publish(
+            &self,
+            topic: &CacheKey,
+            revision: u64,
+            value: &[u8],
+        ) -> Result<bool, CacheError> {
+            self.inner.publish(topic, revision, value).await
+        }
+
+        async fn published(&self, topic: &CacheKey) -> Result<Option<Published>, CacheError> {
+            self.inner.published(topic).await
+        }
+
+        async fn follow(&self, topic: &CacheKey) -> Result<watch::Receiver<u64>, CacheError> {
+            self.inner.follow(topic).await
+        }
+    }
+
     impl Drop for ScratchCache {
         fn drop(&mut self) {
             // The cache's own connection belongs to the test's runtime, which a drop cannot drive.
@@ -204,6 +368,7 @@ pub(crate) mod scratch {
 #[cfg(test)]
 mod suite {
     crate::suite::cache_suite!(crate::cluster::scratch::cache);
+    crate::suite::publication_suite!(crate::cluster::scratch::cache);
 }
 
 #[cfg(test)]

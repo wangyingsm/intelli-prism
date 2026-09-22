@@ -4,11 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use sled::transaction::{ConflictableTransactionError, Transactional};
 use sled::{Db, IVec, Tree};
+use tokio::sync::watch;
 
 use crate::cache::Cache;
 use crate::error::CacheError;
 use crate::key::{CacheKey, CacheLevel};
 use crate::limits::LevelLimits;
+use crate::publication::{Publication, Published, announce, decode, encode};
 use crate::ttl::Ttl;
 
 /// Bytes an entry carries before its value, holding when the entry expires.
@@ -31,6 +33,7 @@ pub struct SledCache {
     used: Tree,
     index: Tree,
     sizes: Tree,
+    published: Tree,
     limits: LevelLimits,
 }
 
@@ -65,11 +68,13 @@ impl SledCache {
         let used = db.open_tree("used").map_err(CacheError::backend)?;
         let index = db.open_tree("index").map_err(CacheError::backend)?;
         let sizes = db.open_tree("sizes").map_err(CacheError::backend)?;
+        let published = db.open_tree("published").map_err(CacheError::backend)?;
         Ok(Self {
             entries: db,
             used,
             index,
             sizes,
+            published,
             limits,
         })
     }
@@ -334,6 +339,70 @@ fn entry(value: &[u8], ttl: Option<Ttl>) -> Vec<u8> {
     entry
 }
 
+#[async_trait]
+impl Publication for SledCache {
+    async fn publish(
+        &self,
+        topic: &CacheKey,
+        revision: u64,
+        value: &[u8],
+    ) -> Result<bool, CacheError> {
+        let key = topic.as_str().as_bytes();
+        let replacement = encode(revision, value);
+        loop {
+            let current = self.published.get(key).map_err(CacheError::backend)?;
+            if let Some(current) = &current
+                && decode(current)?.revision >= revision
+            {
+                return Ok(false);
+            }
+            let swapped = self
+                .published
+                .compare_and_swap(key, current, Some(replacement.as_slice()))
+                .map_err(CacheError::backend)?;
+            if swapped.is_ok() {
+                return Ok(true);
+            }
+        }
+    }
+
+    async fn published(&self, topic: &CacheKey) -> Result<Option<Published>, CacheError> {
+        self.published
+            .get(topic.as_str().as_bytes())
+            .map_err(CacheError::backend)?
+            .map(|stored| decode(&stored))
+            .transpose()
+    }
+
+    async fn follow(&self, topic: &CacheKey) -> Result<watch::Receiver<u64>, CacheError> {
+        let key = IVec::from(topic.as_str().as_bytes());
+        // Watching starts before the read, so nothing published between the two is missed.
+        let mut changes = self.published.watch_prefix(key.clone());
+        let now = self
+            .published(topic)
+            .await?
+            .map_or(0, |published| published.revision);
+        let (follower, following) = watch::channel(now);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    change = &mut changes => match change {
+                        Some(sled::Event::Insert { key: changed, value }) if changed == key => {
+                            if let Ok(published) = decode(&value) {
+                                announce(&follower, published.revision);
+                            }
+                        }
+                        Some(_) => {}
+                        None => return,
+                    },
+                    () = follower.closed() => return,
+                }
+            }
+        });
+        Ok(following)
+    }
+}
+
 /// Reads an entry's value back, or nothing once its ttl has passed.
 fn value_of(entry: &[u8], now: u64) -> Option<&[u8]> {
     let (stamp, value) = entry.split_at_checked(STAMP)?;
@@ -349,6 +418,7 @@ mod suite {
     }
 
     crate::suite::cache_suite!(crate::standalone::suite::open);
+    crate::suite::publication_suite!(crate::standalone::suite::open);
 }
 
 #[cfg(test)]

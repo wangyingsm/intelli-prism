@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::cache::Cache;
 use crate::key::{CacheKey, CacheLevel};
+use crate::publication::Publication;
 use crate::ttl::Ttl;
 
 /// A key in the system level, which is where the shared tests work.
@@ -176,3 +177,96 @@ macro_rules! cache_suite {
 }
 
 pub(crate) use cache_suite;
+
+/// Long enough that an announcement arrives unless something is wrong.
+const ANNOUNCED_WITHIN: Duration = Duration::from_secs(5);
+
+pub(crate) async fn nothing_is_published_until_something_is(cache: &impl Publication) {
+    assert_eq!(cache.published(&key("rules")).await.unwrap(), None);
+}
+
+pub(crate) async fn a_newer_revision_lands_and_an_older_one_does_not(cache: &impl Publication) {
+    assert!(cache.publish(&key("rules"), 2, b"second").await.unwrap());
+    assert!(!cache.publish(&key("rules"), 1, b"first").await.unwrap());
+    assert!(!cache.publish(&key("rules"), 2, b"again").await.unwrap());
+    let published = cache.published(&key("rules")).await.unwrap().unwrap();
+    assert_eq!(
+        (published.revision, published.value),
+        (2, b"second".to_vec())
+    );
+
+    assert!(cache.publish(&key("rules"), 3, b"third").await.unwrap());
+    assert_eq!(
+        cache
+            .published(&key("rules"))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        3
+    );
+}
+
+pub(crate) async fn a_follower_starts_where_publishing_stands_and_hears_what_comes_after(
+    cache: &impl Publication,
+) {
+    cache.publish(&key("rules"), 4, b"four").await.unwrap();
+    let mut following = cache.follow(&key("rules")).await.unwrap();
+    assert_eq!(*following.borrow_and_update(), 4);
+
+    cache.publish(&key("rules"), 5, b"five").await.unwrap();
+    tokio::time::timeout(ANNOUNCED_WITHIN, following.changed())
+        .await
+        .expect("the announcement arrived")
+        .unwrap();
+    assert_eq!(*following.borrow_and_update(), 5);
+}
+
+pub(crate) async fn a_burst_of_changes_wakes_a_follower_at_the_newest(cache: &impl Publication) {
+    let mut following = cache.follow(&key("rules")).await.unwrap();
+    for revision in 1..=3 {
+        cache
+            .publish(&key("rules"), revision, b"burst")
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(ANNOUNCED_WITHIN, async {
+        while *following.borrow_and_update() < 3 {
+            following.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the newest announcement arrived");
+    assert_eq!(*following.borrow(), 3);
+}
+
+pub(crate) async fn a_follower_hears_only_its_own_topic(cache: &impl Publication) {
+    let mut following = cache.follow(&key("rules")).await.unwrap();
+    cache
+        .publish(&key("rules-other"), 9, b"other")
+        .await
+        .unwrap();
+    let heard = tokio::time::timeout(Duration::from_millis(300), following.changed()).await;
+    assert!(heard.is_err(), "a follower of one topic heard another");
+}
+
+/// Writes one `#[tokio::test]` per shared publication test, each on a fresh cache from
+/// `$open`, an async fn that returns `None` when its backend cannot run here.
+macro_rules! publication_suite {
+    ($open:path) => {
+        mod publication {
+            $crate::suite::cache_suite!(
+                $open,
+                [
+                    nothing_is_published_until_something_is,
+                    a_newer_revision_lands_and_an_older_one_does_not,
+                    a_follower_starts_where_publishing_stands_and_hears_what_comes_after,
+                    a_burst_of_changes_wakes_a_follower_at_the_newest,
+                    a_follower_hears_only_its_own_topic,
+                ]
+            );
+        }
+    };
+}
+
+pub(crate) use publication_suite;

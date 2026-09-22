@@ -1363,6 +1363,7 @@ name = "ip-cache"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "redis",
  "sled",
  "thiserror",
