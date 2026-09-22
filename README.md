@@ -38,6 +38,18 @@ cargo build --release --no-default-features \
 Copy `intelli-prism.example.toml` to `intelli-prism.toml` and edit it. Every key is rejected if
 misspelled, so a typo stops the server rather than silently taking a default.
 
+## Testing
+
+```
+cargo nextest run --workspace                            # every crate, sqlite and sled
+tests/api/run.sh                                         # the management api, over http
+```
+
+The postgres and redis tests check nothing unless `DATABASE_URL` and `REDIS_URL` name a server;
+each works on a scratch schema or key prefix of its own. `tests/api/run.sh` starts a server on a
+database and cache that go when the run does, makes a system administrator the way an operator
+does, and runs the `.hurl` files beside it in order.
+
 ## Status
 
 **This is not production software.** It is an unfinished project under active development, at
