@@ -20,7 +20,7 @@ fn plugin_record(row: &sqlx::sqlite::SqliteRow) -> Result<PluginRecord, StorageE
 }
 
 /// Rebuilds a rule from its row, so a row the code could not have written is refused on read.
-fn plugin_rule(row: &sqlx::sqlite::SqliteRow) -> Result<PluginRule, StorageError> {
+pub(super) fn plugin_rule(row: &sqlx::sqlite::SqliteRow) -> Result<PluginRule, StorageError> {
     let order = plugin_order(row.get("position"))?;
     let scope = plugin_scope(row.get("tenant_id"), row.get("user_id"), row.get("api_id"))?;
     Ok(PluginRule::new(

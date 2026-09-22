@@ -1,6 +1,7 @@
 //! Tests every storage backend must pass, written once and run against each backend.
 
 pub(crate) mod identity;
+pub(crate) mod list;
 pub(crate) mod member_add;
 pub(crate) mod member_remove;
 pub(crate) mod plugin;
@@ -96,6 +97,15 @@ macro_rules! backend_suite {
             a_user_id_that_is_taken_conflicts,
         ]);
     };
+    (list, $open:path) => {
+        $crate::suite::backend_suite!(@module list, $open, [
+            members_come_newest_first_a_page_at_a_time,
+            a_moment_to_list_after_keeps_what_came_before_it_out,
+            grants_are_listed_newest_first_by_where_they_are_held,
+            routes_are_listed_newest_first_with_every_target,
+            rules_are_listed_by_chain_newest_first,
+        ]);
+    };
     (member_remove, $open:path) => {
         $crate::suite::backend_suite!(@module member_remove, $open, [
             a_member_leaves_with_every_grant_it_held_inside,
@@ -151,6 +161,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(user_create, $open);
         $crate::suite::backend_suite!(member_add, $open);
         $crate::suite::backend_suite!(member_remove, $open);
+        $crate::suite::backend_suite!(list, $open);
     };
 }
 

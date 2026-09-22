@@ -3,6 +3,7 @@
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 mod codec;
 pub mod error;
+pub mod list;
 pub mod model;
 pub mod plugin;
 #[cfg(feature = "fast-storage")]
@@ -17,6 +18,7 @@ mod suite;
 pub mod transaction;
 
 pub use error::{Entity, StorageError};
+pub use list::{DEFAULT_PAGE_LIMIT, ListStore, Listed, MAX_PAGE_LIMIT, Page};
 pub use model::{
     AccountKind, MemberRemoved, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId,
     TenantWithOwner, User, UserRowId, UserWithMembership,
