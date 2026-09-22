@@ -5,9 +5,11 @@
 //! belongs to the backend rather than to the workflow that runs it.
 
 pub mod member_add;
+pub mod member_remove;
 pub mod user_create;
 
 use async_trait::async_trait;
+use ip_core::{TenantId, UserId};
 use sqlx::Database;
 
 use crate::error::StorageError;
@@ -36,4 +38,19 @@ pub trait IdentityDialect: Database {
         connection: &mut Self::Connection,
         membership: Membership,
     ) -> Result<(), StorageError>;
+
+    /// Detaches a user from a tenant, handing back the attachment that was there, or
+    /// reporting it missing.
+    async fn delete_membership(
+        connection: &mut Self::Connection,
+        user: &UserId,
+        tenant: &TenantId,
+    ) -> Result<Membership, StorageError>;
+
+    /// Revokes every grant one user holds inside one tenant, reporting how many it held.
+    async fn delete_grants_in_tenant(
+        connection: &mut Self::Connection,
+        user: &UserId,
+        tenant: &TenantId,
+    ) -> Result<u64, StorageError>;
 }

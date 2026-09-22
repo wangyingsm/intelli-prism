@@ -12,6 +12,9 @@ use crate::model::{Membership, NewTenant, NewUser, Tenant, TenantRowId, User, Us
 use crate::store::{GrantStore, MembershipStore, TenantStore, UserStore};
 use crate::transaction::IdentityDialect;
 use crate::transaction::member_add::{MemberAddBegun, MemberAddTransactional, MemberAddTxn};
+use crate::transaction::member_remove::{
+    MemberRemoveBegun, MemberRemoveTransactional, MemberRemoveTxn,
+};
 use crate::transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
 
 /// Writes a tenant row over whichever connection it is given, so a transaction and the pool
@@ -92,6 +95,56 @@ pub(super) async fn insert_membership(
     .await
     .map_err(StorageError::backend)?;
     Ok(())
+}
+
+/// Detaches a user from a tenant over whichever connection it is given, handing back the
+/// attachment that was there.
+pub(super) async fn delete_membership(
+    connection: &mut SqliteConnection,
+    user: &UserId,
+    tenant: &TenantId,
+) -> Result<Membership, StorageError> {
+    let row = sqlx::query(
+        "DELETE FROM memberships \
+         WHERE tenant_row_id = (SELECT row_id FROM tenants WHERE id = ?) \
+         AND user_row_id = (SELECT row_id FROM users WHERE id = ?) \
+         RETURNING standing",
+    )
+    .bind(tenant.as_str())
+    .bind(user.as_str())
+    .fetch_optional(connection)
+    .await
+    .map_err(StorageError::backend)?
+    .ok_or_else(|| StorageError::NotFound {
+        entity: Entity::Membership,
+        id: format!("{user}@{tenant}"),
+    })?;
+    Ok(Membership {
+        user: user.clone(),
+        tenant: tenant.clone(),
+        standing: standing(row.get("standing"))?,
+    })
+}
+
+/// Revokes every grant one user holds inside one tenant over whichever connection it is
+/// given, reporting how many it held.
+pub(super) async fn delete_grants_in_tenant(
+    connection: &mut SqliteConnection,
+    user: &UserId,
+    tenant: &TenantId,
+) -> Result<u64, StorageError> {
+    let deleted = sqlx::query(
+        "DELETE FROM grants \
+         WHERE user_row_id = (SELECT row_id FROM users WHERE id = ?) \
+         AND tenant_row_id = (SELECT row_id FROM tenants WHERE id = ?)",
+    )
+    .bind(user.as_str())
+    .bind(tenant.as_str())
+    .execute(connection)
+    .await
+    .map_err(StorageError::backend)?
+    .rows_affected();
+    Ok(deleted)
 }
 
 /// The primary key of a tenant row, or a report that there is none.
@@ -445,6 +498,22 @@ impl IdentityDialect for sqlx::Sqlite {
     ) -> Result<(), StorageError> {
         insert_membership(connection, membership).await
     }
+
+    async fn delete_membership(
+        connection: &mut SqliteConnection,
+        user: &UserId,
+        tenant: &TenantId,
+    ) -> Result<Membership, StorageError> {
+        delete_membership(connection, user, tenant).await
+    }
+
+    async fn delete_grants_in_tenant(
+        connection: &mut SqliteConnection,
+        user: &UserId,
+        tenant: &TenantId,
+    ) -> Result<u64, StorageError> {
+        delete_grants_in_tenant(connection, user, tenant).await
+    }
 }
 
 impl UserCreateTransactional for SqliteStore {
@@ -455,6 +524,17 @@ impl UserCreateTransactional for SqliteStore {
     ) -> Result<UserCreateTxn<Self::Db, UserCreateBegun>, StorageError> {
         let inner = self.pool.begin().await.map_err(StorageError::backend)?;
         Ok(UserCreateTxn::new(inner))
+    }
+}
+
+impl MemberRemoveTransactional for SqliteStore {
+    type Db = sqlx::Sqlite;
+
+    async fn begin_member_remove(
+        &self,
+    ) -> Result<MemberRemoveTxn<Self::Db, MemberRemoveBegun>, StorageError> {
+        let inner = self.pool.begin().await.map_err(StorageError::backend)?;
+        Ok(MemberRemoveTxn::new(inner))
     }
 }
 

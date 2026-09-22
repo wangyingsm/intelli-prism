@@ -121,6 +121,15 @@ pub struct UserWithMembership {
     pub membership: Membership,
 }
 
+/// An attachment that was removed, and how many grants went with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberRemoved {
+    /// The attachment as it was.
+    pub membership: Membership,
+    /// How many grants the user held inside that tenant, all now revoked.
+    pub revoked: u64,
+}
+
 /// What a user is within one tenant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Standing {

@@ -2,6 +2,7 @@
 
 pub(crate) mod identity;
 pub(crate) mod member_add;
+pub(crate) mod member_remove;
 pub(crate) mod plugin;
 pub(crate) mod route;
 pub(crate) mod user_create;
@@ -96,6 +97,13 @@ macro_rules! backend_suite {
             a_user_id_that_is_taken_conflicts,
         ]);
     };
+    (member_remove, $open:path) => {
+        $crate::suite::backend_suite!(@module member_remove, $open, [
+            a_member_leaves_with_every_grant_it_held_inside,
+            a_removal_nobody_commits_leaves_the_member_and_its_grants,
+            leaving_a_tenant_it_is_not_in_reports_it_missing,
+        ]);
+    };
     (user_create, $open:path) => {
         $crate::suite::backend_suite!(@module user_create, $open, [
             a_committed_transaction_lands_every_write,
@@ -143,6 +151,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(plugin, $open);
         $crate::suite::backend_suite!(user_create, $open);
         $crate::suite::backend_suite!(member_add, $open);
+        $crate::suite::backend_suite!(member_remove, $open);
     };
 }
 

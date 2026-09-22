@@ -18,8 +18,8 @@ pub mod transaction;
 
 pub use error::{Entity, StorageError};
 pub use model::{
-    AccountKind, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId, TenantWithOwner,
-    User, UserRowId, UserWithMembership,
+    AccountKind, MemberRemoved, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId,
+    TenantWithOwner, User, UserRowId, UserWithMembership,
 };
 pub use plugin::{NewPlugin, Plugin, PluginRecord, PluginRowId, PluginRuleStore, PluginStore};
 #[cfg(feature = "fast-storage")]
@@ -32,5 +32,9 @@ pub use store::{Backend, GrantStore, MembershipStore, Storage, TenantStore, User
 pub use transaction::IdentityDialect;
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::member_add::{MemberAddBegun, MemberAddTransactional, MemberAddTxn};
+#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
+pub use transaction::member_remove::{
+    MemberRemoveBegun, MemberRemoveTransactional, MemberRemoveTxn,
+};
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
