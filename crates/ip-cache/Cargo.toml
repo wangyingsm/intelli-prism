@@ -20,5 +20,6 @@ tokio.workspace = true
 
 [features]
 default = ["cluster-cache"]
+testing = []
 standalone-cache = ["dep:sled", "dep:tokio"]
 cluster-cache = ["dep:redis", "dep:tokio", "dep:futures-util"]

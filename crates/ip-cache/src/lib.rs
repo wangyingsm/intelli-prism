@@ -4,6 +4,11 @@ pub mod cache;
 #[cfg(feature = "cluster-cache")]
 pub mod cluster;
 pub mod error;
+#[cfg(all(
+    feature = "testing",
+    any(feature = "standalone-cache", feature = "cluster-cache")
+))]
+pub mod failing;
 pub mod key;
 pub mod limits;
 #[cfg(any(feature = "standalone-cache", feature = "cluster-cache"))]
@@ -18,6 +23,11 @@ pub use cache::Cache;
 #[cfg(feature = "cluster-cache")]
 pub use cluster::{Prefix, RedisCache};
 pub use error::CacheError;
+#[cfg(all(
+    feature = "testing",
+    any(feature = "standalone-cache", feature = "cluster-cache")
+))]
+pub use failing::FailingCache;
 pub use key::{CacheKey, CacheLevel};
 pub use limits::{LevelLimits, MaxBytes};
 #[cfg(any(feature = "standalone-cache", feature = "cluster-cache"))]

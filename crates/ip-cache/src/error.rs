@@ -41,6 +41,12 @@ pub enum CacheError {
     Backend(#[source] Box<dyn Error + Send + Sync>),
 }
 
+/// What a cache that was told to fail fails with, so a test can tell it from a real failure.
+#[cfg(feature = "testing")]
+#[derive(Debug, thiserror::Error)]
+#[error("the cache was told to fail")]
+pub struct ToldToFail;
+
 impl CacheError {
     /// Wraps a backend failure, keeping the driver out of this crate's public api.
     pub fn backend(source: impl Error + Send + Sync + 'static) -> Self {
