@@ -58,7 +58,7 @@ async fn list(
     if let Some(refusal) = user_mgr_refusal(&state, &manager, &tenant).await {
         return refusal;
     }
-    match state.stores().backend().list_members(&tenant, page).await {
+    match state.store().list_members(&tenant, page).await {
         Ok(members) => Json(
             members
                 .into_iter()

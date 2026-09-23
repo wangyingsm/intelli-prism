@@ -77,7 +77,7 @@ async fn list(
                 u32::try_from(skipped).unwrap_or(u32::MAX),
                 page.after(),
             );
-            match state.stores().backend().list_routes(stored_page).await {
+            match state.store().list_routes(stored_page).await {
                 Ok(stored) => stored,
                 Err(error) => return store_refusal(error),
             }
@@ -120,7 +120,7 @@ async fn put(State(state): State<AppState>, manager: Manager, body: Bytes) -> Re
         )
             .into_response();
     }
-    match state.stores().backend().put_route(rule).await {
+    match state.store().put_route(rule).await {
         Ok(()) => {
             state.feed().after_change().await;
             StatusCode::NO_CONTENT.into_response()
@@ -138,7 +138,7 @@ async fn remove(State(state): State<AppState>, manager: Manager, body: Bytes) ->
         Ok(key) => key,
         Err(rejection) => return rejection.into_response(),
     };
-    match state.stores().backend().remove_route(&key).await {
+    match state.store().remove_route(&key).await {
         Ok(()) => {
             state.feed().after_change().await;
             StatusCode::NO_CONTENT.into_response()
@@ -320,7 +320,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(state.stores().backend().routes().await.unwrap().is_empty());
+        assert!(state.store().routes().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -342,7 +342,7 @@ mod tests {
                 "{body}"
             );
         }
-        assert!(state.stores().backend().routes().await.unwrap().is_empty());
+        assert!(state.store().routes().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -360,7 +360,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert!(state.stores().backend().routes().await.unwrap().is_empty());
+        assert!(state.store().routes().await.unwrap().is_empty());
 
         let listed = listed(&router, &state).await;
         assert_eq!(listed[0]["source"], "config");
@@ -397,7 +397,7 @@ mod tests {
         let key = serde_json::to_string(&stored.key).unwrap();
         let removed = call(&router, &state, "root", "DELETE", Some(&key)).await;
         assert_eq!(removed.status(), StatusCode::NO_CONTENT);
-        assert!(state.stores().backend().routes().await.unwrap().is_empty());
+        assert!(state.store().routes().await.unwrap().is_empty());
 
         let again = call(&router, &state, "root", "DELETE", Some(&key)).await;
         assert_eq!(again.status(), StatusCode::NOT_FOUND);
@@ -472,7 +472,7 @@ mod tests {
         .await;
 
         let published = state.feed().published().await.unwrap().unwrap();
-        let stored = state.stores().backend().rule_revision().await.unwrap();
+        let stored = state.store().rule_revision().await.unwrap();
         assert_eq!(published.revision, stored);
         assert_eq!(published.routes, [rule("/v1", "api.example.com")]);
 
@@ -482,7 +482,7 @@ mod tests {
         assert!(published.routes.is_empty());
         assert_eq!(
             published.revision,
-            state.stores().backend().rule_revision().await.unwrap()
+            state.store().rule_revision().await.unwrap()
         );
     }
 

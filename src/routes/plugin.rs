@@ -104,7 +104,7 @@ async fn list_plugins(
         Ok(owner) => owner,
         Err(refusal) => return *refusal,
     };
-    match state.stores().backend().list_plugins(&owner, page).await {
+    match state.store().list_plugins(&owner, page).await {
         Ok(listed) => {
             Json(listed.into_iter().map(PluginView::from).collect::<Vec<_>>()).into_response()
         }
@@ -138,7 +138,7 @@ async fn upload(
     if let Some(refusal) = compile_refusal(wasm.clone()).await {
         return refusal;
     }
-    let backend = state.stores().backend();
+    let backend = state.store();
     let stored = backend.put_plugin(NewPlugin { kind, wasm, owner }).await;
     match stored {
         Ok(record) => (StatusCode::CREATED, Json(PluginView::from(record))).into_response(),
@@ -248,7 +248,7 @@ async fn place_rule(
         Ok(rule) => rule,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
-    match state.stores().backend().put_rule(rule).await {
+    match state.store().put_rule(rule).await {
         Ok(placed) => {
             state.feed().after_change().await;
             (StatusCode::CREATED, Json(RuleView::from(&placed))).into_response()
@@ -561,7 +561,7 @@ mod tests {
         }
         let other_kind = upload(&router, &state, "alice", "req_body", wasm("one")).await;
         assert_eq!(other_kind.status(), StatusCode::CONFLICT);
-        assert_eq!(state.stores().backend().plugins().await.unwrap().len(), 1);
+        assert_eq!(state.store().plugins().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -580,7 +580,7 @@ mod tests {
                 "{kind}"
             );
         }
-        assert!(state.stores().backend().plugins().await.unwrap().is_empty());
+        assert!(state.store().plugins().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -637,7 +637,7 @@ mod tests {
         .await;
         let removed = call(&router, &state, "root", "DELETE", &path, None).await;
         assert_eq!(removed.status(), StatusCode::NO_CONTENT);
-        assert!(state.stores().backend().plugins().await.unwrap().is_empty());
+        assert!(state.store().plugins().await.unwrap().is_empty());
     }
 
     #[tokio::test]

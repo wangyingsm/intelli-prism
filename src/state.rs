@@ -51,7 +51,7 @@ impl Stores {
 #[derive(Clone)]
 pub struct AppState {
     stores: Stores,
-    store: Arc<dyn Storage>,
+    store: Arc<dyn Backend>,
     verifier: RequestVerifier,
     logins: Arc<Logins>,
     session_seconds: u64,
@@ -60,6 +60,13 @@ pub struct AppState {
     configured: Arc<[RouteRule]>,
     feed: Arc<RuleFeed>,
     reloader: Arc<Reloader>,
+    /// The store a test reads through, when the state was built for one, so the test can
+    /// make it fail where it means to.
+    #[cfg(test)]
+    failing_store: Option<Arc<ip_storage::FailingStore>>,
+    /// The cache a test reads through, for the same reason.
+    #[cfg(test)]
+    failing_cache: Option<Arc<ip_cache::FailingCache>>,
     /// The revision this node's rules were built from, which is where following starts.
     started_at: RuleRevision,
 }
@@ -70,7 +77,7 @@ impl AppState {
     pub async fn open(config: &Config) -> Result<Self, StartupError> {
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
-        let backend = Arc::clone(&store);
+        let backend: Arc<dyn Backend> = Arc::clone(&store);
         let published = open_cache(&config.cache).await?;
         let feed = Arc::new(RuleFeed::new(Arc::clone(&store), Arc::clone(&published))?);
         // A cache that cannot take the rules yet leaves this node serving what storage holds.
@@ -102,7 +109,7 @@ impl AppState {
             );
         }
         let nonce_ttl = Ttl::new(config.auth.nonce_ttl.as_duration())?;
-        let store = store as Arc<dyn Storage>;
+        let store = Arc::clone(&backend) as Arc<dyn Storage>;
         let tokens = SessionTokens::new(
             &config.auth.jwt.issuer,
             config.auth.jwt.secret.expose().as_bytes(),
@@ -113,14 +120,14 @@ impl AppState {
         let configured: Arc<[RouteRule]> = configured.into();
         let reloader = Arc::new(Reloader::new(
             Arc::clone(&feed),
-            backend,
+            Arc::clone(&backend),
             host,
             Arc::clone(&gateway),
             Arc::clone(&configured),
         ));
         Ok(Self {
             stores,
-            store: Arc::clone(&store) as Arc<dyn Storage>,
+            store: backend,
             verifier: RequestVerifier::new(store, cache, nonce_ttl),
             logins: Arc::new(logins),
             session_seconds: config.auth.jwt.ttl.get(),
@@ -130,29 +137,37 @@ impl AppState {
             feed,
             reloader,
             started_at,
+            #[cfg(test)]
+            failing_store: None,
+            #[cfg(test)]
+            failing_cache: None,
         })
     }
 
     /// Builds state over a store and gateway that are already built, on a cache of its own.
     #[cfg(test)]
     pub fn with_parts(stores: Stores, gateway: Gateway, listen: SocketAddr) -> Self {
-        let published: Arc<dyn CacheBackend> =
-            Arc::new(ip_cache::SledCache::temporary().expect("a temporary cache"));
+        let failing_cache = Arc::new(ip_cache::FailingCache::new(Arc::new(
+            ip_cache::SledCache::temporary().expect("a temporary cache"),
+        )));
+        let published: Arc<dyn CacheBackend> = Arc::clone(&failing_cache) as Arc<dyn CacheBackend>;
+        let failing_store = Arc::new(ip_storage::FailingStore::new(stores.backend()));
+        let backend: Arc<dyn Backend> = Arc::clone(&failing_store) as Arc<dyn Backend>;
         let feed =
-            Arc::new(RuleFeed::new(stores.backend(), Arc::clone(&published)).expect("a feed"));
+            Arc::new(RuleFeed::new(Arc::clone(&backend), Arc::clone(&published)).expect("a feed"));
         let gateway = Arc::new(gateway);
         let host = Arc::new(
             ip_plugin::PluginHost::on_demand(PluginLimits::default()).expect("a plugin host"),
         );
         let reloader = Arc::new(Reloader::new(
             Arc::clone(&feed),
-            stores.backend(),
+            Arc::clone(&backend),
             host,
             Arc::clone(&gateway),
             Arc::new([]),
         ));
-        let store = stores.backend() as Arc<dyn Storage>;
         let cache = published as Arc<dyn Cache>;
+        let store = Arc::clone(&backend) as Arc<dyn Storage>;
         let tokens = SessionTokens::new(
             "intelli-prism",
             b"0123456789abcdef0123456789abcdef",
@@ -161,7 +176,7 @@ impl AppState {
         let logins = Logins::new(Arc::clone(&store), cache.clone(), tokens).expect("logins");
         Self {
             stores,
-            store: Arc::clone(&store),
+            store: backend,
             verifier: RequestVerifier::new(store, cache, Ttl::seconds(300).expect("a nonce ttl")),
             logins: Arc::new(logins),
             session_seconds: 3600,
@@ -171,7 +186,25 @@ impl AppState {
             feed,
             reloader,
             started_at: RuleRevision::new(0),
+            failing_store: Some(failing_store),
+            failing_cache: Some(failing_cache),
         }
+    }
+
+    /// The store every read goes through, which a test can tell to fail.
+    #[cfg(test)]
+    pub fn store_failure(&self) -> &ip_storage::FailingStore {
+        self.failing_store
+            .as_ref()
+            .expect("state built for a test reads through a store that can fail")
+    }
+
+    /// The cache every read goes through, which a test can tell to fail.
+    #[cfg(test)]
+    pub fn cache_failure(&self) -> &ip_cache::FailingCache {
+        self.failing_cache
+            .as_ref()
+            .expect("state built for a test reads through a cache that can fail")
     }
 
     /// The same state, as though the configuration file had contributed these rules.
@@ -191,8 +224,10 @@ impl AppState {
         &self.stores
     }
 
-    /// Reads the tenants, users and grants the management api works on.
-    pub fn store(&self) -> &Arc<dyn Storage> {
+    /// Everything the store holds: the tenants, users and grants the management api works
+    /// on, and the routes, plugins and revision the gateway is built from. Where only the
+    /// identity half is wanted, it is the same handle read as `&dyn Storage`.
+    pub fn store(&self) -> &Arc<dyn Backend> {
         &self.store
     }
 
