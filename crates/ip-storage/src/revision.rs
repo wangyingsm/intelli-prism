@@ -50,3 +50,16 @@ pub trait RevisionStore: Send + Sync {
     /// so the set is never a mix of two moments.
     async fn rule_set(&self) -> Result<RuleSet, StorageError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_revision_is_the_number_the_store_counts_and_says_so() {
+        let revision = RuleRevision::new(7);
+        assert_eq!(revision.get(), 7);
+        assert_eq!(revision.to_string(), "7");
+        assert!(RuleRevision::new(8) > revision);
+    }
+}

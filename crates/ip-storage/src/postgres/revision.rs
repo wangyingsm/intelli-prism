@@ -44,3 +44,30 @@ impl RevisionStore for PostgresStore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A revision below zero is one no write could have made, so it reads as malformed rather
+    /// than as some other number.
+    #[tokio::test]
+    async fn a_revision_below_zero_is_reported_as_malformed() {
+        let Some(store) = crate::postgres::scratch::store().await else {
+            return;
+        };
+        sqlx::query("UPDATE rule_revision SET revision = $1 WHERE id = 1")
+            .bind(-1_i64)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.rule_revision().await,
+            Err(StorageError::Malformed {
+                entity: Entity::RuleRevision,
+                ..
+            })
+        ));
+    }
+}
