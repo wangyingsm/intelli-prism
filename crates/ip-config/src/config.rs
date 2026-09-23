@@ -281,8 +281,9 @@ fn default_jwt_ttl() -> Seconds {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstream::{ModelName, Temperature};
+    use crate::upstream::Temperature;
     use ip_core::ApiId;
+    use ip_core::ModelName;
 
     const FULL: &str = r#"
 [server]

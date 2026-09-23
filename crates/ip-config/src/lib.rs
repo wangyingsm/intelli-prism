@@ -10,5 +10,6 @@ pub use config::{
     StorageConfig, TelemetryConfig,
 };
 pub use error::ConfigError;
+pub use ip_core::ModelName;
 pub use secret::Secret;
-pub use upstream::{ModelName, RouteOverride, Temperature, UpstreamConfig};
+pub use upstream::{RouteOverride, Temperature, UpstreamConfig};
