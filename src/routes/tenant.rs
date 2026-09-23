@@ -581,4 +581,18 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
     }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_is_the_server_s_own_failure() {
+        let (router, state) = fixture().await;
+        let cookie = cookie_of(&state, &admin_id()).await;
+        // The extractor reads the account; the handler's own read is the one that fails.
+        state.store_failure().answer_only(1);
+
+        let response = router
+            .oneshot(request("GET", "/_ip/tenants/acme", &cookie, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

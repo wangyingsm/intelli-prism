@@ -949,4 +949,17 @@ mod tests {
         .await;
         assert!(later.as_array().unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_is_the_server_s_own_failure() {
+        let (router, state) = fixture().await;
+        let cookie = cookie_of(&state, &id("alice")).await;
+        state.store_failure().answer_only(1);
+
+        let response = router
+            .oneshot(request("GET", "/_ip/plugins", &cookie, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

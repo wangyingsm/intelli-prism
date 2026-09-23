@@ -803,4 +803,25 @@ mod tests {
             serde_json::json!([{"capability": "sys_agent"}, {"capability": "observer"}])
         );
     }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_is_the_server_s_own_failure() {
+        let (router, state) = fixture().await;
+        let cookie = cookie_of(&state, &id("alice")).await;
+        state.store_failure().answer_only(1);
+
+        let response = router
+            .clone()
+            .oneshot(request("GET", BOB, &cookie, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        state.store_failure().answer_only(1);
+        let refused = router
+            .oneshot(request("PUT", &format!("{BOB}/observer"), &cookie, None))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

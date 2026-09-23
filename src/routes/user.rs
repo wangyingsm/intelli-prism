@@ -636,4 +636,17 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(state.store().user(&id("root")).await.unwrap().is_some());
     }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_is_the_server_s_own_failure() {
+        let (router, state) = fixture().await;
+        let cookie = cookie_of(&state, &id("root")).await;
+        state.store_failure().answer_only(1);
+
+        let response = router
+            .oneshot(request("GET", "/_ip/users/carol", &cookie, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

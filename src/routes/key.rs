@@ -410,4 +410,26 @@ mod tests {
         let still_locked = reveal(&router, &fresh, "user", &asking(Some("acme"), PASSPHRASE)).await;
         assert_eq!(still_locked.status(), StatusCode::TOO_MANY_REQUESTS);
     }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_shows_no_key() {
+        let (router, state, acme_key) = fixture().await;
+        let cookie = cookie_of(&state, &id("bob")).await;
+        state.store_failure().answer_only(1);
+
+        let response = reveal(&router, &cookie, "user", &asking(Some("acme"), PASSPHRASE)).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body_of(response).await.contains(&acme_key.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_cannot_count_wrong_passphrases_shows_no_key() {
+        let (router, state, _) = fixture().await;
+        let cookie = cookie_of(&state, &id("bob")).await;
+        // The session is read from the cache first; counting the attempt is the next call.
+        state.cache_failure().answer_only(1);
+
+        let response = reveal(&router, &cookie, "user", &asking(Some("acme"), PASSPHRASE)).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
