@@ -22,6 +22,7 @@ use ip_core::{Capability, CapabilityScope, Protocol, Role, Timestamp, TraceId, T
 use ip_gateway::{GatewayBody, GatewayError, RequestContext};
 use ip_storage::{DEFAULT_PAGE_LIMIT, Page, Standing, StorageError};
 use std::net::SocketAddr;
+use tracing::Instrument;
 
 use crate::auth::Authenticated;
 use crate::cookie;
@@ -316,7 +317,13 @@ async fn traced(mut request: Request<Body>, next: Next) -> Response<Body> {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     request.extensions_mut().insert(trace);
-    let mut answered = next.run(request).await;
+    let serving = tracing::info_span!(
+        "request",
+        trace = %trace,
+        method = %request.method(),
+        path = request.uri().path(),
+    );
+    let mut answered = next.run(request).instrument(serving).await;
     // The gateway never continues a trace it was sent, so this is how a caller correlates.
     if let Ok(value) = HeaderValue::from_str(&trace.to_hex()) {
         answered.headers_mut().insert(HEADER_TRACE, value);

@@ -32,4 +32,5 @@ httpdate = "1.0.3"
 
 [dev-dependencies]
 hyper = { version = "1.11.1", features = ["server"] }
+tracing-subscriber = "0.3.23"
 ip-cache = { version = "0.1.0", path = "../ip-cache", features = ["standalone-cache"] }

@@ -15,7 +15,11 @@ use http::{HeaderMap, HeaderValue, Request, Response, Uri};
 use http_body_util::BodyExt;
 use ip_auth::Authority;
 use ip_cache::{CacheKey, Ttl};
-use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey, TraceId, TurnId};
+use ip_core::{
+    ApiId, Capability, CapabilityScope, Endpoint, Protocol, RouteKey, TenantId, TraceId, TurnId,
+    UserId,
+};
+use tracing::{Instrument, Span, field};
 
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, ResponseCache, freshness, response_key};
@@ -114,6 +118,9 @@ impl Gateway {
     }
 
     /// Carries one request through every stage, in the order the types allow.
+    ///
+    /// Each stage runs in a span of its own, all under the trace the request arrived with, so
+    /// what a request did is read back from one place.
     pub async fn handle(
         &self,
         context: RequestContext,
@@ -121,49 +128,134 @@ impl Gateway {
     ) -> Result<Response<GatewayBody>, GatewayError> {
         // One load, so the request is routed and processed by the same rules throughout.
         let routing = self.routing.load();
-        let authorized = Flow::received(context, request).authorize(&routing.table)?;
-        let chains = routing.chains.chains_for(
-            authorized.context().authority.identity(),
-            &authorized.resolution().rule().api,
-        );
-        let mut processed = authorized
-            .process_headers(chains.request_headers())
-            .await?
-            .process_body(&chains)
-            .await?;
+        let followed = Followed::of(&context);
+        let taking_in = stage_span!(INGRESS_REQUEST, followed);
+
+        let taken = async {
+            let authorized = Flow::received(context, request).authorize(&routing.table)?;
+            let api = authorized.resolution().rule().api.clone();
+            Span::current().record("api", field::display(&api));
+            let chains = routing
+                .chains
+                .chains_for(authorized.context().authority.identity(), &api);
+            let processed = authorized
+                .process_headers(chains.request_headers())
+                .await?
+                .process_body(&chains)
+                .await?;
+            Ok::<_, GatewayError>((processed, chains, api))
+        }
+        .instrument(taking_in)
+        .await;
+        let (mut processed, chains, api) = taken?;
+        let followed = followed.serving(api);
+
         let Some(responses) = &self.responses else {
-            return processed
-                .forward(self.upstream.as_ref())
-                .await?
-                .process_response_headers(chains.response_headers())
-                .await?
-                .process_response_body(&chains)
-                .await?
-                .into_response();
+            let done = self.upstream_answer(processed, &chains, &followed).await?;
+            let answered = stage_span!(EGRESS_RESPONSE, followed);
+            answered.record("hit", false);
+            return async { done.into_response() }.instrument(answered).await;
         };
         // A hit answers here, spending no tokens and running no response processor, as designed.
         let key = processed.response_key().await?;
         match responses.get(&key).await {
-            Ok(Some(hit)) => return Ok(answer_with(hit)),
+            Ok(Some(hit)) => {
+                let answered = stage_span!(EGRESS_RESPONSE, followed);
+                answered.record("hit", true);
+                return Ok(answered.in_scope(|| answer_with(hit)));
+            }
             Ok(None) => {}
             // A cache that cannot answer costs a round trip upstream, never the request itself.
             Err(error) => tracing::warn!(%error, "could not read the response cache"),
         }
-        let mut done = processed
-            .forward(self.upstream.as_ref())
-            .await?
-            .process_response_headers(chains.response_headers())
-            .await?
-            .process_response_body(&chains)
-            .await?;
+        let mut done = self.upstream_answer(processed, &chains, &followed).await?;
         if let Some((answer, ttl)) = done.cacheable(responses.ttl()).await?
             && let Err(error) = responses.put(&key, &answer, ttl).await
         {
             tracing::warn!(%error, "could not keep a response in the cache");
         }
-        done.into_response()
+        let answered = stage_span!(EGRESS_RESPONSE, followed);
+        answered.record("hit", false);
+        async { done.into_response() }.instrument(answered).await
+    }
+
+    /// Sends the request on and reads the answer back, each in its own span.
+    async fn upstream_answer(
+        &self,
+        processed: Flow<BodyProcessed>,
+        chains: &Arc<ProcessorChain>,
+        followed: &Followed,
+    ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
+        let forwarded = processed
+            .forward(self.upstream.as_ref())
+            .instrument(stage_span!(EGRESS_REQUEST, followed))
+            .await?;
+        async {
+            forwarded
+                .process_response_headers(chains.response_headers())
+                .await?
+                .process_response_body(chains)
+                .await
+        }
+        .instrument(stage_span!(INGRESS_RESPONSE, followed))
+        .await
     }
 }
+
+/// What every span of one request is read by.
+struct Followed {
+    trace: TraceId,
+    turn: Option<TurnId>,
+    tenant: TenantId,
+    user: UserId,
+    api: Option<ApiId>,
+}
+
+impl Followed {
+    /// What the request arrived with, before its route is known.
+    fn of(context: &RequestContext) -> Self {
+        let identity = context.authority.identity();
+        Self {
+            trace: context.trace,
+            turn: context.turn.clone(),
+            tenant: identity.tenant.clone(),
+            user: identity.user.clone(),
+            api: None,
+        }
+    }
+
+    /// The same, once the route says which api is serving.
+    fn serving(self, api: ApiId) -> Self {
+        Self {
+            api: Some(api),
+            ..self
+        }
+    }
+}
+
+/// The stages `DESIGN.md` names, which are the spans one request opens.
+const INGRESS_REQUEST: &str = "ingress.request";
+const EGRESS_REQUEST: &str = "egress.request";
+const INGRESS_RESPONSE: &str = "ingress.response";
+const EGRESS_RESPONSE: &str = "egress.response";
+
+/// One stage's span, carrying what every trace is read by. `api` is empty until the route is
+/// resolved, and `hit` until the answer is known to have come from the cache or not.
+macro_rules! stage_span {
+    ($name:expr, $followed:expr) => {
+        tracing::info_span!(
+            $name,
+            trace = %$followed.trace,
+            turn = $followed.turn.as_ref().map(field::display),
+            tenant = %$followed.tenant,
+            user = %$followed.user,
+            api = $followed.api.as_ref().map(field::display),
+            hit = field::Empty,
+        )
+    };
+}
+
+use stage_span;
 
 /// Answers from what the cache held, without any stage after the request body running.
 fn answer_with(hit: CachedResponse) -> Response<GatewayBody> {
@@ -674,6 +766,8 @@ async fn run_body(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::future::Future;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1686,5 +1780,157 @@ mod tests {
         let flow = flow.process_response_body(&processors).await.unwrap();
         assert_eq!(flow.stage(), StageName::ResponseBodyProcess);
         assert_eq!(body_of(flow.into_response().unwrap()).await, "pong");
+    }
+
+    /// One span, by the id it was opened under, its name and the fields it ended up carrying.
+    type Recorded = (tracing::span::Id, String, HashMap<String, String>);
+
+    /// Every span that was opened.
+    #[derive(Clone, Default)]
+    struct Opened(Arc<Mutex<Vec<Recorded>>>);
+
+    impl Opened {
+        /// The fields the span of this name carries, or nothing when none was opened.
+        fn span(&self, name: &str) -> Option<HashMap<String, String>> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, opened, _)| opened == name)
+                .map(|(_, _, fields)| fields.clone())
+        }
+
+        /// The name of every span that was opened, in the order they were.
+        fn names(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, name, _)| name.clone())
+                .collect()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Opened
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            attrs.record(&mut Wrote(&mut fields));
+            self.0
+                .lock()
+                .unwrap()
+                .push((id.clone(), attrs.metadata().name().to_owned(), fields));
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut opened = self.0.lock().unwrap();
+            if let Some((_, _, fields)) = opened.iter_mut().find(|(held, _, _)| held == id) {
+                values.record(&mut Wrote(fields));
+            }
+        }
+    }
+
+    /// Writes down what a span carries, whichever type it carries it as.
+    struct Wrote<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for Wrote<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(
+                field.name().to_owned(),
+                format!("{value:?}").replace('"', ""),
+            );
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+    }
+
+    /// Runs `work` to completion with every span it opens written down.
+    fn watching<F: Future>(work: F) -> (F::Output, Opened) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let opened = Opened::default();
+        let subscriber = tracing_subscriber::registry().with(opened.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let answered = tracing::subscriber::with_default(subscriber, || runtime.block_on(work));
+        (answered, opened)
+    }
+
+    #[test]
+    fn every_stage_opens_a_span_under_the_trace_the_request_arrived_with() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream);
+        let context = context(granted());
+        let trace = context.trace.to_hex();
+
+        let (answered, opened) = watching(async move {
+            gateway
+                .handle(context, request("/anthropic/messages", "ping"))
+                .await
+        });
+        assert!(answered.is_ok());
+
+        let names = opened.names();
+        for stage in [
+            INGRESS_REQUEST,
+            EGRESS_REQUEST,
+            INGRESS_RESPONSE,
+            EGRESS_RESPONSE,
+        ] {
+            assert!(names.contains(&stage.to_owned()), "{stage} opened no span");
+            let fields = opened.span(stage).unwrap();
+            assert_eq!(fields["trace"], trace, "{stage} was followed elsewhere");
+            assert_eq!(fields["tenant"], tenant().to_string());
+            assert_eq!(fields["user"], user().to_string());
+        }
+        assert_eq!(
+            opened.span(INGRESS_REQUEST).unwrap()["api"],
+            api().to_string()
+        );
+        assert_eq!(opened.span(EGRESS_RESPONSE).unwrap()["hit"], "false");
+    }
+
+    #[test]
+    fn an_answer_out_of_the_cache_says_so_on_the_span_that_sends_it() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = caching_gateway(upstream);
+        let (_, _) = watching(async {
+            gateway
+                .handle(context(granted()), request("/anthropic/messages", "ping"))
+                .await
+                .unwrap();
+        });
+
+        let (_, opened) = watching(async {
+            gateway
+                .handle(context(granted()), request("/anthropic/messages", "ping"))
+                .await
+                .unwrap();
+        });
+        assert_eq!(opened.span(EGRESS_RESPONSE).unwrap()["hit"], "true");
+        assert!(
+            opened.span(EGRESS_REQUEST).is_none(),
+            "an answer out of the cache went to the upstream"
+        );
     }
 }
