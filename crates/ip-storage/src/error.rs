@@ -95,6 +95,8 @@ pub enum Entity {
     PluginRule,
     /// How far the rules have moved on.
     RuleRevision,
+    /// What one request cost.
+    Usage,
 }
 
 impl fmt::Display for Entity {
@@ -108,6 +110,7 @@ impl fmt::Display for Entity {
             Self::Plugin => "plugin",
             Self::PluginRule => "plugin rule",
             Self::RuleRevision => "rule revision",
+            Self::Usage => "usage",
         })
     }
 }

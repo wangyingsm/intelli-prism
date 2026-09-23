@@ -19,6 +19,7 @@ pub mod store;
 mod suite;
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub mod transaction;
+pub mod usage;
 
 pub use error::{Entity, StorageError};
 #[cfg(feature = "testing")]
@@ -57,3 +58,4 @@ pub use transaction::plugin_upload::{
 pub use transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::{IdentityDialect, PluginDialect};
+pub use usage::{NewUsage, Usage, UsageRowId, UsageStore};

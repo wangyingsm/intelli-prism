@@ -16,6 +16,7 @@ use crate::plugin::{NewPlugin, Plugin, PluginOwner, PluginRecord, PluginRuleStor
 use crate::revision::{RevisionStore, RuleRevision, RuleSet};
 use crate::route::RouteStore;
 use crate::store::{Backend, GrantStore, MembershipStore, TenantStore, UserStore};
+use crate::usage::{NewUsage, Usage, UsageRowId, UsageStore};
 
 /// A store that answers like the one it wraps until the calls it was given run out, and
 /// refuses every call after that.
@@ -307,6 +308,19 @@ impl RevisionStore for FailingStore {
     async fn rule_set(&self) -> Result<RuleSet, StorageError> {
         self.answering()?;
         self.inner.rule_set().await
+    }
+}
+
+#[async_trait]
+impl UsageStore for FailingStore {
+    async fn record_usage(&self, usage: NewUsage) -> Result<Usage, StorageError> {
+        self.answering()?;
+        self.inner.record_usage(usage).await
+    }
+
+    async fn usage(&self, row_id: UsageRowId) -> Result<Option<Usage>, StorageError> {
+        self.answering()?;
+        self.inner.usage(row_id).await
     }
 }
 

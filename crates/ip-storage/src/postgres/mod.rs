@@ -3,6 +3,7 @@ mod list;
 mod plugin;
 mod revision;
 mod route;
+mod usage;
 
 use std::str::FromStr;
 

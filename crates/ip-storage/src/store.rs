@@ -7,6 +7,7 @@ use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{PluginRuleStore, PluginStore};
 use crate::revision::RevisionStore;
 use crate::route::RouteStore;
+use crate::usage::UsageStore;
 
 /// Reads and writes tenants.
 #[async_trait]
@@ -91,12 +92,18 @@ impl<T> Storage for T where T: TenantStore + UserStore + MembershipStore + Grant
 
 /// Everything a storage backend provides, behind one object.
 pub trait Backend:
-    Storage + RouteStore + PluginStore + PluginRuleStore + ListStore + RevisionStore
+    Storage + RouteStore + PluginStore + PluginRuleStore + ListStore + RevisionStore + UsageStore
 {
 }
 
 impl<T> Backend for T where
-    T: Storage + RouteStore + PluginStore + PluginRuleStore + ListStore + RevisionStore
+    T: Storage
+        + RouteStore
+        + PluginStore
+        + PluginRuleStore
+        + ListStore
+        + RevisionStore
+        + UsageStore
 {
 }
 

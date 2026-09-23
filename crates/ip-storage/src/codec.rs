@@ -1,7 +1,8 @@
 //! How identity and plugin values are spelled in the columns every sql backend stores them in.
 
 use ip_core::{
-    ApiId, Capability, CapabilityScope, PluginOrder, PluginScope, TenantId, TnKey, UserId,
+    ApiId, Capability, CapabilityScope, Latency, PluginOrder, PluginScope, Served, TenantId, TnKey,
+    TokenCount, UserId,
 };
 
 use crate::error::{Entity, StorageError};
@@ -150,4 +151,42 @@ pub(crate) fn plugin_scope(
             api: api.as_deref().map(ApiId::new).transpose()?,
         }),
     }
+}
+
+/// The stored name of where an answer came from.
+pub(crate) fn served_name(served: Served) -> &'static str {
+    match served {
+        Served::Upstream => "upstream",
+        Served::Cache => "cache",
+    }
+}
+
+/// Reads back where an answer came from.
+pub(crate) fn served(name: &str) -> Result<Served, StorageError> {
+    match name {
+        "upstream" => Ok(Served::Upstream),
+        "cache" => Ok(Served::Cache),
+        other => Err(StorageError::Malformed {
+            entity: Entity::Usage,
+            detail: format!("unknown answer source {other:?}"),
+        }),
+    }
+}
+
+/// Reads a stored token count back.
+pub(crate) fn token_count(count: i64) -> Result<TokenCount, StorageError> {
+    let count = u32::try_from(count).map_err(|_| StorageError::Malformed {
+        entity: Entity::Usage,
+        detail: format!("{count} is not a token count"),
+    })?;
+    Ok(TokenCount::new(count))
+}
+
+/// Reads a stored span back as a latency.
+pub(crate) fn latency(millis: i64) -> Result<Latency, StorageError> {
+    let millis = u128::try_from(millis).map_err(|_| StorageError::Malformed {
+        entity: Entity::Usage,
+        detail: format!("{millis} is not a span of milliseconds"),
+    })?;
+    Ok(Latency::from_millis(millis))
 }

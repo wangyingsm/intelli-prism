@@ -7,6 +7,7 @@ pub(crate) mod member_remove;
 pub(crate) mod plugin;
 pub(crate) mod revision;
 pub(crate) mod route;
+pub(crate) mod usage;
 pub(crate) mod user_create;
 
 /// The records every backend test builds from.
@@ -170,6 +171,16 @@ macro_rules! backend_suite {
             an_owner_that_is_not_there_leaves_no_wasm_behind,
         ]);
     };
+    (usage, $open:path) => {
+        $crate::suite::backend_suite!(@module usage, $open, [
+            a_recorded_request_round_trips,
+            the_primary_key_is_an_integer_the_backend_assigns,
+            an_answer_out_of_the_cache_is_recorded_spending_nothing,
+            a_request_carrying_no_turn_or_model_round_trips,
+            what_a_tenant_spent_outlives_the_tenant,
+            reading_a_request_nobody_recorded_is_nothing,
+        ]);
+    };
     ($open:path) => {
         $crate::suite::backend_suite!(identity, $open);
         $crate::suite::backend_suite!(route, $open);
@@ -179,6 +190,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(member_remove, $open);
         $crate::suite::backend_suite!(list, $open);
         $crate::suite::backend_suite!(revision, $open);
+        $crate::suite::backend_suite!(usage, $open);
     };
 }
 
