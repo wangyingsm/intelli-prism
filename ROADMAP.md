@@ -75,6 +75,26 @@ round trip upstream and is logged, never a failed request.
 keeps its total and an index ordered by last use, and the oldest go until the level is inside its
 limit.
 
+### Management api and login
+
+- Passphrase login (argon2) issuing the session cookie the web UI carries, `HttpOnly; Secure;
+SameSite=Strict`; logout that keeps a token refused until it would have run out anyway; a session
+endpoint saying who the caller is and what it may do where.
+- One extractor behind every management endpoint, taking a session cookie or a signed request, with
+a CSRF header required of cookie callers that change something.
+- Endpoints for tenants, users, memberships, grants, routing rules, plugins and plugin chains, each
+at the authority the capability model describes, and the first system administrator made by a local
+CLI subcommand rather than by any api.
+- Keys shown to a logged in session that gives its passphrase again, never to a signed call, with a
+limit on wrong passphrases that ends the session it was reached in.
+- Every list newest first, paged by `limit`, `offset` and `after`, with every time a unix second.
+- Plugins owned per chain: wasm stored once under its checksum, a row per owner, compiled and
+checked before it is stored, and removed when its last owner lets go.
+- Rule changes propagated to every node: a revision moved on by database triggers, a published
+snapshot written only when it is newer, a jittered reload, and one pointer swapped so a request is
+never routed by one set of rules and processed by another. A cache left behind heals on a timer.
+- An api suite in hurl, run against a server of its own by `tests/api/run.sh`.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -89,19 +109,21 @@ see the dispatch strategies below.
 - **Only `http` and `https` are forwarded.** `ws`, `wss` and `tcp` parse and are refused at routing.
 - **`telemetry.otlp_endpoint` is parsed and ignored.** Logging is a local subscriber; nothing is
 exported yet.
-- **Nothing hashes a passphrase yet.** `PassphraseHasher` exists but has no caller until a login
-endpoint does.
+- **A rule change is not in force the instant the api answers.** The write is committed and
+published, but each node waits a jittered moment before rebuilding, so nodes come into step within
+seconds of each other rather than at once.
+- **A published rule set that cannot be built leaves a node on the rules it has.** It keeps serving
+and retries, so nodes can serve different revisions while one of them cannot build the newest.
 
 ## To be implemented
 
 Roughly in dependency order. Each entry names what it waits on.
 
-### Management api and login
+### Management api, what is left of it
 
-- Passphrase login issuing the JWT the web UI carries, which is what `auth.jwt` is configured for.
-- Admin endpoints for tenants, users, memberships, grants, rules and plugins, at the authority the
-capability model already describes. Everything below that a person has to configure needs this.
 - Quota and rate limits per tenant and user — no representation for either exists yet.
+- The signed half of the api is covered by the rust tests alone: a signature is sha256 over
+hex-decoded keys, which the hurl suite cannot compute, so that suite exercises the cookie path.
 - Syncing a list by `after`. Every list is newest first and takes `?after=<unix seconds>`, so a
 client that records the newest `created_at` it has seen can ask for only what came since. Times
 are whole seconds and `after` is strict, so a record made in the same second as the last one seen

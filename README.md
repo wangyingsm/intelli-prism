@@ -17,6 +17,12 @@ api. Every refusal looks the same from outside, so failures reveal nothing about
 response headers, response body — each stage is a distinct type, so skipping one does not compile.
 - **WASM plugins.** Header, body and server-sent-event chunk processors on wasmtime, with fuel
 metering, epoch deadlines and a memory cap, scoped globally or per tenant, user and api.
+- **A management api.** Tenants, users, memberships, grants, routing rules and plugin chains, over a
+session cookie for the web or the signed headers for a script. Lists are newest first and paged; keys
+are shown only to a session that gives its passphrase again.
+- **Rule changes that reach every node.** A change moves a revision on inside the same transaction, is
+published to the cache, and every node reloads and swaps its routing table and plugin chains without
+stalling the requests in flight.
 - **Two storage backends.** sqlite for a single node, postgres for a cluster, behind one trait and
 one conformance suite so neither drifts from the other.
 - **Two cache backends.** sled for a single node, redis for a cluster, same arrangement. The
