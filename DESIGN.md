@@ -114,6 +114,9 @@ them. The coverage gate counts them only when run that way.
 a TO(Tenant Owner) user account(Tenant Owner). Tenant is not an entity account. TO is its representative account for management.
 - Tenant has its tn_id which is unique in the application, a random 16 bytes key is generate to tenant, named tn_key. it can be represent
 as a 32 chars hex string and become a root key of the whole tenant roles.
+- Creating a tenant is one endpoint whose three writes — the tenant, the account that owns it, and that
+account's membership — run in one transaction, so a tenant nobody owns cannot exist. The order is fixed at
+compile time: the transaction's stages make the wrong one fail to build rather than fail at runtime.
 
 #### Users
 
@@ -126,7 +129,12 @@ to, named ut_key. compute by sha256(concat(user_id, tn_key)).
 
 #### Authentication
 
-- JWT for web.
+- JWT for web. `POST /_ip/login` checks the passphrase against the stored argon2 verifier and hands back
+a session cookie (`ip_session`, `HttpOnly; Secure; SameSite=Strict; Path=/`), which is what the web UI
+carries; the token is never in a body and never in local storage. A login that fails says only that it
+failed, and costs the same work whether or not the account exists. `POST /_ip/logout` ends a session
+before its token runs out by remembering the session id in the system cache until the token would have
+expired anyway.
 - Authorization of API call:
 	- A customer header `X-Ip-Tnid` is used for identify tenant ID.
 	- A customer header `X-Ip-Userid` is used for identify user ID.
@@ -162,6 +170,90 @@ to, named ut_key. compute by sha256(concat(user_id, tn_key)).
 within its tenant.
 - User can choose an active tenant in web which the tenant is attached to the user.
 - User can never change its capabilities, they are all set by TO.
+
+### Management API
+
+- Everything the gateway serves for itself is under `/_ip`, which no routing rule may claim.
+- Two ways to prove who is calling, and they are not interchangeable:
+	- A **session cookie** from `POST /_ip/login`, which is what the web UI carries.
+	- The **signed headers** a proxied call carries. The system administrator may use these from localhost alone.
+	- A cookie request that changes something must also carry `X-Ip-Csrf`. A signed one need not: nothing
+	sends signed headers by itself, which is the whole of what the header defends against.
+- The first system administrator is made by `intelli-prism admin create <user>` on the machine the store
+lives on, never over the api: an api that made one would be a way to climb to the top of the system from
+inside it. The passphrase is asked for twice and never echoed at a terminal, and read once when piped.
+
+#### Endpoints
+
+- `POST /_ip/login`, `POST /_ip/logout`, `GET /_ip/session` — any account.
+- `POST /_ip/tenants`, `GET`/`DELETE /_ip/tenants/{tenant}` — `TenantMgr`, which only the system
+administrator holds by role. Deleting a tenant takes its memberships, grants and plugin rules with it.
+- `POST /_ip/users`, `GET`/`DELETE /_ip/users/{user}` — `UserMgr` inside the tenant named. An account
+created here is always a member: an owner comes into being with its tenant. A read shows only the tenants
+the caller manages the account in, and an account the caller has no business with reads as one that is not
+there. Removing one takes a caller that sees the whole account, never a corner of it.
+- `GET /_ip/tenants/{t}/members`, `PUT`/`DELETE /_ip/tenants/{t}/members/{user}` — `UserMgr` in that
+tenant. Taking an account out revokes what it held inside, in the same transaction, so putting it back
+never restores capabilities it no longer has.
+- `GET`/`PUT`/`DELETE /_ip/tenants/{t}/members/{u}/grants/{capability}[/{api}]` — the tenant's owner or the
+system administrator. Holding `UserMgr` puts accounts in and out but hands out nothing, which is what
+"capabilities are set by TO" means. A member reads its own grants.
+- `PUT`/`DELETE /_ip/users/{u}/grants/{capability}` — the system administrator alone; `TenantMgr` is the
+only capability held against an account rather than inside a tenant.
+- `GET`/`PUT`/`DELETE /_ip/routes` — the system administrator alone. A stored rule whose key lies inside
+`/_ip` is refused here, because the table refuses it and a stored one would stop the next start; so is one
+under a key the configuration already claims, which would sit in the database doing nothing.
+- `GET`/`POST /_ip/plugins`, `DELETE /_ip/plugins/{checksum}`, `GET`/`POST /_ip/plugin-rules`,
+`DELETE /_ip/plugin-rules/{kind}/{order}` — who calls decides which chain: the system administrator
+manages the global chain and only that, a tenant's owner manages its own tenant's chain and only that, and
+nobody else manages plugins at all.
+- `POST /_ip/keys/user`, `POST /_ip/keys/tenant` — a logged in session, never a signed call.
+
+#### What an answer carries
+
+- Every time is a JSON number of whole seconds since the unix epoch. How it is shown, and in which locale,
+is the frontend's business.
+- Every list is newest first and takes `?limit=`, `?offset=` and `?after=`, each optional, defaulting to 20,
+0 and unbounded, with the limit capped at 100. `after` is a unix second and strict.
+- No answer carries a key.
+
+#### Keys
+
+- `ut_key` and `tn_key` are shown in the web UI alone, and only to a session that gives its passphrase
+again: a cookie left in an unattended browser is not enough on its own. Every key answer carries
+`Cache-Control: no-store`, and the log records who revealed which key, never the key.
+- A member sees its own `ut_key` for a tenant it is in; a TO sees the `tn_key` of the tenant it owns.
+- Wrong passphrases count against the account for fifteen minutes, at most five of them and never fewer
+than two. While the count stands every passphrase is refused unchecked, the right one included, so guessing
+on cannot tell when it hit, and the session that reached the limit is ended: whoever is guessing may hold a
+cookie that is not theirs.
+
+#### Plugins as the api holds them
+
+- Wasm is stored once under its own sha256 however many chains hold it, and a row per owner records who
+does: a tenant, or the global chain. An owner lists, places and lets go of only its own, and the wasm goes
+when its last owner does.
+- An upload is compiled before anything is stored, in a host of its own, and refused if it imports anything
+or does not export the plugin abi — the same load the live host does. A global plugin that will not load
+stops a start, so it must never be storable.
+
+#### Propagating rule changes
+
+- Storage is the truth. A `rule_revision` row is moved on by database triggers on every change to routes,
+route targets or plugin rules, cascades from a deleted tenant or user included, in the same transaction as
+the change itself, so no write path can forget it.
+- After a change the whole rule set is published in the cache under that revision, written only when the
+revision is newer than what is there, and announced: a lua script on redis does the check, the write and
+the announcement in one step; sled does it in a transaction its watchers see.
+- Each node follows the announcement, waits a jittered moment so a change never sends every node to rebuild
+at once, builds the table and the chains from what was published, and puts both in force behind one
+pointer, so no request is routed by one set of rules and processed by another. A set that cannot be built
+leaves the node serving the one it has, retried with a widening wait.
+- Readers never wait for that swap: with 1000 rules and eight threads resolving, a writer swapping 5000
+times a second moved the median resolve from 5107ns to 5148ns, and the swap itself costs about 667ns.
+- Storage and a separate cache cannot commit together. A publish that fails leaves the api answering
+success, because the change is already committed where the truth is, and every node compares the two
+revisions on a jittered timer and publishes again when the cache is behind.
 
 ### Proxy/Gateway
 
