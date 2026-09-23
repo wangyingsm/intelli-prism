@@ -19,5 +19,6 @@ tokio.workspace = true
 
 [features]
 default = ["standalone-storage"]
+testing = []
 standalone-storage = ["dep:sqlx", "sqlx/sqlite"]
 fast-storage = ["dep:sqlx", "sqlx/postgres"]
