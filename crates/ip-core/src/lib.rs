@@ -10,6 +10,7 @@ pub mod plugin;
 pub mod route;
 pub mod timestamp;
 pub mod trace;
+pub mod usage;
 
 pub use capability::{Capability, CapabilityScope, Grant, Grants, Role, ScopeKind};
 pub use error::CoreError;
@@ -25,3 +26,4 @@ pub use route::{
 };
 pub use timestamp::Timestamp;
 pub use trace::TraceId;
+pub use usage::{Latency, Served, TokenCount, Tokens};
