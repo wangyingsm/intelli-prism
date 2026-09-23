@@ -5,6 +5,7 @@ pub mod cache;
 pub mod error;
 pub mod flow;
 pub mod hyper_upstream;
+pub mod measure;
 pub mod processor;
 mod sse;
 pub mod stage;
@@ -16,6 +17,7 @@ pub use cache::{CachedResponse, Freshness, ResponseCache, freshness, response_ke
 pub use error::{GatewayError, GatewayErrorKind, ProcessorError, RouteError, UpstreamError};
 pub use flow::{Flow, Gateway, RequestContext};
 pub use hyper_upstream::{HyperUpstream, UpstreamSettings};
+pub use measure::{Measured, Measuring, measure};
 pub use processor::{BodyProcessor, ChainSource, FixedChains, HeaderProcessor, ProcessorChain};
 pub use stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,

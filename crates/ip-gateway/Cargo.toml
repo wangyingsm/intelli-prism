@@ -23,6 +23,7 @@ ip-cache = { version = "0.1.0", path = "../ip-cache", default-features = false }
 ip-config = { version = "0.1.0", path = "../ip-config" }
 ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }
+serde_json.workspace = true
 sha2.workspace = true
 rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
 thiserror.workspace = true
