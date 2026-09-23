@@ -97,6 +97,11 @@ declare_id!(
     "Identifies a user, unique across the application."
 );
 declare_id!(ApiId, "api id", "Identifies one proxied upstream api.");
+declare_id!(
+    TurnId,
+    "turn id",
+    "Groups every request of one chat turn, as the caller marks them."
+);
 
 /// Per request nonce carried by `X-Ip-Nonce`, which makes a signature single use.
 #[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
