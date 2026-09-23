@@ -497,6 +497,45 @@ mod tests {
         assert_eq!(state.gateway().table().len(), 1, "the node stopped serving");
     }
 
+    /// A route on the gateway's own prefix, which the table refuses and the api never stores.
+    fn refused_snapshot() -> String {
+        serde_json::json!({
+            "routes": [{
+                "api": "chat",
+                "key": {"protocol": "https", "host": "gateway.local", "port": 443, "path": "/_ip/own"},
+                "target": [{"protocol": "https", "host": "api.example.com", "port": 443, "path": "/v1"}],
+            }],
+            "rules": [],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_set_that_cannot_be_built_is_tried_again_until_one_that_can_arrives() {
+        let (state, store) = node().await;
+        let topic = CacheKey::new(CacheLevel::System, "rules").unwrap();
+        let ahead = store.rule_revision().await.unwrap().get() + 1;
+        state
+            .feed()
+            .cache()
+            .publish(&topic, ahead, refused_snapshot().as_bytes())
+            .await
+            .unwrap();
+
+        let following = state.keep_rules_in_step();
+        for path in ["/v1", "/v2"] {
+            store.put_route(route(path)).await.unwrap();
+        }
+        assert!(
+            store.rule_revision().await.unwrap().get() > ahead,
+            "the rules must move past the set that cannot be built"
+        );
+        state.feed().publish().await.unwrap();
+
+        assert!(serves(&state, 2).await, "the node never caught up");
+        following.abort();
+    }
+
     #[tokio::test]
     async fn following_puts_a_change_in_force_of_its_own_accord() {
         let (state, store) = node().await;
