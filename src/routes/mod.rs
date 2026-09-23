@@ -28,6 +28,7 @@ use crate::auth::Authenticated;
 use crate::cookie;
 use crate::manage::{self, Manager};
 use crate::state::AppState;
+use crate::telemetry;
 
 /// Every route the server serves.
 ///
@@ -317,13 +318,18 @@ async fn traced(mut request: Request<Body>, next: Next) -> Response<Body> {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     request.extensions_mut().insert(trace);
-    let serving = tracing::info_span!(
-        "request",
-        trace = %trace,
-        method = %request.method(),
-        path = request.uri().path(),
-    );
-    let mut answered = next.run(request).instrument(serving).await;
+    // The span is opened and closed inside the scope, which is where the exporter reads the id
+    // to name its trace by.
+    let mut answered = telemetry::under(trace, async move {
+        let serving = tracing::info_span!(
+            "request",
+            trace = %trace,
+            method = %request.method(),
+            path = request.uri().path(),
+        );
+        next.run(request).instrument(serving).await
+    })
+    .await;
     // The gateway never continues a trace it was sent, so this is how a caller correlates.
     if let Ok(value) = HeaderValue::from_str(&trace.to_hex()) {
         answered.headers_mut().insert(HEADER_TRACE, value);
@@ -1075,6 +1081,60 @@ secret = "0123456789abcdef0123456789abcdef"
         let other = refused.headers()[HEADER_TRACE].to_str().unwrap();
         assert!(TraceId::from_hex(other).is_ok());
         assert_ne!(other, trace, "two requests shared one trace");
+    }
+
+    #[test]
+    fn every_span_exported_for_a_request_is_followed_by_its_trace() {
+        use ip_config::SampleRatio;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = crate::telemetry::provider(exporter.clone(), SampleRatio::default());
+        let subscriber = Registry::default().with(
+            tracing_opentelemetry::layer().with_tracer(provider.tracer(crate::telemetry::SERVICE)),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let trace = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let (router, key, _) = fixture(true).await;
+                let answered = router
+                    .oneshot(request("/anthropic/messages", Some(&signature(&key))))
+                    .await
+                    .unwrap();
+                assert_eq!(answered.status(), StatusCode::OK);
+                answered.headers()[HEADER_TRACE]
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+        });
+        provider.force_flush().unwrap();
+
+        let stages = [
+            "request",
+            "ingress.request",
+            "egress.request",
+            "ingress.response",
+            "egress.response",
+        ];
+        let exported = exporter.get_finished_spans().unwrap();
+        for stage in stages {
+            let span = exported
+                .iter()
+                .find(|span| span.name == stage)
+                .unwrap_or_else(|| panic!("{stage} was not exported"));
+            assert_eq!(
+                span.span_context.trace_id().to_string(),
+                trace,
+                "{stage} was exported under another trace"
+            );
+        }
     }
 
     #[tokio::test]

@@ -36,7 +36,7 @@ async fn main() -> Result<(), StartupError> {
 /// Opens everything the configuration names and serves until the kernel says to stop.
 async fn serve(config: &Path) -> Result<(), StartupError> {
     let config = Config::load(config)?;
-    telemetry::install(&config.telemetry);
+    let telemetry = telemetry::install(&config.telemetry);
 
     let state = AppState::open(&config).await?;
     let _healing = std::sync::Arc::clone(state.feed()).keep_healing();
@@ -47,13 +47,14 @@ async fn serve(config: &Path) -> Result<(), StartupError> {
         .map_err(|source| StartupError::Bind { address, source })?;
 
     tracing::info!(%address, "listening");
-    axum::serve(
+    let served = axum::serve(
         listener,
         routes::router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown())
-    .await
-    .map_err(StartupError::Serve)
+    .await;
+    telemetry.shutdown();
+    served.map_err(StartupError::Serve)
 }
 
 async fn shutdown() {
