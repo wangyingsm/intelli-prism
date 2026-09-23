@@ -42,3 +42,6 @@ logs/
 .vscode/
 *.swp
 .DS_Store
+
+# drsg — local database, logs, and the MCP configs carrying a live bearer token
+.cursor/mcp.json
