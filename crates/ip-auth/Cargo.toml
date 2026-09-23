@@ -24,5 +24,5 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-ip-cache = { version = "0.1.0", path = "../ip-cache", features = ["standalone-cache"] }
+ip-cache = { version = "0.1.0", path = "../ip-cache", features = ["standalone-cache", "testing"] }
 ip-storage = { version = "0.1.0", path = "../ip-storage", features = ["standalone-storage"] }

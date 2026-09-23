@@ -562,4 +562,26 @@ mod tests {
         }
         assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
     }
+
+    #[tokio::test]
+    async fn a_cache_that_cannot_take_the_rules_leaves_healing_to_try_again() {
+        let (_, store, _) = feed().await;
+        let told = Arc::new(ip_cache::FailingCache::new(Arc::new(
+            SledCache::temporary().unwrap(),
+        )));
+        let feed = RuleFeed::new(
+            Arc::clone(&store) as Arc<dyn Backend>,
+            Arc::clone(&told) as Arc<dyn CacheBackend>,
+        )
+        .unwrap();
+        told.fail_now();
+
+        assert!(matches!(feed.publish().await, Err(FeedError::Cache(_))));
+        assert!(matches!(feed.heal().await, Err(FeedError::Cache(_))));
+        // A change stands whether or not it is published: this only logs.
+        feed.after_change().await;
+
+        told.answer_again();
+        assert!(feed.heal().await.unwrap(), "healing never caught up");
+    }
 }

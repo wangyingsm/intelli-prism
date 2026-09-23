@@ -393,6 +393,57 @@ mod tests {
         assert_eq!(RecheckLimit::default().attempts, MAX_RECHECK_ATTEMPTS);
     }
 
+    /// Logins over a cache that answers until it is told to stop.
+    async fn logins_over_a_failing_cache() -> (Logins, Arc<ip_cache::FailingCache>) {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let hasher = PassphraseHasher::new();
+        store
+            .create_user(NewUser {
+                id: alice(),
+                passphrase: hasher.hash(&passphrase("correct horse staple")).unwrap(),
+                kind: AccountKind::Regular,
+            })
+            .await
+            .unwrap();
+        let cache = Arc::new(ip_cache::FailingCache::new(Arc::new(
+            ip_cache::SledCache::temporary().unwrap(),
+        )));
+        let tokens = SessionTokens::new("intelli-prism", SECRET, Duration::from_secs(3600));
+        let logins = Logins::new(
+            Arc::new(store),
+            Arc::clone(&cache) as Arc<dyn Cache>,
+            tokens,
+        )
+        .unwrap();
+        (logins, cache)
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_cannot_count_a_wrong_passphrase_refuses_the_recheck() {
+        let (logins, cache) = logins_over_a_failing_cache().await;
+        cache.fail_now();
+        assert!(matches!(
+            logins
+                .recheck(&alice(), &passphrase("correct horse staple"))
+                .await,
+            Err(AuthError::Cache(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_cannot_say_whether_a_session_ended_refuses_the_token() {
+        let (logins, cache) = logins_over_a_failing_cache().await;
+        let token = logins
+            .log_in(&alice(), &passphrase("correct horse staple"))
+            .await
+            .unwrap();
+        cache.fail_now();
+        assert!(matches!(
+            logins.session(token.as_str()).await,
+            Err(AuthError::Cache(_))
+        ));
+    }
+
     #[tokio::test]
     async fn the_right_passphrase_given_again_is_accepted() {
         let logins = logins(AccountKind::Regular).await;
