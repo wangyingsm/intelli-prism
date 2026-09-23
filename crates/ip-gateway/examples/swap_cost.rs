@@ -143,7 +143,7 @@ fn at(samples: &[u64], share: f64) -> u64 {
     samples[at]
 }
 
-fn report(name: &str, unit: &str, rounds: &mut Vec<u64>) {
+fn report(name: &str, unit: &str, rounds: &mut [u64]) {
     rounds.sort_unstable();
     println!(
         "{name:<34} min {:>7} {unit}   median {:>7} {unit}   max {:>7} {unit}",
