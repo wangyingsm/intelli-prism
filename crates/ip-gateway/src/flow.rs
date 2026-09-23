@@ -15,7 +15,7 @@ use http::{HeaderMap, HeaderValue, Request, Response, Uri};
 use http_body_util::BodyExt;
 use ip_auth::Authority;
 use ip_cache::{CacheKey, Ttl};
-use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey};
+use ip_core::{Capability, CapabilityScope, Endpoint, Protocol, RouteKey, TraceId, TurnId};
 
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, ResponseCache, freshness, response_key};
@@ -37,6 +37,10 @@ pub struct RequestContext {
     pub protocol: Protocol,
     /// Where the gateway listens, supplying the port a `Host` header omits.
     pub listen: SocketAddr,
+    /// What this request is followed by, drawn at the edge and never taken from a caller.
+    pub trace: TraceId,
+    /// The chat turn it belongs to, when the caller marked one.
+    pub turn: Option<TurnId>,
 }
 
 /// The request dataflow: the stages of `DESIGN.md` run in order.
@@ -184,7 +188,7 @@ fn answer_with(hit: CachedResponse) -> Response<GatewayBody> {
 /// # use ip_gateway::{Flow, ProcessorChain, RoutingTable, RequestContext};
 /// # use ip_gateway::body::empty;
 /// # use ip_auth::{Authority, Identity};
-/// # use ip_core::{Grants, Protocol, Role, TenantId, UserId};
+/// # use ip_core::{Grants, Protocol, Role, TenantId, TraceId, UserId};
 /// # use http::Request;
 /// # fn context() -> RequestContext {
 /// #     RequestContext {
@@ -198,6 +202,8 @@ fn answer_with(hit: CachedResponse) -> Response<GatewayBody> {
 /// #         ),
 /// #         protocol: Protocol::Http,
 /// #         listen: "127.0.0.1:8080".parse().unwrap(),
+/// #         trace: TraceId::generate().unwrap(),
+/// #         turn: None,
 /// #     }
 /// # }
 /// # async fn run(table: &RoutingTable, chain: &ProcessorChain) {
@@ -214,7 +220,7 @@ fn answer_with(hit: CachedResponse) -> Response<GatewayBody> {
 /// # use ip_gateway::{Flow, ProcessorChain, RoutingTable, RequestContext};
 /// # use ip_gateway::body::empty;
 /// # use ip_auth::{Authority, Identity};
-/// # use ip_core::{Grants, Protocol, Role, TenantId, UserId};
+/// # use ip_core::{Grants, Protocol, Role, TenantId, TraceId, UserId};
 /// # use http::Request;
 /// # fn context() -> RequestContext {
 /// #     RequestContext {
@@ -228,6 +234,8 @@ fn answer_with(hit: CachedResponse) -> Response<GatewayBody> {
 /// #         ),
 /// #         protocol: Protocol::Http,
 /// #         listen: "127.0.0.1:8080".parse().unwrap(),
+/// #         trace: TraceId::generate().unwrap(),
+/// #         turn: None,
 /// #     }
 /// # }
 /// # async fn run(table: &RoutingTable, chain: &ProcessorChain) {
@@ -909,6 +917,8 @@ mod tests {
             authority,
             protocol: Protocol::Http,
             listen: "127.0.0.1:8080".parse().unwrap(),
+            trace: TraceId::generate().unwrap(),
+            turn: None,
         }
     }
 

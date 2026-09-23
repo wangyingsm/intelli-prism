@@ -9,15 +9,16 @@ mod tenant;
 mod user;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, FromRequestParts, Query, State};
+use axum::extract::{ConnectInfo, Extension, FromRequestParts, Query, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, Request, Response, StatusCode, header::SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode, header::SET_COOKIE};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use http_body_util::BodyExt;
 use ip_auth::{Identity, Passphrase};
-use ip_core::{Capability, CapabilityScope, Protocol, Role, Timestamp};
+use ip_core::{Capability, CapabilityScope, Protocol, Role, Timestamp, TraceId, TurnId};
 use ip_gateway::{GatewayBody, GatewayError, RequestContext};
 use ip_storage::{DEFAULT_PAGE_LIMIT, Page, Standing, StorageError};
 use std::net::SocketAddr;
@@ -53,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))
         .with_state(state)
+        .layer(middleware::from_fn(traced))
 }
 
 /// Who the caller is, once its signature checked out.
@@ -298,22 +300,62 @@ async fn reserved() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+/// The header a caller marks a chat turn with, which the gateway groups a trace by.
+const HEADER_TURN: &str = "x-ip-turn";
+
+/// The header every answer carries the trace it was followed under in.
+const HEADER_TRACE: &str = "x-ip-trace";
+
+/// Follows every request under an id of this gateway's own, and says which in the answer.
+///
+/// It sits outside every endpoint, so a request refused before it reaches one is followed
+/// too: an answer nobody can name is an answer nobody can ask about.
+async fn traced(mut request: Request<Body>, next: Next) -> Response<Body> {
+    let Ok(trace) = TraceId::generate() else {
+        tracing::error!("could not draw a trace id");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    request.extensions_mut().insert(trace);
+    let mut answered = next.run(request).await;
+    // The gateway never continues a trace it was sent, so this is how a caller correlates.
+    if let Ok(value) = HeaderValue::from_str(&trace.to_hex()) {
+        answered.headers_mut().insert(HEADER_TRACE, value);
+    }
+    answered
+}
+
 /// Carries an authenticated request through the gateway dataflow.
 async fn proxy(
     State(state): State<AppState>,
     Authenticated(authority): Authenticated,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
-    request: Request<Body>,
+    Extension(trace): Extension<TraceId>,
+    mut request: Request<Body>,
 ) -> Response<Body> {
     let context = RequestContext {
         authority,
         protocol: Protocol::Http,
         listen: state.listen(),
+        trace,
+        turn: turn_of(&mut request),
     };
     match state.gateway().handle(context, into_gateway(request)).await {
         Ok(response) => response.map(Body::new),
         Err(error) => refuse(error),
     }
+}
+
+/// The turn the caller marked, with the header taken off so no upstream sees our own.
+///
+/// A mark that is not a turn id is dropped rather than refused: it groups telemetry, and no
+/// request is worth failing over how its trace is filed.
+fn turn_of(request: &mut Request<Body>) -> Option<TurnId> {
+    let marked = request.headers_mut().remove(HEADER_TURN)?;
+    let turn = marked.to_str().ok().and_then(|raw| TurnId::new(raw).ok());
+    if turn.is_none() {
+        tracing::warn!("a request marked a turn that is not a turn id");
+    }
+    turn
 }
 
 fn into_gateway(request: Request<Body>) -> Request<GatewayBody> {
@@ -1000,5 +1042,85 @@ secret = "0123456789abcdef0123456789abcdef"
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_answer_carries_the_trace_it_was_followed_under() {
+        let (router, key, _) = fixture(true).await;
+        let carried = router
+            .clone()
+            .oneshot(request("/anthropic/messages", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_eq!(carried.status(), StatusCode::OK);
+        let trace = carried.headers()[HEADER_TRACE].to_str().unwrap().to_owned();
+        assert!(
+            TraceId::from_hex(&trace).is_ok(),
+            "{trace} is not a trace id"
+        );
+
+        // A refusal is followed the same way, which is what a caller asks about.
+        let refused = router
+            .oneshot(request("/nowhere", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_ne!(refused.status(), StatusCode::OK);
+        let other = refused.headers()[HEADER_TRACE].to_str().unwrap();
+        assert!(TraceId::from_hex(other).is_ok());
+        assert_ne!(other, trace, "two requests shared one trace");
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_of_the_gateway_s_own_is_followed_too() {
+        let (router, ..) = fixture(true).await;
+        let answered = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_ip/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        assert!(TraceId::from_hex(answered.headers()[HEADER_TRACE].to_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_turn_a_caller_marks_never_reaches_the_upstream() {
+        let (router, key, upstream) = fixture(true).await;
+        let mut marked = request("/anthropic/messages", Some(&signature(&key)));
+        marked
+            .headers_mut()
+            .insert(HEADER_TURN, HeaderValue::from_static("turn-42"));
+
+        let answered = router.oneshot(marked).await.unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        let sent = upstream.headers.lock().unwrap();
+        assert!(
+            sent[0].get(HEADER_TURN).is_none(),
+            "the turn the caller marked reached the upstream"
+        );
+    }
+
+    #[test]
+    fn a_mark_that_is_not_a_turn_id_is_dropped_with_the_header() {
+        let marked = |value: &'static str| {
+            let mut request = Request::builder().body(Body::empty()).unwrap();
+            request
+                .headers_mut()
+                .insert(HEADER_TURN, HeaderValue::from_static(value));
+            request
+        };
+        let mut good = marked("turn-42");
+        assert_eq!(turn_of(&mut good), Some(TurnId::new("turn-42").unwrap()));
+        assert!(good.headers().get(HEADER_TURN).is_none());
+
+        let mut bad = marked("not a turn id");
+        assert_eq!(turn_of(&mut bad), None);
+        assert!(bad.headers().get(HEADER_TURN).is_none());
+
+        let mut unmarked = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(turn_of(&mut unmarked), None);
     }
 }
