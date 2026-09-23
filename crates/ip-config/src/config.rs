@@ -160,7 +160,7 @@ pub struct JwtConfig {
 }
 
 /// Logs, traces and metrics.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Lowest level that reaches the log.
@@ -169,6 +169,48 @@ pub struct TelemetryConfig {
     /// Collector traces and metrics are exported to, when one is configured.
     #[serde(default)]
     pub otlp_endpoint: Option<Url>,
+    /// Share of requests whose trace is exported, for an operator who finds every one too costly.
+    #[serde(default)]
+    pub sample_ratio: SampleRatio,
+}
+
+/// The share of requests whose trace is exported, from none of them to all.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(try_from = "f64")]
+pub struct SampleRatio(f64);
+
+impl SampleRatio {
+    /// Exports no trace at all.
+    pub const NONE: f64 = 0.0;
+    /// Exports every request's trace, which is what an unconfigured server does.
+    pub const ALL: f64 = 1.0;
+
+    /// Wraps a share after checking it is one.
+    pub fn new(value: f64) -> Result<Self, ConfigError> {
+        if !value.is_finite() || !(Self::NONE..=Self::ALL).contains(&value) {
+            return Err(ConfigError::SampleRatio { value });
+        }
+        Ok(Self(value))
+    }
+
+    /// The share as the sampler wants it.
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for SampleRatio {
+    fn default() -> Self {
+        Self(Self::ALL)
+    }
+}
+
+impl TryFrom<f64> for SampleRatio {
+    type Error = ConfigError;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
 }
 
 /// Lowest level that reaches the log.
@@ -265,6 +307,7 @@ ttl = 900
 [telemetry]
 log_level = "debug"
 otlp_endpoint = "http://localhost:4317/"
+sample_ratio = 0.25
 
 [[upstream]]
 id = "anthropic"
@@ -303,6 +346,10 @@ secret = "0123456789abcdef0123456789abcdef"
         );
         assert_eq!(config.auth.jwt.ttl, Seconds::new(900));
         assert_eq!(config.telemetry.log_level, LogLevel::Debug);
+        assert_eq!(
+            config.telemetry.sample_ratio,
+            SampleRatio::new(0.25).unwrap()
+        );
         assert_eq!(config.upstreams.len(), 1);
         let upstream = &config.upstreams[0];
         assert_eq!(upstream.id, ApiId::new("anthropic").unwrap());
@@ -316,9 +363,22 @@ secret = "0123456789abcdef0123456789abcdef"
         let config = Config::parse(MINIMAL).unwrap();
         assert_eq!(config.telemetry.log_level, LogLevel::Info);
         assert_eq!(config.telemetry.otlp_endpoint, None);
+        assert_eq!(config.telemetry.sample_ratio, SampleRatio::default());
         assert_eq!(config.auth.nonce_ttl, Seconds::new(300));
         assert_eq!(config.auth.jwt.ttl, Seconds::new(6 * 3600));
         assert!(config.upstreams.is_empty());
+    }
+
+    #[test]
+    fn a_sample_ratio_outside_a_share_is_refused() {
+        for value in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                SampleRatio::new(value),
+                Err(ConfigError::SampleRatio { .. })
+            ));
+        }
+        assert_eq!(SampleRatio::new(0.0).unwrap().get(), 0.0);
+        assert_eq!(SampleRatio::new(1.0).unwrap().get(), 1.0);
     }
 
     #[test]

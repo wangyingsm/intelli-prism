@@ -47,4 +47,11 @@ pub enum ConfigError {
     /// A temperature outside the range every upstream accepts.
     #[error("temperature {value} is outside {min} to {max}")]
     Temperature { value: f64, min: f32, max: f32 },
+
+    /// A trace sampling ratio that is not a share.
+    #[error("sample ratio {value} is not between 0 and 1")]
+    SampleRatio {
+        /// What the file asked for.
+        value: f64,
+    },
 }

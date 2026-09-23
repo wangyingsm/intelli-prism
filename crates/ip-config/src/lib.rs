@@ -6,8 +6,8 @@ pub mod secret;
 pub mod upstream;
 
 pub use config::{
-    AuthConfig, CacheConfig, Config, JwtConfig, LogLevel, Seconds, ServerConfig, StorageConfig,
-    TelemetryConfig,
+    AuthConfig, CacheConfig, Config, JwtConfig, LogLevel, SampleRatio, Seconds, ServerConfig,
+    StorageConfig, TelemetryConfig,
 };
 pub use error::ConfigError;
 pub use secret::Secret;
