@@ -59,15 +59,26 @@ async fn serve(config: &Path) -> Result<(), StartupError> {
         .map_err(|source| StartupError::Bind { address, source })?;
 
     tracing::info!(%address, "listening");
+    let serving = state.clone();
     let served = axum::serve(
         listener,
         routes::router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown())
     .await;
+    // The requests are answered; their records are still being written.
+    if tokio::time::timeout(SETTLE, serving.gateway().settled())
+        .await
+        .is_err()
+    {
+        tracing::warn!("gave up waiting for the record of the last requests");
+    }
     telemetry.shutdown();
     served.map_err(StartupError::Serve)
 }
+
+/// How long a shutdown waits for the records of the requests it has just answered.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn shutdown() {
     if tokio::signal::ctrl_c().await.is_ok() {

@@ -1,7 +1,9 @@
 //! Recording what a request cost, once its answer is done with.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -11,13 +13,55 @@ use http_body_util::BodyExt;
 use ip_core::{ApiId, Latency, Served, TenantId, Tokens, TraceId, TurnId, UserId};
 use ip_storage::{NewUsage, UsageStore};
 
+use tokio::sync::Notify;
+
 use super::followed::Followed;
 use crate::body::{BoxError, GatewayBody};
 use crate::measure::{Measuring, measure};
 
+/// The records still being written, so a shutdown can wait for them.
+///
+/// A record is written off the request path, which means the process could otherwise end
+/// between the last answer and the row for it.
+#[derive(Clone, Default)]
+pub struct Pending {
+    in_flight: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
+}
+
+impl Pending {
+    /// Runs `work` off the request path, counted so a shutdown can wait for it.
+    fn writing(&self, work: impl Future<Output = ()> + Send + 'static) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let counted = self.clone();
+        tokio::spawn(async move {
+            work.await;
+            if counted.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                counted.idle.notify_waiters();
+            }
+        });
+    }
+
+    /// Returns once nothing is left to write.
+    pub async fn settled(&self) {
+        while self.in_flight.load(Ordering::SeqCst) > 0 {
+            // Arming the wait and reading the count are the two halves of a store and a load
+            // the last write races with, which only a sequentially consistent pair orders.
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            idle.await;
+        }
+    }
+}
+
 /// What is known about a request before its answer is, and what writes the row when it ends.
 pub(super) struct Recording {
     store: Arc<dyn UsageStore>,
+    pending: Pending,
     started: Instant,
     trace: TraceId,
     turn: Option<TurnId>,
@@ -30,11 +74,13 @@ impl Recording {
     /// What will record this request, now that the route says which api serves it.
     pub(super) fn of(
         store: &Arc<dyn UsageStore>,
+        pending: &Pending,
         followed: &Followed,
         started: Instant,
     ) -> Option<Self> {
         Some(Self {
             store: Arc::clone(store),
+            pending: pending.clone(),
             started,
             trace: followed.trace,
             turn: followed.turn.clone(),
@@ -75,7 +121,7 @@ impl Recording {
         };
         let store = self.store;
         // A caller never waits on the record of what it already has, and never fails for it.
-        tokio::spawn(async move {
+        self.pending.writing(async move {
             if let Err(error) = store.record_usage(usage).await {
                 tracing::warn!(%error, "could not record what a request cost");
             }

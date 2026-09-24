@@ -16,7 +16,7 @@ use super::followed::{
     EGRESS_REQUEST, EGRESS_RESPONSE, Followed, INGRESS_REQUEST, INGRESS_RESPONSE, stage_span,
 };
 use super::headers::set_length;
-use super::record::Recording;
+use super::record::{Pending, Recording};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
 use crate::error::GatewayError;
@@ -49,6 +49,7 @@ pub struct Gateway {
     upstream: Arc<dyn Upstream>,
     responses: Option<ResponseCache>,
     usage: Option<Arc<dyn UsageStore>>,
+    pending: Pending,
 }
 
 /// The rules in force: the table a request is routed by and the chains it is processed by.
@@ -86,6 +87,7 @@ impl Gateway {
             upstream,
             responses: None,
             usage: None,
+            pending: Pending::default(),
         }
     }
 
@@ -110,6 +112,14 @@ impl Gateway {
     pub fn recording(mut self, usage: Arc<dyn UsageStore>) -> Self {
         self.usage = Some(usage);
         self
+    }
+
+    /// Returns once every record of what this gateway answered has been written.
+    ///
+    /// A shutdown waits on this, so the last requests answered are recorded rather than
+    /// dropped with the runtime.
+    pub async fn settled(&self) {
+        self.pending.settled().await;
     }
 
     /// The rules this flow routes by, as they stand now.
@@ -153,7 +163,7 @@ impl Gateway {
         let recording = self
             .usage
             .as_ref()
-            .and_then(|store| Recording::of(store, &followed, started));
+            .and_then(|store| Recording::of(store, &self.pending, &followed, started));
 
         let Some(responses) = &self.responses else {
             let done = self.upstream_answer(processed, &chains, &followed).await?;
@@ -671,6 +681,37 @@ mod tests {
         assert_eq!(row.tokens, Tokens::ZERO);
         assert_eq!(row.model, None);
         assert_eq!(row.served, Served::Upstream);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_settles_only_once_every_record_is_written() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        )
+        .recording(recorder);
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        // The write is off the request path, so it has not run by the time the answer is sent.
+        assert!(recorded.try_recv().is_err());
+        gateway.settled().await;
+        assert!(recorded.try_recv().is_ok(), "settled before it was written");
+    }
+
+    #[tokio::test]
+    async fn a_gateway_with_nothing_to_write_settles_at_once() {
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        );
+        gateway.settled().await;
     }
 
     #[tokio::test]
