@@ -95,6 +95,28 @@ snapshot written only when it is newer, a jittered reload, and one pointer swapp
 never routed by one set of rules and processed by another. A cache left behind heals on a timer.
 - An api suite in hurl, run against a server of its own by `tests/api/run.sh`.
 
+### Measuring what a request costs
+
+- A trace id per request, drawn here and never taken from a caller, on the answer as
+`x-ip-trace`, with four spans under it: ingress request, egress request, ingress response,
+egress response. Each carries the tenant, the user, the api and whether the cache answered.
+- Requests grouped by the turn a caller marks with `x-ip-turn`, so one chat turn is one group.
+- OpenTelemetry export to `telemetry.otlp_endpoint` over grpc, the exported trace named by the
+same id the caller was answered with, and `telemetry.sample_ratio` deciding what share is
+exported. No collector configured exports nothing and logs as before.
+- A usage row per request: who spent it, on which api and model, the tokens in each direction,
+whether the upstream or the cache answered, how long the caller waited, and the trace it can be
+read back under. The tokens are read out of the answer itself, in the three shapes the upstream
+families spell them in, a streamed answer included.
+- An answer out of the cache is recorded with zero tokens and a cache marker, so the saving is
+visible and a request rate still counts it.
+- `GET /_ip/usage`, newest first and paged, narrowed by tenant, user and api. The system
+administrator reads every tenant; anyone else names a tenant and must hold `Observer` in it,
+which a tenant owner does by standing.
+- `[usage] retention` sweeps away rows past their keeping on a timer, and keeps every row when
+it is unset.
+- The records of the last requests answered are waited for before the process ends.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -107,11 +129,19 @@ are configured on the sled backend alone and TTLs do the real work in a cluster.
 - **Only one target per rule is used.** A rule may name several, but the first is always taken —
 see the dispatch strategies below.
 - **Only `http` and `https` are forwarded.** `ws`, `wss` and `tcp` parse and are refused at routing.
-- **`telemetry.otlp_endpoint` is parsed and ignored.** Logging is a local subscriber; nothing is
-exported yet.
 - **A rule change is not in force the instant the api answers.** The write is committed and
 published, but each node waits a jittered moment before rebuilding, so nodes come into step within
 seconds of each other rather than at once.
+- **Only a grpc collector is exported to.** `telemetry.otlp_endpoint` is reached over
+grpc, so an http endpoint such as `:4318/v1/traces` is not answered by; traces are dropped and
+the failure is logged at startup.
+- **Anthropic's prompt cache counts are not in the input tokens.** `cache_read_input_tokens`
+and `cache_creation_input_tokens` sit beside `input_tokens` and are not added to it, so a
+request served largely from the upstream's own prompt cache records the few tokens it was
+billed for rather than the many it sent.
+- **A request that never reached an upstream is not recorded.** A refusal before routing names
+no api, and a request the upstream failed leaves no row, so request rates are counted over
+answers alone.
 - **A published rule set that cannot be built leaves a node on the rules it has.** It keeps serving
 and retries, so nodes can serve different revisions while one of them cannot build the newest.
 
@@ -162,7 +192,8 @@ like any other request.
 
 - Facts and chat session history as long term memory.
 - Knowledge and RAG with a graph run.
-- Business data: usage, spend and audit records.
+- Spend and audit records. Usage is recorded; what a token costs, and an audit trail of who
+changed what, are not.
 
 ### Web UI
 
@@ -170,13 +201,12 @@ like any other request.
 the gateway menu (rules, processors, agents, graph run, observe), plus a dashboard. Waits on the
 management api.
 
-### Observability
+### Observability, what is left of it
 
-- OpenTelemetry export to the configured endpoint, honouring `telemetry.otlp_endpoint`.
-- A trace id per request with at least four spans: ingress request, egress request, ingress
-response, egress response.
-- Requests grouped by turn id across an agent loop.
-- Logs to open-observe in cluster mode, to a local file standalone.
+- Metrics: only traces are exported, and nothing counts requests, tokens or latency for a
+dashboard to read.
+- Logs to open-observe in cluster mode, to a local file standalone. Logs go to the process
+output wherever it runs.
 
 ### Security
 

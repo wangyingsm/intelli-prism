@@ -23,6 +23,10 @@ are shown only to a session that gives its passphrase again.
 - **Rule changes that reach every node.** A change moves a revision on inside the same transaction, is
 published to the cache, and every node reloads and swaps its routing table and plugin chains without
 stalling the requests in flight.
+- **A record of what every request cost.** A trace id of our own on every answer, four spans
+under it, and a row per request: the model, the tokens in each direction, whether the cache
+answered and how long the caller waited. Exported to an OpenTelemetry collector when one is
+configured, and read back over `GET /_ip/usage`.
 - **Two storage backends.** sqlite for a single node, postgres for a cluster, behind one trait and
 one conformance suite so neither drifts from the other.
 - **Two cache backends.** sled for a single node, redis for a cluster, same arrangement. The
@@ -62,10 +66,10 @@ does, and runs the `.hurl` files beside it in order.
 version 0.1.0, and nothing about it is stable — the configuration format, the storage schema, the
 wire headers and the plugin interface all still change without ceremony.
 
-Large parts of the design are unbuilt: there is no management api, no login endpoint, no web ui, no
-quota or rate limiting, no agents, no semantic cache, and telemetry is not exported anywhere yet.
-The pieces that do exist are tested, but they have never run under real traffic, and no security
-review has been done. Read `ROADMAP.md` before assuming a feature is there.
+Large parts of the design are unbuilt: there is no web ui, no quota or rate limiting, no agents,
+no semantic cache, and no metrics beyond the traces. The pieces that do exist are tested, but they
+have never run under real traffic, and no security review has been done. Read `ROADMAP.md` before
+assuming a feature is there.
 
 ## License
 
