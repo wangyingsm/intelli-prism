@@ -6,6 +6,7 @@ mod member;
 mod plugin;
 mod route;
 mod tenant;
+mod usage;
 mod user;
 
 use axum::body::Body;
@@ -52,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/_ip/keys", key::router())
         .nest("/_ip/plugins", plugin::store_router())
         .nest("/_ip/plugin-rules", plugin::rules_router())
+        .nest("/_ip/usage", usage::router())
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))
