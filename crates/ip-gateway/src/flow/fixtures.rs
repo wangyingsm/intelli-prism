@@ -350,6 +350,10 @@ impl UsageStore for Ledger {
     async fn usage(&self, _: UsageRowId) -> Result<Option<Usage>, StorageError> {
         Ok(None)
     }
+
+    async fn sweep_usage(&self, _: ip_core::Timestamp) -> Result<u64, StorageError> {
+        Ok(0)
+    }
 }
 
 /// An upstream that answers a stream of events, one frame each.

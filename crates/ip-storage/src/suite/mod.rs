@@ -183,6 +183,7 @@ macro_rules! backend_suite {
             a_list_is_narrowed_to_what_the_filter_names,
             a_moment_to_list_after_keeps_what_came_before_it_out,
             a_listed_row_carries_everything_it_was_recorded_with,
+            rows_past_their_keeping_are_swept_away,
         ]);
     };
     ($open:path) => {

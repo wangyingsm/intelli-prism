@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use ip_core::{
     Checksum, Grant, Grants, NewPluginRule, PassphraseHash, PluginKind, PluginOrder, PluginRule,
-    RouteKey, RouteRule, TenantId, UserId,
+    RouteKey, RouteRule, TenantId, Timestamp, UserId,
 };
 
 use crate::error::{StorageError, ToldToFail};
@@ -330,6 +330,11 @@ impl UsageStore for FailingStore {
     async fn usage(&self, row_id: UsageRowId) -> Result<Option<Usage>, StorageError> {
         self.answering()?;
         self.inner.usage(row_id).await
+    }
+
+    async fn sweep_usage(&self, moment: Timestamp) -> Result<u64, StorageError> {
+        self.answering()?;
+        self.inner.sweep_usage(moment).await
     }
 }
 

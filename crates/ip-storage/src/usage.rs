@@ -103,4 +103,7 @@ pub trait UsageStore: Send + Sync {
 
     /// Reads one recorded request back.
     async fn usage(&self, row_id: UsageRowId) -> Result<Option<Usage>, StorageError>;
+
+    /// Removes every row recorded before `moment`, reporting how many went.
+    async fn sweep_usage(&self, moment: Timestamp) -> Result<u64, StorageError>;
 }

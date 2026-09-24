@@ -59,6 +59,16 @@ impl UsageStore for PostgresStore {
         .map_err(StorageError::backend)?;
         row.map(recorded).transpose()
     }
+
+    async fn sweep_usage(&self, moment: Timestamp) -> Result<u64, StorageError> {
+        let swept = sqlx::query("DELETE FROM usage WHERE created_at < $1")
+            .bind(moment.unix_seconds())
+            .execute(&self.pool)
+            .await
+            .map_err(StorageError::backend)?
+            .rows_affected();
+        Ok(swept)
+    }
 }
 
 /// Rebuilds a usage row, refusing one whose stored value its own type will not take.

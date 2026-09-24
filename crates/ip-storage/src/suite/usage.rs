@@ -223,3 +223,31 @@ pub(crate) async fn a_listed_row_carries_everything_it_was_recorded_with(store: 
         .unwrap();
     assert_eq!(listed, vec![recorded]);
 }
+
+pub(crate) async fn rows_past_their_keeping_are_swept_away(store: &impl Backend) {
+    let old = store.record_usage(spent()).await.unwrap();
+    let now = ip_core::Timestamp::now().unix_seconds();
+    store.record_usage(spent()).await.unwrap();
+
+    let long_ago = ip_core::Timestamp::from_unix_seconds(now - 3600).unwrap();
+    assert_eq!(store.sweep_usage(long_ago).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .list_usage(&UsageFilter::default(), Page::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let later = ip_core::Timestamp::from_unix_seconds(now + 1).unwrap();
+    assert_eq!(store.sweep_usage(later).await.unwrap(), 2);
+    assert!(
+        store
+            .list_usage(&UsageFilter::default(), Page::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.usage(old.row_id).await.unwrap(), None);
+}
