@@ -1095,6 +1095,13 @@ secret = "0123456789abcdef0123456789abcdef"
 
         let exporter = InMemorySpanExporter::default();
         let provider = crate::telemetry::provider(exporter.clone(), SampleRatio::default());
+        // Whether a span is worth opening is decided once per callsite for the whole process,
+        // and a test that opened one with no subscriber in place decided it is not.
+        static RECORDING: std::sync::Once = std::sync::Once::new();
+        RECORDING.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(Registry::default());
+        });
+
         let subscriber = Registry::default().with(
             tracing_opentelemetry::layer().with_tracer(provider.tracer(crate::telemetry::SERVICE)),
         );

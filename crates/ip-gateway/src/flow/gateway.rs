@@ -562,6 +562,13 @@ mod tests {
     fn watching<F: Future>(work: F) -> (F::Output, Opened) {
         use tracing_subscriber::layer::SubscriberExt;
 
+        // Whether a span is worth opening is decided once per callsite for the whole process,
+        // and a test that opened one with no subscriber in place decided it is not.
+        static RECORDING: std::sync::Once = std::sync::Once::new();
+        RECORDING.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+
         let opened = Opened::default();
         let subscriber = tracing_subscriber::registry().with(opened.clone());
         let runtime = tokio::runtime::Builder::new_current_thread()
