@@ -1138,6 +1138,48 @@ secret = "0123456789abcdef0123456789abcdef"
     }
 
     #[tokio::test]
+    async fn a_request_the_server_answers_is_recorded_in_the_store() {
+        use ip_storage::{UsageRowId, UsageStore};
+
+        let (store, key) = seeded_store(true).await;
+        let store = Arc::new(store);
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            Arc::new(FakeUpstream::default()),
+        )
+        .recording(Arc::clone(&store) as Arc<dyn UsageStore>);
+        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = AppState::with_parts(Stores::Sqlite(Arc::clone(&store)), gateway, listen);
+        let router = router(state);
+
+        let answered = router
+            .oneshot(request("/anthropic/messages", Some(&signature(&key))))
+            .await
+            .unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        let trace = answered.headers()[HEADER_TRACE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        body_of(answered).await;
+
+        // The row is written off the request path, so it lands a moment after the answer does.
+        let mut recorded = None;
+        for _ in 0..100 {
+            recorded = store.usage(UsageRowId::new(1)).await.unwrap();
+            if recorded.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let recorded = recorded.expect("nothing was recorded");
+        assert_eq!(recorded.trace.to_hex(), trace);
+        assert_eq!(recorded.tenant, tenant_id());
+        assert_eq!(recorded.user, user_id());
+    }
+
+    #[tokio::test]
     async fn an_endpoint_of_the_gateway_s_own_is_followed_too() {
         let (router, ..) = fixture(true).await;
         let answered = router

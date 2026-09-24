@@ -5,8 +5,10 @@ use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use ip_auth::Authority;
 use ip_core::{Protocol, TraceId, TurnId};
+use ip_storage::UsageStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{Instrument, Span, field};
 
 use super::Flow;
@@ -14,6 +16,7 @@ use super::followed::{
     EGRESS_REQUEST, EGRESS_RESPONSE, Followed, INGRESS_REQUEST, INGRESS_RESPONSE, stage_span,
 };
 use super::headers::set_length;
+use super::record::Recording;
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
 use crate::error::GatewayError;
@@ -45,6 +48,7 @@ pub struct Gateway {
     routing: ArcSwap<Routing>,
     upstream: Arc<dyn Upstream>,
     responses: Option<ResponseCache>,
+    usage: Option<Arc<dyn UsageStore>>,
 }
 
 /// The rules in force: the table a request is routed by and the chains it is processed by.
@@ -81,6 +85,7 @@ impl Gateway {
             }),
             upstream,
             responses: None,
+            usage: None,
         }
     }
 
@@ -101,6 +106,12 @@ impl Gateway {
         self
     }
 
+    /// Records what every request costs, an answer out of the cache included.
+    pub fn recording(mut self, usage: Arc<dyn UsageStore>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
     /// The rules this flow routes by, as they stand now.
     pub fn table(&self) -> Arc<RoutingTable> {
         Arc::clone(&self.routing.load().table)
@@ -115,6 +126,7 @@ impl Gateway {
         context: RequestContext,
         request: Request<GatewayBody>,
     ) -> Result<Response<GatewayBody>, GatewayError> {
+        let started = Instant::now();
         // One load, so the request is routed and processed by the same rules throughout.
         let routing = self.routing.load();
         let followed = Followed::of(&context);
@@ -138,12 +150,17 @@ impl Gateway {
         .await;
         let (mut processed, chains, api) = taken?;
         let followed = followed.serving(api);
+        let recording = self
+            .usage
+            .as_ref()
+            .and_then(|store| Recording::of(store, &followed, started));
 
         let Some(responses) = &self.responses else {
             let done = self.upstream_answer(processed, &chains, &followed).await?;
             let answered = stage_span!(EGRESS_RESPONSE, followed);
             answered.record("hit", false);
-            return async { done.into_response() }.instrument(answered).await;
+            let sent = async { done.into_response() }.instrument(answered).await?;
+            return Ok(measuring(sent, recording));
         };
         // A hit answers here, spending no tokens and running no response processor, as designed.
         let key = processed.response_key().await?;
@@ -151,6 +168,9 @@ impl Gateway {
             Ok(Some(hit)) => {
                 let answered = stage_span!(EGRESS_RESPONSE, followed);
                 answered.record("hit", true);
+                if let Some(recording) = recording {
+                    recording.out_of_the_cache(hit.body());
+                }
                 return Ok(answered.in_scope(|| answer_with(hit)));
             }
             Ok(None) => {}
@@ -165,7 +185,8 @@ impl Gateway {
         }
         let answered = stage_span!(EGRESS_RESPONSE, followed);
         answered.record("hit", false);
-        async { done.into_response() }.instrument(answered).await
+        let sent = async { done.into_response() }.instrument(answered).await?;
+        Ok(measuring(sent, recording))
     }
 
     /// Sends the request on and reads the answer back, each in its own span.
@@ -191,6 +212,18 @@ impl Gateway {
     }
 }
 
+/// Measures what an answer costs as it goes out, when there is anywhere to record it.
+fn measuring(
+    response: Response<GatewayBody>,
+    recording: Option<Recording>,
+) -> Response<GatewayBody> {
+    let Some(recording) = recording else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, recording.measuring(body))
+}
+
 /// Answers from what the cache held, without any stage after the request body running.
 fn answer_with(hit: CachedResponse) -> Response<GatewayBody> {
     let mut response = Response::new(from_bytes(hit.body().clone()));
@@ -209,6 +242,7 @@ mod tests {
     use super::*;
     use http::StatusCode;
     use http::header::CONTENT_LENGTH;
+    use ip_core::{Served, TokenCount, Tokens};
 
     use bytes::Bytes;
     use std::collections::HashMap;
@@ -526,6 +560,132 @@ mod tests {
             .unwrap();
         let answered = tracing::subscriber::with_default(subscriber, || runtime.block_on(work));
         (answered, opened)
+    }
+
+    /// An anthropic answer, and the same answer as the events of a stream.
+    const ANSWERED: &str =
+        r#"{"model":"claude-opus-5","usage":{"input_tokens":120,"output_tokens":30}}"#;
+    const EVENTS: [&str; 3] = [
+        "event: message_start\ndata: {\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":120}}}\n\n",
+        "event: content_block_delta\ndata: {\"delta\":{\"text\":\"hi\"}}\n\n",
+        "event: message_delta\ndata: {\"usage\":{\"output_tokens\":30}}\n\n",
+    ];
+
+    #[tokio::test]
+    async fn a_request_is_recorded_with_what_its_answer_said_it_cost() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        )
+        .recording(recorder);
+        let context = context(granted());
+        let trace = context.trace;
+        let answered = gateway
+            .handle(context, request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(body_of(answered).await, ANSWERED);
+
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(row.trace, trace);
+        assert_eq!(row.tenant, tenant());
+        assert_eq!(row.user, user());
+        assert_eq!(row.api, api());
+        assert_eq!(row.model.unwrap().as_str(), "claude-opus-5");
+        assert_eq!(
+            row.tokens,
+            Tokens::new(TokenCount::new(120), TokenCount::new(30))
+        );
+        assert_eq!(row.served, Served::Upstream);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_answer_is_recorded_once_its_last_event_has_gone() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(table(), ProcessorChain::new(), Arc::new(Streaming(&EVENTS)))
+            .recording(recorder);
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert!(recorded.try_recv().is_err(), "recorded before it was sent");
+
+        assert_eq!(body_of(answered).await, EVENTS.concat());
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(
+            row.tokens,
+            Tokens::new(TokenCount::new(120), TokenCount::new(30))
+        );
+        assert_eq!(row.model.unwrap().as_str(), "claude-opus-5");
+        assert_eq!(row.served, Served::Upstream);
+    }
+
+    #[tokio::test]
+    async fn an_answer_out_of_the_cache_is_recorded_as_spending_nothing() {
+        let (recorder, mut recorded) = Ledger::new();
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        )
+        .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
+        .recording(recorder);
+
+        let first = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(first).await;
+        assert_eq!(recorded.recv().await.unwrap().served, Served::Upstream);
+
+        let second = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(second).await;
+        let hit = recorded.recv().await.unwrap();
+        assert_eq!(hit.served, Served::Cache);
+        assert_eq!(hit.tokens, Tokens::ZERO);
+        assert_eq!(hit.model.unwrap().as_str(), "claude-opus-5");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_says_nothing_about_its_cost_is_still_recorded() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .recording(recorder);
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(row.tokens, Tokens::ZERO);
+        assert_eq!(row.model, None);
+        assert_eq!(row.served, Served::Upstream);
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_caller_abandons_is_recorded_all_the_same() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(table(), ProcessorChain::new(), Arc::new(Streaming(&EVENTS)))
+            .recording(recorder);
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        drop(answered);
+
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(row.served, Served::Upstream);
     }
 
     #[test]

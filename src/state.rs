@@ -99,7 +99,9 @@ impl AppState {
         let chains = PluginChains::load(Arc::clone(&host), store.as_ref(), store.as_ref()).await?;
         tracing::info!(rules = chains.len(), "plugin chains built");
         let upstream = Arc::new(HyperUpstream::new()?);
-        let mut gateway = Gateway::with_chains(table, Arc::new(chains), upstream);
+        let gateway = Gateway::with_chains(table, Arc::new(chains), upstream);
+        let mut gateway =
+            gateway.recording(Arc::clone(&backend) as Arc<dyn ip_storage::UsageStore>);
         if let Some(ttl) = config.cache.response_ttl() {
             let responses = ResponseCache::new(Arc::clone(&cache), Ttl::new(ttl.as_duration())?);
             gateway = gateway.caching(responses);

@@ -5,6 +5,7 @@ mod fixtures;
 mod followed;
 mod gateway;
 mod headers;
+mod record;
 mod run;
 mod stages;
 

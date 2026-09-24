@@ -20,6 +20,7 @@ use crate::error::ProcessorError;
 use crate::processor::{BodyProcessor, HeaderProcessor, ProcessorChain};
 use crate::table::RoutingTable;
 use crate::upstream::Upstream;
+use ip_storage::{NewUsage, StorageError, Usage, UsageRowId, UsageStore};
 
 /// Records what it was sent, and answers with what it was built with.
 pub(super) struct FakeUpstream {
@@ -300,4 +301,81 @@ pub(super) fn other_tenant() -> Authority {
         .into_iter()
         .collect();
     Authority::new(identity, grants)
+}
+
+/// Keeps every usage row it is given, so a test can wait for one.
+pub(super) struct Ledger {
+    written: tokio::sync::mpsc::UnboundedSender<Usage>,
+    next_row: std::sync::atomic::AtomicI64,
+}
+
+impl Ledger {
+    /// A store and the end a test reads what was recorded from.
+    pub(super) fn new() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<Usage>) {
+        let (written, read) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                written,
+                next_row: std::sync::atomic::AtomicI64::new(1),
+            }),
+            read,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl UsageStore for Ledger {
+    async fn record_usage(&self, usage: NewUsage) -> Result<Usage, StorageError> {
+        let row_id = UsageRowId::new(
+            self.next_row
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        );
+        let stored = Usage {
+            row_id,
+            trace: usage.trace,
+            turn: usage.turn,
+            tenant: usage.tenant,
+            user: usage.user,
+            api: usage.api,
+            model: usage.model,
+            tokens: usage.tokens,
+            served: usage.served,
+            latency: usage.latency,
+            created_at: ip_core::Timestamp::now(),
+        };
+        let _ = self.written.send(stored.clone());
+        Ok(stored)
+    }
+
+    async fn usage(&self, _: UsageRowId) -> Result<Option<Usage>, StorageError> {
+        Ok(None)
+    }
+}
+
+/// An upstream that answers a stream of events, one frame each.
+pub(super) struct Streaming(pub(super) &'static [&'static str]);
+
+#[async_trait::async_trait]
+impl Upstream for Streaming {
+    async fn send(
+        &self,
+        _: Request<GatewayBody>,
+    ) -> Result<Response<GatewayBody>, crate::error::UpstreamError> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(self.0.len() + 1);
+        for part in self.0 {
+            sender
+                .send(Ok(http_body::Frame::data(Bytes::from_static(
+                    part.as_bytes(),
+                ))))
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        Ok(Response::builder()
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(http_body_util::BodyExt::boxed_unsync(
+                crate::body::ChannelBody::new(receiver),
+            ))
+            .unwrap())
+    }
 }
