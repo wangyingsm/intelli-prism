@@ -14,6 +14,7 @@ use crate::error::StorageError;
 use crate::list::{ListStore, Listed, Page};
 use crate::model::Membership;
 use crate::plugin::{PluginOwner, PluginRecord};
+use crate::usage::{Usage, UsageFilter};
 
 fn created_at(row: &SqliteRow) -> Result<Timestamp, StorageError> {
     Ok(Timestamp::from_unix_seconds(row.get("created_at"))?)
@@ -201,6 +202,32 @@ impl ListStore for SqliteStore {
                 })
             })
             .collect()
+    }
+
+    async fn list_usage(
+        &self,
+        filter: &UsageFilter,
+        page: Page,
+    ) -> Result<Vec<Usage>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
+             input_tokens, output_tokens, served, latency_ms, created_at FROM usage \
+             WHERE created_at > ?1 \
+             AND (?2 IS NULL OR tenant_id = ?2) \
+             AND (?3 IS NULL OR user_id = ?3) \
+             AND (?4 IS NULL OR api_id = ?4) \
+             ORDER BY created_at DESC, row_id DESC LIMIT ?5 OFFSET ?6",
+        )
+        .bind(page.after_seconds())
+        .bind(filter.tenant.as_ref().map(TenantId::as_str))
+        .bind(filter.user.as_ref().map(UserId::as_str))
+        .bind(filter.api.as_ref().map(ApiId::as_str))
+        .bind(i64::from(page.limit()))
+        .bind(i64::from(page.offset()))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StorageError::backend)?;
+        rows.into_iter().map(super::usage::recorded).collect()
     }
 
     async fn list_rules(

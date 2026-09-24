@@ -71,6 +71,27 @@ pub struct NewUsage {
     pub latency: Latency,
 }
 
+/// Which recorded requests a list is narrowed to, each part admitting everything when unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageFilter {
+    /// Only what one tenant spent.
+    pub tenant: Option<TenantId>,
+    /// Only what one account spent.
+    pub user: Option<UserId>,
+    /// Only what went to one api.
+    pub api: Option<ApiId>,
+}
+
+impl UsageFilter {
+    /// Everything one tenant spent.
+    pub fn of_tenant(tenant: TenantId) -> Self {
+        Self {
+            tenant: Some(tenant),
+            ..Self::default()
+        }
+    }
+}
+
 /// Records what each request cost, and reads one back.
 ///
 /// A row is written for every request, an answer out of the cache included, so a quota counts

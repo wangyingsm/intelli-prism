@@ -16,7 +16,7 @@ use crate::plugin::{NewPlugin, Plugin, PluginOwner, PluginRecord, PluginRuleStor
 use crate::revision::{RevisionStore, RuleRevision, RuleSet};
 use crate::route::RouteStore;
 use crate::store::{Backend, GrantStore, MembershipStore, TenantStore, UserStore};
-use crate::usage::{NewUsage, Usage, UsageRowId, UsageStore};
+use crate::usage::{NewUsage, Usage, UsageFilter, UsageRowId, UsageStore};
 
 /// A store that answers like the one it wraps until the calls it was given run out, and
 /// refuses every call after that.
@@ -295,6 +295,15 @@ impl ListStore for FailingStore {
     ) -> Result<Vec<Listed<PluginRule>>, StorageError> {
         self.answering()?;
         self.inner.list_rules(tenant, page).await
+    }
+
+    async fn list_usage(
+        &self,
+        filter: &UsageFilter,
+        page: Page,
+    ) -> Result<Vec<Usage>, StorageError> {
+        self.answering()?;
+        self.inner.list_usage(filter, page).await
     }
 }
 

@@ -6,6 +6,7 @@ use ip_core::{Grant, PluginRule, RouteRule, TenantId, Timestamp, UserId};
 use crate::error::StorageError;
 use crate::model::Membership;
 use crate::plugin::{PluginOwner, PluginRecord};
+use crate::usage::{Usage, UsageFilter};
 
 /// How many records a page holds when the caller names no size.
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
@@ -104,6 +105,16 @@ pub trait ListStore: Send + Sync {
         owner: &PluginOwner,
         page: Page,
     ) -> Result<Vec<Listed<PluginRecord>>, StorageError>;
+
+    /// What was spent, newest first, narrowed to whatever the filter names.
+    ///
+    /// A usage row carries the moment it was recorded itself, so it is listed as it is stored
+    /// rather than wrapped in a date it already holds.
+    async fn list_usage(
+        &self,
+        filter: &UsageFilter,
+        page: Page,
+    ) -> Result<Vec<Usage>, StorageError>;
 
     /// The rules in one chain: a tenant's, or the global chain when none is named.
     async fn list_rules(
