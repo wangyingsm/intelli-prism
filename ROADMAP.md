@@ -47,6 +47,10 @@ deadlines and a memory cap per instance.
 - Instances come from a pooling allocator with imports resolved once at load.
 - Chains are built per request from stored rules, scoped globally or to a tenant, optionally
 narrowed to a user and an api, ordered within each stage.
+- The one thing a plugin may import is `ip::log(level, ptr, len)`, which writes a line at the
+level it names into the gateway's own logs and traces, under the span of the request that ran
+it. A module importing anything else is refused at load. Lines are cut to
+`PluginLimits::log_bytes`.
 
 ### Storage
 
