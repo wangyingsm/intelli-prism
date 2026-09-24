@@ -88,12 +88,16 @@ async fn run(
     input: Bytes,
 ) -> Result<Vec<u8>, ProcessorError> {
     let host = Arc::clone(host);
-    let outcome =
-        tokio::task::spawn_blocking(move || host.instantiate(&checksum)?.transform(&input))
-            .await
-            .map_err(|error| {
-                ProcessorError::failed(format!("plugin {checksum} did not finish: {error}"))
-            })?;
+    // The call leaves this task, so the span goes with it: what a plugin logs belongs to the
+    // request that ran it.
+    let span = tracing::Span::current();
+    let outcome = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| host.instantiate(&checksum)?.transform(&input))
+    })
+    .await
+    .map_err(|error| {
+        ProcessorError::failed(format!("plugin {checksum} did not finish: {error}"))
+    })?;
     match outcome {
         Ok(Transformed::Output(bytes)) => Ok(bytes),
         Ok(Transformed::Refused(reason)) => Err(ProcessorError::refused(reason)),
@@ -171,6 +175,24 @@ mod tests {
         assert_eq!(headers.get("content-type").unwrap(), "application/json");
         assert_eq!(headers.get("x-plugin").unwrap(), "seen");
         assert_eq!(headers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn what_a_plugin_logs_belongs_to_the_request_that_ran_it() {
+        use tracing::Instrument;
+
+        let heard = crate::testing::heard();
+        let host = Arc::new(host());
+        let checksum = load(&host, &talking(1)).unwrap();
+        let processor = WasmBodyProcessor::new(Arc::clone(&host), checksum, order());
+        let answered = processor
+            .process(Bytes::from_static(b"logged from a stage"))
+            .instrument(tracing::info_span!("ingress.request"))
+            .await;
+
+        assert_eq!(answered, Ok(Bytes::from_static(b"logged from a stage")));
+        // The call runs on a blocking thread, so this is the span having gone with it.
+        assert_eq!(heard.saying("logged from a stage").span, "ingress.request");
     }
 
     #[tokio::test]
