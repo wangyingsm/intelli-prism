@@ -54,6 +54,14 @@ secret = "replace-this-with-32-or-more-random-bytes"
 # Seconds a freshly issued token stays valid. Default 21600, six hours.
 ttl = 21600
 
+# What is kept of the record of every request.
+[usage]
+# How long a usage row is kept, in seconds. Unset keeps every row, which is the default:
+# what was spent is a business record, and removing one is an operator's decision.
+# retention = 2592000
+# How often rows past their keeping are swept away. Default one hour.
+# sweep_every = 3600
+
 [telemetry]
 # trace, debug, info, warn or error. Default info.
 log_level = "info"

@@ -26,6 +26,9 @@ pub struct Config {
     /// Logs, traces and metrics.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// What is kept of the record of every request.
+    #[serde(default)]
+    pub usage: UsageConfig,
     /// The upstream llm endpoints that can be routed to.
     #[serde(default, rename = "upstream")]
     pub upstreams: Vec<UpstreamConfig>,
@@ -213,6 +216,33 @@ impl TryFrom<f64> for SampleRatio {
     }
 }
 
+/// What is kept of the record of every request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageConfig {
+    /// How long a usage row is kept. Unset keeps every row, which is the default: a record of
+    /// what was spent is a business record, and deleting one is an operator's decision.
+    #[serde(default)]
+    pub retention: Option<Seconds>,
+    /// How often rows past their retention are swept away.
+    #[serde(default = "default_sweep_every")]
+    pub sweep_every: Seconds,
+}
+
+/// How often the sweeper runs when the file names no interval.
+const fn default_sweep_every() -> Seconds {
+    Seconds::new(3600)
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            retention: None,
+            sweep_every: default_sweep_every(),
+        }
+    }
+}
+
 /// Lowest level that reaches the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -305,6 +335,10 @@ issuer = "intelli-prism"
 secret = "0123456789abcdef0123456789abcdef"
 ttl = 900
 
+[usage]
+retention = 2592000
+sweep_every = 600
+
 [telemetry]
 log_level = "debug"
 otlp_endpoint = "http://localhost:4317/"
@@ -347,6 +381,8 @@ secret = "0123456789abcdef0123456789abcdef"
         );
         assert_eq!(config.auth.jwt.ttl, Seconds::new(900));
         assert_eq!(config.telemetry.log_level, LogLevel::Debug);
+        assert_eq!(config.usage.retention, Some(Seconds::new(2_592_000)));
+        assert_eq!(config.usage.sweep_every, Seconds::new(600));
         assert_eq!(
             config.telemetry.sample_ratio,
             SampleRatio::new(0.25).unwrap()
@@ -365,6 +401,8 @@ secret = "0123456789abcdef0123456789abcdef"
         assert_eq!(config.telemetry.log_level, LogLevel::Info);
         assert_eq!(config.telemetry.otlp_endpoint, None);
         assert_eq!(config.telemetry.sample_ratio, SampleRatio::default());
+        assert_eq!(config.usage, UsageConfig::default());
+        assert_eq!(config.usage.retention, None);
         assert_eq!(config.auth.nonce_ttl, Seconds::new(300));
         assert_eq!(config.auth.jwt.ttl, Seconds::new(6 * 3600));
         assert!(config.upstreams.is_empty());

@@ -7,7 +7,7 @@ pub mod upstream;
 
 pub use config::{
     AuthConfig, CacheConfig, Config, JwtConfig, LogLevel, SampleRatio, Seconds, ServerConfig,
-    StorageConfig, TelemetryConfig,
+    StorageConfig, TelemetryConfig, UsageConfig,
 };
 pub use error::ConfigError;
 pub use ip_core::ModelName;
