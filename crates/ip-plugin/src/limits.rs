@@ -11,6 +11,8 @@ pub struct PluginLimits {
     pub tick: Duration,
     /// Largest linear memory a module may grow to, in bytes.
     pub memory_bytes: usize,
+    /// Longest log line a plugin may write, in bytes. A longer one is cut to this.
+    pub log_bytes: usize,
 }
 
 impl PluginLimits {
@@ -29,6 +31,7 @@ impl Default for PluginLimits {
             deadline: Duration::from_millis(100),
             tick: Duration::from_millis(10),
             memory_bytes: 64 * 1024 * 1024,
+            log_bytes: 1024,
         }
     }
 }

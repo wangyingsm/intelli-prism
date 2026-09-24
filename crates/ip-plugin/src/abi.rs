@@ -11,6 +11,11 @@ pub const ALLOC: &str = "alloc";
 pub const DEALLOC: &str = "dealloc";
 /// The export that does the work: `transform(ptr: i32, len: i32) -> i64`.
 pub const TRANSFORM: &str = "transform";
+/// The module a plugin imports what the host offers from.
+pub const HOST_MODULE: &str = "ip";
+/// The one import a plugin may take: `log(level: i32, ptr: i32, len: i32)`.
+pub const LOG: &str = "log";
+
 /// Set in `transform`'s return when the plugin refuses; the span then holds its reason.
 pub const REFUSED: u64 = 1 << 63;
 

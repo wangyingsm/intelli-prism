@@ -10,7 +10,7 @@ use wasmtime::{
     PoolingAllocationConfig, Store, StoreLimits, StoreLimitsBuilder,
 };
 
-use crate::abi::{self, ALLOC, DEALLOC, MEMORY, Packed, TRANSFORM, Transformed};
+use crate::abi::{self, ALLOC, DEALLOC, HOST_MODULE, LOG, MEMORY, Packed, TRANSFORM, Transformed};
 use crate::error::PluginError;
 use crate::limits::PluginLimits;
 
@@ -20,6 +20,7 @@ const POOLED_CALLS: u32 = 1_000;
 /// Compiles plugins once, keeps them by checksum, and runs each call within its limits.
 pub struct PluginHost {
     engine: Engine,
+    linker: Linker<CallState>,
     modules: RwLock<HashMap<Checksum, InstancePre<CallState>>>,
     limits: PluginLimits,
     _clock: EpochClock,
@@ -53,6 +54,7 @@ impl PluginHost {
             Engine::new(&config).map_err(|error| PluginError::Engine(error.to_string()))?;
         let clock = EpochClock::start(engine.clone(), limits.tick)?;
         Ok(Self {
+            linker: log_linker(&engine)?,
             engine,
             modules: RwLock::new(HashMap::new()),
             limits,
@@ -82,19 +84,22 @@ impl PluginHost {
                 checksum: *checksum,
                 detail: error.to_string(),
             })?;
-        if let Some(import) = module.imports().next() {
-            return Err(PluginError::Imports {
-                checksum: *checksum,
-                import: format!("{}::{}", import.module(), import.name()),
-            });
+        for import in module.imports() {
+            if !(import.module() == HOST_MODULE && import.name() == LOG) {
+                return Err(PluginError::Imports {
+                    checksum: *checksum,
+                    import: format!("{}::{}", import.module(), import.name()),
+                });
+            }
         }
         abi::check_exports(*checksum, &module)?;
-        let prepared = Linker::<CallState>::new(&self.engine)
-            .instantiate_pre(&module)
-            .map_err(|error| PluginError::Instantiate {
-                checksum: *checksum,
-                detail: error.to_string(),
-            })?;
+        let prepared =
+            self.linker
+                .instantiate_pre(&module)
+                .map_err(|error| PluginError::Instantiate {
+                    checksum: *checksum,
+                    detail: error.to_string(),
+                })?;
         self.modules
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -146,6 +151,8 @@ impl PluginHost {
         let mut store = Store::new(
             &self.engine,
             CallState {
+                checksum: *checksum,
+                log_bytes: self.limits.log_bytes,
                 limits: StoreLimitsBuilder::new()
                     .memory_size(self.limits.memory_bytes)
                     .instances(1)
@@ -177,7 +184,48 @@ impl PluginHost {
 
 /// What a store carries for one call.
 pub(crate) struct CallState {
+    checksum: Checksum,
+    log_bytes: usize,
     limits: StoreLimits,
+}
+
+/// The linker every module is prepared against, holding the one import a plugin may take.
+fn log_linker(engine: &Engine) -> Result<Linker<CallState>, PluginError> {
+    let mut linker = Linker::<CallState>::new(engine);
+    linker
+        .func_wrap(
+            HOST_MODULE,
+            LOG,
+            |mut caller: wasmtime::Caller<'_, CallState>, level: i32, ptr: i32, len: i32| {
+                let Some(wasmtime::Extern::Memory(memory)) = caller.get_export(MEMORY) else {
+                    return;
+                };
+                let (checksum, cap) = {
+                    let state = caller.data();
+                    (state.checksum, state.log_bytes)
+                };
+                let len = (len.max(0) as usize).min(cap);
+                let mut line = vec![0_u8; len];
+                if memory
+                    .read(&caller, ptr.max(0) as usize, &mut line)
+                    .is_err()
+                {
+                    return;
+                }
+                let line = String::from_utf8_lossy(&line);
+                // A level outside the range is taken as the nearest end, so a plugin that
+                // miscounts is still heard rather than silently dropped.
+                match level {
+                    ..=0 => tracing::trace!(plugin = %checksum, "{line}"),
+                    1 => tracing::debug!(plugin = %checksum, "{line}"),
+                    2 => tracing::info!(plugin = %checksum, "{line}"),
+                    3 => tracing::warn!(plugin = %checksum, "{line}"),
+                    _ => tracing::error!(plugin = %checksum, "{line}"),
+                }
+            },
+        )
+        .map_err(|error| PluginError::Engine(error.to_string()))?;
+    Ok(linker)
 }
 
 /// One module instance and the store that bounds it, good for a single call.
@@ -351,6 +399,18 @@ mod tests {
         })
     }
 
+    /// A module keeping to the plugin abi that takes `import` before anything else.
+    fn importing(import: &str) -> String {
+        format!(
+            r#"(module
+  {import}
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "dealloc") (param i32 i32))
+  (func (export "transform") (param i32 i32) (result i64) (i64.const 0)))"#
+        )
+    }
+
     fn noop() -> String {
         conforming(1, r#"(func (export "noop"))"#)
     }
@@ -400,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn a_module_that_imports_anything_is_refused() {
+    fn a_module_that_imports_anything_but_the_log_is_refused() {
         let host = host();
         let (checksum, bytes) = wasm(
             r#"(module (import "wasi_snapshot_preview1" "fd_write"
@@ -413,6 +473,41 @@ mod tests {
                 import: "wasi_snapshot_preview1::fd_write".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn a_module_that_only_logs_is_loaded_and_runs() {
+        let host = host();
+        let checksum = loaded(&host, &crate::testing::talking(1));
+        let spoken = host
+            .instantiate(&checksum)
+            .unwrap()
+            .transform(b"a word")
+            .unwrap();
+        assert_eq!(spoken, Transformed::Output(b"a word".to_vec()));
+    }
+
+    #[test]
+    fn an_import_that_is_not_the_log_offered_is_refused() {
+        let host = host();
+        let (checksum, bytes) = wasm(&importing(r#"(import "ip" "shout" (func (param i32)))"#));
+        assert_eq!(
+            host.load(&checksum, &bytes),
+            Err(PluginError::Imports {
+                checksum,
+                import: "ip::shout".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_log_of_another_shape_does_not_instantiate() {
+        let host = host();
+        let (checksum, bytes) = wasm(&importing(r#"(import "ip" "log" (func (param i32)))"#));
+        assert!(matches!(
+            host.load(&checksum, &bytes),
+            Err(PluginError::Instantiate { .. })
+        ));
     }
 
     #[test]
@@ -586,5 +681,73 @@ mod tests {
             call(&mut invocation, "fail"),
             Err(PluginError::Trap { .. })
         ));
+    }
+
+    /// Runs the talking guest over `input`, under a host built with `limits`.
+    fn talked(level: i32, input: &[u8], limits: PluginLimits) -> Checksum {
+        crate::testing::heard();
+        let host = PluginHost::new(limits).unwrap();
+        let checksum = loaded(&host, &crate::testing::talking(level));
+        host.instantiate(&checksum)
+            .unwrap()
+            .transform(input)
+            .unwrap();
+        checksum
+    }
+
+    #[test]
+    fn what_a_plugin_logs_is_heard_at_the_level_it_asked_for() {
+        for (asked, level) in [
+            (0, tracing::Level::TRACE),
+            (1, tracing::Level::DEBUG),
+            (2, tracing::Level::INFO),
+            (3, tracing::Level::WARN),
+            (4, tracing::Level::ERROR),
+        ] {
+            let said = format!("a word at {asked}");
+            let checksum = talked(asked, said.as_bytes(), PluginLimits::default());
+            let line = crate::testing::heard().saying(&said);
+            assert_eq!(line.level, level);
+            assert_eq!(line.plugin, checksum.to_string());
+        }
+    }
+
+    #[test]
+    fn a_level_outside_the_range_is_taken_as_the_nearest_end() {
+        talked(-7, b"below every level", PluginLimits::default());
+        talked(9, b"above every level", PluginLimits::default());
+        let heard = crate::testing::heard();
+        assert_eq!(
+            heard.saying("below every level").level,
+            tracing::Level::TRACE
+        );
+        assert_eq!(
+            heard.saying("above every level").level,
+            tracing::Level::ERROR
+        );
+    }
+
+    #[test]
+    fn a_line_longer_than_a_plugin_may_write_is_cut_to_it() {
+        let limits = PluginLimits {
+            log_bytes: 8,
+            ..PluginLimits::default()
+        };
+        talked(1, b"far more than eight bytes", limits);
+        assert_eq!(
+            crate::testing::heard().saying("far more").message,
+            "far more"
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_not_text_is_heard_as_best_it_can_be() {
+        talked(1, b"broken \xff text", PluginLimits::default());
+        assert_eq!(
+            crate::testing::heard()
+                .saying("broken \u{fffd} text")
+                .message,
+            "broken \u{fffd} text"
+        );
     }
 }
