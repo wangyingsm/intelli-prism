@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use crate::cache::Cache;
+use crate::counter::Counters;
 use crate::error::{CacheError, ToldToFail};
 use crate::key::CacheKey;
 use crate::publication::{CacheBackend, Publication, Published};
@@ -103,6 +104,24 @@ impl Publication for FailingCache {
     async fn follow(&self, topic: &CacheKey) -> Result<watch::Receiver<u64>, CacheError> {
         self.answering()?;
         self.inner.follow(topic).await
+    }
+}
+
+#[async_trait]
+impl Counters for FailingCache {
+    async fn count(&self, key: &CacheKey, by: u64, ttl: Ttl) -> Result<u64, CacheError> {
+        self.answering()?;
+        self.inner.count(key, by, ttl).await
+    }
+
+    async fn counted(&self, key: &CacheKey) -> Result<Option<u64>, CacheError> {
+        self.answering()?;
+        self.inner.counted(key).await
+    }
+
+    async fn seed(&self, key: &CacheKey, from: u64, ttl: Ttl) -> Result<u64, CacheError> {
+        self.answering()?;
+        self.inner.seed(key, from, ttl).await
     }
 }
 

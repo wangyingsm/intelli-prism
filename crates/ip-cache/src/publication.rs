@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use crate::cache::Cache;
+use crate::counter::Counters;
 use crate::error::CacheError;
 use crate::key::CacheKey;
 
@@ -39,10 +40,10 @@ pub trait Publication: Send + Sync {
     async fn follow(&self, topic: &CacheKey) -> Result<watch::Receiver<u64>, CacheError>;
 }
 
-/// A cache that also publishes, which is what every backend is.
-pub trait CacheBackend: Cache + Publication {}
+/// A cache that also publishes and counts, which is what every backend is.
+pub trait CacheBackend: Cache + Publication + Counters {}
 
-impl<T> CacheBackend for T where T: Cache + Publication {}
+impl<T> CacheBackend for T where T: Cache + Publication + Counters {}
 
 /// Moves a follower on to `revision`, reporting whether that was news to it.
 pub(crate) fn announce(follower: &watch::Sender<u64>, revision: u64) -> bool {
