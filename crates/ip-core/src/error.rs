@@ -52,6 +52,20 @@ pub enum CoreError {
         value: String,
     },
 
+    /// Something a limit may count that this application does not.
+    #[error("unknown limit kind {value:?}")]
+    UnknownCounted {
+        /// The text that named no kind.
+        value: String,
+    },
+
+    /// A stretch of clock this application does not count over.
+    #[error("unknown period {value:?}")]
+    UnknownPeriod {
+        /// The text that named no period.
+        value: String,
+    },
+
     /// A plugin order outside the range its scope may use.
     #[error("order {order} is not available to a {scope} plugin rule")]
     OrderOutOfScope {
