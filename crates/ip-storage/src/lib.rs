@@ -5,6 +5,7 @@ mod codec;
 pub mod error;
 #[cfg(feature = "testing")]
 pub mod failing;
+pub mod limit;
 pub mod list;
 pub mod model;
 pub mod plugin;
@@ -24,6 +25,7 @@ pub mod usage;
 pub use error::{Entity, StorageError};
 #[cfg(feature = "testing")]
 pub use failing::FailingStore;
+pub use limit::{Limit, LimitStore, NewLimit};
 pub use list::{DEFAULT_PAGE_LIMIT, ListStore, Listed, MAX_PAGE_LIMIT, Page};
 pub use model::{
     AccountKind, MemberRemoved, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId,

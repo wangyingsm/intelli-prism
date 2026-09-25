@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use ip_core::{
-    Checksum, Grant, Grants, NewPluginRule, PassphraseHash, PluginKind, PluginOrder, PluginRule,
-    RouteKey, RouteRule, TenantId, Timestamp, UserId,
+    Checksum, Counted, Grant, Grants, LimitScope, NewPluginRule, PassphraseHash, Period,
+    PluginKind, PluginOrder, PluginRule, RouteKey, RouteRule, TenantId, Timestamp, UserId,
 };
 
 use crate::error::{StorageError, ToldToFail};
+use crate::limit::{Limit, LimitStore, NewLimit};
 use crate::list::{ListStore, Listed, Page};
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{NewPlugin, Plugin, PluginOwner, PluginRecord, PluginRuleStore, PluginStore};
@@ -335,6 +336,29 @@ impl UsageStore for FailingStore {
     async fn sweep_usage(&self, moment: Timestamp) -> Result<u64, StorageError> {
         self.answering()?;
         self.inner.sweep_usage(moment).await
+    }
+}
+
+#[async_trait]
+impl LimitStore for FailingStore {
+    async fn put_limit(&self, limit: NewLimit) -> Result<Limit, StorageError> {
+        self.answering()?;
+        self.inner.put_limit(limit).await
+    }
+
+    async fn remove_limit(
+        &self,
+        scope: &LimitScope,
+        counted: Counted,
+        period: Period,
+    ) -> Result<(), StorageError> {
+        self.answering()?;
+        self.inner.remove_limit(scope, counted, period).await
+    }
+
+    async fn limits(&self) -> Result<Vec<Limit>, StorageError> {
+        self.answering()?;
+        self.inner.limits().await
     }
 }
 

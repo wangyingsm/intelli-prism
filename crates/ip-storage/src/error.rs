@@ -97,6 +97,8 @@ pub enum Entity {
     RuleRevision,
     /// What one request cost.
     Usage,
+    /// What a scope may spend.
+    Limit,
 }
 
 impl fmt::Display for Entity {
@@ -111,6 +113,7 @@ impl fmt::Display for Entity {
             Self::PluginRule => "plugin rule",
             Self::RuleRevision => "rule revision",
             Self::Usage => "usage",
+            Self::Limit => "limit",
         })
     }
 }

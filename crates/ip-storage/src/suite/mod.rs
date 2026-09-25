@@ -1,6 +1,7 @@
 //! Tests every storage backend must pass, written once and run against each backend.
 
 pub(crate) mod identity;
+pub(crate) mod limit;
 pub(crate) mod list;
 pub(crate) mod member_add;
 pub(crate) mod member_remove;
@@ -171,6 +172,21 @@ macro_rules! backend_suite {
             an_owner_that_is_not_there_leaves_no_wasm_behind,
         ]);
     };
+    (limit, $open:path) => {
+        $crate::suite::backend_suite!(@module limit, $open, [
+            a_limit_round_trips,
+            every_scope_shape_round_trips,
+            setting_the_same_limit_again_replaces_what_it_allows,
+            one_scope_holds_a_limit_per_thing_counted_and_period,
+            removing_a_limit_leaves_the_others,
+            removing_a_limit_that_is_absent_reports_it_missing,
+            a_limit_on_a_tenant_that_is_not_there_is_refused,
+            a_limit_on_a_user_that_is_not_there_is_refused,
+            deleting_a_tenant_takes_its_limits_with_it,
+            deleting_a_user_takes_the_limits_named_for_it,
+            every_change_to_a_limit_moves_the_revision_on,
+        ]);
+    };
     (usage, $open:path) => {
         $crate::suite::backend_suite!(@module usage, $open, [
             a_recorded_request_round_trips,
@@ -196,6 +212,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(list, $open);
         $crate::suite::backend_suite!(revision, $open);
         $crate::suite::backend_suite!(usage, $open);
+        $crate::suite::backend_suite!(limit, $open);
     };
 }
 
