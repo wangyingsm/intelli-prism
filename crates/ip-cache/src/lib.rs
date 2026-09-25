@@ -3,6 +3,7 @@
 pub mod cache;
 #[cfg(feature = "cluster-cache")]
 pub mod cluster;
+pub mod counter;
 pub mod error;
 #[cfg(all(
     feature = "testing",
@@ -22,6 +23,7 @@ pub mod ttl;
 pub use cache::Cache;
 #[cfg(feature = "cluster-cache")]
 pub use cluster::{Prefix, RedisCache};
+pub use counter::Counters;
 pub use error::CacheError;
 #[cfg(all(
     feature = "testing",
