@@ -1,6 +1,6 @@
 use std::fmt;
 
-use chrono::{DateTime, SubsecRound, TimeZone, Utc};
+use chrono::{DateTime, Datelike, SubsecRound, TimeZone, Utc};
 
 use crate::error::CoreError;
 
@@ -28,6 +28,28 @@ impl Timestamp {
     /// Whole seconds since the unix epoch, as it is stored.
     pub fn unix_seconds(&self) -> i64 {
         self.0.timestamp()
+    }
+
+    /// Midnight utc on the first of the month this moment falls in.
+    pub fn month_began(&self) -> Self {
+        Self(
+            self.0
+                .with_day(1)
+                .and_then(|first| first.with_time(chrono::NaiveTime::MIN).single())
+                .unwrap_or(self.0),
+        )
+    }
+
+    /// Midnight utc on the first of the month after the one this moment falls in.
+    pub fn next_month(&self) -> Self {
+        let first = self.month_began().0;
+        let next = match first.month() {
+            12 => first
+                .with_year(first.year() + 1)
+                .and_then(|y| y.with_month(1)),
+            month => first.with_month(month + 1),
+        };
+        Self(next.unwrap_or(first))
     }
 
     /// The moment in rfc 3339 form, for logs and audit records.
