@@ -7,6 +7,7 @@ use redis::{Client, cmd};
 use tokio::sync::watch;
 
 use crate::cache::Cache;
+use crate::counter::Counters;
 use crate::error::CacheError;
 use crate::key::CacheKey;
 use crate::publication::{Publication, Published, announce};
@@ -135,6 +136,25 @@ redis.call('PUBLISH', KEYS[2], ARGV[1])
 return 1
 ";
 
+/// Adds to a count, giving it the stretch it belongs to the first time. A count that lost its
+/// expiry, which nothing here does, is given it again rather than left to outlive its period.
+const COUNT: &str = r"
+local total = redis.call('INCRBY', KEYS[1], ARGV[1])
+if redis.call('PTTL', KEYS[1]) < 0 then
+    redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return total
+";
+
+/// Starts a count unless one is there, which is what seeding from storage needs: however many
+/// nodes seed at once, the first decides and the rest read what it wrote.
+const SEED: &str = r"
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+    return tonumber(ARGV[1])
+end
+return tonumber(redis.call('GET', KEYS[1]))
+";
+
 /// How long a follower waits before subscribing again after losing its connection.
 const RESUBSCRIBE_FIRST: Duration = Duration::from_secs(1);
 
@@ -200,6 +220,44 @@ impl RedisCache {
                 announce(&follower, published.revision);
             }
         }
+    }
+}
+
+#[async_trait]
+impl Counters for RedisCache {
+    async fn count(&self, key: &CacheKey, by: u64, ttl: Ttl) -> Result<u64, CacheError> {
+        let mut connection = self.connection.clone();
+        cmd("EVAL")
+            .arg(COUNT)
+            .arg(1)
+            .arg(self.scoped(key))
+            .arg(by)
+            .arg(millis(ttl))
+            .query_async(&mut connection)
+            .await
+            .map_err(CacheError::backend)
+    }
+
+    async fn counted(&self, key: &CacheKey) -> Result<Option<u64>, CacheError> {
+        let mut connection = self.connection.clone();
+        cmd("GET")
+            .arg(self.scoped(key))
+            .query_async(&mut connection)
+            .await
+            .map_err(CacheError::backend)
+    }
+
+    async fn seed(&self, key: &CacheKey, from: u64, ttl: Ttl) -> Result<u64, CacheError> {
+        let mut connection = self.connection.clone();
+        cmd("EVAL")
+            .arg(SEED)
+            .arg(1)
+            .arg(self.scoped(key))
+            .arg(from)
+            .arg(millis(ttl))
+            .query_async(&mut connection)
+            .await
+            .map_err(CacheError::backend)
     }
 }
 
@@ -324,6 +382,21 @@ pub(crate) mod scratch {
         }
     }
 
+    #[async_trait]
+    impl Counters for ScratchCache {
+        async fn count(&self, key: &CacheKey, by: u64, ttl: Ttl) -> Result<u64, CacheError> {
+            self.inner.count(key, by, ttl).await
+        }
+
+        async fn counted(&self, key: &CacheKey) -> Result<Option<u64>, CacheError> {
+            self.inner.counted(key).await
+        }
+
+        async fn seed(&self, key: &CacheKey, from: u64, ttl: Ttl) -> Result<u64, CacheError> {
+            self.inner.seed(key, from, ttl).await
+        }
+    }
+
     impl Drop for ScratchCache {
         fn drop(&mut self) {
             // The cache's own connection belongs to the test's runtime, which a drop cannot drive.
@@ -369,6 +442,7 @@ pub(crate) mod scratch {
 mod suite {
     crate::suite::cache_suite!(crate::cluster::scratch::cache);
     crate::suite::publication_suite!(crate::cluster::scratch::cache);
+    crate::suite::counter_suite!(crate::cluster::scratch::cache);
 }
 
 #[cfg(test)]
