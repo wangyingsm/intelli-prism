@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Latency, ModelName, Served, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Latency, ModelName, Served, TenantId, Timestamp, Tokens, TraceId, TurnId,
+    UserId,
 };
 
 use crate::error::StorageError;
@@ -106,4 +107,13 @@ pub trait UsageStore: Send + Sync {
 
     /// Removes every row recorded before `moment`, reporting how many went.
     async fn sweep_usage(&self, moment: Timestamp) -> Result<u64, StorageError>;
+
+    /// What the rows matching `filter` hold of `counted` since `moment`, the moment itself
+    /// included, which is what a lost count is seeded from.
+    async fn spent(
+        &self,
+        filter: &UsageFilter,
+        counted: Counted,
+        moment: Timestamp,
+    ) -> Result<u64, StorageError>;
 }

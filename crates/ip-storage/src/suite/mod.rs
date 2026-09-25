@@ -200,6 +200,9 @@ macro_rules! backend_suite {
             a_moment_to_list_after_keeps_what_came_before_it_out,
             a_listed_row_carries_everything_it_was_recorded_with,
             rows_past_their_keeping_are_swept_away,
+            what_was_spent_is_summed_for_a_scope_since_a_moment,
+            what_was_spent_before_the_moment_is_not_counted,
+            nothing_spent_sums_to_nothing,
         ]);
     };
     ($open:path) => {

@@ -79,6 +79,15 @@ mod tests {
             self.0.lock().unwrap().push(moment);
             Ok(1)
         }
+
+        async fn spent(
+            &self,
+            _: &ip_storage::UsageFilter,
+            _: ip_core::Counted,
+            _: Timestamp,
+        ) -> Result<u64, StorageError> {
+            unreachable!("the sweeper counts nothing")
+        }
     }
 
     fn config(retention: Option<u64>) -> UsageConfig {

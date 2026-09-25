@@ -337,6 +337,16 @@ impl UsageStore for FailingStore {
         self.answering()?;
         self.inner.sweep_usage(moment).await
     }
+
+    async fn spent(
+        &self,
+        filter: &UsageFilter,
+        counted: Counted,
+        moment: Timestamp,
+    ) -> Result<u64, StorageError> {
+        self.answering()?;
+        self.inner.spent(filter, counted, moment).await
+    }
 }
 
 #[async_trait]

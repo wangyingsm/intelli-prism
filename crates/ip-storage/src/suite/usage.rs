@@ -1,5 +1,6 @@
 use ip_core::{
-    ApiId, Latency, ModelName, Served, TenantId, TokenCount, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Latency, ModelName, Served, TenantId, TokenCount, Tokens, TraceId, TurnId,
+    UserId,
 };
 
 use crate::list::Page;
@@ -250,4 +251,115 @@ pub(crate) async fn rows_past_their_keeping_are_swept_away(store: &impl Backend)
             .is_empty()
     );
     assert_eq!(store.usage(old.row_id).await.unwrap(), None);
+}
+
+pub(crate) async fn what_was_spent_is_summed_for_a_scope_since_a_moment(store: &impl Backend) {
+    let now = ip_core::Timestamp::now();
+    spent_by(
+        store,
+        &[
+            ("acme", "alice", "anthropic"),
+            ("acme", "bob", "openai"),
+            ("other", "carol", "anthropic"),
+        ],
+    )
+    .await;
+
+    // Every row holds 120 in and 30 out.
+    let long_ago = ip_core::Timestamp::from_unix_seconds(now.unix_seconds() - 3600).unwrap();
+    let everywhere = UsageFilter::default();
+    assert_eq!(
+        store
+            .spent(&everywhere, Counted::Tokens, long_ago)
+            .await
+            .unwrap(),
+        450
+    );
+    assert_eq!(
+        store
+            .spent(&everywhere, Counted::Requests, long_ago)
+            .await
+            .unwrap(),
+        3
+    );
+
+    let acme = UsageFilter::of_tenant(TenantId::new("acme").unwrap());
+    assert_eq!(
+        store.spent(&acme, Counted::Tokens, long_ago).await.unwrap(),
+        300
+    );
+    assert_eq!(
+        store
+            .spent(&acme, Counted::Requests, long_ago)
+            .await
+            .unwrap(),
+        2
+    );
+
+    let alice = UsageFilter {
+        user: Some(UserId::new("alice").unwrap()),
+        ..acme.clone()
+    };
+    assert_eq!(
+        store
+            .spent(&alice, Counted::Tokens, long_ago)
+            .await
+            .unwrap(),
+        150
+    );
+
+    let openai = UsageFilter {
+        api: Some(ApiId::new("openai").unwrap()),
+        ..acme
+    };
+    assert_eq!(
+        store
+            .spent(&openai, Counted::Requests, long_ago)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+pub(crate) async fn what_was_spent_before_the_moment_is_not_counted(store: &impl Backend) {
+    spent_by(store, &[("acme", "alice", "anthropic")]).await;
+    let now = ip_core::Timestamp::now();
+    let filter = UsageFilter::default();
+
+    // The moment a period begins counts what was spent in it, so the row now is inside.
+    assert_eq!(
+        store.spent(&filter, Counted::Requests, now).await.unwrap(),
+        1
+    );
+    let later = ip_core::Timestamp::from_unix_seconds(now.unix_seconds() + 1).unwrap();
+    assert_eq!(
+        store
+            .spent(&filter, Counted::Requests, later)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store.spent(&filter, Counted::Tokens, later).await.unwrap(),
+        0
+    );
+}
+
+pub(crate) async fn nothing_spent_sums_to_nothing(store: &impl Backend) {
+    let long_ago = ip_core::Timestamp::from_unix_seconds(0).unwrap();
+    let nobody = UsageFilter::of_tenant(TenantId::new("nobody").unwrap());
+    assert_eq!(
+        store
+            .spent(&nobody, Counted::Tokens, long_ago)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .spent(&nobody, Counted::Requests, long_ago)
+            .await
+            .unwrap(),
+        0
+    );
 }

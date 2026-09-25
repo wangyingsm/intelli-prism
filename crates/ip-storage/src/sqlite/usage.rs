@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use ip_core::{ApiId, ModelName, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId};
+use ip_core::{ApiId, Counted, ModelName, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use super::SqliteStore;
 use crate::codec::{latency, served as served_of, served_name, token_count};
 use crate::error::{Entity, StorageError};
-use crate::usage::{NewUsage, Usage, UsageRowId, UsageStore};
+use crate::usage::{NewUsage, Usage, UsageFilter, UsageRowId, UsageStore};
 
 #[async_trait]
 impl UsageStore for SqliteStore {
@@ -58,6 +58,39 @@ impl UsageStore for SqliteStore {
         .await
         .map_err(StorageError::backend)?;
         row.map(recorded).transpose()
+    }
+
+    async fn spent(
+        &self,
+        filter: &UsageFilter,
+        counted: Counted,
+        moment: Timestamp,
+    ) -> Result<u64, StorageError> {
+        let query = match counted {
+            Counted::Tokens => sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM usage \
+                 WHERE created_at >= ?1 \
+                 AND (?2 IS NULL OR tenant_id = ?2) \
+                 AND (?3 IS NULL OR user_id = ?3) \
+                 AND (?4 IS NULL OR api_id = ?4)",
+            ),
+            Counted::Requests => sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM usage \
+                 WHERE created_at >= ?1 \
+                 AND (?2 IS NULL OR tenant_id = ?2) \
+                 AND (?3 IS NULL OR user_id = ?3) \
+                 AND (?4 IS NULL OR api_id = ?4)",
+            ),
+        };
+        let spent = query
+            .bind(moment.unix_seconds())
+            .bind(filter.tenant.as_ref().map(TenantId::as_str))
+            .bind(filter.user.as_ref().map(UserId::as_str))
+            .bind(filter.api.as_ref().map(ApiId::as_str))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StorageError::backend)?;
+        Ok(u64::try_from(spent).unwrap_or(0))
     }
 
     async fn sweep_usage(&self, moment: Timestamp) -> Result<u64, StorageError> {
