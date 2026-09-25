@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::cache::Cache;
+use crate::counter::Counters;
 use crate::key::{CacheKey, CacheLevel};
 use crate::publication::Publication;
 use crate::ttl::Ttl;
@@ -270,3 +271,90 @@ macro_rules! publication_suite {
 }
 
 pub(crate) use publication_suite;
+
+pub(crate) async fn a_count_starts_where_the_first_call_puts_it(counters: &impl Counters) {
+    assert_eq!(counters.counted(&key("fresh")).await.unwrap(), None);
+    assert_eq!(
+        counters.count(&key("fresh"), 3, a_while()).await.unwrap(),
+        3
+    );
+    assert_eq!(counters.counted(&key("fresh")).await.unwrap(), Some(3));
+}
+
+pub(crate) async fn counting_again_adds_to_what_is_there(counters: &impl Counters) {
+    counters.count(&key("adding"), 10, a_while()).await.unwrap();
+    assert_eq!(
+        counters.count(&key("adding"), 5, a_while()).await.unwrap(),
+        15
+    );
+    assert_eq!(counters.counted(&key("adding")).await.unwrap(), Some(15));
+}
+
+pub(crate) async fn a_count_lets_go_of_itself_once_its_stretch_passes(counters: &impl Counters) {
+    counters
+        .count(&key("passing"), 7, a_moment())
+        .await
+        .unwrap();
+    tokio::time::sleep(a_moment().get() * 3).await;
+    assert_eq!(counters.counted(&key("passing")).await.unwrap(), None);
+    assert_eq!(
+        counters.count(&key("passing"), 1, a_while()).await.unwrap(),
+        1
+    );
+}
+
+pub(crate) async fn seeding_decides_only_when_nothing_is_counted(counters: &impl Counters) {
+    assert_eq!(
+        counters.seed(&key("seeded"), 100, a_while()).await.unwrap(),
+        100
+    );
+    assert_eq!(
+        counters.seed(&key("seeded"), 999, a_while()).await.unwrap(),
+        100
+    );
+    assert_eq!(counters.counted(&key("seeded")).await.unwrap(), Some(100));
+
+    counters.count(&key("seeded"), 5, a_while()).await.unwrap();
+    assert_eq!(
+        counters.seed(&key("seeded"), 999, a_while()).await.unwrap(),
+        105
+    );
+}
+
+pub(crate) async fn a_seeded_count_carries_on_from_what_it_was_seeded_with(
+    counters: &impl Counters,
+) {
+    counters.seed(&key("carried"), 40, a_while()).await.unwrap();
+    assert_eq!(
+        counters.count(&key("carried"), 2, a_while()).await.unwrap(),
+        42
+    );
+}
+
+pub(crate) async fn counts_under_different_keys_never_meet(counters: &impl Counters) {
+    counters.count(&key("mine"), 1, a_while()).await.unwrap();
+    counters.count(&key("yours"), 2, a_while()).await.unwrap();
+    assert_eq!(counters.counted(&key("mine")).await.unwrap(), Some(1));
+    assert_eq!(counters.counted(&key("yours")).await.unwrap(), Some(2));
+}
+
+/// Writes one `#[tokio::test]` per shared counter test, each on a fresh cache from `$open`.
+macro_rules! counter_suite {
+    ($open:path) => {
+        mod counter {
+            $crate::suite::cache_suite!(
+                $open,
+                [
+                    a_count_starts_where_the_first_call_puts_it,
+                    counting_again_adds_to_what_is_there,
+                    a_count_lets_go_of_itself_once_its_stretch_passes,
+                    seeding_decides_only_when_nothing_is_counted,
+                    a_seeded_count_carries_on_from_what_it_was_seeded_with,
+                    counts_under_different_keys_never_meet,
+                ]
+            );
+        }
+    };
+}
+
+pub(crate) use counter_suite;

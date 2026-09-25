@@ -7,6 +7,7 @@ use sled::{Db, IVec, Tree};
 use tokio::sync::watch;
 
 use crate::cache::Cache;
+use crate::counter::{Counters, count_of, counted_bytes};
 use crate::error::CacheError;
 use crate::key::{CacheKey, CacheLevel};
 use crate::limits::LevelLimits;
@@ -266,6 +267,73 @@ impl Cache for SledCache {
     }
 }
 
+#[async_trait]
+impl Counters for SledCache {
+    async fn count(&self, key: &CacheKey, by: u64, ttl: Ttl) -> Result<u64, CacheError> {
+        self.counting(key, ttl, move |counted| {
+            counted.unwrap_or(0).saturating_add(by)
+        })
+        .await
+    }
+
+    async fn counted(&self, key: &CacheKey) -> Result<Option<u64>, CacheError> {
+        let this = self.clone();
+        let level = key.level();
+        let key = key.as_str().to_owned();
+        blocking(move || {
+            let held = this.entries.get(&key).map_err(CacheError::backend)?;
+            match held.as_deref().and_then(|entry| value_of(entry, now())) {
+                Some(counted) => count_of(counted).map(Some),
+                None => {
+                    this.drop_entry(level, key.as_bytes())?;
+                    Ok(None)
+                }
+            }
+        })
+        .await
+    }
+
+    async fn seed(&self, key: &CacheKey, from: u64, ttl: Ttl) -> Result<u64, CacheError> {
+        self.counting(key, ttl, move |counted| counted.unwrap_or(from))
+            .await
+    }
+}
+
+impl SledCache {
+    /// Replaces a count with what `next` makes of it, retrying until no other writer lands in
+    /// between, which is what one node counting for several requests at once needs.
+    async fn counting(
+        &self,
+        key: &CacheKey,
+        ttl: Ttl,
+        next: impl Fn(Option<u64>) -> u64 + Send + 'static,
+    ) -> Result<u64, CacheError> {
+        let this = self.clone();
+        let level = key.level();
+        let key = key.as_str().to_owned();
+        blocking(move || {
+            loop {
+                let held = this.entries.get(&key).map_err(CacheError::backend)?;
+                let counted = match held.as_deref().and_then(|entry| value_of(entry, now())) {
+                    Some(counted) => Some(count_of(counted)?),
+                    None => None,
+                };
+                let total = next(counted);
+                let written = entry(&counted_bytes(total), Some(ttl));
+                let swapped = this
+                    .entries
+                    .compare_and_swap(&key, held.clone(), Some(IVec::from(written.clone())))
+                    .map_err(CacheError::backend)?;
+                if swapped.is_ok() {
+                    this.write(level, key.as_bytes(), &written)?;
+                    return Ok(total);
+                }
+            }
+        })
+        .await
+    }
+}
+
 /// Runs sled's blocking work off the reactor.
 async fn blocking<T, F>(work: F) -> Result<T, CacheError>
 where
@@ -419,6 +487,7 @@ mod suite {
 
     crate::suite::cache_suite!(crate::standalone::suite::open);
     crate::suite::publication_suite!(crate::standalone::suite::open);
+    crate::suite::counter_suite!(crate::standalone::suite::open);
 }
 
 #[cfg(test)]
