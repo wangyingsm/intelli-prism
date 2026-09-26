@@ -315,12 +315,12 @@ fn resolve(table: &RoutingTable, key: &RouteKey) -> Result<Resolution, GatewayEr
     if let Some(target) = resolution
         .targets()
         .iter()
-        .find(|target| !target.protocol.is_forwarded())
+        .find(|target| !target.endpoint.protocol.is_forwarded())
     {
         return Err(GatewayError::new(
             Authorized::NAME,
             GatewayErrorKind::ProtocolNotServed {
-                protocol: target.protocol,
+                protocol: target.endpoint.protocol,
             },
         ));
     }

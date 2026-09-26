@@ -2,6 +2,7 @@
 
 pub mod body;
 pub mod cache;
+pub mod dispatch;
 pub mod error;
 pub mod flow;
 pub mod hyper_upstream;
@@ -15,6 +16,7 @@ pub mod upstream;
 
 pub use body::{BoxError, GatewayBody};
 pub use cache::{CachedResponse, Freshness, ResponseCache, freshness, response_key};
+pub use dispatch::{Chosen, Dispatcher};
 pub use error::{GatewayError, GatewayErrorKind, ProcessorError, RouteError, UpstreamError};
 pub use flow::{Flow, Gateway, RequestContext};
 pub use hyper_upstream::{HyperUpstream, UpstreamSettings};

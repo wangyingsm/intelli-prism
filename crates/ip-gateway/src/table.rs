@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use ip_config::Config;
-use ip_core::{AbsPath, Endpoint, Host, Port, Protocol, RouteKey, RouteRule};
+use ip_core::{AbsPath, Endpoint, Host, Port, Protocol, RouteKey, RouteRule, Weighted};
+use std::sync::Arc;
+
+use crate::dispatch::Plan;
 use ip_storage::RouteStore;
 
 use crate::error::RouteError;
@@ -11,27 +14,33 @@ use crate::error::RouteError;
 type Authority = (Protocol, Host, Port);
 
 /// Where a matched request may be sent, and the rule that sent it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Resolution {
     rule: RouteRule,
-    targets: Vec<Endpoint>,
+    targets: Vec<Weighted>,
+    plan: Arc<Plan>,
 }
 
 impl Resolution {
-    /// Every endpoint the request may go to, each with the unmatched path remainder
-    /// already appended. Which one it goes to is a dispatch decision.
-    pub fn targets(&self) -> &[Endpoint] {
+    /// Every endpoint the request may go to, each with the unmatched path remainder already
+    /// appended and the share it takes. Which one it goes to is a dispatch decision.
+    pub fn targets(&self) -> &[Weighted] {
         &self.targets
     }
 
-    /// The endpoint used until a dispatch algorithm chooses between them.
+    /// The first endpoint, which is where a rule with one goes.
     pub fn primary(&self) -> &Endpoint {
-        &self.targets[0]
+        &self.targets[0].endpoint
     }
 
     /// The rule that matched.
     pub fn rule(&self) -> &RouteRule {
         &self.rule
+    }
+
+    /// How this rule dispatches, worked out when the table was built.
+    pub fn plan(&self) -> &Arc<Plan> {
+        &self.plan
     }
 }
 
@@ -40,7 +49,21 @@ impl Resolution {
 pub struct RoutingTable {
     /// Rules grouped by the part of the key that matches exactly, each group ordered
     /// longest path first so the first match found is the longest one.
-    by_authority: HashMap<Authority, Vec<RouteRule>>,
+    by_authority: HashMap<Authority, Vec<Planned>>,
+}
+
+/// A rule and what a dispatcher needs to know about its endpoints.
+#[derive(Debug, Clone)]
+struct Planned {
+    rule: RouteRule,
+    plan: Arc<Plan>,
+}
+
+impl From<RouteRule> for Planned {
+    fn from(rule: RouteRule) -> Self {
+        let plan = Arc::new(Plan::of(rule.target.weighted()));
+        Self { rule, plan }
+    }
 }
 
 impl RoutingTable {
@@ -81,22 +104,23 @@ impl RoutingTable {
     }
 
     pub(crate) fn from_rules(rules: Vec<RouteRule>) -> Self {
-        let mut by_authority: HashMap<Authority, Vec<RouteRule>> = HashMap::new();
+        let mut by_authority: HashMap<Authority, Vec<Planned>> = HashMap::new();
         for rule in rules {
             by_authority
                 .entry(authority(rule.key.endpoint()))
                 .or_default()
-                .push(rule);
+                .push(Planned::from(rule));
         }
         for group in by_authority.values_mut() {
             group.sort_by(|left, right| {
                 right
+                    .rule
                     .key
                     .endpoint()
                     .path
                     .as_str()
                     .len()
-                    .cmp(&left.key.endpoint().path.as_str().len())
+                    .cmp(&left.rule.key.endpoint().path.as_str().len())
             });
         }
         Self { by_authority }
@@ -109,25 +133,31 @@ impl RoutingTable {
     pub fn resolve(&self, key: &RouteKey) -> Option<Resolution> {
         let requested = key.endpoint();
         let group = self.by_authority.get(&authority(requested))?;
-        for rule in group {
+        for planned in group {
+            let rule = &planned.rule;
             let Some(remainder) =
                 remainder_of(rule.key.endpoint().path.as_str(), requested.path.as_str())
             else {
                 continue;
             };
-            let mut targets = Vec::with_capacity(rule.target.endpoints().len());
-            for target in rule.target.endpoints() {
-                let path = AbsPath::new(&join(target.path.as_str(), remainder)).ok()?;
-                targets.push(Endpoint::new(
-                    target.protocol,
-                    target.host.clone(),
-                    target.port,
-                    path,
+            let mut targets = Vec::with_capacity(rule.target.weighted().len());
+            for target in rule.target.weighted() {
+                let endpoint = &target.endpoint;
+                let path = AbsPath::new(&join(endpoint.path.as_str(), remainder)).ok()?;
+                targets.push(Weighted::weighing(
+                    Endpoint::new(
+                        endpoint.protocol,
+                        endpoint.host.clone(),
+                        endpoint.port,
+                        path,
+                    ),
+                    target.weight,
                 ));
             }
             return Some(Resolution {
                 rule: rule.clone(),
                 targets,
+                plan: Arc::clone(&planned.plan),
             });
         }
         None
@@ -145,7 +175,10 @@ impl RoutingTable {
 
     /// Every rule in force, in no particular order.
     pub fn rules(&self) -> impl Iterator<Item = &RouteRule> {
-        self.by_authority.values().flatten()
+        self.by_authority
+            .values()
+            .flatten()
+            .map(|planned| &planned.rule)
     }
 }
 
@@ -405,7 +438,11 @@ model = "claude-opus-5"
         .unwrap();
         let table = table(vec![replicated]);
         let resolved = table.resolve(&key("/anthropic/messages")).unwrap();
-        let rendered: Vec<String> = resolved.targets().iter().map(ToString::to_string).collect();
+        let rendered: Vec<String> = resolved
+            .targets()
+            .iter()
+            .map(|target| target.endpoint.to_string())
+            .collect();
         assert_eq!(
             rendered,
             vec![

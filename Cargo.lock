@@ -1449,6 +1449,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
+ "getrandom 0.4.3",
  "hex",
  "http",
  "http-body",
