@@ -31,13 +31,6 @@ pub struct NewLimit {
     pub allowance: Allowance,
 }
 
-impl NewLimit {
-    /// What identifies this limit: one scope may hold one limit per thing counted per period.
-    pub fn key(&self) -> (&LimitScope, Counted, Period) {
-        (&self.scope, self.counted, self.period)
-    }
-}
-
 /// Sets and reads what tenants and their accounts may spend.
 ///
 /// Every node keeps the whole set in memory and is told to rebuild it by the rule revision,
