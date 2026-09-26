@@ -121,6 +121,28 @@ which a tenant owner does by standing.
 it is unset.
 - The records of the last requests answered are waited for before the process ends.
 
+### Quota and rate limits
+
+- A limit is a scope, a thing counted and a stretch of clock: a tenant, optionally narrowed to
+one of its accounts and to one api, counting tokens or requests over a minute, an hour, a day or
+a calendar month. Of the scopes a request falls inside, the narrowest decides, so a tenant's cap
+can be tightened for one account or one expensive api.
+- The running counts live in the cache, keyed by scope and by the stretch's own start, so a
+stretch resets at its boundary with nothing to clear. A count the cache does not hold is seeded
+by summing the usage rows since the stretch began, so losing the cache costs a query rather than
+handing out a fresh allowance.
+- A request is counted against every rate that holds it before the cache is asked, so an answer
+the cache gives still counts as a request made. What an answer spent is counted against a quota
+afterwards, from the same numbers the usage row is written from.
+- A request that has run out is refused with 429, carrying `Retry-After` and a reason naming
+what ran out. A rate that cannot be read lets the request through and says so in the log; a
+quota that cannot be read refuses with 503 rather than spend unmeasured.
+- `GET/PUT/DELETE /_ip/limits`, paged and newest first. A limit over a whole tenant is the
+system administrator's to set; one naming an account is its tenant owner's, inside its own
+tenant.
+- Limits ride the same revision, publication and jittered reload as the routing rules, so a
+change reaches every node the way a rule change does.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -146,6 +168,16 @@ billed for rather than the many it sent.
 - **A request that never reached an upstream is not recorded.** A refusal before routing names
 no api, and a request the upstream failed leaves no row, so request rates are counted over
 answers alone.
+- **A quota can be overshot by one request.** The tokens an answer spends are known only once it
+has been given, so a request that takes a quota past what it allows is answered, and the next one
+is refused.
+- **A spent quota refuses even a request the cache could have answered for nothing.** Every
+limit is checked before the cache is asked, which is what makes a hit count as a request; the
+same order means a hit is not served once a quota is spent.
+- **`LimitMgr` is not consulted.** The capability is scoped to an api, so a grant of it can never
+match a limit that names no api. The limits endpoint goes by ownership instead, which is what
+`DESIGN.md` describes; letting a granted member manage limits needs the capability's scope shape
+widened.
 - **A published rule set that cannot be built leaves a node on the rules it has.** It keeps serving
 and retries, so nodes can serve different revisions while one of them cannot build the newest.
 
@@ -155,7 +187,6 @@ Roughly in dependency order. Each entry names what it waits on.
 
 ### Management api, what is left of it
 
-- Quota and rate limits per tenant and user — no representation for either exists yet.
 - The signed half of the api is covered by the rust tests alone: a signature is sha256 over
 hex-decoded keys, which the hurl suite cannot compute, so that suite exercises the cookie path.
 - Syncing a list by `after`. Every list is newest first and takes `?after=<unix seconds>`, so a

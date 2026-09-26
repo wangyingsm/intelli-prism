@@ -27,6 +27,9 @@ stalling the requests in flight.
 under it, and a row per request: the model, the tokens in each direction, whether the cache
 answered and how long the caller waited. Exported to an OpenTelemetry collector when one is
 configured, and read back over `GET /_ip/usage`.
+- **Quota and rate limits.** What a tenant, one of its accounts or one of its apis may spend, in
+tokens or in requests, over a minute, an hour, a day or a month. The counts live in the cache and
+are seeded from the usage rows; a caller past its limit is told with 429 and when to come back.
 - **Two storage backends.** sqlite for a single node, postgres for a cluster, behind one trait and
 one conformance suite so neither drifts from the other.
 - **Two cache backends.** sled for a single node, redis for a cluster, same arrangement. The
@@ -66,10 +69,10 @@ does, and runs the `.hurl` files beside it in order.
 version 0.1.0, and nothing about it is stable — the configuration format, the storage schema, the
 wire headers and the plugin interface all still change without ceremony.
 
-Large parts of the design are unbuilt: there is no web ui, no quota or rate limiting, no agents,
-no semantic cache, and no metrics beyond the traces. The pieces that do exist are tested, but they
-have never run under real traffic, and no security review has been done. Read `ROADMAP.md` before
-assuming a feature is there.
+Large parts of the design are unbuilt: there is no web ui, no agents, no semantic cache, and no
+metrics beyond the traces. The pieces that do exist are tested, but they have never run under real
+traffic, and no security review has been done. Read `ROADMAP.md` before assuming a feature is
+there.
 
 ## License
 
