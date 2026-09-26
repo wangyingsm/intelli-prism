@@ -71,6 +71,10 @@ log_level = "info"
 # sample_ratio = 1.0
 
 # One block per upstream llm. The id is what routing rules and api capabilities name.
+# An upstream standing behind several endpoints adds a [[upstream.target]] block for each one
+# beyond base_url, and says how requests are spread with `strategy`:
+# round_robin (the default), least_load, or ratio by the `weight` each endpoint carries.
+# A `weight` of 0 drains that endpoint: no strategy sends it a request until it is raised again.
 [[upstream]]
 id = "anthropic"
 base_url = "https://api.anthropic.com/"

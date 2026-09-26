@@ -12,4 +12,4 @@ pub use config::{
 pub use error::ConfigError;
 pub use ip_core::ModelName;
 pub use secret::Secret;
-pub use upstream::{RouteOverride, Temperature, UpstreamConfig};
+pub use upstream::{RouteOverride, Temperature, UpstreamConfig, UpstreamTarget};

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use ip_core::{
     AbsPath, ApiId, Endpoint, Host, ModelName, Port, Protocol, RouteKey, RouteRule, RouteTarget,
-    Strategy,
+    Strategy, Weight, Weighted,
 };
 use url::Url;
 
@@ -27,6 +27,26 @@ pub struct UpstreamConfig {
     /// Overrides the key this upstream would otherwise derive.
     #[serde(default)]
     pub route: Option<RouteOverride>,
+    /// The share `base_url` takes when this upstream is replicated and shared by ratio.
+    #[serde(default)]
+    pub weight: Weight,
+    /// How requests are spread when this upstream stands behind several endpoints.
+    #[serde(default)]
+    pub strategy: Strategy,
+    /// Further endpoints this upstream stands behind, beyond `base_url`.
+    #[serde(default, rename = "target")]
+    pub targets: Vec<UpstreamTarget>,
+}
+
+/// One more endpoint a replicated upstream stands behind.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTarget {
+    /// Where the request is sent.
+    pub url: Url,
+    /// The share it takes when the upstream is shared by ratio.
+    #[serde(default)]
+    pub weight: Weight,
 }
 
 /// Replaces part of the key a configured upstream derives from the listen address.
@@ -68,26 +88,37 @@ impl UpstreamConfig {
         Ok(RouteKey::new(Endpoint::new(protocol, host, port, path)))
     }
 
-    /// Where a matched request is sent, read from `base_url`.
+    /// Where a matched request is sent: `base_url` first, then every `target` block.
     pub fn route_target(&self) -> Result<RouteTarget, ConfigError> {
-        let host = self
-            .base_url
-            .host_str()
-            .ok_or_else(|| ConfigError::UpstreamHost {
+        let mut weighted = vec![Weighted::weighing(
+            self.endpoint(&self.base_url)?,
+            self.weight,
+        )];
+        for target in &self.targets {
+            weighted.push(Weighted::weighing(
+                self.endpoint(&target.url)?,
+                target.weight,
+            ));
+        }
+        Ok(RouteTarget::from_weighted(weighted)?)
+    }
+
+    /// One of this upstream's urls as an endpoint, refusing a url that names no host or port.
+    fn endpoint(&self, url: &Url) -> Result<Endpoint, ConfigError> {
+        let host = url.host_str().ok_or_else(|| ConfigError::UpstreamHost {
+            id: self.id.clone(),
+        })?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| ConfigError::UpstreamPort {
                 id: self.id.clone(),
             })?;
-        let port =
-            self.base_url
-                .port_or_known_default()
-                .ok_or_else(|| ConfigError::UpstreamPort {
-                    id: self.id.clone(),
-                })?;
-        Ok(RouteTarget::new(Endpoint::new(
-            self.base_url.scheme().parse()?,
+        Ok(Endpoint::new(
+            url.scheme().parse()?,
             Host::new(host)?,
             Port::new(port)?,
-            AbsPath::new(self.base_url.path())?,
-        )))
+            AbsPath::new(url.path())?,
+        ))
     }
 
     /// The rule this upstream contributes to the routing table.
@@ -96,7 +127,7 @@ impl UpstreamConfig {
             api: self.id.clone(),
             key: self.route_key(listen)?,
             target: self.route_target()?,
-            strategy: Strategy::default(),
+            strategy: self.strategy,
         })
     }
 }
@@ -150,6 +181,9 @@ mod tests {
             model: ModelName::new("claude-opus-5").unwrap(),
             temperature: None,
             route,
+            weight: Weight::default(),
+            strategy: Strategy::default(),
+            targets: Vec::new(),
         }
     }
 
@@ -269,5 +303,57 @@ mod tests {
                 Err(ConfigError::Temperature { .. })
             ));
         }
+    }
+
+    #[test]
+    fn an_upstream_stands_behind_one_endpoint_unless_it_names_more() {
+        let one = upstream("https://api.anthropic.com/v1", None);
+        assert_eq!(one.route_target().unwrap().weighted().len(), 1);
+        assert_eq!(
+            one.route_rule(listen()).unwrap().strategy,
+            Strategy::RoundRobin
+        );
+    }
+
+    #[test]
+    fn a_replicated_upstream_carries_every_endpoint_with_its_share() {
+        let replicated = UpstreamConfig {
+            strategy: Strategy::Ratio,
+            weight: Weight::new(3),
+            targets: vec![
+                UpstreamTarget {
+                    url: "http://two.local:8000/v1".parse().unwrap(),
+                    weight: Weight::new(1),
+                },
+                UpstreamTarget {
+                    url: "http://three.local:8000/v1".parse().unwrap(),
+                    weight: Weight::default(),
+                },
+            ],
+            ..upstream("http://one.local:8000/v1", None)
+        };
+        let rule = replicated.route_rule(listen()).unwrap();
+        assert_eq!(rule.strategy, Strategy::Ratio);
+        let behind = rule.target.weighted();
+        assert_eq!(behind.len(), 3);
+        assert_eq!(behind[0].endpoint.host.as_str(), "one.local");
+        assert_eq!(behind[0].weight.get(), 3);
+        assert_eq!(behind[1].endpoint.host.as_str(), "two.local");
+        assert_eq!(behind[2].weight.get(), 1);
+    }
+
+    #[test]
+    fn a_further_endpoint_that_names_no_host_is_refused() {
+        let broken = UpstreamConfig {
+            targets: vec![UpstreamTarget {
+                url: "file:///nowhere".parse().unwrap(),
+                weight: Weight::default(),
+            }],
+            ..upstream("https://api.anthropic.com/v1", None)
+        };
+        assert!(matches!(
+            broken.route_target(),
+            Err(ConfigError::UpstreamHost { .. }) | Err(ConfigError::UpstreamPort { .. })
+        ));
     }
 }
