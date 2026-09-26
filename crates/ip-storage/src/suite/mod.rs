@@ -185,6 +185,9 @@ macro_rules! backend_suite {
             deleting_a_tenant_takes_its_limits_with_it,
             deleting_a_user_takes_the_limits_named_for_it,
             every_change_to_a_limit_moves_the_revision_on,
+            limits_come_newest_first_a_page_at_a_time,
+            a_listed_limit_is_the_one_that_was_set,
+            a_list_holds_only_the_tenant_it_names,
         ]);
     };
     (usage, $open:path) => {

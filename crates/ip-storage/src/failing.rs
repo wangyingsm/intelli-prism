@@ -298,6 +298,15 @@ impl ListStore for FailingStore {
         self.inner.list_rules(tenant, page).await
     }
 
+    async fn list_limits(
+        &self,
+        tenant: Option<&TenantId>,
+        page: Page,
+    ) -> Result<Vec<Limit>, StorageError> {
+        self.answering()?;
+        self.inner.list_limits(tenant, page).await
+    }
+
     async fn list_usage(
         &self,
         filter: &UsageFilter,

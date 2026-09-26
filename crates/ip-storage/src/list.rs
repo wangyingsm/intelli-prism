@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use ip_core::{Grant, PluginRule, RouteRule, TenantId, Timestamp, UserId};
 
 use crate::error::StorageError;
+use crate::limit::Limit;
 use crate::model::Membership;
 use crate::plugin::{PluginOwner, PluginRecord};
 use crate::usage::{Usage, UsageFilter};
@@ -105,6 +106,15 @@ pub trait ListStore: Send + Sync {
         owner: &PluginOwner,
         page: Page,
     ) -> Result<Vec<Listed<PluginRecord>>, StorageError>;
+
+    /// The limits set on one tenant, or on every tenant when none is named, newest first.
+    ///
+    /// A limit carries the moment it was set itself, so it is listed as it is stored.
+    async fn list_limits(
+        &self,
+        tenant: Option<&TenantId>,
+        page: Page,
+    ) -> Result<Vec<Limit>, StorageError>;
 
     /// What was spent, newest first, narrowed to whatever the filter names.
     ///

@@ -11,6 +11,7 @@ use super::identity::tenant_row_id;
 use super::plugin::{plugin_record, plugin_rule};
 use crate::codec::{capability, scope, standing};
 use crate::error::StorageError;
+use crate::limit::Limit;
 use crate::list::{ListStore, Listed, Page};
 use crate::model::Membership;
 use crate::plugin::{PluginOwner, PluginRecord};
@@ -202,6 +203,29 @@ impl ListStore for PostgresStore {
                 })
             })
             .collect()
+    }
+
+    async fn list_limits(
+        &self,
+        tenant: Option<&TenantId>,
+        page: Page,
+    ) -> Result<Vec<Limit>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT t.id AS tenant_id, u.id AS user_id, l.api_id, l.counted, l.period, \
+             l.allowance, l.created_at FROM limits l \
+             JOIN tenants t ON t.row_id = l.tenant_row_id \
+             LEFT JOIN users u ON u.row_id = l.user_row_id \
+             WHERE l.created_at > $1 AND ($2::TEXT IS NULL OR t.id = $2) \
+             ORDER BY l.created_at DESC, l.row_id DESC LIMIT $3 OFFSET $4",
+        )
+        .bind(page.after_seconds())
+        .bind(tenant.map(TenantId::as_str))
+        .bind(i64::from(page.limit()))
+        .bind(i64::from(page.offset()))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StorageError::backend)?;
+        rows.into_iter().map(super::limit::set).collect()
     }
 
     async fn list_usage(

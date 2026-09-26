@@ -211,3 +211,76 @@ pub(crate) async fn every_change_to_a_limit_moves_the_revision_on(store: &impl B
         .unwrap();
     assert!(store.rule_revision().await.unwrap() > set);
 }
+
+pub(crate) async fn limits_come_newest_first_a_page_at_a_time(store: &impl Backend) {
+    tenant_with_user(store).await;
+    for (counted, period) in [
+        (Counted::Tokens, Period::Month),
+        (Counted::Tokens, Period::Day),
+        (Counted::Requests, Period::Hour),
+        (Counted::Requests, Period::Minute),
+    ] {
+        store
+            .put_limit(NewLimit {
+                counted,
+                period,
+                ..monthly(10)
+            })
+            .await
+            .unwrap();
+    }
+
+    let first = store
+        .list_limits(None, crate::list::Page::new(2, 0, None))
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].period, Period::Minute);
+    let last = store
+        .list_limits(None, crate::list::Page::new(2, 2, None))
+        .await
+        .unwrap();
+    assert_eq!(last.len(), 2);
+    assert!(
+        store
+            .list_limits(None, crate::list::Page::new(2, 4, None))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+pub(crate) async fn a_listed_limit_is_the_one_that_was_set(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let set = store.put_limit(monthly(1_000)).await.unwrap();
+    assert_eq!(
+        store
+            .list_limits(Some(&tenant_id()), crate::list::Page::default())
+            .await
+            .unwrap(),
+        vec![set]
+    );
+}
+
+pub(crate) async fn a_list_holds_only_the_tenant_it_names(store: &impl Backend) {
+    tenant_with_user(store).await;
+    store.put_limit(monthly(10)).await.unwrap();
+    assert!(
+        store
+            .list_limits(
+                Some(&TenantId::new("elsewhere").unwrap()),
+                crate::list::Page::default()
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list_limits(None, crate::list::Page::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
