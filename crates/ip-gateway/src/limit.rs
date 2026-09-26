@@ -264,7 +264,7 @@ fn filter(scope: &LimitScope) -> UsageFilter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -275,10 +275,10 @@ mod tests {
 
     /// Counts held in memory, which can be told to refuse.
     #[derive(Default)]
-    struct Held(Mutex<HashMap<String, u64>>, Mutex<bool>);
+    pub(crate) struct Held(Mutex<HashMap<String, u64>>, Mutex<bool>);
 
     impl Held {
-        fn refusing(&self) {
+        pub(crate) fn refusing(&self) {
             *self.1.lock().unwrap() = true;
         }
 
@@ -317,10 +317,10 @@ mod tests {
     }
 
     /// Rows that answer with whatever the test says was spent.
-    struct Rows(u64, bool);
+    pub(crate) struct Rows(u64, bool);
 
     impl Rows {
-        fn holding(spent: u64) -> Arc<Self> {
+        pub(crate) fn holding(spent: u64) -> Arc<Self> {
             Arc::new(Self(spent, false))
         }
 

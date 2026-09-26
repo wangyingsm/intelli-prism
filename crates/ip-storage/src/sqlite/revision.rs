@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use sqlx::SqliteConnection;
 
 use super::SqliteStore;
+use super::limit::read_limits;
 use super::plugin::read_rules;
 use super::route::read_routes;
 use crate::error::{Entity, StorageError};
@@ -32,11 +33,13 @@ impl RevisionStore for SqliteStore {
         let revision = read_revision(&mut transaction).await?;
         let routes = read_routes(&mut transaction).await?;
         let rules = read_rules(&mut transaction).await?;
+        let limits = read_limits(&mut transaction).await?;
         transaction.commit().await.map_err(StorageError::backend)?;
         Ok(RuleSet {
             revision,
             routes,
             rules,
+            limits,
         })
     }
 }

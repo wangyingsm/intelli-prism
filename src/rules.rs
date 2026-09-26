@@ -8,14 +8,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ip_gateway::{Gateway, RoutingTable};
+use ip_gateway::{Gateway, Limits, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost};
 use tokio::sync::watch;
 
 use ip_cache::{CacheBackend, CacheKey, CacheLevel};
 use ip_core::{Checksum, PluginKind, PluginOrder, PluginRule, PluginScope, RouteRule};
-use ip_storage::RuleSet;
 use ip_storage::{Backend, RuleRevision};
+use ip_storage::{Limit, RuleSet};
 use tokio::task::JoinHandle;
 
 use crate::error::FeedError;
@@ -41,6 +41,9 @@ const RETRY_MOST: Duration = Duration::from_secs(60);
 struct Snapshot {
     routes: Vec<RouteRule>,
     rules: Vec<Placed>,
+    /// Absent in a snapshot published before limits were carried, which reads as none of them.
+    #[serde(default)]
+    limits: Vec<Limit>,
 }
 
 /// One plugin rule on the wire, rebuilt through its own checks when read back.
@@ -76,6 +79,7 @@ impl RuleFeed {
         let snapshot = Snapshot {
             routes: set.routes,
             rules: set.rules.iter().map(Placed::from).collect(),
+            limits: set.limits,
         };
         let encoded = serde_json::to_vec(&snapshot).map_err(FeedError::Encode)?;
         self.cache
@@ -108,6 +112,7 @@ impl RuleFeed {
             revision: RuleRevision::new(published.revision),
             routes: snapshot.routes,
             rules,
+            limits: snapshot.limits,
         }))
     }
 
@@ -202,7 +207,8 @@ impl Reloader {
         let chains =
             PluginChains::from_rules(Arc::clone(&self.host), self.store.as_ref(), set.rules)
                 .await?;
-        self.gateway.replace(table, Arc::new(chains));
+        self.gateway
+            .replace(table, Arc::new(chains), Limits::new(set.limits));
         Ok(Some(set.revision))
     }
 

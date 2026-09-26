@@ -1,7 +1,7 @@
 use http::StatusCode;
 use ip_cache::CacheError;
 use ip_config::ConfigError;
-use ip_core::{Capability, CoreError, Protocol, RouteKey};
+use ip_core::{Allowance, Capability, CoreError, Counted, Period, Protocol, RouteKey, Timestamp};
 use ip_storage::StorageError;
 
 use crate::stage::StageName;
@@ -54,11 +54,21 @@ impl GatewayError {
         &self.kind
     }
 
-    /// What the caller may be told about why. Only a plugin's deliberate refusal supplies
-    /// one; every other failure stays in the log.
-    pub fn public_reason(&self) -> Option<&str> {
+    /// What the caller may be told about why. A plugin's deliberate refusal supplies one, and
+    /// so does a limit the caller itself holds; every other failure stays in the log.
+    pub fn public_reason(&self) -> Option<String> {
         match &self.kind {
-            GatewayErrorKind::Processor(ProcessorError::Refused { reason }) => Some(reason),
+            GatewayErrorKind::Processor(ProcessorError::Refused { reason }) => Some(reason.clone()),
+            GatewayErrorKind::Spent {
+                counted,
+                period,
+                allowance,
+                ..
+            } => Some(format!(
+                "{} per {} is spent: {allowance} allowed",
+                counted.name(),
+                period.name()
+            )),
             _ => None,
         }
     }
@@ -79,7 +89,18 @@ impl GatewayError {
             }
             GatewayErrorKind::Upstream(_) => StatusCode::BAD_GATEWAY,
             GatewayErrorKind::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            GatewayErrorKind::Spent { .. } => StatusCode::TOO_MANY_REQUESTS,
+            GatewayErrorKind::Unmeasured { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
+    }
+
+    /// How many seconds the caller waits before what it ran out of is allowed again.
+    pub fn retry_after(&self) -> Option<u64> {
+        let GatewayErrorKind::Spent { ends, .. } = &self.kind else {
+            return None;
+        };
+        let left = ends.unix_seconds() - Timestamp::now().unix_seconds();
+        Some(u64::try_from(left).unwrap_or(0).max(1))
     }
 }
 
@@ -133,6 +154,26 @@ pub enum GatewayErrorKind {
     /// The cache could not be read or written.
     #[error(transparent)]
     Cache(#[from] CacheError),
+
+    /// A limit on what the caller may spend is used up for this stretch.
+    #[error("{} per {} is spent, and allows {allowance} until {ends}", counted.name(), period.name())]
+    Spent {
+        /// What ran out.
+        counted: Counted,
+        /// Over what stretch.
+        period: Period,
+        /// How much that stretch allows.
+        allowance: Allowance,
+        /// When the next stretch begins.
+        ends: Timestamp,
+    },
+
+    /// A quota could not be read, so the request is refused rather than spent unmeasured.
+    #[error("what this request would spend could not be counted: {detail}")]
+    Unmeasured {
+        /// Why it could not be.
+        detail: String,
+    },
 }
 
 /// A plugin stopping the request it was given.
@@ -267,7 +308,7 @@ mod tests {
                 reason: "too long".to_owned(),
             }),
         );
-        assert_eq!(refused.public_reason(), Some("too long"));
+        assert_eq!(refused.public_reason().as_deref(), Some("too long"));
         let failed = GatewayError::new(
             StageName::BodyProcess,
             GatewayErrorKind::Processor(ProcessorError::failed("trapped")),

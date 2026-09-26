@@ -16,12 +16,13 @@ use super::followed::{
     EGRESS_REQUEST, EGRESS_RESPONSE, Followed, INGRESS_REQUEST, INGRESS_RESPONSE, stage_span,
 };
 use super::headers::set_length;
-use super::record::{Pending, Recording};
+use super::record::{Limiting, Pending, Recording};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
-use crate::error::GatewayError;
+use crate::error::{GatewayError, GatewayErrorKind};
+use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
-use crate::stage::{BodyProcessed, ResponseBodyProcessed};
+use crate::stage::{Authorized, BodyProcessed, ResponseBodyProcessed, Stage};
 use crate::table::RoutingTable;
 use crate::upstream::Upstream;
 
@@ -49,6 +50,7 @@ pub struct Gateway {
     upstream: Arc<dyn Upstream>,
     responses: Option<ResponseCache>,
     usage: Option<Arc<dyn UsageStore>>,
+    limiter: Option<Arc<Limiter>>,
     pending: Pending,
 }
 
@@ -59,6 +61,7 @@ pub struct Gateway {
 struct Routing {
     table: Arc<RoutingTable>,
     chains: Arc<dyn ChainSource>,
+    limits: Limits,
 }
 
 impl Gateway {
@@ -83,10 +86,12 @@ impl Gateway {
             routing: ArcSwap::from_pointee(Routing {
                 table: Arc::new(table),
                 chains,
+                limits: Limits::default(),
             }),
             upstream,
             responses: None,
             usage: None,
+            limiter: None,
             pending: Pending::default(),
         }
     }
@@ -95,10 +100,11 @@ impl Gateway {
     ///
     /// Readers never wait for this: a request in flight finishes on the rules it started
     /// with, and the next one picks up the new ones.
-    pub fn replace(&self, table: RoutingTable, chains: Arc<dyn ChainSource>) {
+    pub fn replace(&self, table: RoutingTable, chains: Arc<dyn ChainSource>, limits: Limits) {
         self.routing.store(Arc::new(Routing {
             table: Arc::new(table),
             chains,
+            limits,
         }));
     }
 
@@ -111,6 +117,23 @@ impl Gateway {
     /// Records what every request costs, an answer out of the cache included.
     pub fn recording(mut self, usage: Arc<dyn UsageStore>) -> Self {
         self.usage = Some(usage);
+        self
+    }
+
+    /// Checks every request against the limits in force, and counts what it spends.
+    pub fn limiting(mut self, limiter: Arc<Limiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
+    }
+
+    /// Puts the limits a node starts with in force, leaving its rules as they are.
+    pub fn with_limits(self, limits: Limits) -> Self {
+        let held = self.routing.load();
+        self.routing.store(Arc::new(Routing {
+            table: Arc::clone(&held.table),
+            chains: Arc::clone(&held.chains),
+            limits,
+        }));
         self
     }
 
@@ -159,11 +182,23 @@ impl Gateway {
         .instrument(taking_in)
         .await;
         let (mut processed, chains, api) = taken?;
+        let asking = Asking {
+            tenant: followed.tenant.clone(),
+            user: followed.user.clone(),
+            api: api.clone(),
+        };
         let followed = followed.serving(api);
-        let recording = self
-            .usage
-            .as_ref()
-            .and_then(|store| Recording::of(store, &self.pending, &followed, started));
+        // Before the cache is asked, so an answer it holds still counts as a request made.
+        self.admit(&routing.limits, &asking).await?;
+        let recording = self.usage.as_ref().and_then(|store| {
+            Recording::of(
+                store,
+                &self.pending,
+                &followed,
+                started,
+                self.limiting_with(&routing.limits, &asking),
+            )
+        });
 
         let Some(responses) = &self.responses else {
             let done = self.upstream_answer(processed, &chains, &followed).await?;
@@ -197,6 +232,39 @@ impl Gateway {
         answered.record("hit", false);
         let sent = async { done.into_response() }.instrument(answered).await?;
         Ok(measuring(sent, recording))
+    }
+
+    /// Refuses a request that has run out of what it may spend, or that cannot be counted.
+    async fn admit(&self, limits: &Limits, asking: &Asking) -> Result<(), GatewayError> {
+        let Some(limiter) = &self.limiter else {
+            return Ok(());
+        };
+        let kind = match limiter.admit(limits, asking).await {
+            Decision::Allowed => return Ok(()),
+            Decision::Spent {
+                counted,
+                period,
+                allowance,
+                ends,
+            } => GatewayErrorKind::Spent {
+                counted,
+                period,
+                allowance,
+                ends,
+            },
+            Decision::Unknown { detail } => GatewayErrorKind::Unmeasured { detail },
+        };
+        Err(GatewayError::new(Authorized::NAME, kind))
+    }
+
+    /// What the record of this request counts towards, when anything does.
+    fn limiting_with(&self, limits: &Limits, asking: &Asking) -> Option<Limiting> {
+        let limiter = self.limiter.as_ref()?;
+        Some(Limiting::new(
+            Arc::clone(limiter),
+            limits.clone(),
+            asking.clone(),
+        ))
     }
 
     /// Sends the request on and reads the answer back, each in its own span.
@@ -250,6 +318,7 @@ fn answer_with(hit: CachedResponse) -> Response<GatewayBody> {
 mod tests {
     use super::super::fixtures::*;
     use super::*;
+    use crate::limit::tests::Rows;
     use http::StatusCode;
     use http::header::CONTENT_LENGTH;
     use ip_core::{Served, TokenCount, Tokens};
@@ -734,6 +803,204 @@ mod tests {
 
         let row = recorded.recv().await.unwrap();
         assert_eq!(row.served, Served::Upstream);
+    }
+
+    /// A gateway whose limits are checked, over counts held in memory.
+    fn limited(upstream: Arc<FakeUpstream>, limits: Vec<ip_storage::Limit>) -> Gateway {
+        let counters = Arc::new(crate::limit::tests::Held::default());
+        let limiter = Limiter::new(counters, Rows::holding(0));
+        Gateway::new(table(), ProcessorChain::new(), upstream)
+            .limiting(Arc::new(limiter))
+            .with_limits(Limits::new(limits))
+    }
+
+    /// One limit over the fixture tenant.
+    fn allowing(
+        counted: ip_core::Counted,
+        period: ip_core::Period,
+        allowance: u64,
+    ) -> ip_storage::Limit {
+        ip_storage::Limit {
+            scope: ip_core::LimitScope::of_tenant(tenant()),
+            counted,
+            period,
+            allowance: ip_core::Allowance::new(allowance).unwrap(),
+            created_at: ip_core::Timestamp::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_past_a_rate_is_refused_with_when_to_ask_again() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = limited(
+            Arc::clone(&upstream),
+            vec![allowing(
+                ip_core::Counted::Requests,
+                ip_core::Period::Minute,
+                1,
+            )],
+        );
+        let first = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let refused = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(refused.retry_after().is_some_and(|seconds| seconds > 0));
+        assert!(
+            refused
+                .public_reason()
+                .is_some_and(|told| told.contains("requests per minute")),
+            "told {:?}",
+            refused.public_reason()
+        );
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn what_an_answer_spends_is_counted_against_the_quota() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let gateway = limited(
+            upstream,
+            vec![allowing(
+                ip_core::Counted::Tokens,
+                ip_core::Period::Month,
+                100,
+            )],
+        );
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = gateway.recording(recorder);
+
+        // The answer holds 150 tokens, which is past the 100 the month allows.
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        recorded.recv().await.unwrap();
+        gateway.settled().await;
+
+        let refused = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_quota_that_cannot_be_counted_stops_the_request() {
+        let counters = Arc::new(crate::limit::tests::Held::default());
+        counters.refusing();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .limiting(Arc::new(Limiter::new(counters, Rows::holding(0))))
+        .with_limits(Limits::new(vec![allowing(
+            ip_core::Counted::Tokens,
+            ip_core::Period::Month,
+            100,
+        )]));
+
+        let refused = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.retry_after(), None);
+        assert_eq!(refused.public_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_cache_holds_still_counts_as_a_request_made() {
+        let upstream = FakeUpstream::answering("pong");
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let counters = Arc::new(crate::limit::tests::Held::default());
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
+            .limiting(Arc::new(Limiter::new(counters, Rows::holding(0))))
+            .with_limits(Limits::new(vec![allowing(
+                ip_core::Counted::Requests,
+                ip_core::Period::Minute,
+                2,
+            )]));
+
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap();
+            body_of(answered).await;
+        }
+        // The second was answered from the cache, and still counted.
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1);
+        let refused = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_with_no_limiter_answers_whatever_arrives() {
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .with_limits(Limits::new(vec![allowing(
+            ip_core::Counted::Requests,
+            ip_core::Period::Minute,
+            1,
+        )]));
+        for _ in 0..3 {
+            assert!(
+                gateway
+                    .handle(context(granted()), request("/anthropic/messages", "ask"))
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_limits_in_force_are_replaced_with_the_rules() {
+        let gateway = limited(FakeUpstream::answering("pong"), Vec::new());
+        assert!(
+            gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .is_ok()
+        );
+        gateway.replace(
+            table(),
+            Arc::new(FixedChains::new(ProcessorChain::new())),
+            Limits::new(vec![allowing(
+                ip_core::Counted::Requests,
+                ip_core::Period::Minute,
+                1,
+            )]),
+        );
+        assert!(
+            gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{Allowance, Counted, LimitScope, Period, Timestamp};
-use sqlx::Row;
 use sqlx::postgres::PgRow;
+use sqlx::{PgConnection, Row};
 
 use super::PostgresStore;
 use crate::error::{Entity, StorageError};
@@ -79,18 +79,23 @@ impl LimitStore for PostgresStore {
     }
 
     async fn limits(&self) -> Result<Vec<Limit>, StorageError> {
-        let rows = sqlx::query(
-            "SELECT t.id AS tenant_id, u.id AS user_id, l.api_id, l.counted, l.period, \
+        read_limits(&mut *self.connection().await?).await
+    }
+}
+
+/// Every limit held, over whichever connection it is given.
+pub(super) async fn read_limits(connection: &mut PgConnection) -> Result<Vec<Limit>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT t.id AS tenant_id, u.id AS user_id, l.api_id, l.counted, l.period, \
              l.allowance, l.created_at FROM limits l \
              JOIN tenants t ON t.row_id = l.tenant_row_id \
              LEFT JOIN users u ON u.row_id = l.user_row_id \
              ORDER BY l.created_at DESC, l.row_id DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(StorageError::backend)?;
-        rows.into_iter().map(set).collect()
-    }
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?;
+    rows.into_iter().map(set).collect()
 }
 
 /// Rebuilds a limit, refusing a row whose stored value its own type will not take.

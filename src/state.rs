@@ -4,12 +4,14 @@ use std::sync::Arc;
 use ip_auth::{Logins, RequestVerifier, SessionTokens};
 #[cfg(feature = "cluster-cache")]
 use ip_cache::RedisCache;
-use ip_cache::{Cache, CacheBackend, Ttl};
+use ip_cache::{Cache, CacheBackend, Counters, Ttl};
 #[cfg(feature = "standalone-cache")]
 use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_core::RouteRule;
-use ip_gateway::{Gateway, HyperUpstream, ResponseCache, RouteError, RoutingTable};
+use ip_gateway::{
+    Gateway, HyperUpstream, Limiter, Limits, ResponseCache, RouteError, RoutingTable,
+};
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
 use ip_storage::PostgresStore;
@@ -84,6 +86,7 @@ impl AppState {
         if let Err(error) = feed.heal().await {
             tracing::warn!(%error, "could not publish the rules at startup; healing will");
         }
+        let counters = Arc::clone(&published) as Arc<dyn Counters>;
         let cache = published as Arc<dyn Cache>;
         // The revision is read first, so a change that lands while the table is read is
         // followed rather than missed.
@@ -100,8 +103,16 @@ impl AppState {
         tracing::info!(rules = chains.len(), "plugin chains built");
         let upstream = Arc::new(HyperUpstream::new()?);
         let gateway = Gateway::with_chains(table, Arc::new(chains), upstream);
-        let mut gateway =
-            gateway.recording(Arc::clone(&backend) as Arc<dyn ip_storage::UsageStore>);
+        let limits = Limits::new(ip_storage::LimitStore::limits(store.as_ref()).await?);
+        tracing::info!(limits = limits.len(), "limits in force");
+        let limiter = Limiter::new(
+            Arc::clone(&counters),
+            Arc::clone(&backend) as Arc<dyn ip_storage::UsageStore>,
+        );
+        let mut gateway = gateway
+            .recording(Arc::clone(&backend) as Arc<dyn ip_storage::UsageStore>)
+            .limiting(Arc::new(limiter))
+            .with_limits(limits);
         if let Some(ttl) = config.cache.response_ttl() {
             let responses = ResponseCache::new(Arc::clone(&cache), Ttl::new(ttl.as_duration())?);
             gateway = gateway.caching(responses);

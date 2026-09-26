@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 
 use super::followed::Followed;
 use crate::body::{BoxError, GatewayBody};
+use crate::limit::{Asking, Limiter, Limits};
 use crate::measure::{Measuring, measure};
 
 /// The records still being written, so a shutdown can wait for them.
@@ -58,10 +59,29 @@ impl Pending {
     }
 }
 
+/// What a request's tokens are counted towards once its answer is done with.
+pub(super) struct Limiting {
+    limiter: Arc<Limiter>,
+    limits: Limits,
+    asking: Asking,
+}
+
+impl Limiting {
+    /// What this request spends counts against these limits, for this scope.
+    pub(super) fn new(limiter: Arc<Limiter>, limits: Limits, asking: Asking) -> Self {
+        Self {
+            limiter,
+            limits,
+            asking,
+        }
+    }
+}
+
 /// What is known about a request before its answer is, and what writes the row when it ends.
 pub(super) struct Recording {
     store: Arc<dyn UsageStore>,
     pending: Pending,
+    limiting: Option<Limiting>,
     started: Instant,
     trace: TraceId,
     turn: Option<TurnId>,
@@ -77,10 +97,12 @@ impl Recording {
         pending: &Pending,
         followed: &Followed,
         started: Instant,
+        limiting: Option<Limiting>,
     ) -> Option<Self> {
         Some(Self {
             store: Arc::clone(store),
             pending: pending.clone(),
+            limiting,
             started,
             trace: followed.trace,
             turn: followed.turn.clone(),
@@ -120,10 +142,18 @@ impl Recording {
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;
+        let limiting = self.limiting;
+        let spent = tokens.total();
         // A caller never waits on the record of what it already has, and never fails for it.
         self.pending.writing(async move {
             if let Err(error) = store.record_usage(usage).await {
                 tracing::warn!(%error, "could not record what a request cost");
+            }
+            if let Some(limiting) = limiting {
+                limiting
+                    .limiter
+                    .spend(&limiting.limits, &limiting.asking, spent)
+                    .await;
             }
         });
     }

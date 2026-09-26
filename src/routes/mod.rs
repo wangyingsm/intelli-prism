@@ -12,7 +12,10 @@ mod user;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Extension, FromRequestParts, Query, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode, header::SET_COOKIE};
+use axum::http::{
+    HeaderMap, HeaderValue, Request, Response, StatusCode,
+    header::{RETRY_AFTER, SET_COOKIE},
+};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
@@ -386,10 +389,17 @@ fn refuse(error: GatewayError) -> Response<Body> {
     } else {
         tracing::warn!(stage = %error.stage(), %error, "the gateway refused a request");
     }
-    match error.public_reason() {
-        Some(reason) => (status, reason.to_owned()).into_response(),
+    let mut refusal = match error.public_reason() {
+        Some(reason) => (status, reason).into_response(),
         None => (status, ()).into_response(),
+    };
+    // A caller that ran out of what it may spend is told when it may ask again.
+    if let Some(seconds) = error.retry_after()
+        && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+    {
+        refusal.headers_mut().insert(RETRY_AFTER, value);
     }
+    refusal
 }
 
 impl From<Identity> for WhoAmI {
@@ -602,6 +612,25 @@ secret = "0123456789abcdef0123456789abcdef"
                 .header("x-ip-signature", signature);
         }
         let mut request = builder.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((REMOTE, 40_000))));
+        request
+    }
+
+    /// A signed request carrying a nonce of its own, for a test making several.
+    fn signed_afresh(uri: &str, key: &TnKey, spelled: &str) -> Request<Body> {
+        let nonce = Nonce::new(spelled).unwrap();
+        let signature = Signature::of_user(&UtKey::derive(&user_id(), key), &nonce).to_hex();
+        let mut request = Request::builder()
+            .uri(uri)
+            .header("host", "gateway.local:8080")
+            .header("x-ip-tnid", tenant_id().as_str())
+            .header("x-ip-userid", user_id().as_str())
+            .header("x-ip-nonce", nonce.as_str())
+            .header("x-ip-signature", signature)
+            .body(Body::empty())
+            .unwrap();
         request
             .extensions_mut()
             .insert(ConnectInfo(SocketAddr::from((REMOTE, 40_000))));
@@ -1144,6 +1173,66 @@ secret = "0123456789abcdef0123456789abcdef"
                 "{stage} was exported under another trace"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_caller_past_its_rate_is_told_to_come_back_later() {
+        use ip_core::{Allowance, Counted, LimitScope, Period, Timestamp};
+        use ip_gateway::{Limiter, Limits};
+        use ip_storage::Limit;
+
+        let (store, key) = seeded_store(true).await;
+        let store = Arc::new(store);
+        let counters = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let limiter = Limiter::new(
+            counters,
+            Arc::clone(&store) as Arc<dyn ip_storage::UsageStore>,
+        );
+        let limits = Limits::new(vec![Limit {
+            scope: LimitScope::of_tenant(tenant_id()),
+            counted: Counted::Requests,
+            period: Period::Minute,
+            allowance: Allowance::new(1).unwrap(),
+            created_at: Timestamp::now(),
+        }]);
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            Arc::new(FakeUpstream::default()),
+        )
+        .limiting(Arc::new(limiter))
+        .with_limits(limits);
+        let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = AppState::with_parts(Stores::Sqlite(store), gateway, listen);
+        let router = crate::routes::router(state);
+
+        let answered = router
+            .clone()
+            .oneshot(signed_afresh(
+                "/anthropic/messages",
+                &key,
+                "0123456789abcdef",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+
+        let refused = router
+            .oneshot(signed_afresh(
+                "/anthropic/messages",
+                &key,
+                "fedcba9876543210",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let later: u64 = refused.headers()[axum::http::header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(later > 0 && later <= 60, "come back in {later} seconds");
+        assert!(body_of(refused).await.contains("requests per minute"));
     }
 
     #[tokio::test]

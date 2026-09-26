@@ -252,7 +252,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status(), StatusCode::FORBIDDEN);
-        assert_eq!(error.public_reason(), Some("blocked by policy"));
+        assert_eq!(error.public_reason().as_deref(), Some("blocked by policy"));
         assert!(upstream.seen.lock().unwrap().is_empty());
     }
 
