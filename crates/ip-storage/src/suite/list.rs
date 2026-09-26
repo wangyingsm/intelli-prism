@@ -155,7 +155,7 @@ pub(crate) async fn grants_are_listed_newest_first_by_where_they_are_held(store:
 pub(crate) async fn routes_are_listed_newest_first_with_every_target(store: &impl Backend) {
     let replicated = {
         let mut replicated = rule("gateway.local", "/v2", "one.example.com");
-        let mut endpoints: Vec<Endpoint> = replicated.target.endpoints().to_vec();
+        let mut endpoints: Vec<Endpoint> = replicated.target.endpoints().cloned().collect();
         let mut second = endpoints[0].clone();
         second.host = ip_core::Host::new("two.example.com").unwrap();
         endpoints.push(second);

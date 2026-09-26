@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 
 use ip_core::{
     AbsPath, ApiId, Endpoint, Host, ModelName, Port, Protocol, RouteKey, RouteRule, RouteTarget,
+    Strategy,
 };
 use url::Url;
 
@@ -95,6 +96,7 @@ impl UpstreamConfig {
             api: self.id.clone(),
             key: self.route_key(listen)?,
             target: self.route_target()?,
+            strategy: Strategy::default(),
         })
     }
 }

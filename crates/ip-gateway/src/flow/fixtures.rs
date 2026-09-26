@@ -218,6 +218,7 @@ pub(super) fn rule(target: Endpoint) -> RouteRule {
             "/anthropic",
         )),
         target: RouteTarget::new(target),
+        strategy: ip_core::Strategy::default(),
     }
 }
 

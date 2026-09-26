@@ -375,36 +375,169 @@ impl fmt::Display for RouteKey {
     }
 }
 
+/// How much of a rule's traffic one endpoint takes.
+///
+/// Zero drains the endpoint: no strategy sends a request to it, which is how an operator takes a
+/// replica out of rotation without touching the rule. A target whose every endpoint is drained is
+/// dispatched to in turn all the same, since a rule must have somewhere to send a request.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct Weight(u32);
+
+impl Weight {
+    /// No traffic at all, which takes an endpoint out of rotation.
+    pub const DRAINED: Self = Self(0);
+
+    /// Wraps a share.
+    pub const fn new(weight: u32) -> Self {
+        Self(weight)
+    }
+
+    /// The share as a number.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this endpoint is to be sent nothing.
+    pub const fn is_drained(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl Default for Weight {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl fmt::Display for Weight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One endpoint behind a target, and the share of the rule's traffic it takes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Weighted {
+    /// Where the request goes.
+    #[serde(flatten)]
+    pub endpoint: Endpoint,
+    /// Its share, which only ratio dispatch reads. One unless it says otherwise.
+    #[serde(default)]
+    pub weight: Weight,
+}
+
+impl Weighted {
+    /// An endpoint taking an equal share.
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            weight: Weight::default(),
+        }
+    }
+
+    /// The same, taking the share named.
+    pub fn weighing(endpoint: Endpoint, weight: Weight) -> Self {
+        Self { endpoint, weight }
+    }
+}
+
+/// How a request is dispatched across the endpoints behind one target.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    /// Each request to the endpoint after the last, which is what a rule that says nothing does.
+    #[default]
+    RoundRobin,
+    /// The endpoint carrying the least, by what is in flight and how long it has been taking.
+    LeastLoad,
+    /// A share each, in proportion to the endpoints' weights.
+    Ratio,
+}
+
+impl Strategy {
+    /// The name this is stored and reported under.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::LeastLoad => "least_load",
+            Self::Ratio => "ratio",
+        }
+    }
+
+    /// Reads it back from that name.
+    pub fn named(name: &str) -> Result<Self, CoreError> {
+        match name {
+            "round_robin" => Ok(Self::RoundRobin),
+            "least_load" => Ok(Self::LeastLoad),
+            "ratio" => Ok(Self::Ratio),
+            other => Err(CoreError::UnknownStrategy {
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Strategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// The endpoints a matched request may be sent to, of which there is always at least one.
 ///
 /// Several endpoints stand behind one target when an upstream is replicated. Which one
 /// a request goes to is a dispatch decision the gateway makes, not a property of the rule.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(try_from = "Vec<Endpoint>")]
-pub struct RouteTarget(Vec<Endpoint>);
+#[serde(try_from = "Vec<Weighted>")]
+pub struct RouteTarget(Vec<Weighted>);
 
 impl RouteTarget {
     /// Wraps the single endpoint a request is forwarded to.
     pub fn new(endpoint: Endpoint) -> Self {
-        Self(vec![endpoint])
+        Self(vec![Weighted::new(endpoint)])
     }
 
     /// Wraps every endpoint standing behind one target, refusing an empty list.
     pub fn from_endpoints(endpoints: Vec<Endpoint>) -> Result<Self, CoreError> {
-        if endpoints.is_empty() {
-            return Err(CoreError::NoEndpoint);
-        }
-        Ok(Self(endpoints))
+        Self::from_weighted(endpoints.into_iter().map(Weighted::new).collect())
     }
 
-    /// Every endpoint a request may be sent to.
-    pub fn endpoints(&self) -> &[Endpoint] {
+    /// The same, each endpoint with the share it takes.
+    pub fn from_weighted(weighted: Vec<Weighted>) -> Result<Self, CoreError> {
+        if weighted.is_empty() {
+            return Err(CoreError::NoEndpoint);
+        }
+        Ok(Self(weighted))
+    }
+
+    /// Every endpoint a request may be sent to, with its share.
+    pub fn weighted(&self) -> &[Weighted] {
         &self.0
     }
 
-    /// The endpoint used until a dispatch algorithm chooses between them.
+    /// Every endpoint a request may be sent to.
+    pub fn endpoints(&self) -> impl ExactSizeIterator<Item = &Endpoint> {
+        self.0.iter().map(|weighted| &weighted.endpoint)
+    }
+
+    /// The first endpoint, which is where a rule with one goes.
     pub fn primary(&self) -> &Endpoint {
-        &self.0[0]
+        &self.0[0].endpoint
     }
 }
 
@@ -416,9 +549,21 @@ impl TryFrom<Vec<Endpoint>> for RouteTarget {
     }
 }
 
+impl TryFrom<Vec<Weighted>> for RouteTarget {
+    type Error = CoreError;
+
+    fn try_from(weighted: Vec<Weighted>) -> Result<Self, Self::Error> {
+        Self::from_weighted(weighted)
+    }
+}
+
 impl fmt::Display for RouteTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rendered: Vec<String> = self.0.iter().map(ToString::to_string).collect();
+        let rendered: Vec<String> = self
+            .0
+            .iter()
+            .map(|weighted| weighted.endpoint.to_string())
+            .collect();
         f.write_str(&rendered.join(", "))
     }
 }
@@ -432,6 +577,10 @@ pub struct RouteRule {
     pub key: RouteKey,
     /// Where a match is sent.
     pub target: RouteTarget,
+    /// How a request is dispatched when the target holds several endpoints. Round robin
+    /// unless the rule says otherwise, which is what a rule written before this existed does.
+    #[serde(default)]
+    pub strategy: Strategy,
 }
 
 #[cfg(test)]
@@ -681,6 +830,7 @@ mod tests {
             api: ApiId::new("gateway").unwrap(),
             key: key.clone(),
             target: target.clone(),
+            strategy: Strategy::default(),
         };
         assert_eq!(rule.key.endpoint().host.as_str(), "gateway.local");
         assert_eq!(rule.target.primary().host.as_str(), "api.example.com");
@@ -725,5 +875,74 @@ mod tests {
         assert_eq!(endpoint.host.as_str(), "api.example.com");
         let bad = r#"{"protocol":"https","host":"api.example.com","port":0,"path":"/v1"}"#;
         assert!(serde_json::from_str::<Endpoint>(bad).is_err());
+    }
+
+    #[test]
+    fn a_share_of_nothing_drains_the_endpoint_it_is_set_on() {
+        assert!(Weight::DRAINED.is_drained());
+        assert_eq!(Weight::DRAINED.get(), 0);
+        assert!(!Weight::default().is_drained());
+        assert_eq!(Weight::default().get(), 1);
+        assert_eq!(Weight::new(3).get(), 3);
+        assert_eq!(Weight::new(3).to_string(), "3");
+        assert_eq!(
+            serde_json::from_str::<Weight>("0").unwrap(),
+            Weight::DRAINED
+        );
+        assert_eq!(serde_json::to_string(&Weight::new(2)).unwrap(), "2");
+    }
+
+    #[test]
+    fn every_strategy_round_trips_through_its_name() {
+        for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
+            assert_eq!(Strategy::named(strategy.name()).unwrap(), strategy);
+            assert_eq!(strategy.to_string(), strategy.name());
+        }
+        assert!(matches!(
+            Strategy::named("coin toss"),
+            Err(CoreError::UnknownStrategy { .. })
+        ));
+        assert_eq!(Strategy::default(), Strategy::RoundRobin);
+    }
+
+    #[test]
+    fn a_rule_written_without_a_strategy_or_a_weight_reads_as_round_robin_and_equal_shares() {
+        let json = r#"{
+            "api": "anthropic",
+            "key": {"protocol": "https", "host": "gateway.local", "port": 443, "path": "/v1"},
+            "target": [{"protocol": "https", "host": "api.example.com", "port": 443, "path": "/v1"}]
+        }"#;
+        let rule: RouteRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.strategy, Strategy::RoundRobin);
+        assert_eq!(rule.target.weighted()[0].weight, Weight::default());
+        assert_eq!(rule.target.primary().host.as_str(), "api.example.com");
+    }
+
+    #[test]
+    fn a_target_carries_the_share_each_endpoint_takes() {
+        let json = r#"[
+            {"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1", "weight": 3},
+            {"protocol": "https", "host": "two.example.com", "port": 443, "path": "/v1"}
+        ]"#;
+        let target: RouteTarget = serde_json::from_str(json).unwrap();
+        assert_eq!(target.weighted()[0].weight.get(), 3);
+        assert_eq!(target.weighted()[1].weight.get(), 1);
+        let written = serde_json::to_string(&target).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RouteTarget>(&written).unwrap(),
+            target
+        );
+    }
+
+    #[test]
+    fn a_strategy_reads_from_the_name_it_is_written_under() {
+        assert_eq!(
+            serde_json::from_str::<Strategy>("\"least_load\"").unwrap(),
+            Strategy::LeastLoad
+        );
+        assert_eq!(
+            serde_json::to_string(&Strategy::RoundRobin).unwrap(),
+            "\"round_robin\""
+        );
     }
 }

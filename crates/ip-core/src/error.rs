@@ -59,6 +59,13 @@ pub enum CoreError {
         value: String,
     },
 
+    /// A dispatch strategy this application does not carry.
+    #[error("unknown strategy {value:?}")]
+    UnknownStrategy {
+        /// The text that named no strategy.
+        value: String,
+    },
+
     /// A stretch of clock this application does not count over.
     #[error("unknown period {value:?}")]
     UnknownPeriod {

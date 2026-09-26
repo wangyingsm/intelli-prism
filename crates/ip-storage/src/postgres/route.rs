@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use ip_core::{ApiId, Endpoint, RouteKey, RouteRule, RouteTarget, Timestamp};
+use ip_core::{
+    ApiId, Endpoint, RouteKey, RouteRule, RouteTarget, Strategy, Timestamp, Weight, Weighted,
+};
 use sqlx::{PgConnection, Row};
 
 use super::PostgresStore;
@@ -12,10 +14,11 @@ impl RouteStore for PostgresStore {
         let key = rule.key.endpoint();
         let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
         let route_row_id: i64 = sqlx::query_scalar(
-            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO routes \
+             (api_id, key_protocol, key_host, key_port, key_path, strategy, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
-             api_id = excluded.api_id \
+             api_id = excluded.api_id, strategy = excluded.strategy \
              RETURNING row_id",
         )
         .bind(rule.api.as_str())
@@ -23,6 +26,7 @@ impl RouteStore for PostgresStore {
         .bind(key.host.as_str())
         .bind(i64::from(key.port.get()))
         .bind(key.path.as_str())
+        .bind(rule.strategy.name())
         .bind(Timestamp::now().unix_seconds())
         .fetch_one(&mut *transaction)
         .await
@@ -34,10 +38,12 @@ impl RouteStore for PostgresStore {
             .await
             .map_err(StorageError::backend)?;
 
-        for (position, endpoint) in rule.target.endpoints().iter().enumerate() {
+        for (position, weighted) in rule.target.weighted().iter().enumerate() {
+            let endpoint = &weighted.endpoint;
             sqlx::query(
-                "INSERT INTO route_targets (route_row_id, position, protocol, host, port, path) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO route_targets \
+                 (route_row_id, position, protocol, host, port, path, weight) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
             )
             .bind(route_row_id)
             .bind(i64::try_from(position).unwrap_or(i64::MAX))
@@ -45,6 +51,7 @@ impl RouteStore for PostgresStore {
             .bind(endpoint.host.as_str())
             .bind(i64::from(endpoint.port.get()))
             .bind(endpoint.path.as_str())
+            .bind(i64::from(weighted.weight.get()))
             .execute(&mut *transaction)
             .await
             .map_err(StorageError::backend)?;
@@ -79,7 +86,8 @@ impl RouteStore for PostgresStore {
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
         let endpoint = key.endpoint();
         let rows = sqlx::query(
-            "SELECT r.api_id, t.protocol, t.host, t.port, t.path FROM routes r \
+            "SELECT r.api_id, r.strategy, t.protocol, t.host, t.port, t.path, t.weight \
+             FROM routes r \
              JOIN route_targets t ON t.route_row_id = r.row_id \
              WHERE r.key_protocol = $1 AND r.key_host = $2 AND r.key_port = $3 \
              AND r.key_path = $4 \
@@ -100,7 +108,8 @@ impl RouteStore for PostgresStore {
         Ok(Some(RouteRule {
             api,
             key: key.clone(),
-            target: RouteTarget::from_endpoints(targets)?,
+            target: RouteTarget::from_weighted(targets)?,
+            strategy: strategy_of(first)?,
         }))
     }
 
@@ -115,7 +124,7 @@ pub(super) async fn read_routes(
 ) -> Result<Vec<RouteRule>, StorageError> {
     let rows = sqlx::query(
         "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-         t.protocol, t.host, t.port, t.path FROM routes r \
+         r.strategy, t.protocol, t.host, t.port, t.path, t.weight FROM routes r \
          JOIN route_targets t ON t.route_row_id = r.row_id \
          ORDER BY r.key_host, r.key_path, r.key_protocol, r.key_port, t.position",
     )
@@ -131,9 +140,9 @@ pub(super) async fn read_routes(
         if current == Some(route_row_id)
             && let Some(rule) = rules.last_mut()
         {
-            let mut endpoints = rule.target.endpoints().to_vec();
-            endpoints.push(endpoint);
-            rule.target = RouteTarget::from_endpoints(endpoints)?;
+            let mut weighted = rule.target.weighted().to_vec();
+            weighted.push(endpoint);
+            rule.target = RouteTarget::from_weighted(weighted)?;
             continue;
         }
         current = Some(route_row_id);
@@ -145,19 +154,34 @@ pub(super) async fn read_routes(
                 row.get("key_port"),
                 row.get("key_path"),
             )?),
-            target: RouteTarget::new(endpoint),
+            target: RouteTarget::from_weighted(vec![endpoint])?,
+            strategy: strategy_of(row)?,
         });
     }
     Ok(rules)
 }
 
-fn target_of(row: &sqlx::postgres::PgRow) -> Result<Endpoint, StorageError> {
-    Ok(Endpoint::from_parts(
+fn target_of(row: &sqlx::postgres::PgRow) -> Result<Weighted, StorageError> {
+    let endpoint = Endpoint::from_parts(
         row.get("protocol"),
         row.get("host"),
         row.get("port"),
         row.get("path"),
-    )?)
+    )?;
+    let weight: i64 = row.get("weight");
+    let weight = u32::try_from(weight)
+        .map(Weight::new)
+        .map_err(|_| StorageError::Malformed {
+            entity: Entity::Route,
+            detail: format!("{weight} is not a share"),
+        })?;
+    Ok(Weighted::weighing(endpoint, weight))
+}
+
+/// How a stored rule spreads its requests, refusing a strategy this code does not carry.
+fn strategy_of(row: &sqlx::postgres::PgRow) -> Result<Strategy, StorageError> {
+    let named: String = row.get("strategy");
+    Ok(Strategy::named(&named)?)
 }
 
 #[cfg(test)]
@@ -169,8 +193,10 @@ mod tests {
     /// Writes a route around the driver, so a row the code could not have written is read back.
     async fn broken_route(store: &PostgresStore, key_protocol: &str, protocol: &str, port: i64) {
         let route_row_id: i64 = sqlx::query_scalar(
-            "INSERT INTO routes (api_id, key_protocol, key_host, key_port, key_path, created_at) \
-             VALUES ('anthropic', $1, 'gateway.local', 443, '/v1', 0) RETURNING row_id",
+            "INSERT INTO routes \
+             (api_id, key_protocol, key_host, key_port, key_path, strategy, created_at) \
+             VALUES ('anthropic', $1, 'gateway.local', 443, '/v1', 'round_robin', 0) \
+             RETURNING row_id",
         )
         .bind(key_protocol)
         .fetch_one(&store.pool)

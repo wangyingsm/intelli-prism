@@ -85,6 +85,7 @@ mod tests {
             api: ip_core::ApiId::new("anthropic").unwrap(),
             key: ip_core::RouteKey::new(endpoint(host, path)),
             target: RouteTarget::new(endpoint(upstream, path)),
+            strategy: ip_core::Strategy::default(),
         }
     }
 

@@ -147,6 +147,10 @@ macro_rules! backend_suite {
             removing_a_route_that_is_absent_reports_it_missing,
             a_route_may_stand_for_several_endpoints,
             rewriting_a_route_replaces_its_whole_endpoint_list,
+            a_rule_keeps_the_strategy_and_the_shares_it_was_stored_with,
+            a_rule_stored_without_a_strategy_dispatches_in_turn,
+            rewriting_a_rule_replaces_its_strategy,
+            an_endpoint_may_be_stored_drained,
         ]);
     };
     (plugin, $open:path) => {

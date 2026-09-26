@@ -524,6 +524,7 @@ secret = "0123456789abcdef0123456789abcdef"
             api: api_id(),
             key: RouteKey::new(endpoint("gateway.local", 8080, "/anthropic")),
             target: RouteTarget::new(endpoint("upstream.local", 80, "/v1")),
+            strategy: ip_core::Strategy::default(),
         }
     }
 

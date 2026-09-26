@@ -1,4 +1,7 @@
-use ip_core::{AbsPath, ApiId, Endpoint, Host, Port, Protocol, RouteKey, RouteRule, RouteTarget};
+use ip_core::{
+    AbsPath, ApiId, Endpoint, Host, Port, Protocol, RouteKey, RouteRule, RouteTarget, Strategy,
+    Weight, Weighted,
+};
 
 use crate::error::{Entity, StorageError};
 use crate::route::RouteStore;
@@ -18,6 +21,7 @@ pub(crate) fn rule(host: &str, path: &str, upstream: &str) -> RouteRule {
         api: ApiId::new("anthropic").unwrap(),
         key: RouteKey::new(route_endpoint(Protocol::Https, host, 443, path)),
         target: RouteTarget::new(route_endpoint(Protocol::Https, upstream, 443, path)),
+        strategy: ip_core::Strategy::default(),
     }
 }
 
@@ -60,6 +64,7 @@ pub(crate) async fn a_route_key_carries_every_part_of_the_tuple(store: &impl Rou
             443,
             "/v1",
         )),
+        strategy: ip_core::Strategy::default(),
     };
     store.put_route(secure).await.unwrap();
     store.put_route(plain).await.unwrap();
@@ -80,6 +85,7 @@ pub(crate) async fn every_protocol_survives_a_round_trip(store: &impl RouteStore
                 api: ApiId::new("anthropic").unwrap(),
                 key: key.clone(),
                 target: RouteTarget::new(route_endpoint(protocol, "api.example.com", 443, "/v1")),
+                strategy: ip_core::Strategy::default(),
             })
             .await
             .unwrap();
@@ -128,4 +134,61 @@ pub(crate) async fn rewriting_a_route_replaces_its_whole_endpoint_list(store: &i
     let narrowed = rule("gateway.local", "/v1", "three.example.com");
     store.put_route(narrowed.clone()).await.unwrap();
     assert_eq!(store.routes().await.unwrap(), vec![narrowed]);
+}
+
+pub(crate) async fn a_rule_keeps_the_strategy_and_the_shares_it_was_stored_with(
+    store: &impl RouteStore,
+) {
+    let mut replicated = rule("gateway.local", "/v2", "one.example.com");
+    replicated.strategy = Strategy::Ratio;
+    let mut second = replicated.target.primary().clone();
+    second.host = Host::new("two.example.com").unwrap();
+    replicated.target = RouteTarget::from_weighted(vec![
+        Weighted::weighing(replicated.target.primary().clone(), Weight::new(3)),
+        Weighted::new(second),
+    ])
+    .unwrap();
+    store.put_route(replicated.clone()).await.unwrap();
+
+    let read = store.route(&replicated.key).await.unwrap().unwrap();
+    assert_eq!(read, replicated);
+    assert_eq!(read.strategy, Strategy::Ratio);
+    assert_eq!(read.target.weighted()[0].weight.get(), 3);
+    assert_eq!(read.target.weighted()[1].weight.get(), 1);
+    assert_eq!(store.routes().await.unwrap(), vec![replicated]);
+}
+
+pub(crate) async fn a_rule_stored_without_a_strategy_dispatches_in_turn(store: &impl RouteStore) {
+    let plain = rule("gateway.local", "/v1", "api.example.com");
+    store.put_route(plain.clone()).await.unwrap();
+    let read = store.route(&plain.key).await.unwrap().unwrap();
+    assert_eq!(read.strategy, Strategy::RoundRobin);
+    assert_eq!(read.target.weighted()[0].weight, Weight::default());
+}
+
+pub(crate) async fn rewriting_a_rule_replaces_its_strategy(store: &impl RouteStore) {
+    let mut rule = rule("gateway.local", "/v1", "api.example.com");
+    store.put_route(rule.clone()).await.unwrap();
+    rule.strategy = Strategy::LeastLoad;
+    store.put_route(rule.clone()).await.unwrap();
+    assert_eq!(
+        store.route(&rule.key).await.unwrap().unwrap().strategy,
+        Strategy::LeastLoad
+    );
+}
+
+pub(crate) async fn an_endpoint_may_be_stored_drained(store: &impl RouteStore) {
+    let mut drained = rule("gateway.local", "/v3", "one.example.com");
+    let mut spare = drained.target.primary().clone();
+    spare.host = Host::new("two.example.com").unwrap();
+    drained.target = RouteTarget::from_weighted(vec![
+        Weighted::new(drained.target.primary().clone()),
+        Weighted::weighing(spare, Weight::DRAINED),
+    ])
+    .unwrap();
+    store.put_route(drained.clone()).await.unwrap();
+
+    let read = store.route(&drained.key).await.unwrap().unwrap();
+    assert_eq!(read, drained);
+    assert!(read.target.weighted()[1].weight.is_drained());
 }

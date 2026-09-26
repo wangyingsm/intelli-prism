@@ -185,6 +185,7 @@ mod tests {
             api: ApiId::new("chat").unwrap(),
             key: RouteKey::new(endpoint("gateway.local", path)),
             target: RouteTarget::new(endpoint(upstream, "/v1")),
+            strategy: ip_core::Strategy::default(),
         }
     }
 

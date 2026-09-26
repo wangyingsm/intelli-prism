@@ -24,7 +24,8 @@ pub use plugin::{
     Checksum, NewPluginRule, PRIMARY_ORDER_MAX, PluginKind, PluginOrder, PluginRule, PluginScope,
 };
 pub use route::{
-    AbsPath, Endpoint, Host, Port, Protocol, RESERVED_PATH_PREFIX, RouteKey, RouteRule, RouteTarget,
+    AbsPath, Endpoint, Host, Port, Protocol, RESERVED_PATH_PREFIX, RouteKey, RouteRule,
+    RouteTarget, Strategy, Weight, Weighted,
 };
 pub use timestamp::Timestamp;
 pub use trace::TraceId;

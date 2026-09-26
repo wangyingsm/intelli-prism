@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Endpoint, Grant, PluginRule, RouteKey, RouteRule, RouteTarget, TenantId, Timestamp,
-    UserId,
+    ApiId, Endpoint, Grant, PluginRule, RouteKey, RouteRule, RouteTarget, Strategy, TenantId,
+    Timestamp, UserId, Weight, Weighted,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -10,7 +10,7 @@ use super::SqliteStore;
 use super::identity::tenant_row_id;
 use super::plugin::{plugin_record, plugin_rule};
 use crate::codec::{capability, scope, standing};
-use crate::error::StorageError;
+use crate::error::{Entity, StorageError};
 use crate::limit::Limit;
 use crate::list::{ListStore, Listed, Page};
 use crate::model::Membership;
@@ -40,6 +40,24 @@ fn endpoint(row: &SqliteRow, prefix: &str) -> Result<Endpoint, StorageError> {
         row.get(format!("{prefix}port").as_str()),
         row.get(format!("{prefix}path").as_str()),
     )?)
+}
+
+/// A listed endpoint with the share of its rule's traffic it takes.
+fn weighted(row: &SqliteRow) -> Result<Weighted, StorageError> {
+    let weight: i64 = row.get("weight");
+    let weight = u32::try_from(weight)
+        .map(Weight::new)
+        .map_err(|_| StorageError::Malformed {
+            entity: Entity::Route,
+            detail: format!("{weight} is not a share"),
+        })?;
+    Ok(Weighted::weighing(endpoint(row, "")?, weight))
+}
+
+/// How a listed rule spreads its requests.
+fn strategy(row: &SqliteRow) -> Result<Strategy, StorageError> {
+    let named: String = row.get("strategy");
+    Ok(Strategy::named(&named)?)
 }
 
 #[async_trait]
@@ -129,7 +147,7 @@ impl ListStore for SqliteStore {
     async fn list_routes(&self, page: Page) -> Result<Vec<Listed<RouteRule>>, StorageError> {
         let rows = sqlx::query(
             "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-             r.created_at, t.protocol, t.host, t.port, t.path FROM \
+             r.created_at, r.strategy, t.protocol, t.host, t.port, t.path, t.weight FROM \
              (SELECT * FROM routes WHERE created_at > ? \
               ORDER BY created_at DESC, row_id DESC LIMIT ? OFFSET ?) r \
              JOIN route_targets t ON t.route_row_id = r.row_id \
@@ -146,13 +164,13 @@ impl ListStore for SqliteStore {
         let mut current: Option<i64> = None;
         for row in &rows {
             let route_row_id: i64 = row.get("row_id");
-            let target = endpoint(row, "")?;
+            let target = weighted(row)?;
             if current == Some(route_row_id)
                 && let Some(last) = listed.last_mut()
             {
-                let mut endpoints = last.item.target.endpoints().to_vec();
+                let mut endpoints = last.item.target.weighted().to_vec();
                 endpoints.push(target);
-                last.item.target = RouteTarget::from_endpoints(endpoints)?;
+                last.item.target = RouteTarget::from_weighted(endpoints)?;
                 continue;
             }
             current = Some(route_row_id);
@@ -160,7 +178,8 @@ impl ListStore for SqliteStore {
                 item: RouteRule {
                     api: ApiId::new(row.get("api_id"))?,
                     key: RouteKey::new(endpoint(row, "key_")?),
-                    target: RouteTarget::new(target),
+                    target: RouteTarget::from_weighted(vec![target])?,
+                    strategy: strategy(row)?,
                 },
                 created_at: created_at(row)?,
             });

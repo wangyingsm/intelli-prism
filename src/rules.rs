@@ -316,6 +316,7 @@ mod tests {
             api: ApiId::new("chat").unwrap(),
             key: RouteKey::new(endpoint("gateway.local")),
             target: RouteTarget::new(endpoint("api.example.com")),
+            strategy: ip_core::Strategy::default(),
         }
     }
 
