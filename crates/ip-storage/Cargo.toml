@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 async-trait = "0.1.92"
 ip-core = { version = "0.1.0", path = "../ip-core" }
+serde.workspace = true
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "migrate", "macros"], optional = true }
 thiserror.workspace = true
 typestate-txn = { version = "0.1.0", path = "../typestate-txn" }

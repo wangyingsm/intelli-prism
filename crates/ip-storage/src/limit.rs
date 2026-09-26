@@ -4,7 +4,7 @@ use ip_core::{Allowance, Counted, LimitScope, Period, Timestamp};
 use crate::error::StorageError;
 
 /// What one scope may spend of one thing over one period, as it is stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Limit {
     /// Who it applies to.
     pub scope: LimitScope,

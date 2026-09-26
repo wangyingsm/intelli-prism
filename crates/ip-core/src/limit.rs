@@ -15,7 +15,9 @@ const DAY: i64 = 24 * HOUR;
 ///
 /// A request is matched by every scope it falls inside; the narrowest of them decides, so a
 /// tenant's limit can be tightened for one account or one expensive api.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct LimitScope {
     /// The tenant the limit belongs to.
     pub tenant: TenantId,
@@ -79,7 +81,9 @@ impl fmt::Display for LimitScope {
 }
 
 /// What a limit counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Counted {
     /// Tokens spent at an upstream, which an answer from the cache adds nothing to.
@@ -113,7 +117,9 @@ impl Counted {
 ///
 /// A period starts where the clock divides, so it needs no bookkeeping of its own: what is
 /// spent under it is found by the moment it began.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Period {
     /// One minute, which is where a request rate is usually set.
@@ -179,7 +185,7 @@ impl Period {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
-#[serde(transparent)]
+#[serde(into = "u64", try_from = "u64")]
 pub struct Allowance(u64);
 
 impl Allowance {
@@ -200,6 +206,20 @@ impl Allowance {
     /// Whether `spent` is already at or past what is allowed.
     pub const fn is_spent(self, spent: u64) -> bool {
         spent >= self.0
+    }
+}
+
+impl From<Allowance> for u64 {
+    fn from(allowance: Allowance) -> Self {
+        allowance.get()
+    }
+}
+
+impl TryFrom<u64> for Allowance {
+    type Error = CoreError;
+
+    fn try_from(allowed: u64) -> Result<Self, Self::Error> {
+        Self::new(allowed)
     }
 }
 
@@ -331,6 +351,36 @@ mod tests {
         let allowance = Allowance::new(100).unwrap();
         assert_eq!(allowance.get(), 100);
         assert_eq!(allowance.to_string(), "100");
+    }
+
+    #[test]
+    fn an_allowance_that_allows_nothing_is_refused_on_the_wire_too() {
+        assert_eq!(
+            serde_json::to_string(&Allowance::new(10).unwrap()).unwrap(),
+            "10"
+        );
+        assert_eq!(
+            serde_json::from_str::<Allowance>("10").unwrap(),
+            Allowance::new(10).unwrap()
+        );
+        assert!(serde_json::from_str::<Allowance>("0").is_err());
+    }
+
+    #[test]
+    fn a_scope_and_what_it_limits_round_trip_on_the_wire() {
+        let scope = LimitScope::of_tenant(tenant())
+            .of_user(user())
+            .of_api(api());
+        let written = serde_json::to_string(&scope).unwrap();
+        assert_eq!(serde_json::from_str::<LimitScope>(&written).unwrap(), scope);
+        assert_eq!(
+            serde_json::from_str::<Counted>("\"tokens\"").unwrap(),
+            Counted::Tokens
+        );
+        assert_eq!(
+            serde_json::from_str::<Period>("\"month\"").unwrap(),
+            Period::Month
+        );
     }
 
     #[test]
