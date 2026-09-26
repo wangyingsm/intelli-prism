@@ -6,7 +6,7 @@ use crate::store::Backend;
 use crate::suite::fixture::{new_user, tenant_id, tenant_with_user, user_id};
 
 /// A limit over a whole tenant: a million tokens a month.
-fn monthly(allowance: u64) -> NewLimit {
+pub(crate) fn monthly(allowance: u64) -> NewLimit {
     NewLimit {
         scope: LimitScope::of_tenant(tenant_id()),
         counted: Counted::Tokens,

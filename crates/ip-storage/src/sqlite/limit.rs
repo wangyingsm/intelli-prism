@@ -124,3 +124,36 @@ pub(super) fn set(row: SqliteRow) -> Result<Limit, StorageError> {
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite::fixture::*;
+    use crate::suite::limit::monthly;
+
+    /// Sets a limit, then writes over one column with something the code cannot produce.
+    async fn written_over(store: &SqliteStore, update: &'static str) {
+        tenant_with_user(store).await;
+        store.put_limit(monthly(1_000)).await.unwrap();
+        sqlx::query(update).execute(&store.pool).await.unwrap();
+    }
+
+    /// Every column whose stored value its own type can refuse, and a value that it refuses.
+    const REFUSED: [&str; 2] = [
+        "UPDATE limits SET counted = 'dollars'",
+        "UPDATE limits SET period = 'fortnight'",
+    ];
+
+    #[tokio::test]
+    async fn a_row_no_type_of_ours_will_take_is_reported_as_malformed() {
+        for update in REFUSED {
+            let store = store().await;
+            written_over(&store, update).await;
+            assert!(
+                matches!(store.limits().await, Err(StorageError::Value(_))),
+                "{update} was read back as {:?}",
+                store.limits().await
+            );
+        }
+    }
+}
