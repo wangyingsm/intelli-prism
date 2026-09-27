@@ -27,6 +27,9 @@ stalling the requests in flight.
 under it, and a row per request: the model, the tokens in each direction, whether the cache
 answered and how long the caller waited. Exported to an OpenTelemetry collector when one is
 configured, and read back over `GET /_ip/usage`.
+- **Dispatch across the endpoints behind a rule.** Round robin, least load or a share each, chosen
+per rule and per configured upstream. A share of nothing drains an endpoint without touching the
+rule, and every usage row names the endpoint that answered.
 - **Quota and rate limits.** What a tenant, one of its accounts or one of its apis may spend, in
 tokens or in requests, over a minute, an hour, a day or a month. The counts live in the cache and
 are seeded from the usage rows; a caller past its limit is told with 429 and when to come back.

@@ -143,6 +143,25 @@ tenant.
 - Limits ride the same revision, publication and jittered reload as the routing rules, so a
 change reaches every node the way a rule change does.
 
+### Dispatching across the endpoints behind a rule
+
+- A rule says how its requests are spread over the endpoints behind it: `round_robin` by default,
+`least_load`, or `ratio` by the share each endpoint carries. Both a stored rule and a configured
+`[[upstream]]` say it, so a replicated upstream can be described in the file alone.
+- Round robin counts a rule's turn in the rule's own plan, worked out when the routing table is
+built, so a dispatch costs one atomic add and no lock. Ratio draws against a running total found
+at the same moment, so it costs a draw and a search rather than a sum per request.
+- Least load scores each endpoint as what a request arriving now would wait behind: everything in
+flight at what that endpoint has been taking. The counts are this node's own, in atomics beside the
+rule, so the decision reads no lock and hashes nothing.
+- What an endpoint takes is folded in away from the request that finished: a completed request says
+how long it waited and moves on, and a folder works the average into the plan in batches.
+- A share of nothing drains that endpoint: no strategy sends it a request until the share is
+raised again. A target whose every endpoint is drained is dispatched to in turn all the same, since
+a rule must have somewhere to send a request.
+- Each usage row names the endpoint that answered it, by host and port, and the `egress.request`
+span carries the same. An answer out of the cache names none, having reached none.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -152,8 +171,6 @@ would mean deliberately ignoring what the upstream asked for; the call has not b
 so a crash in between leaves the level over until the next write.
 - **Redis enforces no per-level limit.** It evicts by the server's `maxmemory-policy`, so the limits
 are configured on the sled backend alone and TTLs do the real work in a cluster.
-- **Only one target per rule is used.** A rule may name several, but the first is always taken —
-see the dispatch strategies below.
 - **Only `http` and `https` are forwarded.** `ws`, `wss` and `tcp` parse and are refused at routing.
 - **A rule change is not in force the instant the api answers.** The write is committed and
 published, but each node waits a jittered moment before rebuilding, so nodes come into step within
@@ -178,6 +195,18 @@ same order means a hit is not served once a quota is spent.
 match a limit that names no api. The limits endpoint goes by ownership instead, which is what
 `DESIGN.md` describes; letting a granted member manage limits needs the capability's scope shape
 widened.
+- **Hedging is not built.** A rule dispatches to one endpoint. Sending a request to several at
+once and taking the first answer is designed but not written, and it needs a ruling on what a
+cancelled hedge costs a quota.
+- **A load score is one node's own.** Each node counts what it has in flight and what its own
+requests have been taking, so a cluster spreads its traffic by each node spreading its own. Nodes
+carrying very different traffic will not balance each other.
+- **A drained target still answers.** Draining every endpoint behind one rule leaves it dispatching
+in turn rather than refusing, since a matched request must go somewhere. Draining a whole rule is
+done by removing the rule.
+- **A rule change resets that rule's turn.** The turn lives in the plan built with the table, so a
+rewritten rule starts again at its first endpoint. Only that rule's, and only the order, not the
+spread.
 - **A published rule set that cannot be built leaves a node on the rules it has.** It keeps serving
 and retries, so nodes can serve different revisions while one of them cannot build the newest.
 
@@ -196,10 +225,9 @@ is skipped; syncing on it needs a tie-breaker, such as the row id, carried besid
 - Wasm a deleted tenant owned alone is left in the store with no owner. Nothing lists it or runs
 it, but nothing removes it either until a sweep of unowned plugins exists.
 
-### Intelligent routing
+### Intelligent routing, what is left of it
 
-- Dispatch strategies across a rule's targets: round robin, least load, ratio dispatch, hedging.
-Waits on per-upstream load and latency being recorded.
+- Hedging: several endpoints at once, the first answer kept and the rest cancelled.
 - Difficulty classification into `easy`, `routine`, `median`, `hard`, `research`, with a local
 decision tree first and an external arbiter LLM when confidence is low.
 - Endpoint capability matching, so a request goes to the least capable endpoint that can serve it.

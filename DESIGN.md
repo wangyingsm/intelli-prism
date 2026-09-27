@@ -315,8 +315,8 @@ by admin only, they are applied to every flow by default but with low priority.
 list of (protocol, host, port, abs_path) tuples. One entry is the common case for a remote upstream;
 several stand behind a replicated or local one.
 - Which entry a request goes to is a dispatch decision, not a property of the rule: round robin, least
-load, hedging and the rest are chosen per rule. Until those algorithms are designed the first entry is
-used. (todo)
+load, hedging and the rest are chosen per rule. Round robin, least load and ratio are built; hedging
+is not. (todo: hedging)
 - Protocol is an enum (`http://`, `https://`, `ws://`, `wss://`, `tcp`), which `tcp` is for gRPC only.
 - Host is a network hostname or IP addr(v4 and v6).
 - Port is a u16 integer.
