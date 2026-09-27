@@ -275,6 +275,111 @@ mod tests {
         assert_eq!(listed[0]["target"][0]["host"], "api.example.com");
     }
 
+    /// A rule over two endpoints, dispatched to by `strategy`, the first taking `weight`.
+    fn replicated(strategy: &str, weight: u32) -> String {
+        format!(
+            r#"{{
+                "api": "chat",
+                "key": {{"protocol": "https", "host": "gateway.local", "port": 443, "path": "/v1"}},
+                "strategy": "{strategy}",
+                "target": [
+                    {{"protocol": "https", "host": "one.example.com", "port": 443,
+                      "path": "/v1", "weight": {weight}}},
+                    {{"protocol": "https", "host": "two.example.com", "port": 443, "path": "/v1"}}
+                ]
+            }}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rule_is_stored_with_the_strategy_and_the_shares_it_names() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let stored = call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&replicated("ratio", 3)),
+        )
+        .await;
+        assert_eq!(stored.status(), StatusCode::NO_CONTENT);
+
+        let listed = listed(&router, &state).await;
+        assert_eq!(listed[0]["strategy"], "ratio");
+        assert_eq!(listed[0]["target"][0]["host"], "one.example.com");
+        assert_eq!(listed[0]["target"][0]["weight"], 3);
+        assert_eq!(listed[0]["target"][1]["host"], "two.example.com");
+        assert_eq!(listed[0]["target"][1]["weight"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_names_neither_dispatches_in_turn_with_equal_shares() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&json(&rule("/v1", "api.example.com"))),
+        )
+        .await;
+
+        let listed = listed(&router, &state).await;
+        assert_eq!(listed[0]["strategy"], "round_robin");
+        assert_eq!(listed[0]["target"][0]["weight"], 1);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_may_be_drained_through_the_api() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let stored = call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&replicated("least_load", 0)),
+        )
+        .await;
+        assert_eq!(stored.status(), StatusCode::NO_CONTENT);
+
+        let listed = listed(&router, &state).await;
+        assert_eq!(listed[0]["strategy"], "least_load");
+        assert_eq!(listed[0]["target"][0]["weight"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_strategy_this_gateway_does_not_carry_is_refused() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let refused = call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&replicated("coin_toss", 1)),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_share_that_is_not_a_number_of_requests_is_refused() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let refused = call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&replicated("ratio", 1).replace("\"weight\": 1", "\"weight\": -2")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     #[tokio::test]
     async fn storing_a_key_again_replaces_where_it_goes() {
         let state = state_over(store().await);
