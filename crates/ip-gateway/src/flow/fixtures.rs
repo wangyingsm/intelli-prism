@@ -231,6 +231,18 @@ pub(super) fn table() -> RoutingTable {
     ))])
 }
 
+/// A table whose one rule stands behind two endpoints, dispatched to by `strategy`.
+pub(super) fn replicated_table(strategy: ip_core::Strategy) -> RoutingTable {
+    let mut rule = rule(endpoint(Protocol::Https, "one.example.com", 443, "/v1"));
+    rule.strategy = strategy;
+    rule.target = RouteTarget::from_endpoints(vec![
+        endpoint(Protocol::Https, "one.example.com", 443, "/v1"),
+        endpoint(Protocol::Https, "two.example.com", 443, "/v1"),
+    ])
+    .unwrap();
+    RoutingTable::from_rules(vec![rule])
+}
+
 pub(super) fn granted() -> Authority {
     let scope = CapabilityScope::Api {
         user: user(),

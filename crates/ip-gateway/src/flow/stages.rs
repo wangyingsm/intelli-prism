@@ -12,6 +12,7 @@ use super::headers::{authority_of, is_event_stream, rewrite, set_length, strip_h
 use super::run::{collect, run_body, run_headers};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, freshness, response_key};
+use crate::dispatch::Dispatcher;
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
@@ -190,13 +191,21 @@ impl Flow<BodyProcessed> {
             .map_err(|error| GatewayError::new(BodyProcessed::NAME, error.into()))
     }
 
-    /// Sends the request to the endpoint the rule chose.
-    pub async fn forward(self, upstream: &dyn Upstream) -> Result<Flow<Forwarded>, GatewayError> {
+    /// Sends the request to the endpoint the dispatcher chose.
+    ///
+    /// The choice is counted against that endpoint until the upstream answers, so what the
+    /// dispatcher knows about its load is what a request arriving now would actually wait behind.
+    pub async fn forward(
+        self,
+        upstream: &dyn Upstream,
+        dispatcher: &Dispatcher,
+    ) -> Result<Flow<Forwarded>, GatewayError> {
         let Routed {
             request,
             resolution,
         } = self.held;
-        let request = rewrite(request, resolution.primary())?;
+        let chosen = dispatcher.choose(&resolution);
+        let request = rewrite(request, chosen.endpoint())?;
         let mut response = upstream
             .send(request)
             .await
@@ -457,7 +466,8 @@ mod tests {
         let flow = flow.process_body(&processors).await.unwrap();
         assert_eq!(flow.stage(), StageName::BodyProcess);
         let upstream = FakeUpstream::answering("pong");
-        let flow = flow.forward(upstream.as_ref()).await.unwrap();
+        let (dispatcher, _folding) = Dispatcher::new();
+        let flow = flow.forward(upstream.as_ref(), &dispatcher).await.unwrap();
         assert_eq!(flow.stage(), StageName::Route);
         let flow = flow
             .process_response_headers(processors.response_headers())

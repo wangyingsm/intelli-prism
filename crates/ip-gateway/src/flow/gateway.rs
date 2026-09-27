@@ -19,6 +19,7 @@ use super::headers::set_length;
 use super::record::{Limiting, Pending, Recording};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
+use crate::dispatch::Dispatcher;
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
@@ -51,6 +52,7 @@ pub struct Gateway {
     responses: Option<ResponseCache>,
     usage: Option<Arc<dyn UsageStore>>,
     limiter: Option<Arc<Limiter>>,
+    dispatcher: Arc<Dispatcher>,
     pending: Pending,
 }
 
@@ -92,6 +94,8 @@ impl Gateway {
             responses: None,
             usage: None,
             limiter: None,
+            // Nothing folds what this one learns until a caller supplies one that is folded for.
+            dispatcher: Arc::new(Dispatcher::new().0),
             pending: Pending::default(),
         }
     }
@@ -123,6 +127,12 @@ impl Gateway {
     /// Checks every request against the limits in force, and counts what it spends.
     pub fn limiting(mut self, limiter: Arc<Limiter>) -> Self {
         self.limiter = Some(limiter);
+        self
+    }
+
+    /// Dispatches with this one, whose folder keeps what each endpoint takes up to date.
+    pub fn dispatching(mut self, dispatcher: Arc<Dispatcher>) -> Self {
+        self.dispatcher = dispatcher;
         self
     }
 
@@ -275,7 +285,7 @@ impl Gateway {
         followed: &Followed,
     ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
         let forwarded = processed
-            .forward(self.upstream.as_ref())
+            .forward(self.upstream.as_ref(), &self.dispatcher)
             .instrument(stage_span!(EGRESS_REQUEST, followed))
             .await?;
         async {
@@ -1001,6 +1011,79 @@ mod tests {
                 .status(),
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    #[tokio::test]
+    async fn a_replicated_rule_sends_its_requests_round_the_endpoints() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        );
+        for _ in 0..4 {
+            gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap();
+        }
+        let hosts: Vec<String> = upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|seen| seen.host.clone())
+            .collect();
+        assert_eq!(
+            hosts,
+            [
+                "one.example.com:443",
+                "two.example.com:443",
+                "one.example.com:443",
+                "two.example.com:443"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn what_a_dispatcher_learns_reaches_it_through_its_folder() {
+        let upstream = FakeUpstream::answering("pong");
+        let (dispatcher, mut folding) = Dispatcher::new();
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::LeastLoad),
+            ProcessorChain::new(),
+            upstream,
+        )
+        .dispatching(Arc::new(dispatcher));
+
+        gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        // One answer went back, so one is there to fold.
+        assert_eq!(folding.fold().await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_out_of_the_cache_reaches_no_endpoint_at_all() {
+        let upstream = FakeUpstream::answering("pong");
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()));
+
+        for _ in 0..3 {
+            let answered = gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap();
+            body_of(answered).await;
+        }
+        // Only the first reached an endpoint, so the turn moved once.
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1);
     }
 
     #[test]

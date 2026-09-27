@@ -10,7 +10,7 @@ use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_core::RouteRule;
 use ip_gateway::{
-    Gateway, HyperUpstream, Limiter, Limits, ResponseCache, RouteError, RoutingTable,
+    Dispatcher, Gateway, HyperUpstream, Limiter, Limits, ResponseCache, RouteError, RoutingTable,
 };
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
@@ -109,9 +109,13 @@ impl AppState {
             Arc::clone(&counters),
             Arc::clone(&backend) as Arc<dyn ip_storage::UsageStore>,
         );
+        let (dispatcher, folding) = Dispatcher::new();
+        // The folder stops by itself once the last request that could teach it anything is gone.
+        let _folding = folding.keep_folding();
         let mut gateway = gateway
             .recording(Arc::clone(&backend) as Arc<dyn ip_storage::UsageStore>)
             .limiting(Arc::new(limiter))
+            .dispatching(Arc::new(dispatcher))
             .with_limits(limits);
         if let Some(ttl) = config.cache.response_ttl() {
             let responses = ResponseCache::new(Arc::clone(&cache), Ttl::new(ttl.as_duration())?);
