@@ -353,6 +353,34 @@ impl fmt::Display for Endpoint {
     }
 }
 
+/// Which endpoint behind a rule answered, by the part that tells replicas apart.
+///
+/// The protocol and the path belong to the rule, so two endpoints standing behind one target
+/// differ by where they are: this is what a record of a request names it by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Replica {
+    /// Where it is.
+    pub host: Host,
+    /// The port it answers on.
+    pub port: Port,
+}
+
+impl Replica {
+    /// Names the endpoint a request was sent to.
+    pub fn of(endpoint: &Endpoint) -> Self {
+        Self {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+        }
+    }
+}
+
+impl fmt::Display for Replica {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
 /// The endpoint a request arrives at, which a rule is looked up by.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RouteKey(Endpoint);
@@ -944,5 +972,16 @@ mod tests {
             serde_json::to_string(&Strategy::RoundRobin).unwrap(),
             "\"round_robin\""
         );
+    }
+
+    #[test]
+    fn a_replica_is_named_by_where_it_answers() {
+        let endpoint = endpoint(Protocol::Https, "two.example.com", 8443, "/v1");
+        let replica = Replica::of(&endpoint);
+        assert_eq!(replica.to_string(), "two.example.com:8443");
+        assert_eq!(replica.host, endpoint.host);
+        assert_eq!(replica.port, endpoint.port);
+        let written = serde_json::to_string(&replica).unwrap();
+        assert_eq!(serde_json::from_str::<Replica>(&written).unwrap(), replica);
     }
 }

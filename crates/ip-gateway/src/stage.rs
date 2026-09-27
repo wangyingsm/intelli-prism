@@ -2,6 +2,8 @@ use std::fmt;
 
 use http::{Request, Response};
 
+use ip_core::Replica;
+
 use crate::body::GatewayBody;
 use crate::table::Resolution;
 
@@ -116,11 +118,19 @@ impl Stage for BodyProcessed {
     const NAME: StageName = StageName::BodyProcess;
 }
 
+/// What an upstream answered, and which endpoint gave it.
+pub struct Answered {
+    /// The answer itself.
+    pub response: Response<GatewayBody>,
+    /// The endpoint the request was dispatched to.
+    pub served: Replica,
+}
+
 /// The upstream answered.
 pub struct Forwarded;
 
 impl Stage for Forwarded {
-    type Held = Response<GatewayBody>;
+    type Held = Answered;
     const NAME: StageName = StageName::Route;
 }
 
@@ -128,7 +138,7 @@ impl Stage for Forwarded {
 pub struct ResponseHeadersProcessed;
 
 impl Stage for ResponseHeadersProcessed {
-    type Held = Response<GatewayBody>;
+    type Held = Answered;
     const NAME: StageName = StageName::ResponseHeaderProcess;
 }
 
@@ -136,7 +146,7 @@ impl Stage for ResponseHeadersProcessed {
 pub struct ResponseBodyProcessed;
 
 impl Stage for ResponseBodyProcessed {
-    type Held = Response<GatewayBody>;
+    type Held = Answered;
     const NAME: StageName = StageName::ResponseBodyProcess;
 }
 

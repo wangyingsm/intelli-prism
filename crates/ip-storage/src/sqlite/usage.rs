@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use ip_core::{ApiId, Counted, ModelName, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId};
+use ip_core::{
+    ApiId, Counted, ModelName, Replica, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
+};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
@@ -13,8 +15,9 @@ impl UsageStore for SqliteStore {
     async fn record_usage(&self, usage: NewUsage) -> Result<Usage, StorageError> {
         let row = sqlx::query(
             "INSERT INTO usage (trace_id, turn_id, tenant_id, user_id, api_id, model, \
-             input_tokens, output_tokens, served, latency_ms, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
+             created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              RETURNING row_id, created_at",
         )
         .bind(usage.trace.to_hex())
@@ -26,6 +29,18 @@ impl UsageStore for SqliteStore {
         .bind(i64::from(usage.tokens.input.get()))
         .bind(i64::from(usage.tokens.output.get()))
         .bind(served_name(usage.served))
+        .bind(
+            usage
+                .served_by
+                .as_ref()
+                .map(|replica| replica.host.as_str().to_owned()),
+        )
+        .bind(
+            usage
+                .served_by
+                .as_ref()
+                .map(|replica| i64::from(replica.port.get())),
+        )
         .bind(i64::from(usage.latency.millis()))
         .bind(Timestamp::now().unix_seconds())
         .fetch_one(&self.pool)
@@ -42,6 +57,7 @@ impl UsageStore for SqliteStore {
             model: usage.model,
             tokens: usage.tokens,
             served: usage.served,
+            served_by: usage.served_by,
             latency: usage.latency,
             created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
         })
@@ -50,8 +66,8 @@ impl UsageStore for SqliteStore {
     async fn usage(&self, row_id: UsageRowId) -> Result<Option<Usage>, StorageError> {
         let row = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
-             input_tokens, output_tokens, served, latency_ms, created_at \
-             FROM usage WHERE row_id = ?",
+             input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
+             created_at FROM usage WHERE row_id = ?",
         )
         .bind(row_id.get())
         .fetch_optional(&self.pool)
@@ -104,6 +120,24 @@ impl UsageStore for SqliteStore {
     }
 }
 
+/// Which endpoint answered, when the row names one. A row naming half of one is refused: a
+/// host without a port is no endpoint.
+fn served_by(row: &SqliteRow) -> Result<Option<Replica>, StorageError> {
+    let host: Option<String> = row.get("served_host");
+    let port: Option<i64> = row.get("served_port");
+    match (host, port) {
+        (Some(host), Some(port)) => Ok(Some(Replica {
+            host: ip_core::Host::new(&host)?,
+            port: ip_core::Port::try_from(port)?,
+        })),
+        (None, None) => Ok(None),
+        (host, port) => Err(StorageError::Malformed {
+            entity: Entity::Usage,
+            detail: format!("{host:?} and {port:?} are half an endpoint"),
+        }),
+    }
+}
+
 /// Rebuilds a usage row, refusing one whose stored value its own type will not take.
 pub(super) fn recorded(row: SqliteRow) -> Result<Usage, StorageError> {
     let turn: Option<String> = row.get("turn_id");
@@ -125,6 +159,7 @@ pub(super) fn recorded(row: SqliteRow) -> Result<Usage, StorageError> {
             token_count(row.get("output_tokens"))?,
         ),
         served: served_of(&source)?,
+        served_by: served_by(&row)?,
         latency: latency(row.get("latency_ms"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })
@@ -148,11 +183,13 @@ mod tests {
     }
 
     /// Every column whose stored value its own type can refuse, and a value that it refuses.
-    const REFUSED: [&str; 4] = [
+    const REFUSED: [&str; 6] = [
         "UPDATE usage SET served = 'somewhere' WHERE row_id = ?",
         "UPDATE usage SET trace_id = 'not-a-trace' WHERE row_id = ?",
         "UPDATE usage SET input_tokens = 9223372036854775807 WHERE row_id = ?",
         "UPDATE usage SET latency_ms = -1 WHERE row_id = ?",
+        "UPDATE usage SET served_port = NULL WHERE row_id = ?",
+        "UPDATE usage SET served_host = NULL WHERE row_id = ?",
     ];
 
     #[tokio::test]

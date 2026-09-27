@@ -3,9 +3,10 @@
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Request, Response};
 use ip_cache::{CacheKey, Ttl};
-use ip_core::{Capability, CapabilityScope, RouteKey};
+use ip_core::{Capability, CapabilityScope, Replica, RouteKey};
 use std::sync::Arc;
 use std::time::SystemTime;
+use tracing::{Span, field};
 
 use super::RequestContext;
 use super::headers::{authority_of, is_event_stream, rewrite, set_length, strip_hop_by_hop};
@@ -17,8 +18,8 @@ use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
 use crate::stage::{
-    Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
-    ResponseHeadersProcessed, Routed, Stage, StageName,
+    Answered, Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received,
+    ResponseBodyProcessed, ResponseHeadersProcessed, Routed, Stage, StageName,
 };
 use crate::table::{Resolution, RoutingTable, request_key};
 use crate::upstream::Upstream;
@@ -205,6 +206,8 @@ impl Flow<BodyProcessed> {
             resolution,
         } = self.held;
         let chosen = dispatcher.choose(&resolution);
+        let served = Replica::of(chosen.endpoint());
+        Span::current().record("served", field::display(&served));
         let request = rewrite(request, chosen.endpoint())?;
         let mut response = upstream
             .send(request)
@@ -213,7 +216,7 @@ impl Flow<BodyProcessed> {
         strip_hop_by_hop(response.headers_mut());
         Ok(Flow {
             context: self.context,
-            held: response,
+            held: Answered { response, served },
         })
     }
 }
@@ -227,7 +230,7 @@ impl Flow<Forwarded> {
         run_headers(
             ResponseHeadersProcessed::NAME,
             chain,
-            self.held.headers_mut(),
+            self.held.response.headers_mut(),
         )
         .await?;
         Ok(Flow {
@@ -243,10 +246,12 @@ impl Flow<ResponseHeadersProcessed> {
         mut self,
         processors: &ProcessorChain,
     ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
-        if is_event_stream(self.held.headers()) && !processors.response_chunk().is_empty() {
-            self.held.headers_mut().remove(CONTENT_LENGTH);
-            let body = std::mem::replace(self.held.body_mut(), crate::body::empty());
-            *self.held.body_mut() = stream_chunks(body, processors.response_chunk().to_vec());
+        if is_event_stream(self.held.response.headers()) && !processors.response_chunk().is_empty()
+        {
+            self.held.response.headers_mut().remove(CONTENT_LENGTH);
+            let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
+            *self.held.response.body_mut() =
+                stream_chunks(body, processors.response_chunk().to_vec());
             return Ok(Flow {
                 context: self.context,
                 held: self.held,
@@ -255,12 +260,12 @@ impl Flow<ResponseHeadersProcessed> {
         let body = run_body(
             ResponseBodyProcessed::NAME,
             processors.response_body(),
-            self.held.body_mut(),
+            self.held.response.body_mut(),
         )
         .await?;
         if let Some(bytes) = body {
-            set_length(self.held.headers_mut(), bytes.len());
-            *self.held.body_mut() = from_bytes(bytes);
+            set_length(self.held.response.headers_mut(), bytes.len());
+            *self.held.response.body_mut() = from_bytes(bytes);
         }
         Ok(Flow {
             context: self.context,
@@ -270,6 +275,11 @@ impl Flow<ResponseHeadersProcessed> {
 }
 
 impl Flow<ResponseBodyProcessed> {
+    /// Which endpoint answered.
+    pub fn served(&self) -> &Replica {
+        &self.held.served
+    }
+
     /// The answer to keep and how long to keep it, buffering the body so it can still be sent,
     /// or nothing when this response may not be kept at all.
     ///
@@ -279,24 +289,26 @@ impl Flow<ResponseBodyProcessed> {
         default: Ttl,
     ) -> Result<Option<(CachedResponse, Ttl)>, GatewayError> {
         // A stream is answered as it arrives and an error is not an answer to repeat.
-        if !self.held.status().is_success() || is_event_stream(self.held.headers()) {
+        if !self.held.response.status().is_success()
+            || is_event_stream(self.held.response.headers())
+        {
             return Ok(None);
         }
-        let ttl = match freshness(self.held.headers(), SystemTime::now()) {
+        let ttl = match freshness(self.held.response.headers(), SystemTime::now()) {
             Freshness::For(ttl) => ttl,
             Freshness::Unsaid => default,
             Freshness::Never => return Ok(None),
         };
-        let body = std::mem::replace(self.held.body_mut(), crate::body::empty());
+        let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
         let bytes = collect(StageName::ResponseBodyRead, body).await?;
-        *self.held.body_mut() = from_bytes(bytes.clone());
-        let content_type = self.held.headers().get(CONTENT_TYPE).cloned();
+        *self.held.response.body_mut() = from_bytes(bytes.clone());
+        let content_type = self.held.response.headers().get(CONTENT_TYPE).cloned();
         Ok(Some((CachedResponse::new(content_type, bytes), ttl)))
     }
 
     /// Hands the response back to the kernel.
     pub fn into_response(self) -> Result<Response<GatewayBody>, GatewayError> {
-        Ok(self.held)
+        Ok(self.held.response)
     }
 }
 

@@ -44,6 +44,10 @@ pub struct UsageView {
     pub output_tokens: u32,
     /// `upstream` when the model answered, `cache` when nothing was spent.
     pub served: Served,
+    /// Which endpoint behind the rule answered, as `host:port`, absent for an answer the
+    /// cache gave, which reached no endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
     /// How long the caller waited, in milliseconds.
     pub latency_ms: u32,
     /// When it was recorded, in seconds since the unix epoch.
@@ -62,6 +66,7 @@ impl From<Usage> for UsageView {
             input_tokens: usage.tokens.input.get(),
             output_tokens: usage.tokens.output.get(),
             served: usage.served,
+            served_by: usage.served_by.map(|replica| replica.to_string()),
             latency_ms: Latency::millis(usage.latency),
             created_at: usage.created_at,
         }
@@ -203,6 +208,10 @@ mod tests {
             model: Some(ModelName::new("claude-opus-5").unwrap()),
             tokens: Tokens::new(TokenCount::new(120), TokenCount::new(30)),
             served: Served::Upstream,
+            served_by: Some(ip_core::Replica {
+                host: ip_core::Host::new("one.example.com").unwrap(),
+                port: ip_core::Port::new(443).unwrap(),
+            }),
             latency: Latency::from_millis(1_250),
         }
     }
@@ -297,6 +306,7 @@ mod tests {
         assert_eq!(row["input_tokens"], 120);
         assert_eq!(row["output_tokens"], 30);
         assert_eq!(row["served"], "upstream");
+        assert_eq!(row["served_by"], "one.example.com:443");
         assert_eq!(row["latency_ms"], 1250);
         assert_eq!(row["turn"], "turn-1");
         assert!(row["created_at"].is_number(), "a time is not a number");

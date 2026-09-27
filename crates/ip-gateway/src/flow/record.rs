@@ -10,7 +10,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
-use ip_core::{ApiId, Latency, Served, TenantId, Tokens, TraceId, TurnId, UserId};
+use ip_core::{ApiId, Latency, Replica, Served, TenantId, Tokens, TraceId, TurnId, UserId};
 use ip_storage::{NewUsage, UsageStore};
 
 use tokio::sync::Notify;
@@ -113,23 +113,32 @@ impl Recording {
     }
 
     /// Records an answer the cache gave: the model it would have come from, and nothing spent.
+    ///
+    /// No endpoint is named, because none was reached.
     pub(super) fn out_of_the_cache(self, body: &Bytes) {
         let model = measure(body).and_then(|measured| measured.model);
-        self.write(model, Tokens::ZERO, Served::Cache);
+        self.write(model, Tokens::ZERO, Served::Cache, None);
     }
 
     /// Measures an answer as it goes out, recording what it cost once the last of it has.
-    pub(super) fn measuring(self, body: GatewayBody) -> GatewayBody {
+    pub(super) fn measuring(self, body: GatewayBody, served_by: Replica) -> GatewayBody {
         Measured {
             inner: body,
             measuring: Measuring::default(),
+            served_by: Some(served_by),
             recording: Some(self),
         }
         .boxed_unsync()
     }
 
     /// Writes the row, off the path of the request it belongs to.
-    fn write(self, model: Option<ip_core::ModelName>, tokens: Tokens, served: Served) {
+    fn write(
+        self,
+        model: Option<ip_core::ModelName>,
+        tokens: Tokens,
+        served: Served,
+        served_by: Option<Replica>,
+    ) {
         let usage = NewUsage {
             trace: self.trace,
             turn: self.turn,
@@ -139,6 +148,7 @@ impl Recording {
             model,
             tokens,
             served,
+            served_by,
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;
@@ -163,6 +173,7 @@ impl Recording {
 struct Measured {
     inner: GatewayBody,
     measuring: Measuring,
+    served_by: Option<Replica>,
     recording: Option<Recording>,
 }
 
@@ -177,7 +188,7 @@ impl Measured {
             Some(measured) => (measured.model, measured.tokens),
             None => (None, Tokens::ZERO),
         };
-        recording.write(model, tokens, Served::Upstream);
+        recording.write(model, tokens, Served::Upstream, self.served_by.take());
     }
 }
 

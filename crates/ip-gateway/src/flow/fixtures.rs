@@ -353,6 +353,7 @@ impl UsageStore for Ledger {
             model: usage.model,
             tokens: usage.tokens,
             served: usage.served,
+            served_by: usage.served_by,
             latency: usage.latency,
             created_at: ip_core::Timestamp::now(),
         };

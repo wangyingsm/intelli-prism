@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, Latency, ModelName, Served, TenantId, Timestamp, Tokens, TraceId, TurnId,
-    UserId,
+    ApiId, Counted, Latency, ModelName, Replica, Served, TenantId, Timestamp, Tokens, TraceId,
+    TurnId, UserId,
 };
 
 use crate::error::StorageError;
@@ -43,6 +43,8 @@ pub struct Usage {
     pub tokens: Tokens,
     /// Whether the upstream or the cache answered.
     pub served: Served,
+    /// Which endpoint behind the rule answered, when one did.
+    pub served_by: Option<Replica>,
     /// How long the caller waited.
     pub latency: Latency,
     /// When the request was recorded.
@@ -68,6 +70,8 @@ pub struct NewUsage {
     pub tokens: Tokens,
     /// Whether the upstream or the cache answered.
     pub served: Served,
+    /// Which endpoint behind the rule answered, when one did.
+    pub served_by: Option<Replica>,
     /// How long the caller waited.
     pub latency: Latency,
 }

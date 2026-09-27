@@ -1,6 +1,6 @@
 use ip_core::{
-    ApiId, Counted, Latency, ModelName, Served, TenantId, TokenCount, Tokens, TraceId, TurnId,
-    UserId,
+    ApiId, Counted, Host, Latency, ModelName, Port, Replica, Served, TenantId, TokenCount, Tokens,
+    TraceId, TurnId, UserId,
 };
 
 use crate::list::Page;
@@ -18,6 +18,10 @@ pub(crate) fn spent() -> NewUsage {
         model: Some(ModelName::new("claude-opus-5").unwrap()),
         tokens: Tokens::new(TokenCount::new(120), TokenCount::new(30)),
         served: Served::Upstream,
+        served_by: Some(Replica {
+            host: Host::new("one.example.com").unwrap(),
+            port: Port::new(443).unwrap(),
+        }),
         latency: Latency::from_millis(1_250),
     }
 }
@@ -362,4 +366,26 @@ pub(crate) async fn nothing_spent_sums_to_nothing(store: &impl Backend) {
             .unwrap(),
         0
     );
+}
+
+pub(crate) async fn a_row_says_which_endpoint_behind_the_rule_answered(store: &impl Backend) {
+    let recorded = store.record_usage(spent()).await.unwrap();
+    let read = store.usage(recorded.row_id).await.unwrap().unwrap();
+    assert_eq!(read, recorded);
+    let served = read.served_by.expect("an endpoint answered");
+    assert_eq!(served.host.as_str(), "one.example.com");
+    assert_eq!(served.port.get(), 443);
+}
+
+pub(crate) async fn a_row_the_cache_answered_names_no_endpoint(store: &impl Backend) {
+    let hit = NewUsage {
+        served: Served::Cache,
+        served_by: None,
+        tokens: Tokens::ZERO,
+        ..spent()
+    };
+    let recorded = store.record_usage(hit).await.unwrap();
+    let read = store.usage(recorded.row_id).await.unwrap().unwrap();
+    assert_eq!(read.served_by, None);
+    assert_eq!(read.served, Served::Cache);
 }

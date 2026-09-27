@@ -42,7 +42,8 @@ pub(super) const INGRESS_RESPONSE: &str = "ingress.response";
 pub(super) const EGRESS_RESPONSE: &str = "egress.response";
 
 /// One stage's span, carrying what every trace is read by. `api` is empty until the route is
-/// resolved, and `hit` until the answer is known to have come from the cache or not.
+/// resolved, `hit` until the answer is known to have come from the cache or not, and `served`
+/// until an endpoint has been dispatched to.
 macro_rules! stage_span {
     ($name:expr, $followed:expr) => {
         tracing::info_span!(
@@ -53,6 +54,7 @@ macro_rules! stage_span {
             user = %$followed.user,
             api = $followed.api.as_ref().map(tracing::field::display),
             hit = tracing::field::Empty,
+            served = tracing::field::Empty,
         )
     };
 }
