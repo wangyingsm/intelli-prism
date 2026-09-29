@@ -2,7 +2,7 @@ use std::fmt;
 
 use http::{Request, Response};
 
-use ip_core::Replica;
+use ip_core::{Hedge, Replica};
 
 use crate::body::GatewayBody;
 use crate::table::Resolution;
@@ -124,6 +124,9 @@ pub struct Answered {
     pub response: Response<GatewayBody>,
     /// The endpoint the request was dispatched to.
     pub served: Replica,
+    /// How many endpoints the request was raced across; one is what happened when it was not
+    /// raced at all.
+    pub raced: Hedge,
 }
 
 /// The upstream answered.

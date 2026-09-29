@@ -114,31 +114,40 @@ impl Recording {
 
     /// Records an answer the cache gave: the model it would have come from, and nothing spent.
     ///
-    /// No endpoint is named, because none was reached.
+    /// No endpoint is named, because none was reached; nothing was raced either, so the row
+    /// says of it what it says of every answer nothing asked of an endpoint: one endpoint.
     pub(super) fn out_of_the_cache(self, body: &Bytes) {
         let model = measure(body).and_then(|measured| measured.model);
-        self.write(model, Tokens::ZERO, Served::Cache, None);
+        self.write(
+            model,
+            Tokens::ZERO,
+            Serving {
+                source: Served::Cache,
+                endpoint: None,
+                arms: Hedge::default(),
+            },
+        );
     }
 
     /// Measures an answer as it goes out, recording what it cost once the last of it has.
-    pub(super) fn measuring(self, body: GatewayBody, served_by: Replica) -> GatewayBody {
+    pub(super) fn measuring(
+        self,
+        body: GatewayBody,
+        served_by: Replica,
+        raced: Hedge,
+    ) -> GatewayBody {
         Measured {
             inner: body,
             measuring: Measuring::default(),
             served_by: Some(served_by),
+            raced,
             recording: Some(self),
         }
         .boxed_unsync()
     }
 
     /// Writes the row, off the path of the request it belongs to.
-    fn write(
-        self,
-        model: Option<ip_core::ModelName>,
-        tokens: Tokens,
-        served: Served,
-        served_by: Option<Replica>,
-    ) {
+    fn write(self, model: Option<ip_core::ModelName>, tokens: Tokens, serving: Serving) {
         let usage = NewUsage {
             trace: self.trace,
             turn: self.turn,
@@ -147,10 +156,9 @@ impl Recording {
             api: self.api,
             model,
             tokens,
-            served,
-            served_by,
-            // The count of arms is filled in separately; until it is, the row says one.
-            raced_across: Hedge::default(),
+            served: serving.source,
+            served_by: serving.endpoint,
+            raced_across: serving.arms,
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;
@@ -171,11 +179,23 @@ impl Recording {
     }
 }
 
+/// How the request was served, which together is what a row keeps of it past its request.
+struct Serving {
+    /// Where the answer came from.
+    source: Served,
+    /// Which endpoint answered, when one did.
+    endpoint: Option<Replica>,
+    /// How many endpoints it was raced across; one is what it was when nothing was reached and
+    /// when it was not raced at all.
+    arms: Hedge,
+}
+
 /// A body that measures what passes, and records it when the last of it has.
 struct Measured {
     inner: GatewayBody,
     measuring: Measuring,
     served_by: Option<Replica>,
+    raced: Hedge,
     recording: Option<Recording>,
 }
 
@@ -190,7 +210,15 @@ impl Measured {
             Some(measured) => (measured.model, measured.tokens),
             None => (None, Tokens::ZERO),
         };
-        recording.write(model, tokens, Served::Upstream, self.served_by.take());
+        recording.write(
+            model,
+            tokens,
+            Serving {
+                source: Served::Upstream,
+                endpoint: self.served_by.take(),
+                arms: self.raced,
+            },
+        );
     }
 }
 

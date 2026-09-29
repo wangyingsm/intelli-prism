@@ -4,7 +4,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Request, Response};
 use ip_cache::{CacheKey, Ttl};
-use ip_core::{Capability, CapabilityScope, Hedge, Replica, RouteKey};
+use ip_core::{Capability, CapabilityScope, HEDGE_MOST, Hedge, Replica, RouteKey};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{Span, field};
@@ -219,7 +219,12 @@ impl Flow<BodyProcessed> {
             strip_hop_by_hop(response.headers_mut());
             return Ok(Flow {
                 context: self.context,
-                held: Answered { response, served },
+                // Not raced, so one: the default the row carries anyway.
+                held: Answered {
+                    response,
+                    served,
+                    raced: Hedge::default(),
+                },
             });
         }
         race(self.context, upstream, dispatcher, request, &resolution).await
@@ -283,6 +288,12 @@ impl Flow<ResponseBodyProcessed> {
     /// Which endpoint answered.
     pub fn served(&self) -> &Replica {
         &self.held.served
+    }
+
+    /// How many endpoints the request was raced across; one is what it was when it was not
+    /// raced at all.
+    pub fn raced(&self) -> Hedge {
+        self.held.raced
     }
 
     /// The answer to keep and how long to keep it, buffering the body so it can still be sent,
@@ -394,11 +405,23 @@ async fn race(
     drop(racing);
     let served = Replica::of(endpoint);
     Span::current().record("served", field::display(&served));
+    // The number the row will say is what left the gateway, not what the rule asked: the
+    // dispatcher never chooses past the rule's hedge, which a count of endpoints already means.
+    let raced = Hedge::new(
+        u8::try_from(arms.len())
+            .unwrap_or(HEDGE_MOST)
+            .clamp(1, HEDGE_MOST),
+    )
+    .unwrap();
     let mut response = response;
     strip_hop_by_hop(response.headers_mut());
     Ok(Flow {
         context,
-        held: Answered { response, served },
+        held: Answered {
+            response,
+            served,
+            raced,
+        },
     })
 }
 

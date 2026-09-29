@@ -4,7 +4,7 @@ use arc_swap::ArcSwap;
 use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use ip_auth::Authority;
-use ip_core::{Protocol, Replica, TraceId, TurnId};
+use ip_core::{Hedge, Protocol, Replica, TraceId, TurnId};
 use ip_storage::UsageStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -213,10 +213,11 @@ impl Gateway {
         let Some(responses) = &self.responses else {
             let done = self.upstream_answer(processed, &chains, &followed).await?;
             let served_by = done.served().clone();
+            let raced = done.raced();
             let answered = stage_span!(EGRESS_RESPONSE, followed);
             answered.record("hit", false);
             let sent = async { done.into_response() }.instrument(answered).await?;
-            return Ok(measuring(sent, recording, served_by));
+            return Ok(measuring(sent, recording, served_by, raced));
         };
         // A hit answers here, spending no tokens and running no response processor, as designed.
         let key = processed.response_key().await?;
@@ -235,6 +236,7 @@ impl Gateway {
         }
         let mut done = self.upstream_answer(processed, &chains, &followed).await?;
         let served_by = done.served().clone();
+        let raced = done.raced();
         if let Some((answer, ttl)) = done.cacheable(responses.ttl()).await?
             && let Err(error) = responses.put(&key, &answer, ttl).await
         {
@@ -243,7 +245,7 @@ impl Gateway {
         let answered = stage_span!(EGRESS_RESPONSE, followed);
         answered.record("hit", false);
         let sent = async { done.into_response() }.instrument(answered).await?;
-        Ok(measuring(sent, recording, served_by))
+        Ok(measuring(sent, recording, served_by, raced))
     }
 
     /// Refuses a request that has run out of what it may spend, or that cannot be counted.
@@ -307,12 +309,13 @@ fn measuring(
     response: Response<GatewayBody>,
     recording: Option<Recording>,
     served_by: Replica,
+    raced: Hedge,
 ) -> Response<GatewayBody> {
     let Some(recording) = recording else {
         return response;
     };
     let (parts, body) = response.into_parts();
-    Response::from_parts(parts, recording.measuring(body, served_by))
+    Response::from_parts(parts, recording.measuring(body, served_by, raced))
 }
 
 /// Answers from what the cache held, without any stage after the request body running.
@@ -332,9 +335,10 @@ mod tests {
     use super::super::fixtures::*;
     use super::*;
     use crate::limit::tests::Rows;
+    use http::HeaderValue;
     use http::StatusCode;
-    use http::header::CONTENT_LENGTH;
-    use ip_core::{Served, TokenCount, Tokens};
+    use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+    use ip_core::{Hedge, Served, TokenCount, Tokens};
 
     use bytes::Bytes;
     use std::collections::HashMap;
@@ -1035,6 +1039,8 @@ mod tests {
         let served = row.served_by.expect("an endpoint answered");
         assert_eq!(served.host.as_str(), "one.example.com");
         assert_eq!(served.port.get(), 443);
+        // Not raced, so the row says one endpoint was asked.
+        assert_eq!(row.raced_across, Hedge::default());
 
         // The next goes to the other endpoint, and the row says so.
         let answered = gateway
@@ -1046,6 +1052,86 @@ mod tests {
         assert_eq!(
             row.served_by.expect("an endpoint answered").host.as_str(),
             "two.example.com"
+        );
+        assert_eq!(row.raced_across, Hedge::default());
+    }
+
+    #[tokio::test]
+    async fn a_hedged_rule_records_how_many_arms_it_raced_across() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            hedged_replicated_table(ip_core::Strategy::RoundRobin, Hedge::new(2).unwrap()),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .recording(recorder);
+
+        // Either arm may win the race, and the row says two were asked whichever did.
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap();
+            body_of(answered).await;
+            let row = recorded.recv().await.unwrap();
+            assert!(row.served_by.is_some());
+            assert_eq!(row.raced_across, Hedge::new(2).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_asked_for_three_with_two_endpoints_records_two() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            hedged_replicated_table(ip_core::Strategy::RoundRobin, Hedge::new(3).unwrap()),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .recording(recorder);
+
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        // The rule asked for three, only two stand behind it, and the row records what
+        // happened rather than what was asked.
+        assert_eq!(
+            recorded.recv().await.unwrap().raced_across,
+            Hedge::new(2).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_a_race_records_one() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            hedged_replicated_table(ip_core::Strategy::RoundRobin, Hedge::new(2).unwrap()),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .recording(recorder);
+
+        let mut file = request("/anthropic/messages", "ask");
+        file.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("multipart/form-data; boundary=x"),
+        );
+        gateway.handle(context(granted()), file).await.unwrap();
+        assert_eq!(
+            recorded.recv().await.unwrap().raced_across,
+            Hedge::default()
+        );
+
+        // A body declared past the cap is refused a race the same way.
+        let mut oversized = request("/anthropic/messages", "ask");
+        oversized
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("2000000"));
+        gateway.handle(context(granted()), oversized).await.unwrap();
+        assert_eq!(
+            recorded.recv().await.unwrap().raced_across,
+            Hedge::default()
         );
     }
 
@@ -1072,6 +1158,8 @@ mod tests {
         let hit = recorded.recv().await.unwrap();
         assert_eq!(hit.served, ip_core::Served::Cache);
         assert_eq!(hit.served_by, None);
+        // An answer out of the cache was raced across one endpoint: nothing was reached.
+        assert_eq!(hit.raced_across, Hedge::default());
     }
 
     #[tokio::test]
