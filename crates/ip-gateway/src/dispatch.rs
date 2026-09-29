@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+use http::HeaderMap;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use ip_core::{Endpoint, Hedge, Strategy, Weighted};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -24,6 +26,12 @@ const SMOOTHING: u64 = 5;
 
 /// How many answers are folded in before the folder looks for more.
 const BATCH: usize = 128;
+
+/// The largest body a raced request may declare, in bytes.
+///
+/// One mebibyte. A chat completion is a few kilobytes, so the figure is generous for
+/// everything this gateway is for while still refusing to hold three copies of a file.
+const MAX_RACED_BODY: u64 = 1_048_576;
 
 /// What one endpoint behind a rule is carrying.
 ///
@@ -281,6 +289,49 @@ fn extra_arms(plan: &Plan, arms: &mut Vec<usize>, up_to: usize) {
     }
 }
 
+/// The hedge that will actually be used for this request: the rule's, or none.
+///
+/// Racing sends the body once per arm, so it is refused when the body cannot be held in
+/// memory. A declared length past the cap, one declared but not as a number, an unknown
+/// size, and a file transport all stand in the way.
+pub fn may_race(headers: &HeaderMap, asked: Hedge) -> Hedge {
+    if asked == Hedge::NONE {
+        return asked;
+    }
+    if !file_transport(headers) && length_ok(headers) {
+        return asked;
+    }
+    Hedge::NONE
+}
+
+/// Whether the request is a file transport, whatever its declared length.
+///
+/// The primary type is compared up to its first parameter, case-insensitively, so `boundary`
+/// and `charset` after it cannot defeat the match.
+fn file_transport(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .and_then(|media_type| media_type.split('/').next())
+        .is_some_and(|primary| primary.trim().eq_ignore_ascii_case("multipart"))
+}
+
+/// Whether the declared body fits in memory.
+///
+/// With no length at all, a body is still refused unless the encoding says there is none:
+/// a chunked request could be small, and an unknown size cannot be checked against the cap.
+fn length_ok(headers: &HeaderMap) -> bool {
+    match headers.get(CONTENT_LENGTH) {
+        None => headers.get(TRANSFER_ENCODING).is_none(),
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length <= MAX_RACED_BODY),
+    }
+}
+
 /// Works what each endpoint takes into the plan it belongs to, a batch of answers at a time.
 ///
 /// The arithmetic is here rather than in the request that finished, and this is the seam any
@@ -370,6 +421,8 @@ impl Drop for Chosen {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use http::HeaderName;
 
     use ip_core::{
         AbsPath, ApiId, Endpoint, HEDGE_MOST, Hedge, Host, Port, Protocol, RouteKey, RouteRule,
@@ -706,6 +759,83 @@ mod tests {
         for host in ["one.example.com", "two.example.com", "three.example.com"] {
             assert!(carried[host] > 150, "{host}: {carried:?}");
         }
+    }
+
+    /// The headers `may_race` decides on, built directly.
+    fn heads(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn a_rule_that_does_not_hedge_is_never_raced() {
+        for headers in [
+            heads(&[]),
+            heads(&[("content-length", "10")]),
+            heads(&[
+                ("content-type", "multipart/form-data"),
+                ("content-length", "10"),
+            ]),
+        ] {
+            assert_eq!(may_race(&headers, Hedge::NONE), Hedge::NONE);
+        }
+    }
+
+    #[test]
+    fn a_hedging_rule_races_a_small_declared_body_at_what_it_asked_for() {
+        let asked = Hedge::new(3).unwrap();
+        let headers = heads(&[("content-length", "1000")]);
+        assert_eq!(may_race(&headers, asked), asked);
+    }
+
+    #[test]
+    fn a_body_exactly_at_the_cap_is_raced_and_one_byte_over_is_not() {
+        let asked = Hedge::new(2).unwrap();
+        let at_cap = heads(&[("content-length", &MAX_RACED_BODY.to_string())]);
+        assert_eq!(may_race(&at_cap, asked), asked);
+        let over = heads(&[("content-length", &(MAX_RACED_BODY + 1).to_string())]);
+        assert_eq!(may_race(&over, asked), Hedge::NONE);
+    }
+
+    #[test]
+    fn an_unknown_size_is_not_raced() {
+        let asked = Hedge::new(2).unwrap();
+        let chunked = heads(&[("transfer-encoding", "chunked")]);
+        assert_eq!(may_race(&chunked, asked), Hedge::NONE);
+        let junk = heads(&[("content-length", "n/a")]);
+        assert_eq!(may_race(&junk, asked), Hedge::NONE);
+    }
+
+    #[test]
+    fn a_file_transport_is_not_raced_whatever_its_length() {
+        let asked = Hedge::new(2).unwrap();
+        for (name, content_type) in [
+            ("content-type", "multipart/form-data"),
+            ("content-type", "multipart/form-data; boundary=abc123"),
+            ("Content-Type", "Multipart/Mixed; charset=utf-8"),
+        ] {
+            let headers = heads(&[(name, content_type), ("content-length", "10")]);
+            assert_eq!(
+                may_race(&headers, asked),
+                Hedge::NONE,
+                "'{name}: {content_type}'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_with_no_body_is_raced_when_the_rule_asks() {
+        let asked = Hedge::new(2).unwrap();
+        let bare = heads(&[]);
+        assert_eq!(may_race(&bare, asked), asked);
+        let empty = heads(&[("content-length", "0")]);
+        assert_eq!(may_race(&empty, asked), asked);
     }
 
     #[test]
