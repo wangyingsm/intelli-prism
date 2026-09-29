@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use ip_core::{
-    AbsPath, ApiId, Endpoint, Host, ModelName, Port, Protocol, RouteKey, RouteRule, RouteTarget,
-    Strategy, Weight, Weighted,
+    AbsPath, ApiId, Endpoint, Hedge, Host, ModelName, Port, Protocol, RouteKey, RouteRule,
+    RouteTarget, Strategy, Weight, Weighted,
 };
 use url::Url;
 
@@ -33,6 +33,9 @@ pub struct UpstreamConfig {
     /// How requests are spread when this upstream stands behind several endpoints.
     #[serde(default)]
     pub strategy: Strategy,
+    /// How many of this upstream's endpoints one request is raced across.
+    #[serde(default)]
+    pub hedge: Hedge,
     /// Further endpoints this upstream stands behind, beyond `base_url`.
     #[serde(default, rename = "target")]
     pub targets: Vec<UpstreamTarget>,
@@ -128,6 +131,7 @@ impl UpstreamConfig {
             key: self.route_key(listen)?,
             target: self.route_target()?,
             strategy: self.strategy,
+            hedge: self.hedge,
         })
     }
 }
@@ -183,6 +187,7 @@ mod tests {
             route,
             weight: Weight::default(),
             strategy: Strategy::default(),
+            hedge: Hedge::default(),
             targets: Vec::new(),
         }
     }
@@ -340,6 +345,18 @@ mod tests {
         assert_eq!(behind[0].weight.get(), 3);
         assert_eq!(behind[1].endpoint.host.as_str(), "two.local");
         assert_eq!(behind[2].weight.get(), 1);
+    }
+
+    #[test]
+    fn an_upstream_races_one_endpoint_unless_it_says_otherwise() {
+        let one = upstream("https://api.anthropic.com/v1", None);
+        assert_eq!(one.route_rule(listen()).unwrap().hedge, Hedge::NONE);
+
+        let raced = UpstreamConfig {
+            hedge: Hedge::new(2).unwrap(),
+            ..upstream("https://api.anthropic.com/v1", None)
+        };
+        assert_eq!(raced.route_rule(listen()).unwrap().hedge.get(), 2);
     }
 
     #[test]

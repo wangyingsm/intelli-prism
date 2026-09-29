@@ -151,6 +151,9 @@ macro_rules! backend_suite {
             a_rule_stored_without_a_strategy_dispatches_in_turn,
             rewriting_a_rule_replaces_its_strategy,
             an_endpoint_may_be_stored_drained,
+            a_rule_keeps_the_hedge_it_was_stored_with,
+            a_rule_stored_without_a_hedge_reaches_one_endpoint,
+            rewriting_a_rule_replaces_its_hedge,
         ]);
     };
     (plugin, $open:path) => {

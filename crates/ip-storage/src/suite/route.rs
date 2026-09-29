@@ -1,6 +1,6 @@
 use ip_core::{
-    AbsPath, ApiId, Endpoint, Host, Port, Protocol, RouteKey, RouteRule, RouteTarget, Strategy,
-    Weight, Weighted,
+    AbsPath, ApiId, Endpoint, Hedge, Host, Port, Protocol, RouteKey, RouteRule, RouteTarget,
+    Strategy, Weight, Weighted,
 };
 
 use crate::error::{Entity, StorageError};
@@ -22,6 +22,7 @@ pub(crate) fn rule(host: &str, path: &str, upstream: &str) -> RouteRule {
         key: RouteKey::new(route_endpoint(Protocol::Https, host, 443, path)),
         target: RouteTarget::new(route_endpoint(Protocol::Https, upstream, 443, path)),
         strategy: ip_core::Strategy::default(),
+        hedge: Hedge::default(),
     }
 }
 
@@ -65,6 +66,7 @@ pub(crate) async fn a_route_key_carries_every_part_of_the_tuple(store: &impl Rou
             "/v1",
         )),
         strategy: ip_core::Strategy::default(),
+        hedge: Hedge::default(),
     };
     store.put_route(secure).await.unwrap();
     store.put_route(plain).await.unwrap();
@@ -86,6 +88,7 @@ pub(crate) async fn every_protocol_survives_a_round_trip(store: &impl RouteStore
                 key: key.clone(),
                 target: RouteTarget::new(route_endpoint(protocol, "api.example.com", 443, "/v1")),
                 strategy: ip_core::Strategy::default(),
+                hedge: Hedge::default(),
             })
             .await
             .unwrap();
@@ -191,4 +194,34 @@ pub(crate) async fn an_endpoint_may_be_stored_drained(store: &impl RouteStore) {
     let read = store.route(&drained.key).await.unwrap().unwrap();
     assert_eq!(read, drained);
     assert!(read.target.weighted()[1].weight.is_drained());
+}
+
+pub(crate) async fn a_rule_keeps_the_hedge_it_was_stored_with(store: &impl RouteStore) {
+    let mut raced = rule("gateway.local", "/raced", "api.example.com");
+    raced.hedge = Hedge::new(3).unwrap();
+    store.put_route(raced.clone()).await.unwrap();
+
+    let read = store.route(&raced.key).await.unwrap().unwrap();
+    assert_eq!(read, raced);
+    assert_eq!(read.hedge.get(), 3);
+    assert_eq!(store.routes().await.unwrap(), vec![raced]);
+}
+
+pub(crate) async fn a_rule_stored_without_a_hedge_reaches_one_endpoint(store: &impl RouteStore) {
+    let plain = rule("gateway.local", "/v1", "api.example.com");
+    store.put_route(plain.clone()).await.unwrap();
+    let read = store.route(&plain.key).await.unwrap().unwrap();
+    assert_eq!(read.hedge, Hedge::NONE);
+    assert!(!read.hedge.is_hedged());
+}
+
+pub(crate) async fn rewriting_a_rule_replaces_its_hedge(store: &impl RouteStore) {
+    let mut rule = rule("gateway.local", "/v1", "api.example.com");
+    store.put_route(rule.clone()).await.unwrap();
+    rule.hedge = Hedge::new(2).unwrap();
+    store.put_route(rule.clone()).await.unwrap();
+    assert_eq!(
+        store.route(&rule.key).await.unwrap().unwrap().hedge.get(),
+        2
+    );
 }

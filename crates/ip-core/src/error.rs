@@ -110,4 +110,17 @@ pub enum CoreError {
         expected: ScopeKind,
         actual: ScopeKind,
     },
+
+    /// A hedge of nothing, which would race a request across no endpoint at all.
+    #[error("a hedge of nothing reaches no endpoint")]
+    ZeroHedge,
+
+    /// A hedge count past what this application will race a request across.
+    #[error("a hedge of {asked} is past the {most} this gateway races across")]
+    HedgeTooWide {
+        /// What the rule asked for.
+        asked: u8,
+        /// The most it may ask for.
+        most: u8,
+    },
 }

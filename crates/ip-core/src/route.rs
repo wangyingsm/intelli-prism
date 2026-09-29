@@ -526,6 +526,76 @@ impl fmt::Display for Strategy {
     }
 }
 
+/// The most endpoints one request may be raced across.
+///
+/// Past this the upstream cost grows with every endpoint while the latency saved does not, so a
+/// rule asking for more is refused rather than served expensively.
+pub const HEDGE_MOST: u8 = 3;
+
+/// How many endpoints behind a rule one request is raced across.
+///
+/// One is no race at all, which is what a rule that says nothing does.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(into = "u8", try_from = "u8")]
+pub struct Hedge(u8);
+
+impl Hedge {
+    /// One endpoint, which is no race.
+    pub const NONE: Self = Self(1);
+
+    /// Wraps a count, refusing one that reaches nowhere or reaches too far.
+    pub fn new(across: u8) -> Result<Self, CoreError> {
+        if across == 0 {
+            return Err(CoreError::ZeroHedge);
+        }
+        if across > HEDGE_MOST {
+            return Err(CoreError::HedgeTooWide {
+                asked: across,
+                most: HEDGE_MOST,
+            });
+        }
+        Ok(Self(across))
+    }
+
+    /// The count as a number.
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    /// Whether this races a request across more than one endpoint.
+    pub const fn is_hedged(self) -> bool {
+        self.0 > 1
+    }
+}
+
+impl Default for Hedge {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl From<Hedge> for u8 {
+    fn from(hedge: Hedge) -> Self {
+        hedge.get()
+    }
+}
+
+impl TryFrom<u8> for Hedge {
+    type Error = CoreError;
+
+    fn try_from(across: u8) -> Result<Self, Self::Error> {
+        Self::new(across)
+    }
+}
+
+impl fmt::Display for Hedge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// The endpoints a matched request may be sent to, of which there is always at least one.
 ///
 /// Several endpoints stand behind one target when an upstream is replicated. Which one
@@ -609,6 +679,10 @@ pub struct RouteRule {
     /// unless the rule says otherwise, which is what a rule written before this existed does.
     #[serde(default)]
     pub strategy: Strategy,
+    /// How many endpoints behind the target one request is raced across. One unless the rule
+    /// says otherwise, which is what a rule written before this existed does.
+    #[serde(default)]
+    pub hedge: Hedge,
 }
 
 #[cfg(test)]
@@ -859,6 +933,7 @@ mod tests {
             key: key.clone(),
             target: target.clone(),
             strategy: Strategy::default(),
+            hedge: Hedge::default(),
         };
         assert_eq!(rule.key.endpoint().host.as_str(), "gateway.local");
         assert_eq!(rule.target.primary().host.as_str(), "api.example.com");
@@ -921,6 +996,32 @@ mod tests {
     }
 
     #[test]
+    fn a_hedge_of_nothing_reaches_nowhere_and_is_refused() {
+        assert!(matches!(Hedge::new(0), Err(CoreError::ZeroHedge)));
+        assert_eq!(Hedge::default(), Hedge::NONE);
+        assert!(!Hedge::NONE.is_hedged());
+        assert!(Hedge::new(2).unwrap().is_hedged());
+        assert_eq!(Hedge::new(2).unwrap().get(), 2);
+        assert_eq!(Hedge::new(2).unwrap().to_string(), "2");
+    }
+
+    #[test]
+    fn a_hedge_past_what_this_gateway_races_is_refused() {
+        assert!(Hedge::new(HEDGE_MOST).is_ok());
+        assert!(matches!(
+            Hedge::new(HEDGE_MOST + 1),
+            Err(CoreError::HedgeTooWide { .. })
+        ));
+        assert_eq!(
+            serde_json::from_str::<Hedge>("2").unwrap(),
+            Hedge::new(2).unwrap()
+        );
+        assert!(serde_json::from_str::<Hedge>("9").is_err());
+        assert!(serde_json::from_str::<Hedge>("0").is_err());
+        assert_eq!(serde_json::to_string(&Hedge::new(3).unwrap()).unwrap(), "3");
+    }
+
+    #[test]
     fn every_strategy_round_trips_through_its_name() {
         for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
             assert_eq!(Strategy::named(strategy.name()).unwrap(), strategy);
@@ -942,6 +1043,7 @@ mod tests {
         }"#;
         let rule: RouteRule = serde_json::from_str(json).unwrap();
         assert_eq!(rule.strategy, Strategy::RoundRobin);
+        assert_eq!(rule.hedge, Hedge::NONE);
         assert_eq!(rule.target.weighted()[0].weight, Weight::default());
         assert_eq!(rule.target.primary().host.as_str(), "api.example.com");
     }

@@ -72,6 +72,7 @@ fn table(rules: usize, target: &str) -> RoutingTable {
             key: RouteKey::new(endpoint("gateway.local", &format!("/api-{n}"))),
             target: RouteTarget::new(endpoint(target, "/v1")),
             strategy: ip_core::Strategy::default(),
+            hedge: ip_core::Hedge::default(),
         })
         .collect();
     RoutingTable::build(&config, dynamic).unwrap()

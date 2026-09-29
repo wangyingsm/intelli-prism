@@ -86,6 +86,7 @@ mod tests {
             key: ip_core::RouteKey::new(endpoint(host, path)),
             target: RouteTarget::new(endpoint(upstream, path)),
             strategy: ip_core::Strategy::default(),
+            hedge: ip_core::Hedge::default(),
         }
     }
 

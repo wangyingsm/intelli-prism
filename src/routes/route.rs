@@ -186,6 +186,7 @@ mod tests {
             key: RouteKey::new(endpoint("gateway.local", path)),
             target: RouteTarget::new(endpoint(upstream, "/v1")),
             strategy: ip_core::Strategy::default(),
+            hedge: ip_core::Hedge::default(),
         }
     }
 
@@ -291,6 +292,21 @@ mod tests {
         )
     }
 
+    /// A rule over two endpoints, racing each request across `hedge` of them.
+    fn raced(hedge: u8) -> String {
+        format!(
+            r#"{{
+                "api": "chat",
+                "key": {{"protocol": "https", "host": "gateway.local", "port": 443, "path": "/v1"}},
+                "hedge": {hedge},
+                "target": [
+                    {{"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1"}},
+                    {{"protocol": "https", "host": "two.example.com", "port": 443, "path": "/v1"}}
+                ]
+            }}"#
+        )
+    }
+
     #[tokio::test]
     async fn a_rule_is_stored_with_the_strategy_and_the_shares_it_names() {
         let state = state_over(store().await);
@@ -328,6 +344,7 @@ mod tests {
 
         let listed = listed(&router, &state).await;
         assert_eq!(listed[0]["strategy"], "round_robin");
+        assert_eq!(listed[0]["hedge"], 1);
         assert_eq!(listed[0]["target"][0]["weight"], 1);
     }
 
@@ -378,6 +395,31 @@ mod tests {
         )
         .await;
         assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_rule_is_stored_with_the_hedge_it_names() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let stored = call(&router, &state, "root", "PUT", Some(&raced(2))).await;
+        assert_eq!(stored.status(), StatusCode::NO_CONTENT);
+
+        let listed = listed(&router, &state).await;
+        assert_eq!(listed[0]["hedge"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_hedge_this_gateway_will_not_race_is_refused() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        for asked in [0, 9] {
+            let refused = call(&router, &state, "root", "PUT", Some(&raced(asked))).await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a hedge of {asked} was stored"
+            );
+        }
     }
 
     #[tokio::test]

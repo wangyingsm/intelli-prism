@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Endpoint, RouteKey, RouteRule, RouteTarget, Strategy, Timestamp, Weight, Weighted,
+    ApiId, Endpoint, Hedge, RouteKey, RouteRule, RouteTarget, Strategy, Timestamp, Weight, Weighted,
 };
 use sqlx::{PgConnection, Row};
 
@@ -15,10 +15,10 @@ impl RouteStore for PostgresStore {
         let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
         let route_row_id: i64 = sqlx::query_scalar(
             "INSERT INTO routes \
-             (api_id, key_protocol, key_host, key_port, key_path, strategy, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             (api_id, key_protocol, key_host, key_port, key_path, strategy, hedge, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
-             api_id = excluded.api_id, strategy = excluded.strategy \
+             api_id = excluded.api_id, strategy = excluded.strategy, hedge = excluded.hedge \
              RETURNING row_id",
         )
         .bind(rule.api.as_str())
@@ -27,6 +27,7 @@ impl RouteStore for PostgresStore {
         .bind(i64::from(key.port.get()))
         .bind(key.path.as_str())
         .bind(rule.strategy.name())
+        .bind(i64::from(rule.hedge.get()))
         .bind(Timestamp::now().unix_seconds())
         .fetch_one(&mut *transaction)
         .await
@@ -86,7 +87,7 @@ impl RouteStore for PostgresStore {
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
         let endpoint = key.endpoint();
         let rows = sqlx::query(
-            "SELECT r.api_id, r.strategy, t.protocol, t.host, t.port, t.path, t.weight \
+            "SELECT r.api_id, r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight \
              FROM routes r \
              JOIN route_targets t ON t.route_row_id = r.row_id \
              WHERE r.key_protocol = $1 AND r.key_host = $2 AND r.key_port = $3 \
@@ -110,6 +111,7 @@ impl RouteStore for PostgresStore {
             key: key.clone(),
             target: RouteTarget::from_weighted(targets)?,
             strategy: strategy_of(first)?,
+            hedge: hedge_of(first)?,
         }))
     }
 
@@ -124,7 +126,7 @@ pub(super) async fn read_routes(
 ) -> Result<Vec<RouteRule>, StorageError> {
     let rows = sqlx::query(
         "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-         r.strategy, t.protocol, t.host, t.port, t.path, t.weight FROM routes r \
+         r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight FROM routes r \
          JOIN route_targets t ON t.route_row_id = r.row_id \
          ORDER BY r.key_host, r.key_path, r.key_protocol, r.key_port, t.position",
     )
@@ -156,6 +158,7 @@ pub(super) async fn read_routes(
             )?),
             target: RouteTarget::from_weighted(vec![endpoint])?,
             strategy: strategy_of(row)?,
+            hedge: hedge_of(row)?,
         });
     }
     Ok(rules)
@@ -182,6 +185,16 @@ fn target_of(row: &sqlx::postgres::PgRow) -> Result<Weighted, StorageError> {
 fn strategy_of(row: &sqlx::postgres::PgRow) -> Result<Strategy, StorageError> {
     let named: String = row.get("strategy");
     Ok(Strategy::named(&named)?)
+}
+
+/// How many endpoints a stored rule races across, refusing a count this code will not race.
+fn hedge_of(row: &sqlx::postgres::PgRow) -> Result<Hedge, StorageError> {
+    let stored: i64 = row.get("hedge");
+    let across = u8::try_from(stored).map_err(|_| StorageError::Malformed {
+        entity: Entity::Route,
+        detail: format!("{stored} is not a hedge"),
+    })?;
+    Ok(Hedge::new(across)?)
 }
 
 #[cfg(test)]

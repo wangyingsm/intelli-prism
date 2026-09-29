@@ -317,6 +317,7 @@ mod tests {
             key: RouteKey::new(endpoint("gateway.local")),
             target: RouteTarget::new(endpoint("api.example.com")),
             strategy: ip_core::Strategy::default(),
+            hedge: ip_core::Hedge::default(),
         }
     }
 

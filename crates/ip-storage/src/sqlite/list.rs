@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Endpoint, Grant, PluginRule, RouteKey, RouteRule, RouteTarget, Strategy, TenantId,
-    Timestamp, UserId, Weight, Weighted,
+    ApiId, Endpoint, Grant, Hedge, PluginRule, RouteKey, RouteRule, RouteTarget, Strategy,
+    TenantId, Timestamp, UserId, Weight, Weighted,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -58,6 +58,16 @@ fn weighted(row: &SqliteRow) -> Result<Weighted, StorageError> {
 fn strategy(row: &SqliteRow) -> Result<Strategy, StorageError> {
     let named: String = row.get("strategy");
     Ok(Strategy::named(&named)?)
+}
+
+/// How many endpoints a listed rule races across.
+fn hedge(row: &SqliteRow) -> Result<Hedge, StorageError> {
+    let stored: i64 = row.get("hedge");
+    let across = u8::try_from(stored).map_err(|_| StorageError::Malformed {
+        entity: Entity::Route,
+        detail: format!("{stored} is not a hedge"),
+    })?;
+    Ok(Hedge::new(across)?)
 }
 
 #[async_trait]
@@ -147,7 +157,7 @@ impl ListStore for SqliteStore {
     async fn list_routes(&self, page: Page) -> Result<Vec<Listed<RouteRule>>, StorageError> {
         let rows = sqlx::query(
             "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-             r.created_at, r.strategy, t.protocol, t.host, t.port, t.path, t.weight FROM \
+             r.created_at, r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight FROM \
              (SELECT * FROM routes WHERE created_at > ? \
               ORDER BY created_at DESC, row_id DESC LIMIT ? OFFSET ?) r \
              JOIN route_targets t ON t.route_row_id = r.row_id \
@@ -180,6 +190,7 @@ impl ListStore for SqliteStore {
                     key: RouteKey::new(endpoint(row, "key_")?),
                     target: RouteTarget::from_weighted(vec![target])?,
                     strategy: strategy(row)?,
+                    hedge: hedge(row)?,
                 },
                 created_at: created_at(row)?,
             });
