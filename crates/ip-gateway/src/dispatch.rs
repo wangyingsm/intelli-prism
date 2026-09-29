@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
-use ip_core::{Endpoint, Strategy, Weighted};
+use ip_core::{Endpoint, Hedge, Strategy, Weighted};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -195,6 +195,40 @@ impl Dispatcher {
         }
     }
 
+    /// Chooses the several endpoints a request races across, counting each against
+    /// itself until it is done with.
+    ///
+    /// In launch order, first arm first: the first is the endpoint the rule would have
+    /// picked alone, and the rest are drawn without repeating it, cut down to the live
+    /// count.
+    pub fn choose_many(&self, resolution: &Resolution, hedge: Hedge) -> Vec<Chosen> {
+        let plan = resolution.plan();
+        let count = usize::from(hedge.get()).min(plan.live().len());
+        let slots = match resolution.rule().strategy {
+            Strategy::RoundRobin => (0..count).map(|_| plan.in_turn()).collect(),
+            Strategy::LeastLoad => lightest_arms(plan, count),
+            Strategy::Ratio => {
+                let mut slots = vec![Self::by_share(plan)];
+                extra_arms(plan, &mut slots, count);
+                slots
+            }
+        };
+        let started = Instant::now();
+        slots
+            .into_iter()
+            .map(|at| {
+                plan.load[at].in_flight.fetch_add(1, Ordering::Relaxed);
+                Chosen {
+                    endpoint: resolution.targets()[at].endpoint.clone(),
+                    plan: Arc::clone(plan),
+                    at,
+                    answered: self.answered.clone(),
+                    started,
+                }
+            })
+            .collect()
+    }
+
     /// An endpoint drawn in proportion to the shares.
     fn by_share(plan: &Plan) -> usize {
         match plan.total() {
@@ -202,6 +236,46 @@ impl Dispatcher {
             0 => plan.live()[0],
             total => plan.at_share(roll(total)),
         }
+    }
+}
+
+/// The `count` lightest live endpoints, one score read per endpoint.
+///
+/// `count` never reaches beyond a small bound, so the lightest are kept in place as the
+/// scores come by rather than the whole plan being sorted.
+fn lightest_arms(plan: &Plan, count: usize) -> Vec<usize> {
+    let mut lightest: Vec<(u64, usize)> = Vec::with_capacity(count);
+    for at in plan.live() {
+        lightest.push((plan.load[*at].score(), *at));
+        lightest.sort_by_key(|(score, _)| *score);
+        lightest.truncate(count);
+    }
+    lightest.into_iter().map(|(_, at)| at).collect()
+}
+
+/// A ratio rule's arms after the first was drawn, rotated through what is left.
+///
+/// The draw sends the rule's *load* to the endpoint its share names; the extra arms
+/// are insurance, not load, so re-drawing them by share would only skew the proportions
+/// the operator asked for. They instead rotate, one step per request, through the live
+/// endpoints in turn order, so that over many requests every live endpoint carries an
+/// equal share of the insurance.
+fn extra_arms(plan: &Plan, arms: &mut Vec<usize>, up_to: usize) {
+    if arms.len() == up_to {
+        return;
+    }
+    let rest: Vec<usize> = plan
+        .live()
+        .iter()
+        .copied()
+        .filter(|at| !arms.contains(at))
+        .collect();
+    let at = (plan.turn.fetch_add(1, Ordering::Relaxed) % rest.len() as u64) as usize;
+    for step in 0..rest.len() {
+        if arms.len() == up_to {
+            break;
+        }
+        arms.push(rest[(at + step) % rest.len()]);
     }
 }
 
@@ -281,7 +355,8 @@ mod tests {
     use std::collections::HashMap;
 
     use ip_core::{
-        AbsPath, ApiId, Endpoint, Host, Port, Protocol, RouteKey, RouteRule, RouteTarget, Weight,
+        AbsPath, ApiId, Endpoint, HEDGE_MOST, Hedge, Host, Port, Protocol, RouteKey, RouteRule,
+        RouteTarget, Weight,
     };
 
     use super::*;
@@ -434,6 +509,186 @@ mod tests {
         );
         let (dispatcher, _folding) = Dispatcher::new();
         assert_eq!(sent_to(&dispatcher, &resolution, 2).len(), 2);
+    }
+
+    /// Which host each arm of a many choice goes to, in launch order.
+    fn arms_to(resolution: &Resolution, hedge: Hedge) -> Vec<String> {
+        let (dispatcher, _folding) = Dispatcher::new();
+        dispatcher
+            .choose_many(resolution, hedge)
+            .into_iter()
+            .map(|arm| arm.endpoint().host.as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn two_arms_over_three_live_endpoints_are_two_distinct_ones() {
+        for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
+            let resolution = resolution(
+                strategy,
+                &[
+                    ("one.example.com", 1),
+                    ("two.example.com", 1),
+                    ("three.example.com", 1),
+                ],
+            );
+            let taken = arms_to(&resolution, Hedge::new(2).unwrap());
+            assert_eq!(taken.len(), 2, "{strategy}");
+            assert_ne!(taken[0], taken[1], "{strategy}: {taken:?}");
+            if !matches!(strategy, Strategy::Ratio) {
+                // A fresh, loadless plan starts at its first endpoint.
+                assert_eq!(taken[0], "one.example.com", "{strategy}");
+            }
+        }
+    }
+
+    #[test]
+    fn one_arm_gives_what_choose_gives() {
+        for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
+            let behind = [("only.example.com", 1), ("down.example.com", 0)];
+            let alone = resolution(strategy, &behind);
+            let raced = resolution(strategy, &behind);
+            let (by_one, _) = Dispatcher::new();
+            let (by_many, _) = Dispatcher::new();
+            let single = by_one.choose(&alone);
+            let arms = by_many.choose_many(&raced, Hedge::NONE);
+            assert_eq!(arms.len(), 1, "{strategy}");
+            assert_eq!(
+                arms[0].endpoint().host.as_str(),
+                single.endpoint().host.as_str()
+            );
+            assert_eq!(
+                arms[0].endpoint().host.as_str(),
+                "only.example.com",
+                "{strategy}"
+            );
+        }
+    }
+
+    #[test]
+    fn least_load_leaves_out_the_endpoint_carrying_a_request() {
+        let resolution = resolution(
+            Strategy::LeastLoad,
+            &[
+                ("one.example.com", 1),
+                ("two.example.com", 1),
+                ("three.example.com", 1),
+            ],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        let held = dispatcher.choose(&resolution);
+        assert_eq!(held.endpoint().host.as_str(), "one.example.com");
+        let arms = dispatcher.choose_many(&resolution, Hedge::new(2).unwrap());
+        let taken: Vec<&str> = arms
+            .iter()
+            .map(|arm| arm.endpoint().host.as_str())
+            .collect();
+        assert_eq!(taken, ["two.example.com", "three.example.com"]);
+        drop(held);
+    }
+
+    #[test]
+    fn a_hedge_wider_than_the_live_endpoints_is_cut_to_them() {
+        for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
+            let resolution =
+                resolution(strategy, &[("one.example.com", 1), ("two.example.com", 1)]);
+            let taken = arms_to(&resolution, Hedge::new(HEDGE_MOST).unwrap());
+            assert_eq!(taken.len(), 2, "{strategy}");
+            assert_ne!(taken[0], taken[1], "{strategy}: {taken:?}");
+        }
+    }
+
+    #[test]
+    fn a_drained_endpoint_is_never_an_arm() {
+        for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
+            let resolution = resolution(
+                strategy,
+                &[
+                    ("one.example.com", 1),
+                    ("drained.example.com", 0),
+                    ("two.example.com", 1),
+                ],
+            );
+            let taken = arms_to(&resolution, Hedge::new(2).unwrap());
+            for host in &taken {
+                assert_ne!(*host, "drained.example.com", "{strategy}: {taken:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rule_whose_endpoints_are_all_drained_still_answers_with_arms() {
+        for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
+            let resolution =
+                resolution(strategy, &[("one.example.com", 0), ("two.example.com", 0)]);
+            let taken = arms_to(&resolution, Hedge::new(2).unwrap());
+            assert_eq!(taken.len(), 2, "{strategy}");
+            assert_ne!(taken[0], taken[1], "{strategy}: {taken:?}");
+        }
+    }
+
+    #[test]
+    fn every_arm_counts_against_its_endpoint_while_it_is_held() {
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[("one.example.com", 1), ("two.example.com", 1)],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        let plan = resolution.plan();
+        let arms = dispatcher.choose_many(&resolution, Hedge::new(2).unwrap());
+        assert_eq!(plan.load[0].in_flight.load(Ordering::Relaxed), 1);
+        assert_eq!(plan.load[1].in_flight.load(Ordering::Relaxed), 1);
+        drop(arms);
+        assert_eq!(plan.load[0].in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(plan.load[1].in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn extra_arms_rotate_through_every_live_endpoint() {
+        let targets = vec![
+            Weighted::new(endpoint("one.example.com", "/v1")),
+            Weighted::new(endpoint("two.example.com", "/v1")),
+            Weighted::new(endpoint("three.example.com", "/v1")),
+        ];
+        let plan = Plan::of(&targets);
+        let mut drawn = Vec::new();
+        for _ in 0..6 {
+            let mut arms = vec![0usize];
+            extra_arms(&plan, &mut arms, 2);
+            drawn.push(arms[1]);
+        }
+        // The same first arm, repeated calls: the extra arm covers every live
+        // endpoint before it repeats.
+        assert_eq!(drawn, [1, 2, 1, 2, 1, 2]);
+    }
+
+    #[test]
+    fn a_ratio_rule_spreads_the_insurance_across_its_endpoints() {
+        let resolution = resolution(
+            Strategy::Ratio,
+            &[
+                ("one.example.com", 1),
+                ("two.example.com", 1),
+                ("three.example.com", 1),
+            ],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        let mut carried: HashMap<String, usize> = HashMap::new();
+        for _ in 0..300 {
+            for arm in dispatcher.choose_many(&resolution, Hedge::new(2).unwrap()) {
+                *carried
+                    .entry(arm.endpoint().host.as_str().to_owned())
+                    .or_insert(0) += 1;
+            }
+        }
+        // One draw in three makes a first arm and one rotation in three makes an
+        // extra arm, so each endpoint is in about two races in three of 300; the
+        // old walk left the last endpoint in one in three. The bound is the middle
+        // of the two, well away from either side because the draw is random and the
+        // rotation alternates, so it cannot flake.
+        for host in ["one.example.com", "two.example.com", "three.example.com"] {
+            assert!(carried[host] > 150, "{host}: {carried:?}");
+        }
     }
 
     #[test]
