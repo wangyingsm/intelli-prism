@@ -14,6 +14,9 @@
 /perf.data
 /perf.data.old
 
+# Coding plans: the specification each commit is written from, kept out of the history
+coding-plan/
+
 # Claude Code
 .claude/
 CLAUDE.md
