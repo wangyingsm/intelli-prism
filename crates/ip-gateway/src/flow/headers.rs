@@ -14,12 +14,28 @@ use crate::error::{GatewayError, GatewayErrorKind};
 use crate::stage::{Forwarded, Stage};
 
 /// Points the request at the endpoint it was routed to, carrying its query across.
+///
+/// What rides on is stripped first, and the caller is left with the request aimed as well
+/// as stripped.
 pub(super) fn rewrite(
     request: Request<GatewayBody>,
     target: &Endpoint,
 ) -> Result<Request<GatewayBody>, GatewayError> {
-    let query = request.uri().query().map(ToOwned::to_owned);
     let (mut parts, body) = request.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    aim(parts, body, target)
+}
+
+/// A request aimed at the endpoint it is routed to, carrying its query across.
+///
+/// The uri is built from the one the parts carry, so call it on parts that still have the
+/// original uri; the caller is responsible for the hop by hop headers.
+pub(super) fn aim(
+    mut parts: http::request::Parts,
+    body: GatewayBody,
+    target: &Endpoint,
+) -> Result<Request<GatewayBody>, GatewayError> {
+    let query = parts.uri.query().map(ToOwned::to_owned);
     parts.uri = target_uri(target, query.as_deref()).map_err(|detail| {
         GatewayError::new(Forwarded::NAME, GatewayErrorKind::Malformed { detail })
     })?;
@@ -32,7 +48,6 @@ pub(super) fn rewrite(
             },
         )
     })?;
-    strip_hop_by_hop(&mut parts.headers);
     parts.headers.insert(HOST, host);
     Ok(Request::from_parts(parts, body))
 }

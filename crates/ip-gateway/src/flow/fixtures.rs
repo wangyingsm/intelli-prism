@@ -22,6 +22,16 @@ use crate::table::RoutingTable;
 use crate::upstream::Upstream;
 use ip_storage::{NewUsage, StorageError, Usage, UsageRowId, UsageStore};
 
+/// What one host answers with when a race reaches it: how long it keeps the caller waiting,
+/// with what it answers, or that it does not answer at all.
+#[derive(Clone)]
+pub(super) struct Behaviour {
+    pub(super) delay: std::time::Duration,
+    pub(super) status: StatusCode,
+    pub(super) body: &'static str,
+    pub(super) fail: bool,
+}
+
 /// Records what it was sent, and answers with what it was built with.
 pub(super) struct FakeUpstream {
     pub(super) seen: Mutex<Vec<Seen>>,
@@ -29,6 +39,7 @@ pub(super) struct FakeUpstream {
     body: Bytes,
     headers: Vec<(&'static str, &'static str)>,
     fail: bool,
+    behaviours: Mutex<Vec<(String, Behaviour)>>,
 }
 
 pub(super) struct Seen {
@@ -46,6 +57,7 @@ impl FakeUpstream {
             body: Bytes::from(body.to_owned()),
             headers: Vec::new(),
             fail: false,
+            behaviours: Mutex::new(Vec::new()),
         })
     }
 
@@ -57,6 +69,7 @@ impl FakeUpstream {
             body: Bytes::from(body.to_owned()),
             headers: Vec::new(),
             fail: false,
+            behaviours: Mutex::new(Vec::new()),
         })
     }
 
@@ -67,6 +80,7 @@ impl FakeUpstream {
             body: Bytes::new(),
             headers: Vec::new(),
             fail: true,
+            behaviours: Mutex::new(Vec::new()),
         })
     }
 
@@ -80,6 +94,24 @@ impl FakeUpstream {
             body: Bytes::from(body.to_owned()),
             headers,
             fail: false,
+            behaviours: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Answers per endpoint: a host named here answers on its own timing, the rest as built.
+    pub(super) fn answering_each(named: &[(&str, Behaviour)]) -> Arc<Self> {
+        Arc::new(Self {
+            seen: Mutex::new(Vec::new()),
+            status: StatusCode::OK,
+            body: Bytes::new(),
+            headers: Vec::new(),
+            fail: false,
+            behaviours: Mutex::new(
+                named
+                    .iter()
+                    .map(|(host, behaviour)| (String::from(*host), behaviour.clone()))
+                    .collect(),
+            ),
         })
     }
 
@@ -105,17 +137,36 @@ impl Upstream for FakeUpstream {
             .unwrap_or_default();
         let headers = request.headers().clone();
         let body = request.into_body().collect().await.unwrap().to_bytes();
+        let behaviour = self
+            .behaviours
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(named, _)| *named == host)
+            .map(|(_, behaviour)| behaviour.clone());
         self.seen.lock().unwrap().push(Seen {
             uri,
             host,
             headers,
             body,
         });
-        let mut response = Response::builder().status(self.status);
+        let (status, answered) = match behaviour {
+            Some(behaviour) if behaviour.fail => {
+                return Err(crate::error::UpstreamError::new("connection refused"));
+            }
+            Some(behaviour) => {
+                if !behaviour.delay.is_zero() {
+                    tokio::time::sleep(behaviour.delay).await;
+                }
+                (behaviour.status, Bytes::from(behaviour.body.to_owned()))
+            }
+            None => (self.status, self.body.clone()),
+        };
+        let mut response = Response::builder().status(status);
         for (name, value) in &self.headers {
             response = response.header(*name, *value);
         }
-        Ok(response.body(from_bytes(self.body.clone())).unwrap())
+        Ok(response.body(from_bytes(answered)).unwrap())
     }
 }
 
@@ -236,6 +287,23 @@ pub(super) fn table() -> RoutingTable {
 pub(super) fn replicated_table(strategy: ip_core::Strategy) -> RoutingTable {
     let mut rule = rule(endpoint(Protocol::Https, "one.example.com", 443, "/v1"));
     rule.strategy = strategy;
+    rule.target = RouteTarget::from_endpoints(vec![
+        endpoint(Protocol::Https, "one.example.com", 443, "/v1"),
+        endpoint(Protocol::Https, "two.example.com", 443, "/v1"),
+    ])
+    .unwrap();
+    RoutingTable::from_rules(vec![rule])
+}
+
+/// A table whose one rule stands behind two endpoints, dispatched to by `strategy`, and raced
+/// across `hedge` of them.
+pub(super) fn hedged_replicated_table(
+    strategy: ip_core::Strategy,
+    hedge: ip_core::Hedge,
+) -> RoutingTable {
+    let mut rule = rule(endpoint(Protocol::Https, "one.example.com", 443, "/v1"));
+    rule.strategy = strategy;
+    rule.hedge = hedge;
     rule.target = RouteTarget::from_endpoints(vec![
         endpoint(Protocol::Https, "one.example.com", 443, "/v1"),
         endpoint(Protocol::Https, "two.example.com", 443, "/v1"),

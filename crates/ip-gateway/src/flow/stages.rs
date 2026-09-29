@@ -1,19 +1,20 @@
 //! The typestate machine: a request as it moves from one stage to the next.
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Request, Response};
 use ip_cache::{CacheKey, Ttl};
-use ip_core::{Capability, CapabilityScope, Replica, RouteKey};
+use ip_core::{Capability, CapabilityScope, Hedge, Replica, RouteKey};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{Span, field};
 
 use super::RequestContext;
-use super::headers::{authority_of, is_event_stream, rewrite, set_length, strip_hop_by_hop};
+use super::headers::{aim, authority_of, is_event_stream, rewrite, set_length, strip_hop_by_hop};
 use super::run::{collect, run_body, run_headers};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, freshness, response_key};
-use crate::dispatch::Dispatcher;
+use crate::dispatch::{Dispatcher, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
@@ -192,9 +193,10 @@ impl Flow<BodyProcessed> {
             .map_err(|error| GatewayError::new(BodyProcessed::NAME, error.into()))
     }
 
-    /// Sends the request to the endpoint the dispatcher chose.
+    /// Sends the request to the endpoint the dispatcher chose, or races it across the arms the
+    /// rule allows.
     ///
-    /// The choice is counted against that endpoint until the upstream answers, so what the
+    /// Each arm is counted against its endpoint until the upstream answers, so what the
     /// dispatcher knows about its load is what a request arriving now would actually wait behind.
     pub async fn forward(
         self,
@@ -205,19 +207,22 @@ impl Flow<BodyProcessed> {
             request,
             resolution,
         } = self.held;
-        let chosen = dispatcher.choose(&resolution);
-        let served = Replica::of(chosen.endpoint());
-        Span::current().record("served", field::display(&served));
-        let request = rewrite(request, chosen.endpoint())?;
-        let mut response = upstream
-            .send(request)
-            .await
-            .map_err(|error| GatewayError::new(Forwarded::NAME, error.into()))?;
-        strip_hop_by_hop(response.headers_mut());
-        Ok(Flow {
-            context: self.context,
-            held: Answered { response, served },
-        })
+        if may_race(request.headers(), resolution.rule().hedge) == Hedge::NONE {
+            let chosen = dispatcher.choose(&resolution);
+            let served = Replica::of(chosen.endpoint());
+            Span::current().record("served", field::display(&served));
+            let request = rewrite(request, chosen.endpoint())?;
+            let mut response = upstream
+                .send(request)
+                .await
+                .map_err(|error| GatewayError::new(Forwarded::NAME, error.into()))?;
+            strip_hop_by_hop(response.headers_mut());
+            return Ok(Flow {
+                context: self.context,
+                held: Answered { response, served },
+            });
+        }
+        race(self.context, upstream, dispatcher, request, &resolution).await
     }
 }
 
@@ -312,6 +317,101 @@ impl Flow<ResponseBodyProcessed> {
     }
 }
 
+/// Sends the arm's request and comes back with its index and its outcome.
+///
+/// The future carries only the armed request and the arm's index, never the arm itself, so a
+/// losing arm can still be abandoned once its future is dropped.
+async fn send_arm(
+    at: usize,
+    upstream: &dyn Upstream,
+    sent: Request<GatewayBody>,
+) -> (usize, Result<Response<GatewayBody>, GatewayError>) {
+    (
+        at,
+        upstream
+            .send(sent)
+            .await
+            .map_err(|error| GatewayError::new(Forwarded::NAME, error.into())),
+    )
+}
+
+/// Races one request across the arms the dispatcher chose and keeps the first acceptable
+/// answer.
+///
+/// The arms are polled together on the task the flow already runs on: they stay inside the
+/// request's span, and cancelling a losing arm is a matter of dropping the future it is in.
+async fn race(
+    context: RequestContext,
+    upstream: &dyn Upstream,
+    dispatcher: &Dispatcher,
+    request: Request<GatewayBody>,
+    resolution: &Resolution,
+) -> Result<Flow<Forwarded>, GatewayError> {
+    // The body leaves once per arm, so it is held in hand once for the whole race; collecting
+    // what is already bytes is cheap.
+    let (mut parts, body) = request.into_parts();
+    let buffered = collect(StageName::BodyRead, body).await?;
+    // The same work on every arm, so it runs once, on the parts every arm is aimed from.
+    strip_hop_by_hop(&mut parts.headers);
+    let mut arms = dispatcher.choose_many(resolution, resolution.rule().hedge);
+    let mut racing = FuturesUnordered::new();
+    for (at, arm) in arms.iter().enumerate() {
+        if at + 1 == arms.len() {
+            continue;
+        }
+        let sent = aim(parts.clone(), from_bytes(buffered.clone()), arm.endpoint())?;
+        racing.push(send_arm(at, upstream, sent));
+    }
+    // The last arm takes the parts that were already in hand, so it needs no clone.
+    let last = arms.len() - 1;
+    let sent = aim(parts, from_bytes(buffered.clone()), arms[last].endpoint())?;
+    racing.push(send_arm(last, upstream, sent));
+    let mut answered = vec![false; arms.len()];
+    let mut winner: Option<(usize, Response<GatewayBody>)> = None;
+    let mut first_failure: Option<(usize, Result<Response<GatewayBody>, GatewayError>)> = None;
+    while let Some((at, outcome)) = racing.next().await {
+        answered[at] = true;
+        if answers_acceptably(&outcome) {
+            winner = Some((at, outcome.expect("an acceptable answer is a response")));
+            break;
+        }
+        if first_failure.is_none() {
+            first_failure = Some((at, outcome));
+        }
+    }
+    for (at, arm) in arms.iter_mut().enumerate() {
+        if !answered[at] {
+            arm.abandon();
+        }
+    }
+    let (at, response) = match (winner, first_failure) {
+        (Some((at, response)), _) => (at, response),
+        (None, Some((at, Ok(response)))) => (at, response),
+        (None, Some((_, Err(error)))) => return Err(error),
+        (None, None) => unreachable!("every arm answered once"),
+    };
+    let endpoint = arms[at].endpoint();
+    drop(racing);
+    let served = Replica::of(endpoint);
+    Span::current().record("served", field::display(&served));
+    let mut response = response;
+    strip_hop_by_hop(response.headers_mut());
+    Ok(Flow {
+        context,
+        held: Answered { response, served },
+    })
+}
+
+/// Whether one arm's answer may win a race.
+///
+/// A transport error and a 5xx both say the endpoint cannot serve the request, and while one
+/// arm answered badly the request may still be racing on its other arms.
+fn answers_acceptably(outcome: &Result<Response<GatewayBody>, GatewayError>) -> bool {
+    outcome
+        .as_ref()
+        .is_ok_and(|response| !response.status().is_server_error())
+}
+
 fn key_of(
     context: &RequestContext,
     request: &Request<GatewayBody>,
@@ -374,8 +474,11 @@ mod tests {
     use crate::processor::ProcessorChain;
     use crate::stage::StageName;
     use crate::table::RoutingTable;
-    use http::StatusCode;
+    use bytes::Bytes;
+    use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
+    use http::{HeaderValue, StatusCode};
     use ip_core::Protocol;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn a_routed_request_reaches_the_target_with_its_remainder_and_query() {
@@ -489,5 +592,297 @@ mod tests {
         let flow = flow.process_response_body(&processors).await.unwrap();
         assert_eq!(flow.stage(), StageName::ResponseBodyProcess);
         assert_eq!(body_of(flow.into_response().unwrap()).await, "pong");
+    }
+
+    /// What one host in a race answers with.
+    fn behaviour(delay: Duration, status: StatusCode, body: &'static str, fail: bool) -> Behaviour {
+        Behaviour {
+            delay,
+            status,
+            body,
+            fail,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_does_not_hedge_sends_one_request() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        );
+        let response = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent_to: Vec<String> = upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|seen| seen.host.clone())
+            .collect();
+        assert_eq!(sent_to, ["one.example.com:443".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_hedged_rule_races_its_arms_and_the_faster_one_is_recorded() {
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                behaviour(
+                    Duration::from_millis(300),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "slow",
+                    false,
+                ),
+            ),
+            (
+                "two.example.com:443",
+                behaviour(Duration::from_millis(20), StatusCode::OK, "fast", false),
+            ),
+        ]);
+        let table = hedged_replicated_table(
+            ip_core::Strategy::RoundRobin,
+            ip_core::Hedge::new(2).unwrap(),
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        let mut request = request("/anthropic/messages", "ask");
+        request
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("3"));
+        // Rides in, and must not ride on.
+        request
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+        let flow = Flow::received(context(granted()), request)
+            .authorize(&table)
+            .unwrap();
+        let processors = ProcessorChain::new();
+        let flow = flow
+            .process_headers(processors.request_headers())
+            .await
+            .unwrap()
+            .process_body(&processors)
+            .await
+            .unwrap();
+        let flow = flow.forward(upstream.as_ref(), &dispatcher).await.unwrap();
+        let flow = flow
+            .process_response_headers(processors.response_headers())
+            .await
+            .unwrap()
+            .process_response_body(&processors)
+            .await
+            .unwrap();
+        assert_eq!(flow.served().host.as_str(), "two.example.com");
+        assert_eq!(body_of(flow.into_response().unwrap()).await, "fast");
+        let seen = upstream.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "a hedged rule sent one request per arm");
+        let won = seen
+            .iter()
+            .find(|seen| seen.host == "two.example.com:443")
+            .expect("the winning arm reached the upstream");
+        assert_eq!(won.body, Bytes::from_static(b"ask"));
+        assert_eq!(won.headers.get(CONTENT_LENGTH).unwrap(), "3");
+        assert_eq!(won.headers.get(HOST).unwrap(), "two.example.com:443");
+        assert!(won.headers.get(CONNECTION).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_arm_that_fails_fast_does_not_win_a_race() {
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                behaviour(
+                    Duration::from_millis(5),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "boom",
+                    false,
+                ),
+            ),
+            (
+                "two.example.com:443",
+                behaviour(
+                    Duration::from_millis(300),
+                    StatusCode::OK,
+                    "slow-pong",
+                    false,
+                ),
+            ),
+        ]);
+        let gateway = Gateway::new(
+            hedged_replicated_table(
+                ip_core::Strategy::RoundRobin,
+                ip_core::Hedge::new(2).unwrap(),
+            ),
+            ProcessorChain::new(),
+            upstream.clone(),
+        );
+        let response = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await, "slow-pong");
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_arm_that_drops_off_does_not_end_a_race() {
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                behaviour(Duration::from_millis(5), StatusCode::OK, "", true),
+            ),
+            (
+                "two.example.com:443",
+                behaviour(
+                    Duration::from_millis(200),
+                    StatusCode::OK,
+                    "slow-pong",
+                    false,
+                ),
+            ),
+        ]);
+        let gateway = Gateway::new(
+            hedged_replicated_table(
+                ip_core::Strategy::RoundRobin,
+                ip_core::Hedge::new(2).unwrap(),
+            ),
+            ProcessorChain::new(),
+            upstream,
+        );
+        let response = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await, "slow-pong");
+    }
+
+    #[tokio::test]
+    async fn a_race_lost_by_every_arm_answers_with_the_first_failure() {
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                behaviour(
+                    Duration::from_millis(5),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "boom",
+                    false,
+                ),
+            ),
+            (
+                "two.example.com:443",
+                behaviour(
+                    Duration::from_millis(1_000),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "away",
+                    false,
+                ),
+            ),
+        ]);
+        let gateway = Gateway::new(
+            hedged_replicated_table(
+                ip_core::Strategy::RoundRobin,
+                ip_core::Hedge::new(2).unwrap(),
+            ),
+            ProcessorChain::new(),
+            upstream,
+        );
+        let response = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_of(response).await, "boom");
+    }
+
+    #[tokio::test]
+    async fn a_race_lost_to_every_arm_is_a_bad_gateway() {
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                behaviour(Duration::ZERO, StatusCode::OK, "", true),
+            ),
+            (
+                "two.example.com:443",
+                behaviour(Duration::ZERO, StatusCode::OK, "", true),
+            ),
+        ]);
+        let gateway = Gateway::new(
+            hedged_replicated_table(
+                ip_core::Strategy::RoundRobin,
+                ip_core::Hedge::new(2).unwrap(),
+            ),
+            ProcessorChain::new(),
+            upstream,
+        );
+        let error = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(error.stage(), StageName::Route);
+    }
+
+    #[tokio::test]
+    async fn an_arm_that_lost_a_race_teaches_the_dispatcher_nothing() {
+        let (dispatcher, mut folding) = Dispatcher::new();
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                behaviour(Duration::from_millis(300), StatusCode::OK, "slow", false),
+            ),
+            (
+                "two.example.com:443",
+                behaviour(Duration::from_millis(20), StatusCode::OK, "fast", false),
+            ),
+        ]);
+        let gateway = Gateway::new(
+            hedged_replicated_table(
+                ip_core::Strategy::RoundRobin,
+                ip_core::Hedge::new(2).unwrap(),
+            ),
+            ProcessorChain::new(),
+            upstream,
+        )
+        .dispatching(Arc::new(dispatcher));
+        let response = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(body_of(response).await, "fast");
+        // Only the winner's answer reached the folder; the arm that lost was abandoned
+        // and reports no latency of its own.
+        assert_eq!(folding.fold().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_the_decision_will_not_race_reaches_only_one_arm() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            hedged_replicated_table(
+                ip_core::Strategy::RoundRobin,
+                ip_core::Hedge::new(3).unwrap(),
+            ),
+            ProcessorChain::new(),
+            upstream.clone(),
+        );
+        let mut oversized = request("/anthropic/messages", "ask");
+        oversized
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("5000000"));
+        gateway.handle(context(granted()), oversized).await.unwrap();
+        let mut multipart = request("/anthropic/messages", "ask");
+        multipart.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("multipart/form-data; boundary=here"),
+        );
+        gateway.handle(context(granted()), multipart).await.unwrap();
+        let sent: usize = upstream.seen.lock().unwrap().len();
+        assert_eq!(sent, 2, "a refused race went out more than once");
     }
 }
