@@ -192,6 +192,7 @@ impl Dispatcher {
             at,
             answered: self.answered.clone(),
             started: Instant::now(),
+            abandoned: false,
         }
     }
 
@@ -224,6 +225,7 @@ impl Dispatcher {
                     at,
                     answered: self.answered.clone(),
                     started,
+                    abandoned: false,
                 }
             })
             .collect()
@@ -323,12 +325,24 @@ pub struct Chosen {
     at: usize,
     answered: mpsc::UnboundedSender<Answered>,
     started: Instant,
+    /// Whether it was abandoned, so its span is not reported when it is dropped.
+    abandoned: bool,
 }
 
 impl Chosen {
     /// Where the request goes.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Say this arm was abandoned, so dropping it still comes off the count but reports
+    /// no latency.
+    ///
+    /// An abandoned arm is dropped when the winner answers, and the span it held is the
+    /// winner's, not its own; folded in, it would make the endpoint that had not
+    /// answered look as quick as the one that did.
+    pub fn abandon(&mut self) {
+        self.abandoned = true;
     }
 }
 
@@ -337,6 +351,9 @@ impl Drop for Chosen {
         self.plan.load[self.at]
             .in_flight
             .fetch_sub(1, Ordering::Relaxed);
+        if self.abandoned {
+            return;
+        }
         // The folder does the arithmetic; a request that is done only says how long it waited.
         let _ = self.answered.send(Answered {
             plan: Arc::clone(&self.plan),
@@ -776,6 +793,74 @@ mod tests {
         let (dispatcher, mut folding) = Dispatcher::new();
         drop(dispatcher);
         assert_eq!(folding.fold().await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_arm_teaches_no_latency_to_the_folder() {
+        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1)]);
+        let (dispatcher, mut folding) = Dispatcher::new();
+        let mut arm = dispatcher.choose(&resolution);
+        arm.abandon();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(arm);
+        drop(dispatcher); // No sender left, so the fold can answer at all.
+        assert_eq!(folding.fold().await, 0);
+        assert_eq!(
+            resolution.plan().taking(0),
+            None,
+            "an arm that never answered should have taught nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_arm_leaves_a_recorded_latency_unchanged() {
+        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1)]);
+        let (dispatcher, mut folding) = Dispatcher::new();
+        let held = dispatcher.choose(&resolution);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        drop(held);
+        assert_eq!(folding.fold().await, 1);
+        let recorded = resolution
+            .plan()
+            .taking(0)
+            .expect("the first answer was folded in");
+
+        let mut arm = dispatcher.choose(&resolution);
+        arm.abandon();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(arm);
+        drop(dispatcher);
+        assert_eq!(folding.fold().await, 0);
+        assert_eq!(resolution.plan().taking(0), Some(recorded));
+    }
+
+    #[test]
+    fn an_abandoned_arm_still_comes_off_the_in_flight_count() {
+        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1)]);
+        let (dispatcher, _folding) = Dispatcher::new();
+        let plan = resolution.plan();
+        let mut arm = dispatcher.choose(&resolution);
+        assert_eq!(plan.load[0].in_flight.load(Ordering::Relaxed), 1);
+        arm.abandon();
+        drop(arm);
+        assert_eq!(plan.load[0].in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoning_one_arm_leaves_the_other_arms_reporting() {
+        let resolution = resolution(
+            Strategy::LeastLoad,
+            &[("one.example.com", 1), ("two.example.com", 1)],
+        );
+        let (dispatcher, mut folding) = Dispatcher::new();
+        let mut arms = dispatcher.choose_many(&resolution, Hedge::new(2).unwrap());
+        arms[0].abandon();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(arms);
+        assert_eq!(folding.fold().await, 1);
+        let plan = resolution.plan();
+        assert_eq!(plan.taking(0), None, "the abandoned arm taught nothing");
+        assert!(plan.taking(1).is_some(), "the held arm still reported");
     }
 
     #[test]
