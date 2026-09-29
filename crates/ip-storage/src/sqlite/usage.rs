@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, ModelName, Replica, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Hedge, ModelName, Replica, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -16,8 +16,8 @@ impl UsageStore for SqliteStore {
         let row = sqlx::query(
             "INSERT INTO usage (trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             created_at, raced_across) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              RETURNING row_id, created_at",
         )
         .bind(usage.trace.to_hex())
@@ -43,6 +43,7 @@ impl UsageStore for SqliteStore {
         )
         .bind(i64::from(usage.latency.millis()))
         .bind(Timestamp::now().unix_seconds())
+        .bind(i64::from(usage.raced_across.get()))
         .fetch_one(&self.pool)
         .await
         .map_err(StorageError::backend)?;
@@ -58,6 +59,7 @@ impl UsageStore for SqliteStore {
             tokens: usage.tokens,
             served: usage.served,
             served_by: usage.served_by,
+            raced_across: usage.raced_across,
             latency: usage.latency,
             created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
         })
@@ -67,7 +69,7 @@ impl UsageStore for SqliteStore {
         let row = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at FROM usage WHERE row_id = ?",
+             created_at, raced_across FROM usage WHERE row_id = ?",
         )
         .bind(row_id.get())
         .fetch_optional(&self.pool)
@@ -138,6 +140,21 @@ fn served_by(row: &SqliteRow) -> Result<Option<Replica>, StorageError> {
     }
 }
 
+/// How many endpoints one request was raced across, as the row holds it.
+///
+/// A stored count the type refuses is a row the code cannot have written.
+fn raced_across(row: &SqliteRow) -> Result<Hedge, StorageError> {
+    let stored: i64 = row.get("raced_across");
+    let across = u8::try_from(stored).map_err(|_| StorageError::Malformed {
+        entity: Entity::Usage,
+        detail: format!("{stored} is not a count of endpoints"),
+    })?;
+    Hedge::new(across).map_err(|_| StorageError::Malformed {
+        entity: Entity::Usage,
+        detail: format!("{stored} is not a count of endpoints"),
+    })
+}
+
 /// Rebuilds a usage row, refusing one whose stored value its own type will not take.
 pub(super) fn recorded(row: SqliteRow) -> Result<Usage, StorageError> {
     let turn: Option<String> = row.get("turn_id");
@@ -160,6 +177,7 @@ pub(super) fn recorded(row: SqliteRow) -> Result<Usage, StorageError> {
         ),
         served: served_of(&source)?,
         served_by: served_by(&row)?,
+        raced_across: raced_across(&row)?,
         latency: latency(row.get("latency_ms"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })
@@ -183,13 +201,14 @@ mod tests {
     }
 
     /// Every column whose stored value its own type can refuse, and a value that it refuses.
-    const REFUSED: [&str; 6] = [
+    const REFUSED: [&str; 7] = [
         "UPDATE usage SET served = 'somewhere' WHERE row_id = ?",
         "UPDATE usage SET trace_id = 'not-a-trace' WHERE row_id = ?",
         "UPDATE usage SET input_tokens = 9223372036854775807 WHERE row_id = ?",
         "UPDATE usage SET latency_ms = -1 WHERE row_id = ?",
         "UPDATE usage SET served_port = NULL WHERE row_id = ?",
         "UPDATE usage SET served_host = NULL WHERE row_id = ?",
+        "UPDATE usage SET raced_across = 9 WHERE row_id = ?",
     ];
 
     #[tokio::test]
@@ -208,5 +227,42 @@ mod tests {
                 "{update} was read back"
             );
         }
+    }
+
+    /// A count the schema's own check will not store, written around the driver, is refused by
+    /// the schema itself, before any read ever sees it.
+    #[tokio::test]
+    async fn a_count_the_schema_will_not_store_is_refused_around_the_driver() {
+        let store = store().await;
+        let row_id = store.record_usage(spent()).await.unwrap().row_id;
+        assert!(
+            sqlx::query("UPDATE usage SET raced_across = 0 WHERE row_id = ?")
+                .bind(row_id.get())
+                .execute(&store.pool)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A row written around the driver, holding no count at all, reads back as one endpoint.
+    #[tokio::test]
+    async fn a_row_holding_no_count_reads_back_as_one() {
+        let store = store().await;
+        sqlx::query(
+            "INSERT INTO usage (trace_id, tenant_id, user_id, api_id, input_tokens, \
+             output_tokens, served, latency_ms, created_at) \
+             VALUES ('11111111111111111111111111111111', 'acme', 'alice', 'anthropic', 0, 0, \
+             'upstream', 1, 0)",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let row_id: i64 = sqlx::query_scalar("SELECT row_id FROM usage WHERE trace_id = ?")
+            .bind("11111111111111111111111111111111")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let read = store.usage(UsageRowId::new(row_id)).await.unwrap().unwrap();
+        assert_eq!(read.raced_across, Hedge::NONE);
     }
 }

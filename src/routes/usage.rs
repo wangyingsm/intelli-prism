@@ -6,7 +6,9 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use ip_core::{ApiId, Capability, CapabilityScope, Latency, Served, TenantId, Timestamp, UserId};
+use ip_core::{
+    ApiId, Capability, CapabilityScope, Hedge, Latency, Served, TenantId, Timestamp, UserId,
+};
 use ip_storage::{Usage, UsageFilter};
 
 use super::{Paged, store_refusal};
@@ -48,6 +50,9 @@ pub struct UsageView {
     /// cache gave, which reached no endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_by: Option<String>,
+    /// How many endpoints behind the rule it was raced across; one is what it was before
+    /// anything raced.
+    pub raced_across: Hedge,
     /// How long the caller waited, in milliseconds.
     pub latency_ms: u32,
     /// When it was recorded, in seconds since the unix epoch.
@@ -67,6 +72,7 @@ impl From<Usage> for UsageView {
             output_tokens: usage.tokens.output.get(),
             served: usage.served,
             served_by: usage.served_by.map(|replica| replica.to_string()),
+            raced_across: usage.raced_across,
             latency_ms: Latency::millis(usage.latency),
             created_at: usage.created_at,
         }
@@ -177,7 +183,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Narrowed {
 
 #[cfg(test)]
 mod tests {
-    use ip_core::{Grant, ModelName, TnKey, TokenCount, Tokens, TraceId, TurnId};
+    use ip_core::{Grant, Hedge, ModelName, TnKey, TokenCount, Tokens, TraceId, TurnId};
     use ip_storage::{
         AccountKind, GrantStore, Membership, MembershipStore, NewTenant, NewUsage, NewUser,
         SqliteStore, Standing, TenantStore, UsageStore, UserStore,
@@ -212,6 +218,7 @@ mod tests {
                 host: ip_core::Host::new("one.example.com").unwrap(),
                 port: ip_core::Port::new(443).unwrap(),
             }),
+            raced_across: Hedge::default(),
             latency: Latency::from_millis(1_250),
         }
     }
@@ -293,24 +300,39 @@ mod tests {
 
     #[tokio::test]
     async fn the_administrator_reads_what_every_tenant_spent() {
-        let state = state_over_shared(store().await);
+        let store = store().await;
+        // Recorded now, so it is the newest row and comes back first from the listing.
+        let count = NewUsage {
+            tenant: tenant("other"),
+            user: user("dave"),
+            api: ApiId::new("anthropic").unwrap(),
+            raced_across: Hedge::new(2).unwrap(),
+            ..spent("other", "dave", "anthropic")
+        };
+        store.record_usage(count).await.unwrap();
+        let state = state_over_shared(store);
         let router = crate::routes::router(state.clone());
         let listed = listed(read(&router, &state, "root", "").await).await;
-        assert_eq!(listed.as_array().unwrap().len(), 3);
+        assert_eq!(listed.as_array().unwrap().len(), 4);
 
         let row = &listed[0];
         assert_eq!(row["tenant"], "other");
-        assert_eq!(row["user"], "carol");
+        assert_eq!(row["user"], "dave");
         assert_eq!(row["api"], "anthropic");
         assert_eq!(row["model"], "claude-opus-5");
         assert_eq!(row["input_tokens"], 120);
         assert_eq!(row["output_tokens"], 30);
         assert_eq!(row["served"], "upstream");
         assert_eq!(row["served_by"], "one.example.com:443");
+        assert_eq!(row["raced_across"], 2);
         assert_eq!(row["latency_ms"], 1250);
         assert_eq!(row["turn"], "turn-1");
         assert!(row["created_at"].is_number(), "a time is not a number");
         assert_eq!(row["trace"].as_str().unwrap().len(), 32);
+
+        // A default row still renders as one, that both a raced count and the ordinary one
+        // reach the view.
+        assert_eq!(listed.as_array().unwrap()[1]["raced_across"], 1);
     }
 
     #[tokio::test]

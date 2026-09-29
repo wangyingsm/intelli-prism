@@ -1,6 +1,6 @@
 use ip_core::{
-    ApiId, Counted, Host, Latency, ModelName, Port, Replica, Served, TenantId, TokenCount, Tokens,
-    TraceId, TurnId, UserId,
+    ApiId, Counted, Hedge, Host, Latency, ModelName, Port, Replica, Served, TenantId, TokenCount,
+    Tokens, TraceId, TurnId, UserId,
 };
 
 use crate::list::Page;
@@ -22,6 +22,7 @@ pub(crate) fn spent() -> NewUsage {
             host: Host::new("one.example.com").unwrap(),
             port: Port::new(443).unwrap(),
         }),
+        raced_across: Hedge::default(),
         latency: Latency::from_millis(1_250),
     }
 }
@@ -375,6 +376,23 @@ pub(crate) async fn a_row_says_which_endpoint_behind_the_rule_answered(store: &i
     let served = read.served_by.expect("an endpoint answered");
     assert_eq!(served.host.as_str(), "one.example.com");
     assert_eq!(served.port.get(), 443);
+}
+
+/// One request raced across two endpoints, the count it was raced across round-tripping onto
+/// the row and out of the paged list alike.
+pub(crate) async fn a_row_says_how_many_endpoints_it_was_raced_across(store: &impl Backend) {
+    let raced = NewUsage {
+        raced_across: Hedge::new(2).unwrap(),
+        ..spent()
+    };
+    let recorded = store.record_usage(raced).await.unwrap();
+    let read = store.usage(recorded.row_id).await.unwrap().unwrap();
+    assert_eq!(read.raced_across, Hedge::new(2).unwrap());
+    let listed = store
+        .list_usage(&UsageFilter::default(), Page::default())
+        .await
+        .unwrap();
+    assert_eq!(listed, vec![recorded]);
 }
 
 pub(crate) async fn a_row_the_cache_answered_names_no_endpoint(store: &impl Backend) {

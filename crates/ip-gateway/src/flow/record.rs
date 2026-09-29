@@ -10,7 +10,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
-use ip_core::{ApiId, Latency, Replica, Served, TenantId, Tokens, TraceId, TurnId, UserId};
+use ip_core::{ApiId, Hedge, Latency, Replica, Served, TenantId, Tokens, TraceId, TurnId, UserId};
 use ip_storage::{NewUsage, UsageStore};
 
 use tokio::sync::Notify;
@@ -149,6 +149,8 @@ impl Recording {
             tokens,
             served,
             served_by,
+            // The count of arms is filled in separately; until it is, the row says one.
+            raced_across: Hedge::default(),
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;

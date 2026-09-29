@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, ModelName, Replica, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Hedge, ModelName, Replica, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -16,8 +16,8 @@ impl UsageStore for PostgresStore {
         let row = sqlx::query(
             "INSERT INTO usage (trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+             created_at, raced_across) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
              RETURNING row_id, created_at",
         )
         .bind(usage.trace.to_hex())
@@ -43,6 +43,7 @@ impl UsageStore for PostgresStore {
         )
         .bind(i64::from(usage.latency.millis()))
         .bind(Timestamp::now().unix_seconds())
+        .bind(i64::from(usage.raced_across.get()))
         .fetch_one(&self.pool)
         .await
         .map_err(StorageError::backend)?;
@@ -58,6 +59,7 @@ impl UsageStore for PostgresStore {
             tokens: usage.tokens,
             served: usage.served,
             served_by: usage.served_by,
+            raced_across: usage.raced_across,
             latency: usage.latency,
             created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
         })
@@ -67,7 +69,7 @@ impl UsageStore for PostgresStore {
         let row = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at FROM usage WHERE row_id = $1",
+             created_at, raced_across FROM usage WHERE row_id = $1",
         )
         .bind(row_id.get())
         .fetch_optional(&self.pool)
@@ -138,6 +140,21 @@ fn served_by(row: &PgRow) -> Result<Option<Replica>, StorageError> {
     }
 }
 
+/// How many endpoints one request was raced across, as the row holds it.
+///
+/// A stored count the type refuses is a row the code cannot have written.
+fn raced_across(row: &PgRow) -> Result<Hedge, StorageError> {
+    let stored: i64 = row.get("raced_across");
+    let across = u8::try_from(stored).map_err(|_| StorageError::Malformed {
+        entity: Entity::Usage,
+        detail: format!("{stored} is not a count of endpoints"),
+    })?;
+    Hedge::new(across).map_err(|_| StorageError::Malformed {
+        entity: Entity::Usage,
+        detail: format!("{stored} is not a count of endpoints"),
+    })
+}
+
 /// Rebuilds a usage row, refusing one whose stored value its own type will not take.
 pub(super) fn recorded(row: PgRow) -> Result<Usage, StorageError> {
     let turn: Option<String> = row.get("turn_id");
@@ -160,7 +177,39 @@ pub(super) fn recorded(row: PgRow) -> Result<Usage, StorageError> {
         ),
         served: served_of(&source)?,
         served_by: served_by(&row)?,
+        raced_across: raced_across(&row)?,
         latency: latency(row.get("latency_ms"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::postgres::scratch;
+
+    /// A row written around the driver, holding no count at all, reads back as one endpoint, the
+    /// column's default.
+    #[tokio::test]
+    async fn a_row_holding_no_count_reads_back_as_one() {
+        let Some(store) = scratch::store().await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO usage (trace_id, tenant_id, user_id, api_id, input_tokens, \
+             output_tokens, served, latency_ms, created_at) \
+             VALUES ('11111111111111111111111111111111', 'acme', 'alice', 'anthropic', 0, 0, \
+             'upstream', 1, 0)",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let row_id: i64 = sqlx::query_scalar("SELECT row_id FROM usage WHERE trace_id = $1")
+            .bind("11111111111111111111111111111111")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let read = store.usage(UsageRowId::new(row_id)).await.unwrap().unwrap();
+        assert_eq!(read.raced_across, Hedge::NONE);
+    }
 }
