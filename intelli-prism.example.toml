@@ -75,7 +75,10 @@ log_level = "info"
 # beyond base_url, and says how requests are spread with `strategy`:
 # round_robin (the default), least_load, or ratio by the `weight` each endpoint carries.
 # A `weight` of 0 drains that endpoint: no strategy sends it a request until it is raised again.
-# A `hedge` of 2 or 3 races each request across that many of them and keeps the first answer.
+# A `hedge` of 2 or 3 races each request across that many of them and keeps the first
+# successful answer — a slow endpoint failing does not end the race. A request that cannot be
+# sent twice is sent once instead: a body declared too large to hold, a body that declares no
+# length, or a file upload. The usage row says how many arms each request took.
 [[upstream]]
 id = "anthropic"
 base_url = "https://api.anthropic.com/"

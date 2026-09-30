@@ -28,8 +28,10 @@ under it, and a row per request: the model, the tokens in each direction, whethe
 answered and how long the caller waited. Exported to an OpenTelemetry collector when one is
 configured, and read back over `GET /_ip/usage`.
 - **Dispatch across the endpoints behind a rule.** Round robin, least load or a share each, chosen
-per rule and per configured upstream. A share of nothing drains an endpoint without touching the
-rule, and every usage row names the endpoint that answered.
+per rule and per configured upstream; a rule can also race a request across two or three of them
+and take the first successful answer, when the body is one the gateway can send more than once. A
+share of nothing drains an endpoint without touching the rule, and every usage row names the
+endpoint that answered and how many it was raced across.
 - **Quota and rate limits.** What a tenant, one of its accounts or one of its apis may spend, in
 tokens or in requests, over a minute, an hour, a day or a month. The counts live in the cache and
 are seeded from the usage rows; a caller past its limit is told with 429 and when to come back.

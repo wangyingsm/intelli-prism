@@ -148,6 +148,15 @@ change reaches every node the way a rule change does.
 - A rule says how its requests are spread over the endpoints behind it: `round_robin` by default,
 `least_load`, or `ratio` by the share each endpoint carries. Both a stored rule and a configured
 `[[upstream]]` say it, so a replicated upstream can be described in the file alone.
+- A rule may name a count as well, which races each request across that many of the rule's
+endpoints at once. The count is capped at three and clamped to the endpoints a request may reach, so
+a race is across what is live, at least one. The first successful answer wins; a failure on one arm
+does not end the race, and the arms that lose are abandoned, paying back the load each had claimed
+and reporting no latency of their own, so the least-load scores do not skew.
+- A race is refused when the request cannot be sent more than once, and the request goes once
+instead, to the one endpoint the strategy would have chosen: a body declared past what the gateway
+will hold in memory, a body that declares no length, since an unknown size cannot be checked against
+that limit, and a file transport.
 - Round robin counts a rule's turn in the rule's own plan, worked out when the routing table is
 built, so a dispatch costs one atomic add and no lock. Ratio draws against a running total found
 at the same moment, so it costs a draw and a search rather than a sum per request.
@@ -160,7 +169,8 @@ how long it waited and moves on, and a folder works the average into the plan in
 raised again. A target whose every endpoint is drained is dispatched to in turn all the same, since
 a rule must have somewhere to send a request.
 - Each usage row names the endpoint that answered it, by host and port, and the `egress.request`
-span carries the same. An answer out of the cache names none, having reached none.
+span carries the same. An answer out of the cache names none, having reached none. And the row
+says how many endpoints the request was raced across, one when it was not raced at all.
 
 ## Shipped with a caveat
 
@@ -195,9 +205,12 @@ same order means a hit is not served once a quota is spent.
 match a limit that names no api. The limits endpoint goes by ownership instead, which is what
 `DESIGN.md` describes; letting a granted member manage limits needs the capability's scope shape
 widened.
-- **Hedging is not built.** A rule dispatches to one endpoint. Sending a request to several at
-once and taking the first answer is designed but not written, and it needs a ruling on what a
-cancelled hedge costs a quota.
+- **Whether a request may be raced is decided the HTTP/1.1 way.** A request carrying neither a
+content length nor a transfer encoding is read as having no body at all, which for HTTP/1.1 is what
+the specification says. The inbound server speaks only that, so the reading holds. Serving HTTP/2
+would break it: an h2 request may carry a body with no declared length, and such a request would
+then be raced and its body held once per arm, with nothing checking its size. Turning inbound h2 on
+means teaching that decision about it first.
 - **A load score is one node's own.** Each node counts what it has in flight and what its own
 requests have been taking, so a cluster spreads its traffic by each node spreading its own. Nodes
 carrying very different traffic will not balance each other.
@@ -227,7 +240,12 @@ it, but nothing removes it either until a sweep of unowned plugins exists.
 
 ### Intelligent routing, what is left of it
 
-- Hedging: several endpoints at once, the first answer kept and the rest cancelled.
+- Staggering the arms of a hedge: they start together today, so a hedged rule asks the upstream
+for one request per arm, every time. Delaying the later arms until the first is later than usual
+would make most requests cost one; the single largest improvement left in hedging.
+- A report of what the gateway actually spent on the upstream: the usage row says how many arms
+went out and a quota counts one, which is the ruling, but nothing yet adds up the arms into a
+bill to show an operator.
 - Difficulty classification into `easy`, `routine`, `median`, `hard`, `research`, with a local
 decision tree first and an external arbiter LLM when confidence is low.
 - Endpoint capability matching, so a request goes to the least capable endpoint that can serve it.

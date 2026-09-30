@@ -315,8 +315,27 @@ by admin only, they are applied to every flow by default but with low priority.
 list of (protocol, host, port, abs_path) tuples. One entry is the common case for a remote upstream;
 several stand behind a replicated or local one.
 - Which entry a request goes to is a dispatch decision, not a property of the rule: round robin, least
-load, hedging and the rest are chosen per rule. Round robin, least load and ratio are built; hedging
-is not. (todo: hedging)
+load, hedging and the rest are chosen per rule. Round robin, least load and ratio are built, and a
+rule may name a count as well as a strategy.
+- A count races the request across that many of the rule's endpoints at once. It is capped at
+three and clamped to the endpoints a request may reach — those with a share, or every one when
+all are drained — so a race is always across at least one and never more endpoints than stand
+live behind the rule; a request to a rule with one endpoint is never a race, whatever the count
+says.
+- The first successful answer wins the race. A failure on one arm does not end it: a transport
+error or a 5xx is dropped and the other arms go on, until an arm succeeds or every arm has
+answered. The caller sees one request and one answer either way, and the arms that lost are
+abandoned: each pays back the load it had claimed, and none reports how long it waited, since what
+it waited was the winner's time rather than its own. So a lost race leaves the dispatcher's view of
+what a request arriving next would wait behind exactly as it found it.
+- A race is refused when the request cannot be sent more than once, and the request goes once
+instead, to the one endpoint the strategy would have chosen. Three things refuse it: a body whose
+declared length is past what the gateway will hold in memory, a body that declares no length at all,
+since an unknown size cannot be checked against that limit, and a file transport, whatever length it
+declares.
+- However many arms were sent, the caller is charged once. A quota counts the request, not its
+arms, and the usage row carries the number of arms with it, so the extra the upstream paid is
+visible without billing it.
 - Protocol is an enum (`http://`, `https://`, `ws://`, `wss://`, `tcp`), which `tcp` is for gRPC only.
 - Host is a network hostname or IP addr(v4 and v6).
 - Port is a u16 integer.
