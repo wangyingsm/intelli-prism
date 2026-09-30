@@ -154,6 +154,9 @@ macro_rules! backend_suite {
             a_rule_keeps_the_hedge_it_was_stored_with,
             a_rule_stored_without_a_hedge_reaches_one_endpoint,
             rewriting_a_rule_replaces_its_hedge,
+            a_rule_keeps_the_classes_its_endpoints_serve,
+            a_rule_stored_without_a_ceiling_serves_anything,
+            rewriting_a_rule_replaces_its_endpoints_ceilings,
         ]);
     };
     (plugin, $open:path) => {

@@ -446,7 +446,8 @@ impl fmt::Display for Weight {
     }
 }
 
-/// One endpoint behind a target, and the share of the rule's traffic it takes.
+/// One endpoint behind a target, the share of the rule's traffic it takes, and the highest
+/// class of request it can serve.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Weighted {
     /// Where the request goes.
@@ -455,20 +456,38 @@ pub struct Weighted {
     /// Its share, which only ratio dispatch reads. One unless it says otherwise.
     #[serde(default)]
     pub weight: Weight,
+    /// The hardest request it serves, and everything easier than it. Nothing unless it says
+    /// otherwise, which serves anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serves: Option<Difficulty>,
 }
 
 impl Weighted {
-    /// An endpoint taking an equal share.
+    /// An endpoint taking an equal share and serving anything.
     pub fn new(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
             weight: Weight::default(),
+            serves: None,
         }
     }
 
     /// The same, taking the share named.
     pub fn weighing(endpoint: Endpoint, weight: Weight) -> Self {
-        Self { endpoint, weight }
+        Self {
+            endpoint,
+            weight,
+            serves: None,
+        }
+    }
+
+    /// The same, serving at most the class named — every class when it names none.
+    pub fn serving(endpoint: Endpoint, weight: Weight, serves: Option<Difficulty>) -> Self {
+        Self {
+            endpoint,
+            weight,
+            serves,
+        }
     }
 }
 
@@ -593,6 +612,61 @@ impl TryFrom<u8> for Hedge {
 impl fmt::Display for Hedge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// How hard a request is, and the hardest class an endpoint serves.
+///
+/// The variants are declared easiest first, and that declaration order *is* the total order:
+/// an endpoint that serves a class serves every class below it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Difficulty {
+    /// A common-sense question for simple chat.
+    Easy,
+    /// An agent-driven question with simple tool calls, the loop within three turns.
+    Routine,
+    /// A simple agent-driven task: a new function in a project, a paper translated.
+    Median,
+    /// A complex agent-driven task: a new feature of a project, a new algorithm design.
+    Hard,
+    /// A research-level agent-driven task: a thorough analysis of a large codebase, a
+    /// research paper written.
+    Research,
+}
+
+impl Difficulty {
+    /// The name this is stored and reported under.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Easy => "easy",
+            Self::Routine => "routine",
+            Self::Median => "median",
+            Self::Hard => "hard",
+            Self::Research => "research",
+        }
+    }
+
+    /// Reads it back from that name.
+    pub fn named(name: &str) -> Result<Self, CoreError> {
+        match name {
+            "easy" => Ok(Self::Easy),
+            "routine" => Ok(Self::Routine),
+            "median" => Ok(Self::Median),
+            "hard" => Ok(Self::Hard),
+            "research" => Ok(Self::Research),
+            other => Err(CoreError::UnknownDifficulty {
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Difficulty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -1045,6 +1119,7 @@ mod tests {
         assert_eq!(rule.strategy, Strategy::RoundRobin);
         assert_eq!(rule.hedge, Hedge::NONE);
         assert_eq!(rule.target.weighted()[0].weight, Weight::default());
+        assert_eq!(rule.target.weighted()[0].serves, None);
         assert_eq!(rule.target.primary().host.as_str(), "api.example.com");
     }
 
@@ -1073,6 +1148,62 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Strategy::RoundRobin).unwrap(),
             "\"round_robin\""
+        );
+    }
+
+    #[test]
+    fn every_class_round_trips_through_its_name() {
+        for class in [
+            Difficulty::Easy,
+            Difficulty::Routine,
+            Difficulty::Median,
+            Difficulty::Hard,
+            Difficulty::Research,
+        ] {
+            assert_eq!(Difficulty::named(class.name()).unwrap(), class);
+            assert_eq!(class.to_string(), class.name());
+        }
+        assert!(matches!(
+            Difficulty::named("epic"),
+            Err(CoreError::UnknownDifficulty { .. })
+        ));
+    }
+
+    #[test]
+    fn the_classes_compare_in_the_documented_order() {
+        assert!(Difficulty::Easy < Difficulty::Routine);
+        assert!(Difficulty::Routine < Difficulty::Median);
+        assert!(Difficulty::Median < Difficulty::Hard);
+        assert!(Difficulty::Hard < Difficulty::Research);
+    }
+
+    #[test]
+    fn a_class_reads_from_the_name_it_is_written_under() {
+        assert_eq!(
+            serde_json::from_str::<Difficulty>("\"research\"").unwrap(),
+            Difficulty::Research
+        );
+        assert_eq!(
+            serde_json::to_string(&Difficulty::Easy).unwrap(),
+            "\"easy\""
+        );
+        assert!(serde_json::from_str::<Difficulty>("\"trivial\"").is_err());
+    }
+
+    #[test]
+    fn an_endpoint_names_the_hardest_class_it_serves_and_omits_one_that_names_none() {
+        let json = r#"[
+            {"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1", "serves": "median"},
+            {"protocol": "https", "host": "two.example.com", "port": 443, "path": "/v1"}
+        ]"#;
+        let target: RouteTarget = serde_json::from_str(json).unwrap();
+        assert_eq!(target.weighted()[0].serves, Some(Difficulty::Median));
+        assert_eq!(target.weighted()[1].serves, None);
+        let written = serde_json::to_string(&target).unwrap();
+        assert_eq!(written.matches("serves").count(), 1);
+        assert_eq!(
+            serde_json::from_str::<RouteTarget>(&written).unwrap(),
+            target
         );
     }
 

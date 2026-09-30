@@ -307,6 +307,21 @@ mod tests {
         )
     }
 
+    /// A rule over two endpoints, the first serving at most the class named.
+    fn ceiled(serves: &str) -> String {
+        format!(
+            r#"{{
+                "api": "chat",
+                "key": {{"protocol": "https", "host": "gateway.local", "port": 443, "path": "/v1"}},
+                "target": [
+                    {{"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1",
+                      "serves": "{serves}"}},
+                    {{"protocol": "https", "host": "two.example.com", "port": 443, "path": "/v1"}}
+                ]
+            }}"#
+        )
+    }
+
     #[tokio::test]
     async fn a_rule_is_stored_with_the_strategy_and_the_shares_it_names() {
         let state = state_over(store().await);
@@ -346,6 +361,28 @@ mod tests {
         assert_eq!(listed[0]["strategy"], "round_robin");
         assert_eq!(listed[0]["hedge"], 1);
         assert_eq!(listed[0]["target"][0]["weight"], 1);
+        assert!(listed[0]["target"][0].get("serves").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rule_is_stored_with_the_class_each_endpoint_serves() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let stored = call(&router, &state, "root", "PUT", Some(&ceiled("median"))).await;
+        assert_eq!(stored.status(), StatusCode::NO_CONTENT);
+
+        let listed = listed(&router, &state).await;
+        assert_eq!(listed[0]["target"][0]["serves"], "median");
+        assert!(listed[0]["target"][1].get("serves").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_class_this_gateway_does_not_carry_is_refused() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let refused = call(&router, &state, "root", "PUT", Some(&ceiled("epic"))).await;
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(state.store().routes().await.unwrap().is_empty());
     }
 
     #[tokio::test]

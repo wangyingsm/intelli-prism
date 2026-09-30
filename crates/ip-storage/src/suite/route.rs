@@ -1,6 +1,6 @@
 use ip_core::{
-    AbsPath, ApiId, Endpoint, Hedge, Host, Port, Protocol, RouteKey, RouteRule, RouteTarget,
-    Strategy, Weight, Weighted,
+    AbsPath, ApiId, Difficulty, Endpoint, Hedge, Host, Port, Protocol, RouteKey, RouteRule,
+    RouteTarget, Strategy, Weight, Weighted,
 };
 
 use crate::error::{Entity, StorageError};
@@ -224,4 +224,57 @@ pub(crate) async fn rewriting_a_rule_replaces_its_hedge(store: &impl RouteStore)
         store.route(&rule.key).await.unwrap().unwrap().hedge.get(),
         2
     );
+}
+
+pub(crate) async fn a_rule_keeps_the_classes_its_endpoints_serve(store: &impl RouteStore) {
+    let mut ceiled = rule("gateway.local", "/ceiled", "one.example.com");
+    let spare = route_endpoint(Protocol::Https, "two.example.com", 443, "/ceiled");
+    ceiled.target = RouteTarget::from_weighted(vec![
+        Weighted::serving(
+            ceiled.target.primary().clone(),
+            Weight::default(),
+            Some(Difficulty::Median),
+        ),
+        Weighted::serving(spare, Weight::default(), Some(Difficulty::Research)),
+    ])
+    .unwrap();
+    store.put_route(ceiled.clone()).await.unwrap();
+
+    let read = store.route(&ceiled.key).await.unwrap().unwrap();
+    assert_eq!(read, ceiled);
+    assert_eq!(read.target.weighted()[0].serves, Some(Difficulty::Median));
+    assert_eq!(read.target.weighted()[1].serves, Some(Difficulty::Research));
+    assert_eq!(store.routes().await.unwrap(), vec![ceiled]);
+}
+
+pub(crate) async fn a_rule_stored_without_a_ceiling_serves_anything(store: &impl RouteStore) {
+    let plain = rule("gateway.local", "/v1", "api.example.com");
+    store.put_route(plain.clone()).await.unwrap();
+    let read = store.route(&plain.key).await.unwrap().unwrap();
+    assert_eq!(read.target.weighted()[0].serves, None);
+    assert_eq!(store.routes().await.unwrap(), vec![plain]);
+}
+
+pub(crate) async fn rewriting_a_rule_replaces_its_endpoints_ceilings(store: &impl RouteStore) {
+    let mut lowered = rule("gateway.local", "/v1", "api.example.com");
+    lowered.target = RouteTarget::from_weighted(vec![Weighted::serving(
+        lowered.target.primary().clone(),
+        Weight::default(),
+        Some(Difficulty::Easy),
+    )])
+    .unwrap();
+    store.put_route(lowered).await.unwrap();
+
+    let mut raised = rule("gateway.local", "/v1", "api.example.com");
+    raised.target = RouteTarget::from_weighted(vec![Weighted::serving(
+        raised.target.primary().clone(),
+        Weight::default(),
+        Some(Difficulty::Hard),
+    )])
+    .unwrap();
+    store.put_route(raised.clone()).await.unwrap();
+
+    let read = store.route(&raised.key).await.unwrap().unwrap();
+    assert_eq!(read.target.weighted()[0].serves, Some(Difficulty::Hard));
+    assert_eq!(store.routes().await.unwrap(), vec![raised]);
 }

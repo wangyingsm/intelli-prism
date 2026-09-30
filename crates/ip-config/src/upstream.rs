@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use ip_core::{
-    AbsPath, ApiId, Endpoint, Hedge, Host, ModelName, Port, Protocol, RouteKey, RouteRule,
-    RouteTarget, Strategy, Weight, Weighted,
+    AbsPath, ApiId, Difficulty, Endpoint, Hedge, Host, ModelName, Port, Protocol, RouteKey,
+    RouteRule, RouteTarget, Strategy, Weight, Weighted,
 };
 use url::Url;
 
@@ -36,6 +36,10 @@ pub struct UpstreamConfig {
     /// How many of this upstream's endpoints one request is raced across.
     #[serde(default)]
     pub hedge: Hedge,
+    /// The hardest request `base_url` serves, and everything easier than it. Nothing
+    /// unless it says otherwise, which serves anything.
+    #[serde(default)]
+    pub serves: Option<Difficulty>,
     /// Further endpoints this upstream stands behind, beyond `base_url`.
     #[serde(default, rename = "target")]
     pub targets: Vec<UpstreamTarget>,
@@ -50,6 +54,10 @@ pub struct UpstreamTarget {
     /// The share it takes when the upstream is shared by ratio.
     #[serde(default)]
     pub weight: Weight,
+    /// The hardest request it serves, and everything easier than it. Nothing unless it
+    /// says otherwise, which serves anything.
+    #[serde(default)]
+    pub serves: Option<Difficulty>,
 }
 
 /// Replaces part of the key a configured upstream derives from the listen address.
@@ -93,14 +101,16 @@ impl UpstreamConfig {
 
     /// Where a matched request is sent: `base_url` first, then every `target` block.
     pub fn route_target(&self) -> Result<RouteTarget, ConfigError> {
-        let mut weighted = vec![Weighted::weighing(
+        let mut weighted = vec![Weighted::serving(
             self.endpoint(&self.base_url)?,
             self.weight,
+            self.serves,
         )];
         for target in &self.targets {
-            weighted.push(Weighted::weighing(
+            weighted.push(Weighted::serving(
                 self.endpoint(&target.url)?,
                 target.weight,
+                target.serves,
             ));
         }
         Ok(RouteTarget::from_weighted(weighted)?)
@@ -188,6 +198,7 @@ mod tests {
             weight: Weight::default(),
             strategy: Strategy::default(),
             hedge: Hedge::default(),
+            serves: None,
             targets: Vec::new(),
         }
     }
@@ -329,10 +340,12 @@ mod tests {
                 UpstreamTarget {
                     url: "http://two.local:8000/v1".parse().unwrap(),
                     weight: Weight::new(1),
+                    serves: None,
                 },
                 UpstreamTarget {
                     url: "http://three.local:8000/v1".parse().unwrap(),
                     weight: Weight::default(),
+                    serves: None,
                 },
             ],
             ..upstream("http://one.local:8000/v1", None)
@@ -360,11 +373,36 @@ mod tests {
     }
 
     #[test]
+    fn an_upstream_names_the_hardest_class_its_endpoints_serve() {
+        let plain = upstream("https://api.anthropic.com/v1", None);
+        assert_eq!(plain.route_target().unwrap().weighted()[0].serves, None);
+
+        let ceiled = UpstreamConfig {
+            serves: Some(Difficulty::Median),
+            targets: vec![UpstreamTarget {
+                url: "http://two.local:8000/v1".parse().unwrap(),
+                weight: Weight::default(),
+                serves: Some(Difficulty::Research),
+            }],
+            ..upstream("http://one.local:8000/v1", None)
+        };
+        let behind = ceiled
+            .route_rule(listen())
+            .unwrap()
+            .target
+            .weighted()
+            .to_vec();
+        assert_eq!(behind[0].serves, Some(Difficulty::Median));
+        assert_eq!(behind[1].serves, Some(Difficulty::Research));
+    }
+
+    #[test]
     fn a_further_endpoint_that_names_no_host_is_refused() {
         let broken = UpstreamConfig {
             targets: vec![UpstreamTarget {
                 url: "file:///nowhere".parse().unwrap(),
                 weight: Weight::default(),
+                serves: None,
             }],
             ..upstream("https://api.anthropic.com/v1", None)
         };

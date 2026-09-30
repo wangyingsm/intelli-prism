@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Endpoint, Hedge, RouteKey, RouteRule, RouteTarget, Strategy, Timestamp, Weight, Weighted,
+    ApiId, Difficulty, Endpoint, Hedge, RouteKey, RouteRule, RouteTarget, Strategy, Timestamp,
+    Weight, Weighted,
 };
 use sqlx::{Row, SqliteConnection};
 
@@ -43,8 +44,8 @@ impl RouteStore for SqliteStore {
             let endpoint = &weighted.endpoint;
             sqlx::query(
                 "INSERT INTO route_targets \
-                 (route_row_id, position, protocol, host, port, path, weight) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (route_row_id, position, protocol, host, port, path, weight, serves) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(route_row_id)
             .bind(i64::try_from(position).unwrap_or(i64::MAX))
@@ -53,6 +54,7 @@ impl RouteStore for SqliteStore {
             .bind(i64::from(endpoint.port.get()))
             .bind(endpoint.path.as_str())
             .bind(i64::from(weighted.weight.get()))
+            .bind(weighted.serves.map(Difficulty::name))
             .execute(&mut *transaction)
             .await
             .map_err(StorageError::backend)?;
@@ -87,7 +89,8 @@ impl RouteStore for SqliteStore {
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
         let endpoint = key.endpoint();
         let rows = sqlx::query(
-            "SELECT r.api_id, r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight \
+            "SELECT r.api_id, r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight, \
+             t.serves \
              FROM routes r \
              JOIN route_targets t ON t.route_row_id = r.row_id \
              WHERE r.key_protocol = ? AND r.key_host = ? AND r.key_port = ? AND r.key_path = ? \
@@ -125,7 +128,7 @@ pub(super) async fn read_routes(
 ) -> Result<Vec<RouteRule>, StorageError> {
     let rows = sqlx::query(
         "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-         r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight FROM routes r \
+         r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight, t.serves FROM routes r \
          JOIN route_targets t ON t.route_row_id = r.row_id \
          ORDER BY r.key_host, r.key_path, r.key_protocol, r.key_port, t.position",
     )
@@ -177,7 +180,13 @@ fn target_of(row: &sqlx::sqlite::SqliteRow) -> Result<Weighted, StorageError> {
             entity: Entity::Route,
             detail: format!("{weight} is not a share"),
         })?;
-    Ok(Weighted::weighing(endpoint, weight))
+    Ok(Weighted::serving(endpoint, weight, serves_of(row)?))
+}
+
+/// The hardest class a stored endpoint serves, refusing a name this code does not carry.
+fn serves_of(row: &sqlx::sqlite::SqliteRow) -> Result<Option<Difficulty>, StorageError> {
+    let named: Option<String> = row.get("serves");
+    Ok(named.map(|name| Difficulty::named(&name)).transpose()?)
 }
 
 /// How a stored rule spreads its requests, refusing a strategy this code does not carry.
@@ -291,5 +300,46 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A class no endpoint serves, written around the driver into an endpoint's ceiling.
+    #[tokio::test]
+    async fn a_stored_class_this_code_does_not_carry_is_refused_on_read() {
+        let store = store().await;
+        store
+            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE route_targets SET serves = 'impossible'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.routes().await,
+            Err(StorageError::Value(
+                ip_core::CoreError::UnknownDifficulty { .. }
+            ))
+        ));
+    }
+
+    /// A listed row carrying the same impossible name is refused the same way.
+    #[tokio::test]
+    async fn a_listed_class_this_code_does_not_carry_is_refused_on_read() {
+        use crate::list::ListStore;
+        let store = store().await;
+        store
+            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE route_targets SET serves = 'impossible'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.list_routes(crate::Page::default()).await,
+            Err(StorageError::Value(
+                ip_core::CoreError::UnknownDifficulty { .. }
+            ))
+        ));
     }
 }

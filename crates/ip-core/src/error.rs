@@ -66,6 +66,13 @@ pub enum CoreError {
         value: String,
     },
 
+    /// A difficulty class this application does not carry.
+    #[error("unknown difficulty {value:?}")]
+    UnknownDifficulty {
+        /// The text that named no class.
+        value: String,
+    },
+
     /// A stretch of clock this application does not count over.
     #[error("unknown period {value:?}")]
     UnknownPeriod {

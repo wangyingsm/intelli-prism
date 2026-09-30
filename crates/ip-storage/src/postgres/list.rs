@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Endpoint, Grant, Hedge, PluginRule, RouteKey, RouteRule, RouteTarget, Strategy,
-    TenantId, Timestamp, UserId, Weight, Weighted,
+    ApiId, Difficulty, Endpoint, Grant, Hedge, PluginRule, RouteKey, RouteRule, RouteTarget,
+    Strategy, TenantId, Timestamp, UserId, Weight, Weighted,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -49,7 +49,13 @@ fn weighted(row: &PgRow) -> Result<Weighted, StorageError> {
             entity: Entity::Route,
             detail: format!("{weight} is not a share"),
         })?;
-    Ok(Weighted::weighing(endpoint(row, "")?, weight))
+    Ok(Weighted::serving(endpoint(row, "")?, weight, serves(row)?))
+}
+
+/// The hardest class a listed endpoint serves, refusing a name this code does not carry.
+fn serves(row: &PgRow) -> Result<Option<Difficulty>, StorageError> {
+    let named: Option<String> = row.get("serves");
+    Ok(named.map(|name| Difficulty::named(&name)).transpose()?)
 }
 
 /// How a listed rule spreads its requests.
@@ -155,7 +161,8 @@ impl ListStore for PostgresStore {
     async fn list_routes(&self, page: Page) -> Result<Vec<Listed<RouteRule>>, StorageError> {
         let rows = sqlx::query(
             "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-             r.created_at, r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight FROM \
+             r.created_at, r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight, \
+             t.serves FROM \
              (SELECT * FROM routes WHERE created_at > $1 \
               ORDER BY created_at DESC, row_id DESC LIMIT $2 OFFSET $3) r \
              JOIN route_targets t ON t.route_row_id = r.row_id \

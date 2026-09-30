@@ -50,8 +50,8 @@ x-ip-csrf: 1
 {"protocol": "https", "host": "gateway.local", "port": 443, "path": "/v1"}
 HTTP 404
 
-# A rule standing behind several endpoints says how its requests are spread, and what share
-# each takes. A share of nothing drains that endpoint.
+# A rule standing behind several endpoints says how its requests are spread, what share
+# each takes, and the hardest class each can serve. A share of nothing drains that endpoint.
 PUT {{host}}/_ip/routes
 x-ip-csrf: 1
 {
@@ -60,7 +60,7 @@ x-ip-csrf: 1
   "strategy": "ratio",
   "hedge": 2,
   "target": [
-    {"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1", "weight": 3},
+    {"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1", "weight": 3, "serves": "hard"},
     {"protocol": "https", "host": "two.example.com", "port": 443, "path": "/v1"},
     {"protocol": "https", "host": "drained.example.com", "port": 443, "path": "/v1", "weight": 0}
   ]
@@ -73,6 +73,7 @@ HTTP 200
 jsonpath "$[?(@.key.path == '/replicated')].strategy" nth 0 == "ratio"
 jsonpath "$[?(@.key.path == '/replicated')].hedge" nth 0 == 2
 jsonpath "$[?(@.key.path == '/replicated')].target[0].weight" nth 0 == 3
+jsonpath "$[?(@.key.path == '/replicated')].target[0].serves" nth 0 == "hard"
 jsonpath "$[?(@.key.path == '/replicated')].target[1].weight" nth 0 == 1
 jsonpath "$[?(@.key.path == '/replicated')].target[2].weight" nth 0 == 0
 
