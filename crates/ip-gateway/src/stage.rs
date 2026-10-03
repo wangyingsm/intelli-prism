@@ -2,7 +2,7 @@ use std::fmt;
 
 use http::{Request, Response};
 
-use ip_core::{Hedge, Replica};
+use ip_core::{Difficulty, Hedge, Replica};
 
 use crate::body::GatewayBody;
 use crate::table::Resolution;
@@ -84,6 +84,12 @@ pub struct Routed {
     pub request: Request<GatewayBody>,
     /// Where it is going, and the rule that said so.
     pub resolution: Resolution,
+    /// The difficulty class the request named, which narrows the dispatch.
+    ///
+    /// Read once the request header chain has run — a processor that sets the header is
+    /// honoured, which is how an operator plugs in a classifier of their own — and before
+    /// any limit is counted, so a value the gateway cannot read is refused unbilled.
+    pub class: Option<Difficulty>,
 }
 
 /// The request has arrived and nothing has touched it.

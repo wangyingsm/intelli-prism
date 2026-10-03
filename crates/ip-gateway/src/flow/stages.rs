@@ -2,9 +2,9 @@
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use http::{Request, Response};
+use http::{HeaderName, Request, Response};
 use ip_cache::{CacheKey, Ttl};
-use ip_core::{Capability, CapabilityScope, HEDGE_MOST, Hedge, Replica, RouteKey};
+use ip_core::{Capability, CapabilityScope, Difficulty, HEDGE_MOST, Hedge, Replica, RouteKey};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{Span, field};
@@ -14,7 +14,7 @@ use super::headers::{aim, authority_of, is_event_stream, rewrite, set_length, st
 use super::run::{collect, run_body, run_headers};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, freshness, response_key};
-use crate::dispatch::{Dispatcher, may_race};
+use crate::dispatch::{Dispatcher, Dispatching, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
@@ -24,6 +24,9 @@ use crate::stage::{
 };
 use crate::table::{Resolution, RoutingTable, request_key};
 use crate::upstream::Upstream;
+
+/// The request header naming the difficulty class the caller asks to be served at.
+const DIFFICULTY: HeaderName = HeaderName::from_static("x-ip-difficulty");
 
 /// A request part way through the dataflow, with the stage it reached in its type.
 ///
@@ -129,6 +132,7 @@ impl Flow<Received> {
             held: Routed {
                 request: self.held,
                 resolution,
+                class: None,
             },
         })
     }
@@ -140,7 +144,13 @@ impl Flow<Authorized> {
         &self.held.resolution
     }
 
-    /// Runs the request header chain.
+    /// Runs the request header chain, then reads the difficulty class the request names.
+    ///
+    /// The read follows the chain on purpose: a header processor that sets
+    /// `x-ip-difficulty` is honoured, which is how an operator plugs in a classifier of
+    /// their own before this gateway grows one. It also sits before the admission check, so
+    /// a request carrying a class the gateway cannot read is refused without having been
+    /// counted against any limit.
     pub async fn process_headers(
         mut self,
         chain: &[Arc<dyn HeaderProcessor>],
@@ -151,6 +161,8 @@ impl Flow<Authorized> {
             self.held.request.headers_mut(),
         )
         .await?;
+        let class = asked_class(&self.held.request)?;
+        self.held.class = class;
         Ok(Flow {
             context: self.context,
             held: self.held,
@@ -206,9 +218,11 @@ impl Flow<BodyProcessed> {
         let Routed {
             request,
             resolution,
+            class,
         } = self.held;
+        let dispatching = Dispatching::new(&resolution, class);
         if may_race(request.headers(), resolution.rule().hedge) == Hedge::NONE {
-            let chosen = dispatcher.choose(&resolution);
+            let chosen = dispatcher.choose(&dispatching);
             let served = Replica::of(chosen.endpoint());
             Span::current().record("served", field::display(&served));
             let request = rewrite(request, chosen.endpoint())?;
@@ -227,8 +241,30 @@ impl Flow<BodyProcessed> {
                 },
             });
         }
-        race(self.context, upstream, dispatcher, request, &resolution).await
+        race(self.context, upstream, dispatcher, request, &dispatching).await
     }
+}
+
+/// The difficulty class this request names, refusing a value that is not one.
+///
+/// A caller that said what it needs is believed, and answering 400 beats sending the request
+/// somewhere the caller did not ask for. Read at the header stage, not inside `forward`: the
+/// chain may have set the header, and a name that cannot be read costs no limit count.
+fn asked_class(request: &Request<GatewayBody>) -> Result<Option<Difficulty>, GatewayError> {
+    let Some(value) = request.headers().get(&DIFFICULTY) else {
+        return Ok(None);
+    };
+    let named = value.to_str().map_err(|_| {
+        GatewayError::new(
+            HeadersProcessed::NAME,
+            GatewayErrorKind::Malformed {
+                detail: format!("{DIFFICULTY} is not readable as text"),
+            },
+        )
+    })?;
+    Difficulty::named(named)
+        .map(Some)
+        .map_err(|error| GatewayError::new(HeadersProcessed::NAME, error.into()))
 }
 
 impl Flow<Forwarded> {
@@ -356,7 +392,7 @@ async fn race(
     upstream: &dyn Upstream,
     dispatcher: &Dispatcher,
     request: Request<GatewayBody>,
-    resolution: &Resolution,
+    dispatching: &Dispatching<'_>,
 ) -> Result<Flow<Forwarded>, GatewayError> {
     // The body leaves once per arm, so it is held in hand once for the whole race; collecting
     // what is already bytes is cheap.
@@ -364,7 +400,7 @@ async fn race(
     let buffered = collect(StageName::BodyRead, body).await?;
     // The same work on every arm, so it runs once, on the parts every arm is aimed from.
     strip_hop_by_hop(&mut parts.headers);
-    let mut arms = dispatcher.choose_many(resolution, resolution.rule().hedge);
+    let mut arms = dispatcher.choose_many(dispatching, dispatching.resolution().rule().hedge);
     let mut racing = FuturesUnordered::new();
     for (at, arm) in arms.iter().enumerate() {
         if at + 1 == arms.len() {
@@ -615,6 +651,41 @@ mod tests {
         let flow = flow.process_response_body(&processors).await.unwrap();
         assert_eq!(flow.stage(), StageName::ResponseBodyProcess);
         assert_eq!(body_of(flow.into_response().unwrap()).await, "pong");
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_a_class_reaches_an_endpoint_that_serves_it() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            ceiled_table(&[
+                ("silent.example.com", None),
+                ("hard.example.com", Some(ip_core::Difficulty::Hard)),
+            ]),
+            ProcessorChain::new(),
+            upstream.clone(),
+        );
+        let mut hard = request("/anthropic/messages", "ask");
+        hard.headers_mut()
+            .insert(DIFFICULTY, HeaderValue::from_static("hard"));
+        let response = gateway.handle(context(granted()), hard).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = upstream.seen.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        // The silent endpoint serves hard too, and lost to the one that declared it.
+        assert_eq!(sent[0].host, "hard.example.com:443");
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_a_value_that_is_not_a_class_reaches_no_endpoint() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone());
+        let mut bogus = request("/anthropic/messages", "ask");
+        bogus
+            .headers_mut()
+            .insert(DIFFICULTY, HeaderValue::from_static("epic"));
+        let error = gateway.handle(context(granted()), bogus).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert!(upstream.seen.lock().unwrap().is_empty());
     }
 
     /// What one host in a race answers with.

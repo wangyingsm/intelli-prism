@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use http::HeaderMap;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
-use ip_core::{Endpoint, Hedge, Strategy, Weighted};
+use ip_core::{Difficulty, Endpoint, Hedge, Strategy, Weighted};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -65,18 +65,102 @@ impl EndpointLoad {
     }
 }
 
+/// The endpoints one class of request may go to, and the running total of their shares.
+///
+/// Held as indices into the rule's endpoints, which is how the load is indexed too, so a
+/// narrowed set never reads a score off the wrong endpoint.
+#[derive(Debug)]
+struct Tier {
+    /// The endpoints themselves, each as it stands behind the rule.
+    at: Vec<usize>,
+    /// The running total of their shares, so a draw is one search rather than a sum.
+    shares: Vec<u64>,
+}
+
+impl Tier {
+    /// Wraps the endpoints, working out their running shares.
+    fn of(targets: &[Weighted], at: Vec<usize>) -> Self {
+        let mut running = 0;
+        let shares = at
+            .iter()
+            .map(|at| {
+                running += u64::from(targets[*at].weight.get());
+                running
+            })
+            .collect();
+        Self { at, shares }
+    }
+
+    /// What can serve one class: the endpoints whose ceiling is the lowest that carries it,
+    /// since the cheapest machine that can do the work is the one that should. An endpoint
+    /// that named no ceiling serves anything but never said it could, so it comes after every
+    /// declared one; and when nothing carries the class at all, §427 sends the request to the
+    /// most capable endpoint there is rather than refusing it.
+    fn for_class(targets: &[Weighted], live: &[usize], class: Difficulty) -> Self {
+        let served = |at: &usize| targets[*at].serves;
+        let declaring = |ceiling: Difficulty| -> Vec<usize> {
+            live.iter()
+                .copied()
+                .filter(|at| served(at) == Some(ceiling))
+                .collect()
+        };
+        let at = match live
+            .iter()
+            .filter_map(served)
+            .filter(|declared| *declared >= class)
+            .min()
+        {
+            Some(lowest) => declaring(lowest),
+            None => {
+                let silent: Vec<usize> = live
+                    .iter()
+                    .copied()
+                    .filter(|at| served(at).is_none())
+                    .collect();
+                if !silent.is_empty() {
+                    return Self::of(targets, silent);
+                }
+                match live.iter().filter_map(served).max() {
+                    Some(highest) => declaring(highest),
+                    // Every live endpoint named nothing, which qualified above: unreachable,
+                    // and a rule never stands behind no endpoints anyway.
+                    None => live.to_vec(),
+                }
+            }
+        };
+        Self::of(targets, at)
+    }
+
+    /// How many endpoints this reaches.
+    fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    /// Every share together, which is what a draw is made below.
+    fn total(&self) -> u64 {
+        self.shares.last().copied().unwrap_or(0)
+    }
+
+    /// The endpoint whose share `rolled` falls in.
+    fn at_share(&self, rolled: u64) -> usize {
+        let at = self.shares.partition_point(|running| *running <= rolled);
+        self.at[at.min(self.at.len() - 1)]
+    }
+}
+
 /// What a rule's endpoints look like to a dispatcher, and what they are carrying.
 ///
 /// A rule changes far less often than it is used, so the live endpoints and the running total of
-/// their shares are found once here rather than on the path of every request. The load sits here
-/// too, one entry per endpoint by the same index, so reading it is an array index.
+/// their shares are found once here rather than on the path of every request — as are the
+/// endpoints each difficulty class narrows to. The load sits here too, one entry per endpoint by
+/// the same index, so reading it is an array index.
 #[derive(Debug)]
 pub struct Plan {
-    /// Which endpoints a request may go to: those not drained, or every one when all are,
+    /// Where an unclassified request may go: those not drained, or every one when all are,
     /// since a rule must have somewhere to send a request.
-    live: Vec<usize>,
-    /// The running total of the live shares, so a draw is one search rather than a sum.
-    shares: Vec<u64>,
+    live: Tier,
+    /// What each class in `Difficulty::ALL` order may be served by, worked out once.
+    tiers: [Tier; 5],
     /// Where this rule's turn has reached. Its exact order between two requests does not
     /// matter, only that each takes a number of its own, so it is counted without a lock.
     turn: AtomicU64,
@@ -96,52 +180,63 @@ impl Plan {
         if live.is_empty() {
             live = (0..targets.len()).collect();
         }
-        let mut running = 0;
-        let shares = live
-            .iter()
-            .map(|at| {
-                running += u64::from(targets[*at].weight.get());
-                running
-            })
-            .collect();
+        let tiers = Difficulty::ALL.map(|class| Tier::for_class(targets, &live, class));
+        let live = Tier::of(targets, live);
         Self {
             live,
-            shares,
+            tiers,
             turn: AtomicU64::new(0),
             load: targets.iter().map(|_| EndpointLoad::default()).collect(),
         }
     }
 
     /// The endpoints a request may go to.
+    ///
+    /// Test only: a classified request is dispatched from its tier, never from the live set.
+    #[cfg(test)]
     pub fn live(&self) -> &[usize] {
-        &self.live
+        &self.live.at
+    }
+
+    /// Where a request naming this class may go: every live endpoint when it names none.
+    fn tier(&self, class: Option<Difficulty>) -> &Tier {
+        match class {
+            None => &self.live,
+            Some(class) => &self.tiers[class.position()],
+        }
     }
 
     /// Every live share together, which is what a draw is made below.
-    pub fn total(&self) -> u64 {
-        self.shares.last().copied().unwrap_or(0)
-    }
-
-    /// The endpoint after the one this rule last used.
-    pub fn in_turn(&self) -> usize {
-        let turn = self.turn.fetch_add(1, Ordering::Relaxed);
-        self.live[(turn % self.live.len() as u64) as usize]
-    }
-
-    /// The endpoint whose share `rolled` falls in.
-    pub fn at_share(&self, rolled: u64) -> usize {
-        let at = self.shares.partition_point(|running| *running <= rolled);
-        self.live[at.min(self.live.len() - 1)]
-    }
-
-    /// The live endpoint a new request would wait least behind.
     ///
-    /// A scan of the live endpoints' atomics: no lock, and the count it reads is the true one,
-    /// so a burst of requests is spread rather than piled onto whoever was lightest a moment ago.
-    pub fn lightest(&self) -> usize {
-        let mut lightest = self.live[0];
+    /// Test only: dispatch answers from the request's tier, and the live total would be
+    /// the wrong set for a classified request.
+    #[cfg(test)]
+    pub fn total(&self) -> u64 {
+        self.live.total()
+    }
+
+    /// The endpoint of this tier after the one this rule last used.
+    fn in_turn(&self, tier: &Tier) -> usize {
+        let turn = self.turn.fetch_add(1, Ordering::Relaxed);
+        tier.at[(turn % tier.len() as u64) as usize]
+    }
+
+    /// The live endpoint whose share `rolled` falls in.
+    ///
+    /// Test only, as `total` is: a draw for a classified request runs on its tier.
+    #[cfg(test)]
+    pub fn at_share(&self, rolled: u64) -> usize {
+        self.live.at_share(rolled)
+    }
+
+    /// The endpoint of this tier a new request would wait least behind.
+    ///
+    /// A scan of the tier's atomics: no lock, and the count it reads is the true one, so a
+    /// burst of requests is spread rather than piled onto whoever was lightest a moment ago.
+    fn lightest(&self, tier: &Tier) -> usize {
+        let mut lightest = tier.at[0];
         let mut least = u64::MAX;
-        for at in &self.live {
+        for at in &tier.at {
             let score = self.load[*at].score();
             if score < least {
                 least = score;
@@ -169,6 +264,27 @@ struct Answered {
     micros: u64,
 }
 
+/// One request as dispatch sees it: what its rule allows, and what the request asks for.
+#[derive(Debug)]
+pub struct Dispatching<'a> {
+    /// The rule that matched, and the endpoints it stands behind.
+    resolution: &'a Resolution,
+    /// The class the caller named, if it named one. Nothing narrows an unclassified request.
+    class: Option<Difficulty>,
+}
+
+impl<'a> Dispatching<'a> {
+    /// The pair a dispatcher is given: this resolution, narrowed to this class.
+    pub fn new(resolution: &'a Resolution, class: Option<Difficulty>) -> Self {
+        Self { resolution, class }
+    }
+
+    /// The rule that matched, and the endpoints it stands behind.
+    pub fn resolution(&self) -> &Resolution {
+        self.resolution
+    }
+}
+
 /// Picks an endpoint for each request, and counts the request against it.
 ///
 /// What an endpoint takes is worked out away from here: a finished request says how long it
@@ -186,16 +302,17 @@ impl Dispatcher {
     }
 
     /// Chooses where this request goes, counting it against that endpoint until it is done.
-    pub fn choose(&self, resolution: &Resolution) -> Chosen {
-        let plan = resolution.plan();
-        let at = match resolution.rule().strategy {
-            Strategy::RoundRobin => plan.in_turn(),
-            Strategy::Ratio => Self::by_share(plan),
-            Strategy::LeastLoad => plan.lightest(),
+    pub fn choose(&self, dispatching: &Dispatching) -> Chosen {
+        let plan = dispatching.resolution.plan();
+        let tier = plan.tier(dispatching.class);
+        let at = match dispatching.resolution.rule().strategy {
+            Strategy::RoundRobin => plan.in_turn(tier),
+            Strategy::Ratio => Self::by_share(tier),
+            Strategy::LeastLoad => plan.lightest(tier),
         };
         plan.load[at].in_flight.fetch_add(1, Ordering::Relaxed);
         Chosen {
-            endpoint: resolution.targets()[at].endpoint.clone(),
+            endpoint: dispatching.resolution.targets()[at].endpoint.clone(),
             plan: Arc::clone(plan),
             at,
             answered: self.answered.clone(),
@@ -208,17 +325,18 @@ impl Dispatcher {
     /// itself until it is done with.
     ///
     /// In launch order, first arm first: the first is the endpoint the rule would have
-    /// picked alone, and the rest are drawn without repeating it, cut down to the live
-    /// count.
-    pub fn choose_many(&self, resolution: &Resolution, hedge: Hedge) -> Vec<Chosen> {
-        let plan = resolution.plan();
-        let count = usize::from(hedge.get()).min(plan.live().len());
-        let slots = match resolution.rule().strategy {
-            Strategy::RoundRobin => (0..count).map(|_| plan.in_turn()).collect(),
-            Strategy::LeastLoad => lightest_arms(plan, count),
+    /// picked alone, and the rest are drawn without repeating it, cut down to how many of
+    /// the endpoints the request's class leaves in play.
+    pub fn choose_many(&self, dispatching: &Dispatching, hedge: Hedge) -> Vec<Chosen> {
+        let plan = dispatching.resolution.plan();
+        let tier = plan.tier(dispatching.class);
+        let count = usize::from(hedge.get()).min(tier.len());
+        let slots = match dispatching.resolution.rule().strategy {
+            Strategy::RoundRobin => (0..count).map(|_| plan.in_turn(tier)).collect(),
+            Strategy::LeastLoad => lightest_arms(plan, tier, count),
             Strategy::Ratio => {
-                let mut slots = vec![Self::by_share(plan)];
-                extra_arms(plan, &mut slots, count);
+                let mut slots = vec![Self::by_share(tier)];
+                extra_arms(plan, tier, &mut slots, count);
                 slots
             }
         };
@@ -228,7 +346,7 @@ impl Dispatcher {
             .map(|at| {
                 plan.load[at].in_flight.fetch_add(1, Ordering::Relaxed);
                 Chosen {
-                    endpoint: resolution.targets()[at].endpoint.clone(),
+                    endpoint: dispatching.resolution.targets()[at].endpoint.clone(),
                     plan: Arc::clone(plan),
                     at,
                     answered: self.answered.clone(),
@@ -240,22 +358,22 @@ impl Dispatcher {
     }
 
     /// An endpoint drawn in proportion to the shares.
-    fn by_share(plan: &Plan) -> usize {
-        match plan.total() {
-            // Every live endpoint is drained, which the plan already widened to all of them.
-            0 => plan.live()[0],
-            total => plan.at_share(roll(total)),
+    fn by_share(tier: &Tier) -> usize {
+        match tier.total() {
+            // Every endpoint of this tier is drained, which the plan already widened to all.
+            0 => tier.at[0],
+            total => tier.at_share(roll(total)),
         }
     }
 }
 
-/// The `count` lightest live endpoints, one score read per endpoint.
+/// The `count` lightest endpoints of a tier, one score read per endpoint.
 ///
 /// `count` never reaches beyond a small bound, so the lightest are kept in place as the
-/// scores come by rather than the whole plan being sorted.
-fn lightest_arms(plan: &Plan, count: usize) -> Vec<usize> {
+/// scores come by rather than the whole tier being sorted.
+fn lightest_arms(plan: &Plan, tier: &Tier, count: usize) -> Vec<usize> {
     let mut lightest: Vec<(u64, usize)> = Vec::with_capacity(count);
-    for at in plan.live() {
+    for at in &tier.at {
         lightest.push((plan.load[*at].score(), *at));
         lightest.sort_by_key(|(score, _)| *score);
         lightest.truncate(count);
@@ -263,19 +381,19 @@ fn lightest_arms(plan: &Plan, count: usize) -> Vec<usize> {
     lightest.into_iter().map(|(_, at)| at).collect()
 }
 
-/// A ratio rule's arms after the first was drawn, rotated through what is left.
+/// A ratio rule's arms after the first was drawn, rotated through what is left of the tier.
 ///
 /// The draw sends the rule's *load* to the endpoint its share names; the extra arms
 /// are insurance, not load, so re-drawing them by share would only skew the proportions
-/// the operator asked for. They instead rotate, one step per request, through the live
-/// endpoints in turn order, so that over many requests every live endpoint carries an
-/// equal share of the insurance.
-fn extra_arms(plan: &Plan, arms: &mut Vec<usize>, up_to: usize) {
+/// the operator asked for. They instead rotate, one step per request, through the tier's
+/// endpoints in turn order, so that over many requests every endpoint carries an equal
+/// share of the insurance.
+fn extra_arms(plan: &Plan, tier: &Tier, arms: &mut Vec<usize>, up_to: usize) {
     if arms.len() == up_to {
         return;
     }
-    let rest: Vec<usize> = plan
-        .live()
+    let rest: Vec<usize> = tier
+        .at
         .iter()
         .copied()
         .filter(|at| !arms.contains(at))
@@ -441,16 +559,22 @@ mod tests {
         )
     }
 
-    /// A rule over `behind`, each host with the share it takes.
-    fn resolution(strategy: Strategy, behind: &[(&str, u32)]) -> Resolution {
+    /// A rule over `behind`, each host with the share it takes and the ceiling it serves.
+    fn resolution(strategy: Strategy, behind: &[(&str, u32, Option<Difficulty>)]) -> Resolution {
         resolution_at("/anthropic", strategy, behind)
     }
 
     /// The same, under a key of its own, for a test about two rules.
-    fn resolution_at(path: &str, strategy: Strategy, behind: &[(&str, u32)]) -> Resolution {
+    fn resolution_at(
+        path: &str,
+        strategy: Strategy,
+        behind: &[(&str, u32, Option<Difficulty>)],
+    ) -> Resolution {
         let weighted = behind
             .iter()
-            .map(|(host, weight)| Weighted::weighing(endpoint(host, "/v1"), Weight::new(*weight)))
+            .map(|(host, weight, serves)| {
+                Weighted::serving(endpoint(host, "/v1"), Weight::new(*weight), *serves)
+            })
             .collect();
         let rule = RouteRule {
             api: ApiId::new("anthropic").unwrap(),
@@ -465,14 +589,24 @@ mod tests {
             .expect("the rule carries its own key")
     }
 
-    /// Which host each of `rounds` requests went to.
-    fn sent_to(dispatcher: &Dispatcher, resolution: &Resolution, rounds: usize) -> Vec<String> {
+    /// Which host each of `rounds` requests naming `class` went to.
+    fn sent_by_class(
+        dispatcher: &Dispatcher,
+        resolution: &Resolution,
+        class: Option<Difficulty>,
+        rounds: usize,
+    ) -> Vec<String> {
         (0..rounds)
             .map(|_| {
-                let chosen = dispatcher.choose(resolution);
+                let chosen = dispatcher.choose(&Dispatching::new(resolution, class));
                 chosen.endpoint().host.as_str().to_owned()
             })
             .collect()
+    }
+
+    /// Which host each of `rounds` unclassified requests went to.
+    fn sent_to(dispatcher: &Dispatcher, resolution: &Resolution, rounds: usize) -> Vec<String> {
+        sent_by_class(dispatcher, resolution, None, rounds)
     }
 
     /// How many of `rounds` requests each host took.
@@ -488,10 +622,24 @@ mod tests {
         counted
     }
 
+    /// How many of `rounds` requests naming `class` each host took.
+    fn counted_by_class(
+        dispatcher: &Dispatcher,
+        resolution: &Resolution,
+        class: Option<Difficulty>,
+        rounds: usize,
+    ) -> HashMap<String, usize> {
+        let mut counted = HashMap::new();
+        for host in sent_by_class(dispatcher, resolution, class, rounds) {
+            *counted.entry(host).or_insert(0) += 1;
+        }
+        counted
+    }
+
     #[test]
     fn one_endpoint_takes_every_request_whatever_the_strategy() {
         for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
-            let resolution = resolution(strategy, &[("only.example.com", 1)]);
+            let resolution = resolution(strategy, &[("only.example.com", 1, None)]);
             let (dispatcher, _folding) = Dispatcher::new();
             assert_eq!(
                 sent_to(&dispatcher, &resolution, 3),
@@ -504,7 +652,7 @@ mod tests {
     fn dispatching_in_turn_goes_round_the_endpoints() {
         let resolution = resolution(
             Strategy::RoundRobin,
-            &[("one.example.com", 1), ("two.example.com", 1)],
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
         );
         let (dispatcher, _folding) = Dispatcher::new();
         assert_eq!(
@@ -524,7 +672,7 @@ mod tests {
         let first = resolution_at(
             "/anthropic",
             Strategy::RoundRobin,
-            &[("one.example.com", 1), ("two.example.com", 1)],
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
         );
         let (dispatcher, _folding) = Dispatcher::new();
         // Another rule's turn starts at its own beginning, not where this one has reached.
@@ -532,7 +680,10 @@ mod tests {
         let second = resolution_at(
             "/openai",
             Strategy::RoundRobin,
-            &[("three.example.com", 1), ("four.example.com", 1)],
+            &[
+                ("three.example.com", 1, None),
+                ("four.example.com", 1, None),
+            ],
         );
         assert_eq!(sent_to(&dispatcher, &second, 1), ["three.example.com"]);
     }
@@ -541,7 +692,7 @@ mod tests {
     fn a_share_of_the_traffic_is_roughly_the_share_it_was_given() {
         let resolution = resolution(
             Strategy::Ratio,
-            &[("one.example.com", 1), ("three.example.com", 3)],
+            &[("one.example.com", 1, None), ("three.example.com", 3, None)],
         );
         let (dispatcher, _folding) = Dispatcher::new();
         let counted = counted(&dispatcher, &resolution, 4_000);
@@ -562,7 +713,10 @@ mod tests {
         for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
             let resolution = resolution(
                 strategy,
-                &[("live.example.com", 1), ("drained.example.com", 0)],
+                &[
+                    ("live.example.com", 1, None),
+                    ("drained.example.com", 0, None),
+                ],
             );
             let (dispatcher, _folding) = Dispatcher::new();
             let counted = counted(&dispatcher, &resolution, 200);
@@ -575,20 +729,29 @@ mod tests {
     fn a_target_drained_to_nothing_still_takes_its_requests() {
         let resolution = resolution(
             Strategy::Ratio,
-            &[("one.example.com", 0), ("two.example.com", 0)],
+            &[("one.example.com", 0, None), ("two.example.com", 0, None)],
         );
         let (dispatcher, _folding) = Dispatcher::new();
         assert_eq!(sent_to(&dispatcher, &resolution, 2).len(), 2);
     }
 
-    /// Which host each arm of a many choice goes to, in launch order.
-    fn arms_to(resolution: &Resolution, hedge: Hedge) -> Vec<String> {
+    /// Which host each arm of a many choice naming `class` goes to, in launch order.
+    fn arms_by_class(
+        resolution: &Resolution,
+        class: Option<Difficulty>,
+        hedge: Hedge,
+    ) -> Vec<String> {
         let (dispatcher, _folding) = Dispatcher::new();
         dispatcher
-            .choose_many(resolution, hedge)
+            .choose_many(&Dispatching::new(resolution, class), hedge)
             .into_iter()
             .map(|arm| arm.endpoint().host.as_str().to_owned())
             .collect()
+    }
+
+    /// Which host each arm of an unclassified many choice goes to, in launch order.
+    fn arms_to(resolution: &Resolution, hedge: Hedge) -> Vec<String> {
+        arms_by_class(resolution, None, hedge)
     }
 
     #[test]
@@ -597,9 +760,9 @@ mod tests {
             let resolution = resolution(
                 strategy,
                 &[
-                    ("one.example.com", 1),
-                    ("two.example.com", 1),
-                    ("three.example.com", 1),
+                    ("one.example.com", 1, None),
+                    ("two.example.com", 1, None),
+                    ("three.example.com", 1, None),
                 ],
             );
             let taken = arms_to(&resolution, Hedge::new(2).unwrap());
@@ -615,13 +778,13 @@ mod tests {
     #[test]
     fn one_arm_gives_what_choose_gives() {
         for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
-            let behind = [("only.example.com", 1), ("down.example.com", 0)];
+            let behind = [("only.example.com", 1, None), ("down.example.com", 0, None)];
             let alone = resolution(strategy, &behind);
             let raced = resolution(strategy, &behind);
             let (by_one, _) = Dispatcher::new();
             let (by_many, _) = Dispatcher::new();
-            let single = by_one.choose(&alone);
-            let arms = by_many.choose_many(&raced, Hedge::NONE);
+            let single = by_one.choose(&Dispatching::new(&alone, None));
+            let arms = by_many.choose_many(&Dispatching::new(&raced, None), Hedge::NONE);
             assert_eq!(arms.len(), 1, "{strategy}");
             assert_eq!(
                 arms[0].endpoint().host.as_str(),
@@ -640,15 +803,16 @@ mod tests {
         let resolution = resolution(
             Strategy::LeastLoad,
             &[
-                ("one.example.com", 1),
-                ("two.example.com", 1),
-                ("three.example.com", 1),
+                ("one.example.com", 1, None),
+                ("two.example.com", 1, None),
+                ("three.example.com", 1, None),
             ],
         );
         let (dispatcher, _folding) = Dispatcher::new();
-        let held = dispatcher.choose(&resolution);
+        let held = dispatcher.choose(&Dispatching::new(&resolution, None));
         assert_eq!(held.endpoint().host.as_str(), "one.example.com");
-        let arms = dispatcher.choose_many(&resolution, Hedge::new(2).unwrap());
+        let arms =
+            dispatcher.choose_many(&Dispatching::new(&resolution, None), Hedge::new(2).unwrap());
         let taken: Vec<&str> = arms
             .iter()
             .map(|arm| arm.endpoint().host.as_str())
@@ -660,8 +824,10 @@ mod tests {
     #[test]
     fn a_hedge_wider_than_the_live_endpoints_is_cut_to_them() {
         for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
-            let resolution =
-                resolution(strategy, &[("one.example.com", 1), ("two.example.com", 1)]);
+            let resolution = resolution(
+                strategy,
+                &[("one.example.com", 1, None), ("two.example.com", 1, None)],
+            );
             let taken = arms_to(&resolution, Hedge::new(HEDGE_MOST).unwrap());
             assert_eq!(taken.len(), 2, "{strategy}");
             assert_ne!(taken[0], taken[1], "{strategy}: {taken:?}");
@@ -674,9 +840,9 @@ mod tests {
             let resolution = resolution(
                 strategy,
                 &[
-                    ("one.example.com", 1),
-                    ("drained.example.com", 0),
-                    ("two.example.com", 1),
+                    ("one.example.com", 1, None),
+                    ("drained.example.com", 0, None),
+                    ("two.example.com", 1, None),
                 ],
             );
             let taken = arms_to(&resolution, Hedge::new(2).unwrap());
@@ -689,8 +855,10 @@ mod tests {
     #[test]
     fn a_rule_whose_endpoints_are_all_drained_still_answers_with_arms() {
         for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
-            let resolution =
-                resolution(strategy, &[("one.example.com", 0), ("two.example.com", 0)]);
+            let resolution = resolution(
+                strategy,
+                &[("one.example.com", 0, None), ("two.example.com", 0, None)],
+            );
             let taken = arms_to(&resolution, Hedge::new(2).unwrap());
             assert_eq!(taken.len(), 2, "{strategy}");
             assert_ne!(taken[0], taken[1], "{strategy}: {taken:?}");
@@ -698,14 +866,225 @@ mod tests {
     }
 
     #[test]
+    fn an_unclassified_request_is_narrowed_by_no_ceiling_whatever_the_strategy() {
+        // The path every request takes until a classifier exists: no class named, every
+        // live endpoint in play whoever it serves.
+        let behind = &[
+            ("easy.example.com", 1, Some(Difficulty::Easy)),
+            ("hard.example.com", 1, Some(Difficulty::Hard)),
+            ("silent.example.com", 1, None),
+        ];
+        let (dispatcher, _folding) = Dispatcher::new();
+        let round_robin = resolution(Strategy::RoundRobin, behind);
+        assert_eq!(
+            sent_to(&dispatcher, &round_robin, 6),
+            [
+                "easy.example.com",
+                "hard.example.com",
+                "silent.example.com",
+                "easy.example.com",
+                "hard.example.com",
+                "silent.example.com"
+            ]
+        );
+        // Nothing is loaded, so least load answers with the first, exactly as it always did.
+        let least_load = resolution(Strategy::LeastLoad, behind);
+        assert_eq!(
+            sent_to(&dispatcher, &least_load, 2),
+            ["easy.example.com", "easy.example.com"]
+        );
+        let ratio = resolution(Strategy::Ratio, behind);
+        let counted = counted(&dispatcher, &ratio, 3_000);
+        for host in ["easy.example.com", "hard.example.com", "silent.example.com"] {
+            assert!((900..1_100).contains(&counted[host]), "{counted:?}");
+        }
+    }
+
+    #[test]
+    fn a_class_goes_to_the_lowest_ceiling_that_carries_it() {
+        let behind = &[
+            ("easy.example.com", 1, Some(Difficulty::Easy)),
+            ("hard.example.com", 1, Some(Difficulty::Hard)),
+            ("research.example.com", 1, Some(Difficulty::Research)),
+        ];
+        let (dispatcher, _folding) = Dispatcher::new();
+        let resolution = resolution(Strategy::RoundRobin, behind);
+        assert_eq!(
+            sent_by_class(&dispatcher, &resolution, Some(Difficulty::Hard), 3),
+            ["hard.example.com"; 3]
+        );
+        // A median request goes to `hard` because nothing between them declared.
+        assert_eq!(
+            sent_by_class(&dispatcher, &resolution, Some(Difficulty::Median), 1),
+            ["hard.example.com"]
+        );
+        assert_eq!(
+            sent_by_class(&dispatcher, &resolution, Some(Difficulty::Research), 2),
+            ["research.example.com"; 2]
+        );
+    }
+
+    #[test]
+    fn an_endpoint_below_the_class_is_never_sent_the_request() {
+        let behind = &[
+            ("easy.example.com", 1, Some(Difficulty::Easy)),
+            ("median.example.com", 1, Some(Difficulty::Median)),
+        ];
+        let (dispatcher, _folding) = Dispatcher::new();
+        let resolution = resolution(Strategy::RoundRobin, behind);
+        let counted = counted_by_class(&dispatcher, &resolution, Some(Difficulty::Median), 50);
+        assert_eq!(counted.get("easy.example.com"), None);
+        assert_eq!(counted["median.example.com"], 50);
+    }
+
+    #[test]
+    fn a_drained_endpoint_that_could_serve_the_class_is_still_never_sent_it() {
+        let behind = &[
+            ("live.example.com", 1, Some(Difficulty::Research)),
+            ("drained.example.com", 0, Some(Difficulty::Research)),
+        ];
+        let (dispatcher, _folding) = Dispatcher::new();
+        let resolution = resolution(Strategy::RoundRobin, behind);
+        for class in [None, Some(Difficulty::Hard), Some(Difficulty::Research)] {
+            let counted = counted_by_class(&dispatcher, &resolution, class, 40);
+            assert_eq!(counted.get("drained.example.com"), None, "{class:?}");
+            assert_eq!(counted["live.example.com"], 40, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_with_no_ceiling_serves_every_class_and_yields_to_what_declared_it() {
+        let behind = &[
+            ("silent.example.com", 1, None),
+            ("hard.example.com", 1, Some(Difficulty::Hard)),
+        ];
+        let (dispatcher, _folding) = Dispatcher::new();
+        let resolution = resolution(Strategy::RoundRobin, behind);
+        // One that declared it can serve the class beats one that never said.
+        let counted = counted_by_class(&dispatcher, &resolution, Some(Difficulty::Hard), 40);
+        assert_eq!(counted.get("silent.example.com"), None);
+        assert_eq!(counted["hard.example.com"], 40);
+        // Nothing declared carries research, so the silent one serves it after all.
+        assert_eq!(
+            sent_by_class(&dispatcher, &resolution, Some(Difficulty::Research), 20),
+            ["silent.example.com"; 20]
+        );
+    }
+
+    #[test]
+    fn a_class_no_endpoint_carries_goes_to_the_most_capable_there_is() {
+        let behind = &[
+            ("easy.example.com", 1, Some(Difficulty::Easy)),
+            ("median.example.com", 1, Some(Difficulty::Median)),
+        ];
+        let (dispatcher, _folding) = Dispatcher::new();
+        let resolution = resolution(Strategy::RoundRobin, behind);
+        assert_eq!(
+            sent_by_class(&dispatcher, &resolution, Some(Difficulty::Research), 20),
+            ["median.example.com"; 20]
+        );
+        // A rule drained to nothing widens to all of them, and the fallback stays inside it.
+        let drained = resolution_at(
+            "/anthropic",
+            Strategy::RoundRobin,
+            &[
+                ("easy.example.com", 0, Some(Difficulty::Easy)),
+                ("median.example.com", 0, Some(Difficulty::Median)),
+            ],
+        );
+        assert_eq!(
+            sent_by_class(&dispatcher, &drained, Some(Difficulty::Research), 1),
+            ["median.example.com"]
+        );
+    }
+
+    #[test]
+    fn within_a_tier_the_rule_s_own_strategy_still_decides() {
+        let (dispatcher, _folding) = Dispatcher::new();
+        let shared = resolution(
+            Strategy::RoundRobin,
+            &[
+                ("one.example.com", 1, Some(Difficulty::Hard)),
+                ("two.example.com", 1, Some(Difficulty::Hard)),
+                ("three.example.com", 1, Some(Difficulty::Hard)),
+            ],
+        );
+        assert_eq!(
+            sent_by_class(&dispatcher, &shared, Some(Difficulty::Hard), 4),
+            [
+                "one.example.com",
+                "two.example.com",
+                "three.example.com",
+                "one.example.com"
+            ]
+        );
+        let shares = resolution(
+            Strategy::Ratio,
+            &[
+                ("one.example.com", 1, Some(Difficulty::Hard)),
+                ("three.example.com", 3, Some(Difficulty::Hard)),
+            ],
+        );
+        let counted = counted_by_class(&dispatcher, &shares, Some(Difficulty::Hard), 4_000);
+        assert!(
+            (800..1_200).contains(&counted["one.example.com"]),
+            "{counted:?}"
+        );
+        assert!(
+            (2_800..3_200).contains(&counted["three.example.com"]),
+            "{counted:?}"
+        );
+    }
+
+    #[test]
+    fn a_hedge_is_cut_to_what_the_class_qualifies_not_to_what_lives() {
+        let behind = &[
+            ("one.example.com", 1, Some(Difficulty::Hard)),
+            ("two.example.com", 1, Some(Difficulty::Hard)),
+            ("easy.example.com", 1, Some(Difficulty::Easy)),
+        ];
+        for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
+            let resolution = resolution(strategy, behind);
+            let taken = arms_by_class(
+                &resolution,
+                Some(Difficulty::Hard),
+                Hedge::new(HEDGE_MOST).unwrap(),
+            );
+            assert_eq!(taken.len(), 2, "{strategy}: {taken:?}");
+            assert_ne!(taken[0], taken[1], "{strategy}: {taken:?}");
+            for host in taken {
+                assert_ne!(host, "easy.example.com", "{strategy} raced below the class");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tier_counts_load_against_the_endpoint_it_named() {
+        let behind = &[
+            ("easy.example.com", 1, Some(Difficulty::Easy)),
+            ("hard.example.com", 1, Some(Difficulty::Hard)),
+        ];
+        let (dispatcher, _folding) = Dispatcher::new();
+        let resolution = resolution(Strategy::RoundRobin, behind);
+        let held = dispatcher.choose(&Dispatching::new(&resolution, Some(Difficulty::Hard)));
+        assert_eq!(held.endpoint().host.as_str(), "hard.example.com");
+        let plan = resolution.plan();
+        assert_eq!(plan.load[0].in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(plan.load[1].in_flight.load(Ordering::Relaxed), 1);
+        drop(held);
+        assert_eq!(plan.load[1].in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn every_arm_counts_against_its_endpoint_while_it_is_held() {
         let resolution = resolution(
             Strategy::RoundRobin,
-            &[("one.example.com", 1), ("two.example.com", 1)],
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
         );
         let (dispatcher, _folding) = Dispatcher::new();
         let plan = resolution.plan();
-        let arms = dispatcher.choose_many(&resolution, Hedge::new(2).unwrap());
+        let arms =
+            dispatcher.choose_many(&Dispatching::new(&resolution, None), Hedge::new(2).unwrap());
         assert_eq!(plan.load[0].in_flight.load(Ordering::Relaxed), 1);
         assert_eq!(plan.load[1].in_flight.load(Ordering::Relaxed), 1);
         drop(arms);
@@ -724,7 +1103,7 @@ mod tests {
         let mut drawn = Vec::new();
         for _ in 0..6 {
             let mut arms = vec![0usize];
-            extra_arms(&plan, &mut arms, 2);
+            extra_arms(&plan, plan.tier(None), &mut arms, 2);
             drawn.push(arms[1]);
         }
         // The same first arm, repeated calls: the extra arm covers every live
@@ -737,15 +1116,17 @@ mod tests {
         let resolution = resolution(
             Strategy::Ratio,
             &[
-                ("one.example.com", 1),
-                ("two.example.com", 1),
-                ("three.example.com", 1),
+                ("one.example.com", 1, None),
+                ("two.example.com", 1, None),
+                ("three.example.com", 1, None),
             ],
         );
         let (dispatcher, _folding) = Dispatcher::new();
         let mut carried: HashMap<String, usize> = HashMap::new();
         for _ in 0..300 {
-            for arm in dispatcher.choose_many(&resolution, Hedge::new(2).unwrap()) {
+            for arm in
+                dispatcher.choose_many(&Dispatching::new(&resolution, None), Hedge::new(2).unwrap())
+            {
                 *carried
                     .entry(arm.endpoint().host.as_str().to_owned())
                     .or_insert(0) += 1;
@@ -842,15 +1223,19 @@ mod tests {
     fn the_least_loaded_endpoint_is_the_one_carrying_least() {
         let resolution = resolution(
             Strategy::LeastLoad,
-            &[("one.example.com", 1), ("two.example.com", 1)],
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
         );
         let (dispatcher, _folding) = Dispatcher::new();
         // Nothing is in flight, so the first is as good as the second.
-        let held = dispatcher.choose(&resolution);
+        let held = dispatcher.choose(&Dispatching::new(&resolution, None));
         assert_eq!(held.endpoint().host.as_str(), "one.example.com");
         // With that one carrying a request, the next goes elsewhere.
         assert_eq!(
-            dispatcher.choose(&resolution).endpoint().host.as_str(),
+            dispatcher
+                .choose(&Dispatching::new(&resolution, None))
+                .endpoint()
+                .host
+                .as_str(),
             "two.example.com"
         );
         drop(held);
@@ -860,13 +1245,17 @@ mod tests {
     fn a_request_that_is_done_stops_counting_against_its_endpoint() {
         let resolution = resolution(
             Strategy::LeastLoad,
-            &[("one.example.com", 1), ("two.example.com", 1)],
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
         );
         let (dispatcher, _folding) = Dispatcher::new();
-        drop(dispatcher.choose(&resolution));
+        drop(dispatcher.choose(&Dispatching::new(&resolution, None)));
         // The first is free again, and answered quickly, so it is still the lightest.
         assert_eq!(
-            dispatcher.choose(&resolution).endpoint().host.as_str(),
+            dispatcher
+                .choose(&Dispatching::new(&resolution, None))
+                .endpoint()
+                .host
+                .as_str(),
             "one.example.com"
         );
     }
@@ -875,11 +1264,14 @@ mod tests {
     async fn an_endpoint_that_has_been_slow_carries_less() {
         let resolution = resolution(
             Strategy::LeastLoad,
-            &[("slow.example.com", 1), ("quick.example.com", 1)],
+            &[
+                ("slow.example.com", 1, None),
+                ("quick.example.com", 1, None),
+            ],
         );
         let (dispatcher, mut folding) = Dispatcher::new();
         // The first request goes to the first endpoint, both being unknown, and takes a while.
-        let held = dispatcher.choose(&resolution);
+        let held = dispatcher.choose(&Dispatching::new(&resolution, None));
         assert_eq!(held.endpoint().host.as_str(), "slow.example.com");
         std::thread::sleep(std::time::Duration::from_millis(20));
         drop(held);
@@ -898,10 +1290,10 @@ mod tests {
 
     #[tokio::test]
     async fn what_an_endpoint_takes_settles_towards_what_it_keeps_answering_in() {
-        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1)]);
+        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1, None)]);
         let (dispatcher, mut folding) = Dispatcher::new();
         for _ in 0..40 {
-            drop(dispatcher.choose(&resolution));
+            drop(dispatcher.choose(&Dispatching::new(&resolution, None)));
         }
         // Every answer is folded in, in batches, and the average lands near the truth.
         let mut folded = 0;
@@ -927,9 +1319,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_abandoned_arm_teaches_no_latency_to_the_folder() {
-        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1)]);
+        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1, None)]);
         let (dispatcher, mut folding) = Dispatcher::new();
-        let mut arm = dispatcher.choose(&resolution);
+        let mut arm = dispatcher.choose(&Dispatching::new(&resolution, None));
         arm.abandon();
         std::thread::sleep(std::time::Duration::from_millis(20));
         drop(arm);
@@ -944,9 +1336,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_abandoned_arm_leaves_a_recorded_latency_unchanged() {
-        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1)]);
+        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1, None)]);
         let (dispatcher, mut folding) = Dispatcher::new();
-        let held = dispatcher.choose(&resolution);
+        let held = dispatcher.choose(&Dispatching::new(&resolution, None));
         std::thread::sleep(std::time::Duration::from_millis(30));
         drop(held);
         assert_eq!(folding.fold().await, 1);
@@ -955,7 +1347,7 @@ mod tests {
             .taking(0)
             .expect("the first answer was folded in");
 
-        let mut arm = dispatcher.choose(&resolution);
+        let mut arm = dispatcher.choose(&Dispatching::new(&resolution, None));
         arm.abandon();
         std::thread::sleep(std::time::Duration::from_millis(10));
         drop(arm);
@@ -966,10 +1358,10 @@ mod tests {
 
     #[test]
     fn an_abandoned_arm_still_comes_off_the_in_flight_count() {
-        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1)]);
+        let resolution = resolution(Strategy::LeastLoad, &[("only.example.com", 1, None)]);
         let (dispatcher, _folding) = Dispatcher::new();
         let plan = resolution.plan();
-        let mut arm = dispatcher.choose(&resolution);
+        let mut arm = dispatcher.choose(&Dispatching::new(&resolution, None));
         assert_eq!(plan.load[0].in_flight.load(Ordering::Relaxed), 1);
         arm.abandon();
         drop(arm);
@@ -980,10 +1372,11 @@ mod tests {
     async fn abandoning_one_arm_leaves_the_other_arms_reporting() {
         let resolution = resolution(
             Strategy::LeastLoad,
-            &[("one.example.com", 1), ("two.example.com", 1)],
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
         );
         let (dispatcher, mut folding) = Dispatcher::new();
-        let mut arms = dispatcher.choose_many(&resolution, Hedge::new(2).unwrap());
+        let mut arms =
+            dispatcher.choose_many(&Dispatching::new(&resolution, None), Hedge::new(2).unwrap());
         arms[0].abandon();
         std::thread::sleep(std::time::Duration::from_millis(20));
         drop(arms);
@@ -1024,7 +1417,7 @@ mod tests {
             let resolution = table.resolve(&key).unwrap();
             sent.push(
                 dispatcher
-                    .choose(&resolution)
+                    .choose(&Dispatching::new(&resolution, None))
                     .endpoint()
                     .host
                     .as_str()
@@ -1055,6 +1448,31 @@ mod tests {
         assert_eq!(plan.at_share(0), 0);
         assert_eq!(plan.at_share(1), 1);
         assert_eq!(plan.at_share(3), 1);
+    }
+
+    #[test]
+    fn a_plan_narrows_each_class_to_what_can_serve_it() {
+        let targets = vec![
+            Weighted::serving(
+                endpoint("easy.example.com", "/v1"),
+                Weight::new(1),
+                Some(Difficulty::Easy),
+            ),
+            Weighted::serving(
+                endpoint("hard.example.com", "/v1"),
+                Weight::new(1),
+                Some(Difficulty::Hard),
+            ),
+            Weighted::serving(endpoint("silent.example.com", "/v1"), Weight::new(1), None),
+        ];
+        let plan = Plan::of(&targets);
+        assert_eq!(plan.tier(None).at, [0, 1, 2]);
+        assert_eq!(plan.tier(Some(Difficulty::Easy)).at, [0]);
+        // The next declared ceiling above what is asked, with the silent one behind it.
+        assert_eq!(plan.tier(Some(Difficulty::Routine)).at, [1]);
+        assert_eq!(plan.tier(Some(Difficulty::Hard)).at, [1]);
+        // Nothing declared carries research, so the silent endpoint serves it.
+        assert_eq!(plan.tier(Some(Difficulty::Research)).at, [2]);
     }
 
     #[test]

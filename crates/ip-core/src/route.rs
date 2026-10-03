@@ -638,6 +638,20 @@ pub enum Difficulty {
 }
 
 impl Difficulty {
+    /// The five classes, in the order of the total order.
+    pub const ALL: [Difficulty; 5] = [
+        Difficulty::Easy,
+        Difficulty::Routine,
+        Difficulty::Median,
+        Difficulty::Hard,
+        Difficulty::Research,
+    ];
+
+    /// Its place in that order, which is how dispatch indexes the endpoints prepared per class.
+    pub const fn position(self) -> usize {
+        self as usize
+    }
+
     /// The name this is stored and reported under.
     pub fn name(self) -> &'static str {
         match self {
@@ -1162,6 +1176,10 @@ mod tests {
         ] {
             assert_eq!(Difficulty::named(class.name()).unwrap(), class);
             assert_eq!(class.to_string(), class.name());
+        }
+        for (at, class) in Difficulty::ALL.iter().enumerate() {
+            assert_eq!(class.position(), at);
+            assert_eq!(*class, Difficulty::named(class.name()).unwrap());
         }
         assert!(matches!(
             Difficulty::named("epic"),

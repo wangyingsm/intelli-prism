@@ -144,7 +144,7 @@ impl RoutingTable {
             for target in rule.target.weighted() {
                 let endpoint = &target.endpoint;
                 let path = AbsPath::new(&join(endpoint.path.as_str(), remainder)).ok()?;
-                targets.push(Weighted::weighing(
+                targets.push(Weighted::serving(
                     Endpoint::new(
                         endpoint.protocol,
                         endpoint.host.clone(),
@@ -152,6 +152,7 @@ impl RoutingTable {
                         path,
                     ),
                     target.weight,
+                    target.serves,
                 ));
             }
             return Some(Resolution {

@@ -282,6 +282,11 @@ pub(crate) mod tests {
             *self.1.lock().unwrap() = true;
         }
 
+        /// Whether anything at all was counted, which a refused request must not have done.
+        pub(crate) fn saw_anything(&self) -> bool {
+            !self.0.lock().unwrap().is_empty()
+        }
+
         fn answering(&self) -> Result<(), CacheError> {
             match *self.1.lock().unwrap() {
                 true => Err(CacheError::backend(std::io::Error::other("told to refuse"))),

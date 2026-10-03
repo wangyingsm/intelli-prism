@@ -312,6 +312,30 @@ pub(super) fn hedged_replicated_table(
     RoutingTable::from_rules(vec![rule])
 }
 
+/// A table whose one rule stands behind the hosts named, each with the ceiling given.
+pub(super) fn ceiled_table(behind: &[(&str, Option<ip_core::Difficulty>)]) -> RoutingTable {
+    let mut rule = rule(endpoint(
+        Protocol::Https,
+        behind.first().expect("a rule stands behind something").0,
+        443,
+        "/v1",
+    ));
+    rule.target = RouteTarget::from_weighted(
+        behind
+            .iter()
+            .map(|(host, serves)| {
+                ip_core::Weighted::serving(
+                    endpoint(Protocol::Https, host, 443, "/v1"),
+                    ip_core::Weight::default(),
+                    *serves,
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    RoutingTable::from_rules(vec![rule])
+}
+
 pub(super) fn granted() -> Authority {
     let scope = CapabilityScope::Api {
         user: user(),

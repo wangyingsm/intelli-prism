@@ -879,6 +879,58 @@ mod tests {
         assert_eq!(upstream.seen.lock().unwrap().len(), 1);
     }
 
+    /// A class the gateway cannot read is refused when the headers finish, before the
+    /// admission check, so the request is never counted against a limit and never reaches
+    /// the upstream.
+    #[tokio::test]
+    async fn a_request_naming_a_class_that_cannot_be_read_costs_no_limit_count() {
+        let upstream = FakeUpstream::answering("pong");
+        let counters = Arc::new(crate::limit::tests::Held::default());
+        let limiter = Limiter::new(counters.clone(), Rows::holding(0));
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .limiting(Arc::new(limiter))
+            .with_limits(Limits::new(vec![allowing(
+                ip_core::Counted::Requests,
+                ip_core::Period::Minute,
+                100,
+            )]));
+        let mut asked = request("/anthropic/messages", "ask");
+        asked
+            .headers_mut()
+            .insert("x-ip-difficulty", HeaderValue::from_static("epic"));
+
+        let refused = gateway.handle(context(granted()), asked).await.unwrap_err();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !counters.saw_anything(),
+            "a request that could never proceed was counted against a limit"
+        );
+        assert!(upstream.seen.lock().unwrap().is_empty());
+    }
+
+    /// The class is read once the request header chain has run, so a processor that sets
+    /// it routes the request — which is how a classifier of one's own plugs in.
+    #[tokio::test]
+    async fn a_header_processor_naming_the_class_is_honoured() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            ceiled_table(&[
+                ("silent.example.com", None),
+                ("hard.example.com", Some(ip_core::Difficulty::Hard)),
+            ]),
+            ProcessorChain::new().with_request_header(SetHeader::new("x-ip-difficulty", "hard")),
+            upstream.clone(),
+        );
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        let sent = upstream.seen.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        // No class in the request itself: the header processor named it, and the read saw that.
+        assert_eq!(sent[0].host, "hard.example.com:443");
+    }
     #[tokio::test]
     async fn what_an_answer_spends_is_counted_against_the_quota() {
         let upstream = FakeUpstream::answering(ANSWERED);
