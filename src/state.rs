@@ -116,6 +116,7 @@ impl AppState {
             .recording(Arc::clone(&backend) as Arc<dyn ip_storage::UsageStore>)
             .limiting(Arc::new(limiter))
             .dispatching(Arc::new(dispatcher))
+            .sticky_turns(Arc::clone(&cache))
             .with_limits(limits);
         if let Some(ttl) = config.cache.response_ttl() {
             let responses = ResponseCache::new(Arc::clone(&cache), Ttl::new(ttl.as_duration())?);

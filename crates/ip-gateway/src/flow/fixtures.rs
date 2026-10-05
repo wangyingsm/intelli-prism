@@ -9,7 +9,7 @@ use ip_auth::{Authority, Identity};
 use ip_cache::Ttl;
 use ip_core::{
     AbsPath, ApiId, Capability, CapabilityScope, Endpoint, Grant, Grants, Host, PluginOrder, Port,
-    Protocol, Role, RouteKey, RouteRule, RouteTarget, TenantId, TraceId, UserId,
+    Protocol, Role, RouteKey, RouteRule, RouteTarget, TenantId, TraceId, TurnId, UserId,
 };
 use std::sync::{Arc, Mutex};
 
@@ -312,6 +312,30 @@ pub(super) fn hedged_replicated_table(
     RoutingTable::from_rules(vec![rule])
 }
 
+/// A table whose one rule stands behind the hosts named, raced `hedge` of them at a time.
+pub(super) fn hedged_table(
+    strategy: ip_core::Strategy,
+    hedge: ip_core::Hedge,
+    behind: &[&str],
+) -> RoutingTable {
+    let mut rule = rule(endpoint(
+        Protocol::Https,
+        behind.first().expect("a rule stands behind something"),
+        443,
+        "/v1",
+    ));
+    rule.strategy = strategy;
+    rule.hedge = hedge;
+    rule.target = RouteTarget::from_endpoints(
+        behind
+            .iter()
+            .map(|host| endpoint(Protocol::Https, host, 443, "/v1"))
+            .collect(),
+    )
+    .unwrap();
+    RoutingTable::from_rules(vec![rule])
+}
+
 /// A table whose one rule stands behind the hosts named, each with the ceiling given.
 pub(super) fn ceiled_table(behind: &[(&str, Option<ip_core::Difficulty>)]) -> RoutingTable {
     let mut rule = rule(endpoint(
@@ -367,6 +391,14 @@ pub(super) fn context(authority: Authority) -> RequestContext {
         listen: "127.0.0.1:8080".parse().unwrap(),
         trace: TraceId::generate().unwrap(),
         turn: None,
+    }
+}
+
+/// The context of a request that marked a chat turn.
+pub(super) fn in_turn(authority: Authority, turn: &str) -> RequestContext {
+    RequestContext {
+        turn: Some(TurnId::new(turn).unwrap()),
+        ..context(authority)
     }
 }
 

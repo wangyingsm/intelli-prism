@@ -4,6 +4,7 @@ use arc_swap::ArcSwap;
 use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use ip_auth::Authority;
+use ip_cache::Cache;
 use ip_core::{Hedge, Protocol, Replica, TraceId, TurnId};
 use ip_storage::UsageStore;
 use std::net::SocketAddr;
@@ -25,6 +26,7 @@ use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
 use crate::stage::{Authorized, BodyProcessed, ResponseBodyProcessed, Stage};
 use crate::table::RoutingTable;
+use crate::turns::TurnAffinity;
 use crate::upstream::Upstream;
 
 /// What the dataflow needs about a request beyond the request itself.
@@ -53,6 +55,8 @@ pub struct Gateway {
     usage: Option<Arc<dyn UsageStore>>,
     limiter: Option<Arc<Limiter>>,
     dispatcher: Arc<Dispatcher>,
+    /// Where the turns that pass through are kept to the endpoints they landed on.
+    turns: Option<TurnAffinity>,
     pending: Pending,
 }
 
@@ -96,6 +100,7 @@ impl Gateway {
             limiter: None,
             // Nothing folds what this one learns until a caller supplies one that is folded for.
             dispatcher: Arc::new(Dispatcher::new().0),
+            turns: None,
             pending: Pending::default(),
         }
     }
@@ -133,6 +138,15 @@ impl Gateway {
     /// Dispatches with this one, whose folder keeps what each endpoint takes up to date.
     pub fn dispatching(mut self, dispatcher: Arc<Dispatcher>) -> Self {
         self.dispatcher = dispatcher;
+        self
+    }
+
+    /// Keeps each chat turn on the endpoint it landed on, for as long as the turn lasts, and
+    /// remembers the landing in `turns`: the short-lived state is the cache's kind, and this
+    /// writes through the same handle the responses do. A request that marks no turn with
+    /// `x-ip-turn` is dispatched as though none of this were configured.
+    pub fn sticky_turns(mut self, turns: Arc<dyn Cache>) -> Self {
+        self.turns = Some(TurnAffinity::new(turns, &self.pending));
         self
     }
 
@@ -289,7 +303,11 @@ impl Gateway {
         followed: &Followed,
     ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
         let forwarded = processed
-            .forward(self.upstream.as_ref(), &self.dispatcher)
+            .forward(
+                self.upstream.as_ref(),
+                &self.dispatcher,
+                self.turns.as_ref(),
+            )
             .instrument(stage_span!(EGRESS_REQUEST, followed))
             .await?;
         async {
@@ -1244,6 +1262,238 @@ mod tests {
                 "two.example.com:443"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_turn_is_served_twice_by_the_endpoint_it_landed_on() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+
+        for _ in 0..2 {
+            gateway
+                .handle(
+                    in_turn(granted(), "turn-1"),
+                    request("/anthropic/messages", "ask"),
+                )
+                .await
+                .unwrap();
+            gateway.settled().await;
+        }
+        let hosts = hosts_of(&upstream);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(
+            hosts[0], hosts[1],
+            "round-robin alone would have sent the second request of the turn elsewhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_turn_is_dispatched_as_though_the_first_had_never_been() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+
+        for turn in ["turn-1", "turn-2", "turn-1"] {
+            gateway
+                .handle(
+                    in_turn(granted(), turn),
+                    request("/anthropic/messages", "ask"),
+                )
+                .await
+                .unwrap();
+            gateway.settled().await;
+        }
+        let hosts = hosts_of(&upstream);
+        assert_eq!(hosts.len(), 3);
+        assert_ne!(
+            hosts[1], hosts[0],
+            "a second turn shared the first one's landing"
+        );
+        assert_eq!(hosts[2], hosts[0], "the first turn forgot where it landed");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_marks_no_turn_is_dispatched_as_it_always_was() {
+        // The regression at the flow level: with the memory configured and no turn marked,
+        // the rotation is bit for bit the one the same table makes with memory unconfigured.
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+        for _ in 0..4 {
+            gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            hosts_of(&upstream),
+            [
+                "one.example.com:443",
+                "two.example.com:443",
+                "one.example.com:443",
+                "two.example.com:443"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_whose_memory_cannot_answer_is_still_served() {
+        let memory =
+            ip_cache::FailingCache::new(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+        memory.fail_now();
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(memory));
+
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(
+                    in_turn(granted(), "turn-1"),
+                    request("/anthropic/messages", "ask"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(answered.status(), StatusCode::OK);
+            gateway.settled().await;
+        }
+        let hosts = hosts_of(&upstream);
+        assert_ne!(
+            hosts[0], hosts[1],
+            "a memory that cannot answer was kept to anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hedged_turn_races_from_where_the_turn_landed() {
+        // Two of three endpoints race; the first request's first arm refuses, so the turn
+        // lands on the second. The second request starts its race from that landing — not
+        // from where the round-robin had reached — and still races what remains of the draw.
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::ZERO,
+                    status: StatusCode::OK,
+                    body: "one",
+                    fail: true,
+                },
+            ),
+            (
+                "two.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::from_millis(30),
+                    status: StatusCode::OK,
+                    body: "two",
+                    fail: false,
+                },
+            ),
+            (
+                "three.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::from_millis(80),
+                    status: StatusCode::OK,
+                    body: "three",
+                    fail: false,
+                },
+            ),
+        ]);
+        let gateway = Gateway::new(
+            hedged_table(
+                ip_core::Strategy::RoundRobin,
+                ip_core::Hedge::new(2).unwrap(),
+                &["one.example.com", "two.example.com", "three.example.com"],
+            ),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(
+                    in_turn(granted(), "turn-1"),
+                    request("/anthropic/messages", "ask"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(body_of(answered).await, "two");
+            gateway.settled().await;
+        }
+        assert_eq!(
+            hosts_of(&upstream),
+            [
+                "one.example.com:443",
+                "two.example.com:443",
+                "two.example.com:443",
+                "three.example.com:443",
+            ],
+            "the second race neither started at the landing nor raced the rest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_harder_class_in_the_same_turn_moves_the_turn() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            ceiled_table(&[
+                ("easy.example.com", Some(ip_core::Difficulty::Easy)),
+                ("hard.example.com", Some(ip_core::Difficulty::Hard)),
+            ]),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+
+        for class in ["easy", "hard", "easy"] {
+            let mut asked = request("/anthropic/messages", "ask");
+            asked
+                .headers_mut()
+                .insert("x-ip-difficulty", HeaderValue::from_static(class));
+            gateway
+                .handle(in_turn(granted(), "turn-1"), asked)
+                .await
+                .unwrap();
+            gateway.settled().await;
+        }
+        // The turn leaves an endpoint that cannot take the harder ask, moves to one that
+        // can, and stays there when the easier one returns: §429 asks only whether the
+        // endpoint can serve what is asked, never whether a cheaper one could serve less.
+        assert_eq!(
+            hosts_of(&upstream),
+            [
+                "easy.example.com:443",
+                "hard.example.com:443",
+                "hard.example.com:443",
+            ]
+        );
+    }
+
+    /// The hosts an upstream was sent to, in the order it was sent to them.
+    fn hosts_of(upstream: &FakeUpstream) -> Vec<String> {
+        upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|seen| seen.host.clone())
+            .collect()
     }
 
     #[tokio::test]

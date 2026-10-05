@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use http::HeaderMap;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
-use ip_core::{Difficulty, Endpoint, Hedge, Strategy, Weighted};
+use ip_core::{Difficulty, Endpoint, Hedge, Replica, Strategy, Weighted};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -271,17 +271,48 @@ pub struct Dispatching<'a> {
     resolution: &'a Resolution,
     /// The class the caller named, if it named one. Nothing narrows an unclassified request.
     class: Option<Difficulty>,
+    /// Where this request's turn landed before, if it marked a turn and the memory kept one.
+    landed: Option<&'a Replica>,
 }
 
 impl<'a> Dispatching<'a> {
     /// The pair a dispatcher is given: this resolution, narrowed to this class.
     pub fn new(resolution: &'a Resolution, class: Option<Difficulty>) -> Self {
-        Self { resolution, class }
+        Self {
+            resolution,
+            class,
+            landed: None,
+        }
+    }
+
+    /// Where the turn this request belongs to landed last time, which is where it goes again
+    /// as long as that endpoint still stands behind the rule, unsunk and able to carry what
+    /// is asked now. It replaces what the strategy would have picked, for this request only:
+    /// a turn is not consulted over an endpoint that cannot serve it.
+    #[must_use]
+    pub fn landed_on(self, landed: Option<&'a Replica>) -> Self {
+        Self { landed, ..self }
     }
 
     /// The rule that matched, and the endpoints it stands behind.
     pub fn resolution(&self) -> &Resolution {
         self.resolution
+    }
+
+    /// Where the remembered endpoint stands among this rule's targets, if this request could
+    /// still have been sent there: the rule stands behind it, it is not drained, and what it
+    /// serves covers the class being asked. A turn whose endpoint fails any of these is not
+    /// kept, and the request is dispatched as though it were new.
+    fn landed_at(&self) -> Option<usize> {
+        let landed = self.landed?;
+        self.resolution.targets().iter().position(|target| {
+            Replica::of(&target.endpoint) == *landed
+                && !target.weight.is_drained()
+                && match (self.class, target.serves) {
+                    (Some(asked), Some(ceiling)) => ceiling >= asked,
+                    _ => true,
+                }
+        })
     }
 }
 
@@ -304,11 +335,19 @@ impl Dispatcher {
     /// Chooses where this request goes, counting it against that endpoint until it is done.
     pub fn choose(&self, dispatching: &Dispatching) -> Chosen {
         let plan = dispatching.resolution.plan();
-        let tier = plan.tier(dispatching.class);
-        let at = match dispatching.resolution.rule().strategy {
-            Strategy::RoundRobin => plan.in_turn(tier),
-            Strategy::Ratio => Self::by_share(tier),
-            Strategy::LeastLoad => plan.lightest(tier),
+        // Where a turn landed goes ahead of the choosing, and is chosen instead of: no tier is
+        // narrowed through and no strategy consulted, so the rule's turn is not spent on a
+        // request its turn has already answered for.
+        let at = match dispatching.landed_at() {
+            Some(at) => at,
+            None => {
+                let tier = plan.tier(dispatching.class);
+                match dispatching.resolution.rule().strategy {
+                    Strategy::RoundRobin => plan.in_turn(tier),
+                    Strategy::Ratio => Self::by_share(tier),
+                    Strategy::LeastLoad => plan.lightest(tier),
+                }
+            }
         };
         plan.load[at].in_flight.fetch_add(1, Ordering::Relaxed);
         Chosen {
@@ -324,9 +363,9 @@ impl Dispatcher {
     /// Chooses the several endpoints a request races across, counting each against
     /// itself until it is done with.
     ///
-    /// In launch order, first arm first: the first is the endpoint the rule would have
-    /// picked alone, and the rest are drawn without repeating it, cut down to how many of
-    /// the endpoints the request's class leaves in play.
+    /// In launch order, first arm first: where the turn landed if the request belongs to one,
+    /// and the endpoint the rule would have picked alone otherwise; the rest are drawn without
+    /// repeating it, cut down to how many of the endpoints the request's class leaves in play.
     pub fn choose_many(&self, dispatching: &Dispatching, hedge: Hedge) -> Vec<Chosen> {
         let plan = dispatching.resolution.plan();
         let tier = plan.tier(dispatching.class);
@@ -339,6 +378,18 @@ impl Dispatcher {
                 extra_arms(plan, tier, &mut slots, count);
                 slots
             }
+        };
+        // The memory moves the first arm of the race; it does not thin it. What the strategy
+        // drew comes after the turn's endpoint in the order it drew it, and the count the
+        // class and the hedge allowed is the count that races.
+        let slots = match dispatching.landed_at() {
+            Some(at) => {
+                let mut raced = vec![at];
+                raced.extend(slots.into_iter().filter(|arm| *arm != at));
+                raced.truncate(count);
+                raced
+            }
+            None => slots,
         };
         let started = Instant::now();
         slots
@@ -1507,5 +1558,257 @@ mod tests {
         let plan = Plan::of(&targets);
         assert_eq!(plan.at_share(plan.total()), 1);
         assert_eq!(plan.at_share(u64::MAX), 1);
+    }
+
+    /// The endpoint a turn remembers having landed on.
+    fn replica(host: &str) -> Replica {
+        Replica::of(&endpoint(host, "/v1"))
+    }
+
+    /// Where a request went when its turn landed on `landed_on` before it.
+    fn sent_landing(
+        dispatcher: &Dispatcher,
+        resolution: &Resolution,
+        class: Option<Difficulty>,
+        landed_on: &Replica,
+    ) -> String {
+        let chosen =
+            dispatcher.choose(&Dispatching::new(resolution, class).landed_on(Some(landed_on)));
+        chosen.endpoint().host.as_str().to_owned()
+    }
+
+    #[test]
+    fn a_turn_lands_where_the_turn_before_it_landed() {
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        for _ in 0..3 {
+            assert_eq!(
+                sent_landing(&dispatcher, &resolution, None, &replica("two.example.com")),
+                "two.example.com",
+                "an unclassified turn moves off the endpoint it landed on"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_that_marks_no_turn_is_dispatched_as_it_always_was() {
+        // The regression of §429 over all three strategies: a request landed nowhere is a
+        // request untouched. The rotation of a round-robin is the sharpest witness, so it is
+        // held exact; the other two are held to choosing only among what the rule stands
+        // behind, as every test above them already holds their own shape.
+        for strategy in [Strategy::RoundRobin, Strategy::LeastLoad, Strategy::Ratio] {
+            let resolution = resolution(
+                strategy,
+                &[
+                    ("one.example.com", 1, None),
+                    ("two.example.com", 1, None),
+                    ("three.example.com", 1, None),
+                ],
+            );
+            let (dispatcher, _folding) = Dispatcher::new();
+            let hosts = (0..6)
+                .map(|_| {
+                    dispatcher
+                        .choose(&Dispatching::new(&resolution, None).landed_on(None))
+                        .endpoint()
+                        .host
+                        .as_str()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            if strategy == Strategy::RoundRobin {
+                assert_eq!(
+                    hosts,
+                    [
+                        "one.example.com",
+                        "two.example.com",
+                        "three.example.com",
+                        "one.example.com",
+                        "two.example.com",
+                        "three.example.com",
+                    ]
+                );
+            } else {
+                for host in &hosts {
+                    assert!(
+                        ["one.example.com", "two.example.com", "three.example.com"]
+                            .contains(&host.as_str()),
+                        "{host} is behind no rule"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_landing_does_not_spend_the_rule_turn_it_landed_on() {
+        // A landed request goes without consulting the strategy, so the strategy resumes where
+        // it was, not a turn further on.
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        for _ in 0..3 {
+            sent_landing(&dispatcher, &resolution, None, &replica("two.example.com"));
+        }
+        assert_eq!(
+            sent_to(&dispatcher, &resolution, 4),
+            [
+                "one.example.com",
+                "two.example.com",
+                "one.example.com",
+                "two.example.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_ceiling_below_the_class_asked_is_not_where_the_turn_lands() {
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[
+                ("easy.example.com", 1, Some(Difficulty::Easy)),
+                ("hard.example.com", 1, Some(Difficulty::Hard)),
+            ],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        assert_eq!(
+            sent_landing(
+                &dispatcher,
+                &resolution,
+                Some(Difficulty::Hard),
+                &replica("easy.example.com"),
+            ),
+            "hard.example.com",
+            "a turn was kept on an endpoint that cannot serve what it now asks"
+        );
+        // A ceiling that covers what is asked, at or above it, is where the turn stays.
+        assert_eq!(
+            sent_landing(
+                &dispatcher,
+                &resolution,
+                Some(Difficulty::Hard),
+                &replica("hard.example.com"),
+            ),
+            "hard.example.com"
+        );
+        assert_eq!(
+            sent_landing(
+                &dispatcher,
+                &resolution,
+                Some(Difficulty::Easy),
+                &replica("easy.example.com"),
+            ),
+            "easy.example.com"
+        );
+    }
+
+    #[test]
+    fn a_higher_ceiling_than_the_class_asked_is_where_the_turn_lands_too() {
+        // The tiers narrow by the lowest ceiling that covers the class; a turn already on a
+        // higher one is not dragged out of it, because the question §429 asks of the endpoint
+        // is whether it can serve, not whether it was the cheapest that could.
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[
+                ("hard.example.com", 1, Some(Difficulty::Hard)),
+                ("research.example.com", 1, Some(Difficulty::Research)),
+            ],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        assert_eq!(
+            sent_landing(
+                &dispatcher,
+                &resolution,
+                Some(Difficulty::Hard),
+                &replica("research.example.com"),
+            ),
+            "research.example.com"
+        );
+    }
+
+    #[test]
+    fn a_drained_landing_is_no_landing() {
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[("one.example.com", 0, None), ("two.example.com", 1, None)],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        assert_eq!(
+            sent_landing(&dispatcher, &resolution, None, &replica("one.example.com")),
+            "two.example.com",
+            "a turn was kept on an endpoint that has since drained"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_rule_lands_the_turn_fresh() {
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        assert_eq!(
+            sent_landing(&dispatcher, &resolution, None, &replica("gone.example.com")),
+            "one.example.com",
+            "a rule rewritten away from its turn's endpoint must land the turn afresh"
+        );
+    }
+
+    #[test]
+    fn a_race_starts_where_the_turn_landed() {
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[
+                ("one.example.com", 1, None),
+                ("two.example.com", 1, None),
+                ("three.example.com", 1, None),
+            ],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        let arms = arms_by_class(&resolution, None, Hedge::new(3).unwrap());
+        assert_ne!(
+            arms[0], "two.example.com",
+            "the test wants a first arm to move"
+        );
+        let raced = dispatcher
+            .choose_many(
+                &Dispatching::new(&resolution, None).landed_on(Some(&replica("two.example.com"))),
+                Hedge::new(3).unwrap(),
+            )
+            .iter()
+            .map(|arm| arm.endpoint().host.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(raced[0], "two.example.com");
+        assert_eq!(
+            raced.len(),
+            3,
+            "the rest of the race was thinned by the memory: {raced:?}"
+        );
+        let mut rest: Vec<_> = raced[1..].to_vec();
+        rest.sort();
+        assert_eq!(rest, ["one.example.com", "three.example.com"]);
+    }
+
+    #[test]
+    fn a_sticky_race_still_races_the_rest() {
+        let resolution = resolution(
+            Strategy::RoundRobin,
+            &[("one.example.com", 1, None), ("two.example.com", 1, None)],
+        );
+        let (dispatcher, _folding) = Dispatcher::new();
+        let raced = dispatcher
+            .choose_many(
+                &Dispatching::new(&resolution, None).landed_on(Some(&replica("two.example.com"))),
+                Hedge::new(2).unwrap(),
+            )
+            .iter()
+            .map(|arm| arm.endpoint().host.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(raced, ["two.example.com", "one.example.com"]);
     }
 }

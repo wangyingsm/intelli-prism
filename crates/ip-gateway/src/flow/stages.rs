@@ -23,6 +23,7 @@ use crate::stage::{
     ResponseBodyProcessed, ResponseHeadersProcessed, Routed, Stage, StageName,
 };
 use crate::table::{Resolution, RoutingTable, request_key};
+use crate::turns::{TurnAffinity, Verdict};
 use crate::upstream::Upstream;
 
 /// The request header naming the difficulty class the caller asks to be served at.
@@ -210,17 +211,25 @@ impl Flow<BodyProcessed> {
     ///
     /// Each arm is counted against its endpoint until the upstream answers, so what the
     /// dispatcher knows about its load is what a request arriving now would actually wait behind.
+    ///
+    /// A turn marked with `x-ip-turn` reads once, before the choosing, where it landed before,
+    /// and an endpoint that answers keeps it as the landing afresh. A request that marks no
+    /// turn asks nothing of that memory, and a memory that cannot answer asks nothing of the
+    /// request.
     pub async fn forward(
         self,
         upstream: &dyn Upstream,
         dispatcher: &Dispatcher,
+        turns: Option<&TurnAffinity>,
     ) -> Result<Flow<Forwarded>, GatewayError> {
         let Routed {
             request,
             resolution,
             class,
         } = self.held;
-        let dispatching = Dispatching::new(&resolution, class);
+        let landed = remembered(turns, &self.context).await;
+        let dispatching =
+            Dispatching::new(&resolution, class).landed_on(landed.as_ref().map(|v| &v.endpoint));
         if may_race(request.headers(), resolution.rule().hedge) == Hedge::NONE {
             let chosen = dispatcher.choose(&dispatching);
             let served = Replica::of(chosen.endpoint());
@@ -231,6 +240,7 @@ impl Flow<BodyProcessed> {
                 .await
                 .map_err(|error| GatewayError::new(Forwarded::NAME, error.into()))?;
             strip_hop_by_hop(response.headers_mut());
+            remember(turns, &self.context, class, &served);
             return Ok(Flow {
                 context: self.context,
                 // Not raced, so one: the default the row carries anyway.
@@ -241,7 +251,40 @@ impl Flow<BodyProcessed> {
                 },
             });
         }
-        race(self.context, upstream, dispatcher, request, &dispatching).await
+        let outcome = race(self.context, upstream, dispatcher, request, &dispatching).await?;
+        remember(turns, &outcome.context, class, &outcome.held.served);
+        Ok(outcome)
+    }
+}
+
+/// Where a marked turn landed, if there is one: one read of the memory before the choosing,
+/// since after the choosing the request is on its way and no decision is left that could
+/// know a better endpoint than the one it is already at.
+async fn remembered(turns: Option<&TurnAffinity>, context: &RequestContext) -> Option<Verdict> {
+    match (turns, context.turn.as_ref()) {
+        (Some(turns), Some(turn)) => turns.landed(context.authority.identity(), turn).await,
+        _ => None,
+    }
+}
+
+/// Keeps where this request was answered as where its turn lands from now on, which the next
+/// request of the turn reads back. The write travels the way the usage row does, off the path
+/// the answer takes; a memory that will not hold costs the landing and nothing else.
+fn remember(
+    turns: Option<&TurnAffinity>,
+    context: &RequestContext,
+    class: Option<Difficulty>,
+    served: &Replica,
+) {
+    if let (Some(turns), Some(turn)) = (turns, context.turn.as_ref()) {
+        turns.keep(
+            context.authority.identity(),
+            turn,
+            &Verdict {
+                class,
+                endpoint: served.clone(),
+            },
+        );
     }
 }
 
@@ -641,7 +684,10 @@ mod tests {
         assert_eq!(flow.stage(), StageName::BodyProcess);
         let upstream = FakeUpstream::answering("pong");
         let (dispatcher, _folding) = Dispatcher::new();
-        let flow = flow.forward(upstream.as_ref(), &dispatcher).await.unwrap();
+        let flow = flow
+            .forward(upstream.as_ref(), &dispatcher, None)
+            .await
+            .unwrap();
         assert_eq!(flow.stage(), StageName::Route);
         let flow = flow
             .process_response_headers(processors.response_headers())
@@ -762,7 +808,10 @@ mod tests {
             .process_body(&processors)
             .await
             .unwrap();
-        let flow = flow.forward(upstream.as_ref(), &dispatcher).await.unwrap();
+        let flow = flow
+            .forward(upstream.as_ref(), &dispatcher, None)
+            .await
+            .unwrap();
         let flow = flow
             .process_response_headers(processors.response_headers())
             .await

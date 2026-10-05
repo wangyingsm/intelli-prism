@@ -32,7 +32,7 @@ pub struct Pending {
 
 impl Pending {
     /// Runs `work` off the request path, counted so a shutdown can wait for it.
-    fn writing(&self, work: impl Future<Output = ()> + Send + 'static) {
+    pub(crate) fn writing(&self, work: impl Future<Output = ()> + Send + 'static) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let counted = self.clone();
         tokio::spawn(async move {

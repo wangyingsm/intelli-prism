@@ -12,6 +12,7 @@ pub mod processor;
 mod sse;
 pub mod stage;
 pub mod table;
+pub mod turns;
 pub mod upstream;
 
 pub use body::{BoxError, GatewayBody};
@@ -28,4 +29,5 @@ pub use stage::{
     ResponseHeadersProcessed, Routed, Stage, StageName,
 };
 pub use table::{Resolution, RoutingTable, request_key};
+pub use turns::{TurnAffinity, Verdict};
 pub use upstream::Upstream;

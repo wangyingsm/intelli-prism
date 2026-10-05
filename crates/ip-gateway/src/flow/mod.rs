@@ -5,7 +5,7 @@ mod fixtures;
 mod followed;
 mod gateway;
 mod headers;
-mod record;
+pub(crate) mod record;
 mod run;
 mod stages;
 
