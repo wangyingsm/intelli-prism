@@ -4,7 +4,9 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderName, Request, Response};
 use ip_cache::{CacheKey, Ttl};
-use ip_core::{Capability, CapabilityScope, Difficulty, HEDGE_MOST, Hedge, Replica, RouteKey};
+use ip_core::{
+    Capability, CapabilityScope, Difficulty, HEDGE_MOST, Hedge, Replica, RouteKey, TurnId,
+};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{Span, field};
@@ -14,7 +16,7 @@ use super::headers::{aim, authority_of, is_event_stream, rewrite, set_length, st
 use super::run::{collect, run_body, run_headers};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, freshness, response_key};
-use crate::dispatch::{Dispatcher, Dispatching, may_race};
+use crate::dispatch::{Dispatcher, Dispatching, may_hold, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
@@ -23,7 +25,7 @@ use crate::stage::{
     ResponseBodyProcessed, ResponseHeadersProcessed, Routed, Stage, StageName,
 };
 use crate::table::{Resolution, RoutingTable, request_key};
-use crate::turns::{TurnAffinity, Verdict};
+use crate::turns::{Opening, TurnAffinity, Verdict};
 use crate::upstream::Upstream;
 
 /// The request header naming the difficulty class the caller asks to be served at.
@@ -212,10 +214,11 @@ impl Flow<BodyProcessed> {
     /// Each arm is counted against its endpoint until the upstream answers, so what the
     /// dispatcher knows about its load is what a request arriving now would actually wait behind.
     ///
-    /// A turn marked with `x-ip-turn` reads once, before the choosing, where it landed before,
-    /// and an endpoint that answers keeps it as the landing afresh. A request that marks no
-    /// turn asks nothing of that memory, and a memory that cannot answer asks nothing of the
-    /// request.
+    /// A request belongs to a turn either because `x-ip-turn` named one or because §429
+    /// recognised it from the conversation's opening. A named turn is known before the body
+    /// is, so a marked request never waits on its body; recognising one asks the body, and a
+    /// body that may not be held is not read at all — such a request streams through exactly
+    /// as it did before any of this, and is simply not sticky.
     pub async fn forward(
         self,
         upstream: &dyn Upstream,
@@ -227,10 +230,26 @@ impl Flow<BodyProcessed> {
             resolution,
             class,
         } = self.held;
-        let landed = remembered(turns, &self.context).await;
+        let raced = may_race(request.headers(), resolution.rule().hedge);
+        let unmarked = turns.is_some() && self.context.turn.is_none();
+        let mut request = request;
+        let mut opening = None;
+        // The body is held here when the turn's opening has to be read out of it: only for
+        // an unmarked request, and only when a memory is configured that would read it. A
+        // race makes its own buffer below — for a request whose opening was read here that
+        // is a second collect over bytes already in memory, cheap for the reasons `race`
+        // gives.
+        if unmarked && may_hold(request.headers()) {
+            let (parts, body) = request.into_parts();
+            let bytes = collect(StageName::BodyRead, body).await?;
+            opening = Opening::read(&bytes);
+            request = Request::from_parts(parts, from_bytes(bytes));
+        }
+        let taken = taken_turn(self.context.turn.as_ref(), opening, class);
+        let landed = remembered(turns, &self.context, taken.as_ref()).await;
         let dispatching =
             Dispatching::new(&resolution, class).landed_on(landed.as_ref().map(|v| &v.endpoint));
-        if may_race(request.headers(), resolution.rule().hedge) == Hedge::NONE {
+        if raced == Hedge::NONE {
             let chosen = dispatcher.choose(&dispatching);
             let served = Replica::of(chosen.endpoint());
             Span::current().record("served", field::display(&served));
@@ -240,7 +259,7 @@ impl Flow<BodyProcessed> {
                 .await
                 .map_err(|error| GatewayError::new(Forwarded::NAME, error.into()))?;
             strip_hop_by_hop(response.headers_mut());
-            remember(turns, &self.context, class, &served);
+            remember(turns, &self.context, taken.as_ref(), &served);
             return Ok(Flow {
                 context: self.context,
                 // Not raced, so one: the default the row carries anyway.
@@ -252,19 +271,61 @@ impl Flow<BodyProcessed> {
             });
         }
         let outcome = race(self.context, upstream, dispatcher, request, &dispatching).await?;
-        remember(turns, &outcome.context, class, &outcome.held.served);
+        remember(
+            turns,
+            &outcome.context,
+            taken.as_ref(),
+            &outcome.held.served,
+        );
         Ok(outcome)
     }
 }
 
-/// Where a marked turn landed, if there is one: one read of the memory before the choosing,
-/// since after the choosing the request is on its way and no decision is left that could
-/// know a better endpoint than the one it is already at.
-async fn remembered(turns: Option<&TurnAffinity>, context: &RequestContext) -> Option<Verdict> {
-    match (turns, context.turn.as_ref()) {
-        (Some(turns), Some(turn)) => turns.landed(context.authority.identity(), turn).await,
-        _ => None,
-    }
+/// Which turn a request takes part in, and what that turn's verdict is to leave behind:
+/// the caller's own word on the matter wins wherever it was said, and the conversation
+/// speaks for itself where it was not. A request neither is on its own, and nothing of it
+/// is kept.
+fn taken_turn(
+    marked: Option<&TurnId>,
+    opening: Option<Opening>,
+    class: Option<Difficulty>,
+) -> Option<Taken> {
+    let id = match (marked, &opening) {
+        (Some(marked), _) => marked.clone(),
+        (None, Some(opening)) => opening.anchor.clone(),
+        (None, None) => return None,
+    };
+    Some(Taken {
+        id,
+        class,
+        messages: opening.map(|opening| opening.messages),
+    })
+}
+
+/// What one request settles about the turn it is in: which turn, and what to leave in its
+/// verdict. `messages` is none when the body was never read; a verdict that holds no count
+/// trusts the next request and compares nothing.
+struct Taken {
+    id: TurnId,
+    class: Option<Difficulty>,
+    messages: Option<usize>,
+}
+
+/// Where this turn landed, if there was one to remember: one read of the memory before the
+/// choosing, since after the choosing the request is on its way and no decision is left
+/// that could know a better endpoint than the one it is already at.
+async fn remembered(
+    turns: Option<&TurnAffinity>,
+    context: &RequestContext,
+    taken: Option<&Taken>,
+) -> Option<Verdict> {
+    let (turns, taken) = (turns?, taken?);
+    let verdict = turns
+        .landed(context.authority.identity(), &taken.id)
+        .await?;
+    // A history that has shrunk under the turn's landing is a compaction, and a compaction
+    // starts a turn rather than continuing one.
+    verdict.continues(taken.messages).then_some(verdict)
 }
 
 /// Keeps where this request was answered as where its turn lands from now on, which the next
@@ -273,15 +334,16 @@ async fn remembered(turns: Option<&TurnAffinity>, context: &RequestContext) -> O
 fn remember(
     turns: Option<&TurnAffinity>,
     context: &RequestContext,
-    class: Option<Difficulty>,
+    taken: Option<&Taken>,
     served: &Replica,
 ) {
-    if let (Some(turns), Some(turn)) = (turns, context.turn.as_ref()) {
+    if let (Some(turns), Some(taken)) = (turns, taken) {
         turns.keep(
             context.authority.identity(),
-            turn,
+            &taken.id,
             &Verdict {
-                class,
+                class: taken.class,
+                messages: taken.messages,
                 endpoint: served.clone(),
             },
         );

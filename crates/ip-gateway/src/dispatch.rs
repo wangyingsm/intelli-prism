@@ -27,10 +27,12 @@ const SMOOTHING: u64 = 5;
 /// How many answers are folded in before the folder looks for more.
 const BATCH: usize = 128;
 
-/// The largest body a raced request may declare, in bytes.
+/// The largest body the gateway may hold in memory for one request, in bytes.
 ///
 /// One mebibyte. A chat completion is a few kilobytes, so the figure is generous for
 /// everything this gateway is for while still refusing to hold three copies of a file.
+/// It caps the racing that sends a body to several endpoints at once and the reading of a
+/// turn's opening from §429 alike: both hold the body, so both accept the same bound.
 const MAX_RACED_BODY: u64 = 1_048_576;
 
 /// What one endpoint behind a rule is carrying.
@@ -467,10 +469,20 @@ pub fn may_race(headers: &HeaderMap, asked: Hedge) -> Hedge {
     if asked == Hedge::NONE {
         return asked;
     }
-    if !file_transport(headers) && length_ok(headers) {
+    if may_hold(headers) {
         return asked;
     }
     Hedge::NONE
+}
+
+/// Whether the body behind these headers may be held in memory whole.
+///
+/// One policy with two callers: the racing of a request, which sends the held body to
+/// several endpoints, and §429's turn recognition, which reads a conversation's opening out
+/// of it. A request it refuses streams through the gateway untouched, by both.
+#[must_use]
+pub fn may_hold(headers: &HeaderMap) -> bool {
+    !file_transport(headers) && length_ok(headers)
 }
 
 /// Whether the request is a file transport, whatever its declared length.
@@ -1757,6 +1769,36 @@ mod tests {
             "one.example.com",
             "a rule rewritten away from its turn's endpoint must land the turn afresh"
         );
+    }
+
+    #[test]
+    fn what_a_race_may_hold_is_what_a_turn_may_read_from() {
+        let asked = Hedge::new(2).unwrap();
+        for (name, headers) in [
+            ("a small declared body", heads(&[("content-length", "40")])),
+            ("an undeclared body", heads(&[])),
+        ] {
+            assert!(may_hold(&headers), "{name} is holdable");
+            assert_eq!(may_race(&headers, asked), asked, "{name} may race");
+        }
+        for (name, headers) in [
+            ("past the cap", heads(&[("content-length", "2000000")])),
+            (
+                "a file transport",
+                heads(&[("content-type", "multipart/form-data")]),
+            ),
+            (
+                "chunked with no length",
+                heads(&[("transfer-encoding", "chunked")]),
+            ),
+        ] {
+            assert!(!may_hold(&headers), "{name} is not holdable");
+            assert_eq!(
+                may_race(&headers, asked),
+                Hedge::NONE,
+                "{name} may not race"
+            );
+        }
     }
 
     #[test]

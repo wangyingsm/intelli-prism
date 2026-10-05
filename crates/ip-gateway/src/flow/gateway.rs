@@ -1485,6 +1485,144 @@ mod tests {
         );
     }
 
+    /// A conversation body: one system prompt, then this exchange.
+    fn conversation(turns: &[(&str, &str)]) -> String {
+        let messages = turns
+            .iter()
+            .map(|(role, content)| format!("{{\"role\": \"{role}\", \"content\": \"{content}\"}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{\"model\": \"claude\", \"system\": \"talk\", \"messages\": [{messages}]}}")
+    }
+
+    #[tokio::test]
+    async fn a_conversation_is_a_turn_without_anyone_being_told_so() {
+        // The test this commit exists for: two requests of one conversation, neither
+        // carrying `x-ip-turn`, where round robin alone would have sent the second
+        // elsewhere.
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+
+        for turns in [
+            &[("user", "hi")][..],
+            &[("user", "hi"), ("assistant", "hello"), ("user", "again")][..],
+        ] {
+            gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic/messages", &conversation(turns)),
+                )
+                .await
+                .unwrap();
+            gateway.settled().await;
+        }
+        let hosts = hosts_of(&upstream);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(
+            hosts[0], hosts[1],
+            "two requests of one conversation, neither marked, reached different endpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_may_not_be_held_is_neither_read_nor_made_sticky() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+        let turns = [("user", "hi")];
+
+        for _ in 0..2 {
+            let mut asking = request("/anthropic/messages", &conversation(&turns));
+            asking
+                .headers_mut()
+                .insert("transfer-encoding", HeaderValue::from_static("chunked"));
+            gateway.handle(context(granted()), asking).await.unwrap();
+            gateway.settled().await;
+        }
+        let hosts = hosts_of(&upstream);
+        assert_eq!(hosts.len(), 2, "one send each, nothing raced or repeated");
+        assert_ne!(
+            hosts[0], hosts[1],
+            "a body that may not be held was made sticky anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marked_turn_is_the_turn_whatever_the_conversation_says() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+
+        for turns in [
+            &[("user", "hi")][..],
+            &[("user", "something else entirely")][..],
+        ] {
+            gateway
+                .handle(
+                    in_turn(granted(), "turn-9"),
+                    request("/anthropic/messages", &conversation(turns)),
+                )
+                .await
+                .unwrap();
+            gateway.settled().await;
+        }
+        let hosts = hosts_of(&upstream);
+        assert_eq!(
+            hosts[0], hosts[1],
+            "a caller that named its turn was overruled by the conversation's own anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compaction_starts_a_new_turn_though_its_anchor_survives() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()));
+
+        // The opening survives the compaction — same system prompt, same first user
+        // message — so only the count tells the summarised history from a longer one.
+        for turns in [
+            &[("user", "hi"), ("assistant", "hello"), ("user", "again")][..],
+            &[("user", "hi"), ("user", "again")][..],
+            &[("user", "hi"), ("user", "again"), ("assistant", "twice")][..],
+        ] {
+            gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic/messages", &conversation(turns)),
+                )
+                .await
+                .unwrap();
+            gateway.settled().await;
+        }
+        let hosts = hosts_of(&upstream);
+        assert_ne!(
+            hosts[1], hosts[0],
+            "the shrunk history continued the turn it compacted away"
+        );
+        assert_eq!(
+            hosts[2], hosts[1],
+            "the turn the compaction started did not stay the turn it landed on"
+        );
+    }
+
     /// The hosts an upstream was sent to, in the order it was sent to them.
     fn hosts_of(upstream: &FakeUpstream) -> Vec<String> {
         upstream

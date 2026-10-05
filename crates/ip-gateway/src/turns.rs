@@ -9,6 +9,11 @@
 //! The verdict a turn leaves carries the class the request was asked at as well as the endpoint,
 //! though nothing acts on the class yet: it is what a classifier, the change asked for after this
 //! one, would send back, and putting it here now is why that change needs no new write.
+//!
+//! Almost no client says which turn it is in, so a turn is usually recognised from the request:
+//! `opening` reads a request body — the first place a *request* body is parsed, as `measure.rs`
+//! does to a response — and the anchor of its conversation names the turn. `x-ip-turn` still
+//! wins wherever a caller sends one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +21,8 @@ use std::time::Duration;
 use ip_auth::Identity;
 use ip_cache::{Cache, CacheKey, CacheLevel, Ttl};
 use ip_core::{Difficulty, Host, Port, Replica, TurnId};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::flow::record::Pending;
 
@@ -28,42 +35,151 @@ const TURN_TTL: Duration = Duration::from_secs(15 * 60);
 /// read as a whole; a turn that named none has a slot too, and no class is not any class name.
 const NO_CLASS: &str = "-";
 
+/// The count slot of a turn whose request was never read. As with the class, the slot is always
+/// written, and a dash is the one thing a count is never spelled as.
+const NO_COUNT: &str = "-";
+
 /// Where one caller's turn landed: what the memory of §429 keeps, and reads back whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
     /// The class the request that landed was asked at, if it named one.
     pub class: Option<Difficulty>,
+    /// How many messages that request carried, once its body had been read; nothing to
+    /// compare a shrink against until it has been.
+    pub messages: Option<usize>,
     /// The endpoint it landed on.
     pub endpoint: Replica,
 }
 
 impl Verdict {
-    /// The two halves with their separator: a space is in neither a class name nor a host, and
-    /// the endpoint keeps the form `Replica` displays itself with.
+    /// The three slots with their separator: a space is in no class name, no count and no
+    /// host, and the endpoint keeps the form `Replica` displays itself with.
     fn encode(&self) -> String {
         let class = self.class.map_or(NO_CLASS, Difficulty::name);
-        format!("{class} {}", self.endpoint)
+        let messages = match self.messages {
+            Some(count) => count.to_string(),
+            None => NO_COUNT.to_owned(),
+        };
+        format!("{class} {messages} {}", self.endpoint)
     }
 
-    /// A value this read cannot make a verdict of — a name no class has, an endpoint no host
-    /// was written for — is not an error to answer with but a verdict from a gateway of another
-    /// version, which reads as the miss it always was.
+    /// A value this read cannot make a verdict of — a name no class has, a count that is not
+    /// one, an endpoint no host was written for — is not an error to answer with but a verdict
+    /// from a gateway of another version, which reads as the miss it always was.
     fn decode(stored: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(stored).ok()?;
-        let (class, endpoint) = text.split_once(' ')?;
+        let mut slots = text.split(' ');
+        let (Some(class), Some(messages), Some(endpoint)) =
+            (slots.next(), slots.next(), slots.next())
+        else {
+            return None;
+        };
+        if slots.next().is_some() {
+            return None;
+        }
         let class = match class {
             NO_CLASS => None,
             named => Some(Difficulty::named(named).ok()?),
+        };
+        let messages = match messages {
+            NO_COUNT => None,
+            count => Some(count.parse::<usize>().ok()?),
         };
         let (host, port) = endpoint.rsplit_once(':')?;
         let port = port.parse::<u16>().ok()?;
         Some(Self {
             class,
+            messages,
             endpoint: Replica {
                 host: Host::new(host).ok()?,
                 port: Port::new(port).ok()?,
             },
         })
+    }
+
+    /// Whether a request standing in front of this verdict continues the turn it landed on.
+    ///
+    /// A turn only ever adds messages; nothing but a compaction takes them away, and a
+    /// compaction is a new turn whatever the client means by it, so a lower count starts one.
+    /// The message count carries the check rather than a size threshold: a count is exact and
+    /// cheap, and a size would need a fraction of the old body that nobody could justify.
+    #[must_use]
+    pub fn continues(&self, messages: Option<usize>) -> bool {
+        !matches!((self.messages, messages), (Some(kept), Some(now)) if now < kept)
+    }
+}
+
+/// What the opening of one request says about it: the anchor its conversation is known by,
+/// and how much conversation there is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opening {
+    /// The conversation's anchor: a digest of the system prompt and the first user message,
+    /// which every request of the conversation repeats unchanged.
+    pub anchor: TurnId,
+    /// How many messages the request carries, the whole exchange and not just the opening.
+    pub messages: usize,
+}
+
+impl Opening {
+    /// Reads the opening out of a request body: its system prompt — the `system` field of one
+    /// payload shape, the first `system` message of the other — and the content of its first
+    /// user message, hashed together.
+    ///
+    /// An agent loop sends the whole history every time, so request N+1 carries request N's
+    /// opening verbatim and one digest names the conversation for all of them. The opening is
+    /// worth hashing for a reason past latency: both providers cache prompt *prefixes* per
+    /// endpoint, so a turn kept on the endpoint that already holds its prefix keeps that cache
+    /// warm too, and the caller never pays the input tokens for it twice. Affinity keyed on the
+    /// opening is affinity with the provider's own cache, not only with the gateway's dispatch.
+    ///
+    /// Content is hashed *serialised*, not walked block by block: a block may be text, an image
+    /// or a tool result, and reaching into each shape is work this does not need. One client
+    /// sending one conversation serialises its own content the same way every time, which is
+    /// all an anchor requires; two clients spelling the same conversation differently are two
+    /// turns, and that costs an affinity, not a correctness.
+    ///
+    /// A body that is not json, carries no `messages`, or holds no user message — embeddings
+    /// and plain completions fall here — has no opening, and is simply not sticky.
+    pub fn read(body: &[u8]) -> Option<Self> {
+        let value = serde_json::from_slice::<Value>(body).ok()?;
+        let messages = value.get("messages")?.as_array()?;
+        let user = first_with_role(messages, "user")?;
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, system_of(&value));
+        // A serialised json value never holds a raw NUL, so it cannot fuse the two halves.
+        hasher.update([0u8]);
+        hash_field(&mut hasher, user.get("content"));
+        let anchor = TurnId::new(&hex::encode(hasher.finalize()))
+            .unwrap_or_else(|_| unreachable!("a hex digest is exactly what an id takes"));
+        Some(Self {
+            anchor,
+            messages: messages.len(),
+        })
+    }
+}
+
+/// The prompt a conversation opens with, if it opens with one: the top-level `system` field,
+/// else a message whose role is `system`, whose content is the half of the anchor either way.
+fn system_of(value: &Value) -> Option<&Value> {
+    if let Some(system) = value.get("system") {
+        return Some(system);
+    }
+    let messages = value.get("messages")?.as_array()?;
+    first_with_role(messages, "system")?.get("content")
+}
+
+/// The first entry with this role, if there is one.
+fn first_with_role<'a>(messages: &'a [Value], role: &str) -> Option<&'a Value> {
+    messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some(role))
+}
+
+/// One half of the anchor, written as its serialised value; a missing half as the null it is.
+fn hash_field(hasher: &mut Sha256, field: Option<&Value>) {
+    match field {
+        Some(value) => hasher.update(value.to_string().as_bytes()),
+        None => hasher.update("null"),
     }
 }
 
@@ -153,6 +269,7 @@ mod tests {
     fn landed_on(host: &str) -> Verdict {
         Verdict {
             class: None,
+            messages: None,
             endpoint: Replica {
                 host: Host::new(host).unwrap(),
                 port: Port::new(443).unwrap(),
@@ -206,6 +323,174 @@ mod tests {
                 "read {stored:?} as a verdict"
             );
         }
+    }
+
+    #[test]
+    fn a_verdict_keeps_the_count_it_landed_with() {
+        let verdict = Verdict {
+            messages: Some(7),
+            ..landed_on("one.example.com")
+        };
+        assert_eq!(Verdict::decode(verdict.encode().as_bytes()), Some(verdict));
+    }
+
+    #[test]
+    fn a_count_that_is_not_one_is_no_verdict() {
+        for stored in [
+            "hard many one.example.com:443",
+            "hard -1 one.example.com:443",
+            "hard 3.5 one.example.com:443",
+            "hard 3 one.example.com:443 extra",
+        ] {
+            assert_eq!(
+                Verdict::decode(stored.as_bytes()),
+                None,
+                "read {stored:?} as a verdict"
+            );
+        }
+    }
+
+    #[test]
+    fn only_more_messages_than_the_turn_landed_with_continue_it() {
+        let kept = Verdict {
+            messages: Some(9),
+            ..landed_on("one.example.com")
+        };
+        assert!(
+            kept.continues(Some(9)),
+            "repeating a count is no compaction"
+        );
+        assert!(kept.continues(Some(13)), "adding messages continues a turn");
+        assert!(
+            !kept.continues(Some(8)),
+            "fewer messages than the turn landed with is a compaction, not a continuation"
+        );
+        // A request whose body was never read, or a verdict from before the count existed,
+        // has nothing to compare and continues on trust.
+        assert!(kept.continues(None));
+        assert!(landed_on("one.example.com").continues(Some(1)));
+    }
+
+    /// A conversation body: one system prompt (empty for none), then the exchange.
+    fn conversation(system: &str, turns: &[(&str, &str)]) -> String {
+        let system_field = if system.is_empty() {
+            String::new()
+        } else {
+            format!(", \"system\": \"{system}\"")
+        };
+        let messages = turns
+            .iter()
+            .map(|(role, content)| format!("{{\"role\": \"{role}\", \"content\": \"{content}\"}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{\"model\": \"claude\"{system_field}, \"messages\": [{messages}]}}")
+    }
+
+    fn anchor_of(body: &str) -> Option<TurnId> {
+        Opening::read(body.as_bytes()).map(|opening| opening.anchor)
+    }
+
+    #[test]
+    fn one_conversation_is_the_same_turn_whatever_it_has_become() {
+        let opening = conversation("talk", &[("user", "hi")]);
+        let next = conversation(
+            "talk",
+            &[("user", "hi"), ("assistant", "hello"), ("user", "again")],
+        );
+        assert_eq!(anchor_of(&opening), anchor_of(&next));
+    }
+
+    #[test]
+    fn two_first_user_messages_are_two_turns() {
+        assert_ne!(
+            anchor_of(&conversation("talk", &[("user", "hi")])),
+            anchor_of(&conversation("talk", &[("user", "yo")]))
+        );
+    }
+
+    #[test]
+    fn the_same_first_message_under_another_system_prompt_is_another_turn() {
+        assert_ne!(
+            anchor_of(&conversation("talk", &[("user", "hi")])),
+            anchor_of(&conversation("walk", &[("user", "hi")]))
+        );
+    }
+
+    #[test]
+    fn a_system_message_opens_the_same_turn_a_system_field_does() {
+        let field = conversation("talk", &[("user", "hi")]);
+        let as_message = "{\"messages\": [{\"role\": \"system\", \"content\": \"talk\"}, \
+            {\"role\": \"user\", \"content\": \"hi\"}]}";
+        assert_eq!(anchor_of(&field), anchor_of(as_message));
+    }
+
+    #[test]
+    fn content_blocks_are_read_as_well_as_strings() {
+        let blocks = |text: &str| {
+            format!(
+                "{{\"system\": [{{\"type\": \"text\", \"text\": \"{text}\"}}], \
+                 \"messages\": [{{\"role\": \"user\", \"content\": \"hi\"}}]}}"
+            )
+        };
+        assert_eq!(anchor_of(&blocks("talk")), anchor_of(&blocks("talk")));
+        assert_ne!(anchor_of(&blocks("talk")), anchor_of(&blocks("walk")));
+    }
+
+    #[test]
+    fn no_conversation_has_no_anchor_and_no_complaint() {
+        for body in [
+            "",
+            "not json at all",
+            "{\"model\": \"embed\", \"input\": \"text\"}",
+            "{\"messages\": []}",
+            "{\"messages\": [{\"role\": \"assistant\", \"content\": \"only\"}]}",
+        ] {
+            assert_eq!(anchor_of(body), None, "anchored {body:?}");
+        }
+    }
+
+    #[test]
+    fn every_anchor_is_an_id() {
+        // The whole trick rests on a hex digest fitting `TurnId`: assert it, do not assume
+        // the charset.
+        for body in [
+            conversation("talk", &[("user", "hi")]),
+            conversation("", &[("user", "hi")]),
+            conversation(
+                "talk",
+                &[("user", "hi"), ("assistant", "hello"), ("user", "again")],
+            ),
+        ] {
+            let anchor = anchor_of(&body).expect("a conversation has an anchor");
+            assert!(TurnId::new(anchor.as_str()).is_ok(), "{anchor} is no id");
+        }
+    }
+
+    #[test]
+    fn an_opening_counts_the_whole_exchange_not_just_its_opening() {
+        let next = conversation(
+            "talk",
+            &[("user", "hi"), ("assistant", "hello"), ("user", "again")],
+        );
+        assert_eq!(Opening::read(next.as_bytes()).unwrap().messages, 3);
+    }
+
+    #[test]
+    fn a_shrunk_history_starts_the_turn_and_a_grown_one_carries_it() {
+        // Both directions of the shrink check as the landing verdict actually applies them:
+        // a middle compaction keeps the opening whole, and only the count notices.
+        let opening = conversation("talk", &[("user", "hi")]);
+        let grown = conversation(
+            "talk",
+            &[("user", "hi"), ("assistant", "hello"), ("user", "again")],
+        );
+        let read = |body: &str| Opening::read(body.as_bytes()).unwrap().messages;
+        let landed = Verdict {
+            messages: Some(read(&grown)),
+            ..landed_on("one.example.com")
+        };
+        assert!(!landed.continues(Some(read(&opening))));
+        assert!(landed.continues(Some(read(&grown) + 2)));
     }
 
     #[tokio::test]
