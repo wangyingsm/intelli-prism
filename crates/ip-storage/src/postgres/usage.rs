@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, Hedge, ModelName, Replica, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Difficulty, Hedge, ModelName, Replica, TenantId, Timestamp, Tokens, TraceId,
+    TurnId, UserId,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -16,8 +17,8 @@ impl UsageStore for PostgresStore {
         let row = sqlx::query(
             "INSERT INTO usage (trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             created_at, raced_across, dispatched_class) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
              RETURNING row_id, created_at",
         )
         .bind(usage.trace.to_hex())
@@ -44,6 +45,7 @@ impl UsageStore for PostgresStore {
         .bind(i64::from(usage.latency.millis()))
         .bind(Timestamp::now().unix_seconds())
         .bind(i64::from(usage.raced_across.get()))
+        .bind(usage.dispatched_class.map(Difficulty::name))
         .fetch_one(&self.pool)
         .await
         .map_err(StorageError::backend)?;
@@ -60,6 +62,7 @@ impl UsageStore for PostgresStore {
             served: usage.served,
             served_by: usage.served_by,
             raced_across: usage.raced_across,
+            dispatched_class: usage.dispatched_class,
             latency: usage.latency,
             created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
         })
@@ -69,7 +72,7 @@ impl UsageStore for PostgresStore {
         let row = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across FROM usage WHERE row_id = $1",
+             created_at, raced_across, dispatched_class FROM usage WHERE row_id = $1",
         )
         .bind(row_id.get())
         .fetch_optional(&self.pool)
@@ -155,6 +158,12 @@ fn raced_across(row: &PgRow) -> Result<Hedge, StorageError> {
     })
 }
 
+/// The class a stored row was dispatched at, refusing a name this code does not carry.
+fn dispatched_class(row: &PgRow) -> Result<Option<Difficulty>, StorageError> {
+    let named: Option<String> = row.get("dispatched_class");
+    Ok(named.map(|name| Difficulty::named(&name)).transpose()?)
+}
+
 /// Rebuilds a usage row, refusing one whose stored value its own type will not take.
 pub(super) fn recorded(row: PgRow) -> Result<Usage, StorageError> {
     let turn: Option<String> = row.get("turn_id");
@@ -178,6 +187,7 @@ pub(super) fn recorded(row: PgRow) -> Result<Usage, StorageError> {
         served: served_of(&source)?,
         served_by: served_by(&row)?,
         raced_across: raced_across(&row)?,
+        dispatched_class: dispatched_class(&row)?,
         latency: latency(row.get("latency_ms"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })

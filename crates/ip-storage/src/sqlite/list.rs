@@ -273,7 +273,7 @@ impl ListStore for SqliteStore {
         let rows = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across FROM usage \
+             created_at, raced_across, dispatched_class FROM usage \
              WHERE created_at > ?1 \
              AND (?2 IS NULL OR tenant_id = ?2) \
              AND (?3 IS NULL OR user_id = ?3) \

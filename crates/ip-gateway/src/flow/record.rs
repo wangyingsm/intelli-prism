@@ -159,6 +159,8 @@ impl Recording {
             served: serving.source,
             served_by: serving.endpoint,
             raced_across: serving.arms,
+            // What the request was dispatched at arrives with the thing that decides it.
+            dispatched_class: None,
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;

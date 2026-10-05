@@ -480,6 +480,7 @@ impl UsageStore for Ledger {
             served: usage.served,
             served_by: usage.served_by,
             raced_across: usage.raced_across,
+            dispatched_class: usage.dispatched_class,
             latency: usage.latency,
             created_at: ip_core::Timestamp::now(),
         };

@@ -218,6 +218,7 @@ macro_rules! backend_suite {
             nothing_spent_sums_to_nothing,
             a_row_says_which_endpoint_behind_the_rule_answered,
             a_row_says_how_many_endpoints_it_was_raced_across,
+            a_row_says_what_class_it_was_dispatched_at,
             a_row_the_cache_answered_names_no_endpoint,
         ]);
     };

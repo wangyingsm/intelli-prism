@@ -7,7 +7,8 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ip_core::{
-    ApiId, Capability, CapabilityScope, Hedge, Latency, Served, TenantId, Timestamp, UserId,
+    ApiId, Capability, CapabilityScope, Difficulty, Hedge, Latency, Served, TenantId, Timestamp,
+    UserId,
 };
 use ip_storage::{Usage, UsageFilter};
 
@@ -53,6 +54,9 @@ pub struct UsageView {
     /// How many endpoints behind the rule it was raced across; one is what it was before
     /// anything raced.
     pub raced_across: Hedge,
+    /// The difficulty class the request was dispatched at, absent when it named none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched_class: Option<Difficulty>,
     /// How long the caller waited, in milliseconds.
     pub latency_ms: u32,
     /// When it was recorded, in seconds since the unix epoch.
@@ -73,6 +77,7 @@ impl From<Usage> for UsageView {
             served: usage.served,
             served_by: usage.served_by.map(|replica| replica.to_string()),
             raced_across: usage.raced_across,
+            dispatched_class: usage.dispatched_class,
             latency_ms: Latency::millis(usage.latency),
             created_at: usage.created_at,
         }
@@ -219,6 +224,7 @@ mod tests {
                 port: ip_core::Port::new(443).unwrap(),
             }),
             raced_across: Hedge::default(),
+            dispatched_class: None,
             latency: Latency::from_millis(1_250),
         }
     }
@@ -307,6 +313,7 @@ mod tests {
             user: user("dave"),
             api: ApiId::new("anthropic").unwrap(),
             raced_across: Hedge::new(2).unwrap(),
+            dispatched_class: Some(Difficulty::Hard),
             ..spent("other", "dave", "anthropic")
         };
         store.record_usage(count).await.unwrap();
@@ -325,14 +332,21 @@ mod tests {
         assert_eq!(row["served"], "upstream");
         assert_eq!(row["served_by"], "one.example.com:443");
         assert_eq!(row["raced_across"], 2);
+        assert_eq!(row["dispatched_class"], "hard");
         assert_eq!(row["latency_ms"], 1250);
         assert_eq!(row["turn"], "turn-1");
         assert!(row["created_at"].is_number(), "a time is not a number");
         assert_eq!(row["trace"].as_str().unwrap().len(), 32);
 
         // A default row still renders as one, that both a raced count and the ordinary one
-        // reach the view.
+        // reach the view, and one without a class renders without the key at all rather than
+        // with a null in it.
         assert_eq!(listed.as_array().unwrap()[1]["raced_across"], 1);
+        assert!(
+            listed.as_array().unwrap()[1]
+                .get("dispatched_class")
+                .is_none()
+        );
     }
 
     #[tokio::test]

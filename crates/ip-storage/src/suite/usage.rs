@@ -1,6 +1,6 @@
 use ip_core::{
-    ApiId, Counted, Hedge, Host, Latency, ModelName, Port, Replica, Served, TenantId, TokenCount,
-    Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Difficulty, Hedge, Host, Latency, ModelName, Port, Replica, Served, TenantId,
+    TokenCount, Tokens, TraceId, TurnId, UserId,
 };
 
 use crate::list::Page;
@@ -23,6 +23,7 @@ pub(crate) fn spent() -> NewUsage {
             port: Port::new(443).unwrap(),
         }),
         raced_across: Hedge::default(),
+        dispatched_class: None,
         latency: Latency::from_millis(1_250),
     }
 }
@@ -406,4 +407,26 @@ pub(crate) async fn a_row_the_cache_answered_names_no_endpoint(store: &impl Back
     let read = store.usage(recorded.row_id).await.unwrap().unwrap();
     assert_eq!(read.served_by, None);
     assert_eq!(read.served, Served::Cache);
+}
+
+/// One request dispatched at a class it named: the class round-trips onto the row and out
+/// of the paged list, and a request that named none reads back with none.
+pub(crate) async fn a_row_says_what_class_it_was_dispatched_at(store: &impl Backend) {
+    let classed = NewUsage {
+        dispatched_class: Some(Difficulty::Hard),
+        ..spent()
+    };
+    let recorded = store.record_usage(classed).await.unwrap();
+    let read = store.usage(recorded.row_id).await.unwrap().unwrap();
+    assert_eq!(read.dispatched_class, Some(Difficulty::Hard));
+    let listed = store
+        .list_usage(&UsageFilter::default(), Page::default())
+        .await
+        .unwrap();
+    assert_eq!(listed, vec![recorded]);
+
+    let unclassed = store.record_usage(spent()).await.unwrap();
+    assert_eq!(unclassed.dispatched_class, None);
+    let read = store.usage(unclassed.row_id).await.unwrap().unwrap();
+    assert_eq!(read.dispatched_class, None);
 }
