@@ -5,7 +5,7 @@ use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use ip_auth::Authority;
 use ip_cache::Cache;
-use ip_core::{Hedge, Protocol, Replica, TraceId, TurnId};
+use ip_core::{Difficulty, Hedge, Protocol, Replica, TraceId, TurnId};
 use ip_storage::UsageStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -206,6 +206,9 @@ impl Gateway {
         .instrument(taking_in)
         .await;
         let (mut processed, chains, api) = taken?;
+        // Read once here, where the header chain left it, so both answers — the cache's and
+        // the upstream's — record the same class the request was dispatched at.
+        let class = processed.class();
         let asking = Asking {
             tenant: followed.tenant.clone(),
             user: followed.user.clone(),
@@ -231,7 +234,7 @@ impl Gateway {
             let answered = stage_span!(EGRESS_RESPONSE, followed);
             answered.record("hit", false);
             let sent = async { done.into_response() }.instrument(answered).await?;
-            return Ok(measuring(sent, recording, served_by, raced));
+            return Ok(measuring(sent, recording, served_by, raced, class));
         };
         // A hit answers here, spending no tokens and running no response processor, as designed.
         let key = processed.response_key().await?;
@@ -240,7 +243,7 @@ impl Gateway {
                 let answered = stage_span!(EGRESS_RESPONSE, followed);
                 answered.record("hit", true);
                 if let Some(recording) = recording {
-                    recording.out_of_the_cache(hit.body());
+                    recording.out_of_the_cache(hit.body(), class);
                 }
                 return Ok(answered.in_scope(|| answer_with(hit)));
             }
@@ -259,7 +262,7 @@ impl Gateway {
         let answered = stage_span!(EGRESS_RESPONSE, followed);
         answered.record("hit", false);
         let sent = async { done.into_response() }.instrument(answered).await?;
-        Ok(measuring(sent, recording, served_by, raced))
+        Ok(measuring(sent, recording, served_by, raced, class))
     }
 
     /// Refuses a request that has run out of what it may spend, or that cannot be counted.
@@ -328,12 +331,13 @@ fn measuring(
     recording: Option<Recording>,
     served_by: Replica,
     raced: Hedge,
+    class: Option<Difficulty>,
 ) -> Response<GatewayBody> {
     let Some(recording) = recording else {
         return response;
     };
     let (parts, body) = response.into_parts();
-    Response::from_parts(parts, recording.measuring(body, served_by, raced))
+    Response::from_parts(parts, recording.measuring(body, served_by, raced, class))
 }
 
 /// Answers from what the cache held, without any stage after the request body running.
@@ -771,6 +775,127 @@ mod tests {
         assert_eq!(hit.served, Served::Cache);
         assert_eq!(hit.tokens, Tokens::ZERO);
         assert_eq!(hit.model.unwrap().as_str(), "claude-opus-5");
+    }
+
+    #[tokio::test]
+    async fn a_recorded_request_names_the_class_it_was_dispatched_at() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            ceiled_table(&[("hard.example.com", Some(ip_core::Difficulty::Hard))]),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .recording(recorder);
+
+        let mut asked = request("/anthropic/messages", "ask");
+        asked
+            .headers_mut()
+            .insert("x-ip-difficulty", HeaderValue::from_static("hard"));
+        let answered = gateway.handle(context(granted()), asked).await.unwrap();
+        body_of(answered).await;
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+
+        // A request that named none records none, its row sitting beside the first.
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(row.dispatched_class, None);
+    }
+
+    /// The counterpart on the row of `a_header_processor_naming_the_class_is_honoured`: the
+    /// row keeps what the processor set, not the nothing the request arrived with.
+    #[tokio::test]
+    async fn a_class_named_by_a_header_processor_is_recorded_on_the_row() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            ceiled_table(&[
+                ("silent.example.com", None),
+                ("hard.example.com", Some(ip_core::Difficulty::Hard)),
+            ]),
+            ProcessorChain::new().with_request_header(SetHeader::new("x-ip-difficulty", "hard")),
+            FakeUpstream::answering("pong"),
+        )
+        .recording(recorder);
+
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+    }
+
+    /// The one a reader gets wrong: a cache answer keeps the class the request named, since
+    /// the class is the request's own, while naming no endpoint, since none was reached.
+    #[tokio::test]
+    async fn an_answer_out_of_the_cache_records_the_class_it_named() {
+        let (recorder, mut recorded) = Ledger::new();
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        )
+        .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
+        .recording(recorder);
+        let hard = |mut req: http::Request<crate::body::GatewayBody>| {
+            req.headers_mut()
+                .insert("x-ip-difficulty", HeaderValue::from_static("hard"));
+            req
+        };
+
+        let first = gateway
+            .handle(
+                context(granted()),
+                hard(request("/anthropic/messages", "ask")),
+            )
+            .await
+            .unwrap();
+        body_of(first).await;
+        assert_eq!(recorded.recv().await.unwrap().served, Served::Upstream);
+
+        let second = gateway
+            .handle(
+                context(granted()),
+                hard(request("/anthropic/messages", "ask")),
+            )
+            .await
+            .unwrap();
+        body_of(second).await;
+        let hit = recorded.recv().await.unwrap();
+        assert_eq!(hit.served, Served::Cache);
+        assert_eq!(hit.served_by, None, "a cache answer reached no endpoint");
+        assert_eq!(hit.dispatched_class, Some(ip_core::Difficulty::Hard));
+    }
+
+    /// A class that cannot be read is refused where the header chain ends, before anything
+    /// is recorded: the request never reaches the recording at all.
+    #[tokio::test]
+    async fn a_request_refused_for_an_unreadable_class_writes_no_row() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .recording(recorder);
+        let mut asked = request("/anthropic/messages", "ask");
+        asked
+            .headers_mut()
+            .insert("x-ip-difficulty", HeaderValue::from_static("epic"));
+
+        let refused = gateway.handle(context(granted()), asked).await.unwrap_err();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        gateway.settled().await;
+        assert!(
+            recorded.try_recv().is_err(),
+            "a request refused before dispatch wrote a row anyway"
+        );
     }
 
     #[tokio::test]

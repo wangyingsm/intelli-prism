@@ -197,6 +197,14 @@ impl Flow<HeadersProcessed> {
 }
 
 impl Flow<BodyProcessed> {
+    /// What the request is dispatched at, read once where the header chain left it: anything
+    /// that needs the class later takes it from here rather than reading the header again,
+    /// which could let two readings disagree.
+    #[must_use]
+    pub fn class(&self) -> Option<Difficulty> {
+        self.held.class
+    }
+
     /// Names this request in the response cache, buffering the body it is keyed by so the
     /// request can still be forwarded.
     pub async fn response_key(&mut self) -> Result<CacheKey, GatewayError> {
