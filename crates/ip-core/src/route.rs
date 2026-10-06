@@ -615,6 +615,57 @@ impl fmt::Display for Hedge {
     }
 }
 
+/// How long a hedged rule waits before sending the next arm, in milliseconds.
+///
+/// A fixed wait per rule, not a figure read from observed latency: hedging exists for the
+/// slow tail, and a percentile needs a distribution this gateway does not keep — the mean it
+/// does keep is the wrong statistic for the question. The type's own range is the sanity
+/// check: past sixty-five seconds the gateway is not waiting on a request anyway.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct HedgeDelay(u16);
+
+impl HedgeDelay {
+    /// Arms go out together with no waiting, which is what every rule did before the wait
+    /// existed.
+    pub const NONE: Self = Self(0);
+
+    /// Wraps a wait in milliseconds. Any width the type holds is a wait it will keep.
+    pub const fn new(millis: u16) -> Self {
+        Self(millis)
+    }
+
+    /// The wait in milliseconds.
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+
+    /// Whether the arms go out together.
+    pub const fn is_none(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl Default for HedgeDelay {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl From<HedgeDelay> for u16 {
+    fn from(delay: HedgeDelay) -> Self {
+        delay.get()
+    }
+}
+
+impl fmt::Display for HedgeDelay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// How hard a request is, and the hardest class an endpoint serves.
 ///
 /// The variants are declared easiest first, and that declaration order *is* the total order:
@@ -771,6 +822,11 @@ pub struct RouteRule {
     /// says otherwise, which is what a rule written before this existed does.
     #[serde(default)]
     pub hedge: Hedge,
+    /// How long a raced request waits before its next arm goes out. None unless the rule says
+    /// otherwise, and skipped from the payload when none, so a rule that never waits reads as
+    /// the rule it always was.
+    #[serde(default, skip_serializing_if = "HedgeDelay::is_none")]
+    pub hedge_delay: HedgeDelay,
 }
 
 #[cfg(test)]
@@ -1022,6 +1078,7 @@ mod tests {
             target: target.clone(),
             strategy: Strategy::default(),
             hedge: Hedge::default(),
+            hedge_delay: HedgeDelay::default(),
         };
         assert_eq!(rule.key.endpoint().host.as_str(), "gateway.local");
         assert_eq!(rule.target.primary().host.as_str(), "api.example.com");
@@ -1081,6 +1138,55 @@ mod tests {
             Weight::DRAINED
         );
         assert_eq!(serde_json::to_string(&Weight::new(2)).unwrap(), "2");
+    }
+
+    #[test]
+    fn a_hedge_delay_of_zero_sends_together_and_is_the_default() {
+        assert_eq!(HedgeDelay::default(), HedgeDelay::NONE);
+        assert!(HedgeDelay::NONE.is_none());
+        assert!(!HedgeDelay::new(250).is_none());
+        assert_eq!(HedgeDelay::new(250).get(), 250);
+        assert_eq!(HedgeDelay::new(250).to_string(), "250");
+        assert_eq!(serde_json::to_string(&HedgeDelay::new(250)).unwrap(), "250");
+        assert_eq!(
+            serde_json::from_str::<HedgeDelay>("250").unwrap(),
+            HedgeDelay::new(250)
+        );
+    }
+
+    #[test]
+    fn a_hedge_delay_the_type_cannot_hold_is_refused_on_read() {
+        // The width is the whole check: 65_535 is a wait, 65_536 is not a delay anyone is
+        // still waiting for.
+        assert!(serde_json::from_str::<HedgeDelay>("65535").is_ok());
+        assert!(serde_json::from_str::<HedgeDelay>("65536").is_err());
+        assert!(serde_json::from_str::<HedgeDelay>("-1").is_err());
+    }
+
+    #[test]
+    fn a_rule_without_a_delay_carries_no_field_and_a_rule_with_one_carries_it() {
+        let rule = RouteRule {
+            api: ApiId::new("chat").unwrap(),
+            key: RouteKey::new(endpoint(Protocol::Https, "gateway.local", 443, "/v1")),
+            target: RouteTarget::new(endpoint(Protocol::Https, "api.example.com", 443, "/v1")),
+            strategy: Strategy::default(),
+            hedge: Hedge::NONE,
+            hedge_delay: HedgeDelay::default(),
+        };
+        let written = serde_json::to_string(&rule).unwrap();
+        assert!(
+            !written.contains("hedge_delay"),
+            "the default wait was written: {written}"
+        );
+        assert_eq!(serde_json::from_str::<RouteRule>(&written).unwrap(), rule);
+
+        let waited = RouteRule {
+            hedge_delay: HedgeDelay::new(250),
+            ..rule
+        };
+        let written = serde_json::to_string(&waited).unwrap();
+        assert!(written.contains(r#""hedge_delay":250"#), "{written}");
+        assert_eq!(serde_json::from_str::<RouteRule>(&written).unwrap(), waited);
     }
 
     #[test]

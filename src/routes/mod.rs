@@ -526,6 +526,7 @@ secret = "0123456789abcdef0123456789abcdef"
             target: RouteTarget::new(endpoint("upstream.local", 80, "/v1")),
             strategy: ip_core::Strategy::default(),
             hedge: ip_core::Hedge::default(),
+            hedge_delay: ip_core::HedgeDelay::default(),
         }
     }
 

@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use ip_core::{
-    AbsPath, ApiId, Difficulty, Endpoint, Hedge, Host, ModelName, Port, Protocol, RouteKey,
-    RouteRule, RouteTarget, Strategy, Weight, Weighted,
+    AbsPath, ApiId, Difficulty, Endpoint, Hedge, HedgeDelay, Host, ModelName, Port, Protocol,
+    RouteKey, RouteRule, RouteTarget, Strategy, Weight, Weighted,
 };
 use url::Url;
 
@@ -36,6 +36,9 @@ pub struct UpstreamConfig {
     /// How many of this upstream's endpoints one request is raced across.
     #[serde(default)]
     pub hedge: Hedge,
+    /// How long a raced request waits before its next arm goes out.
+    #[serde(default)]
+    pub hedge_delay: HedgeDelay,
     /// The hardest request `base_url` serves, and everything easier than it. Nothing
     /// unless it says otherwise, which serves anything.
     #[serde(default)]
@@ -142,6 +145,7 @@ impl UpstreamConfig {
             target: self.route_target()?,
             strategy: self.strategy,
             hedge: self.hedge,
+            hedge_delay: self.hedge_delay,
         })
     }
 }
@@ -198,6 +202,7 @@ mod tests {
             weight: Weight::default(),
             strategy: Strategy::default(),
             hedge: Hedge::default(),
+            hedge_delay: HedgeDelay::default(),
             serves: None,
             targets: Vec::new(),
         }
@@ -370,6 +375,21 @@ mod tests {
             ..upstream("https://api.anthropic.com/v1", None)
         };
         assert_eq!(raced.route_rule(listen()).unwrap().hedge.get(), 2);
+    }
+
+    #[test]
+    fn an_upstream_waits_nothing_between_arms_unless_it_says_otherwise() {
+        let one = upstream("https://api.anthropic.com/v1", None);
+        assert_eq!(
+            one.route_rule(listen()).unwrap().hedge_delay,
+            HedgeDelay::NONE
+        );
+
+        let waited = UpstreamConfig {
+            hedge_delay: HedgeDelay::new(250),
+            ..upstream("https://api.anthropic.com/v1", None)
+        };
+        assert_eq!(waited.route_rule(listen()).unwrap().hedge_delay.get(), 250);
     }
 
     #[test]

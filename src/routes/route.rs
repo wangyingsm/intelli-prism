@@ -187,6 +187,7 @@ mod tests {
             target: RouteTarget::new(endpoint(upstream, "/v1")),
             strategy: ip_core::Strategy::default(),
             hedge: ip_core::Hedge::default(),
+            hedge_delay: ip_core::HedgeDelay::default(),
         }
     }
 
@@ -307,6 +308,22 @@ mod tests {
         )
     }
 
+    /// A rule racing across two endpoints, waiting `delay` milliseconds between the arms.
+    fn delayed(delay: i64) -> String {
+        format!(
+            r#"{{
+                "api": "chat",
+                "key": {{"protocol": "https", "host": "gateway.local", "port": 443, "path": "/v1"}},
+                "hedge": 2,
+                "hedge_delay": {delay},
+                "target": [
+                    {{"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1"}},
+                    {{"protocol": "https", "host": "two.example.com", "port": 443, "path": "/v1"}}
+                ]
+            }}"#
+        )
+    }
+
     /// A rule over two endpoints, the first serving at most the class named.
     fn ceiled(serves: &str) -> String {
         format!(
@@ -360,6 +377,10 @@ mod tests {
         let listed = listed(&router, &state).await;
         assert_eq!(listed[0]["strategy"], "round_robin");
         assert_eq!(listed[0]["hedge"], 1);
+        assert!(
+            listed[0].get("hedge_delay").is_none(),
+            "a rule that waits nothing grew a zero"
+        );
         assert_eq!(listed[0]["target"][0]["weight"], 1);
         assert!(listed[0]["target"][0].get("serves").is_none());
     }
@@ -455,6 +476,31 @@ mod tests {
                 refused.status(),
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "a hedge of {asked} was stored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_is_stored_with_the_hedge_delay_it_names() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let stored = call(&router, &state, "root", "PUT", Some(&delayed(250))).await;
+        assert_eq!(stored.status(), StatusCode::NO_CONTENT);
+
+        let listed = listed(&router, &state).await;
+        assert_eq!(listed[0]["hedge_delay"], 250);
+    }
+
+    #[tokio::test]
+    async fn a_hedge_delay_past_what_the_type_holds_is_refused() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        for asked in [-1, 65_536] {
+            let refused = call(&router, &state, "root", "PUT", Some(&delayed(asked))).await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a hedge delay of {asked} was stored"
             );
         }
     }

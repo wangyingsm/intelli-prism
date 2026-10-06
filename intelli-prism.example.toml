@@ -79,6 +79,8 @@ log_level = "info"
 # successful answer — a slow endpoint failing does not end the race. A request that cannot be
 # sent twice is sent once instead: a body declared too large to hold, a body that declares no
 # length, or a file upload. The usage row says how many arms each request took.
+# A `hedge_delay` in milliseconds holds each arm until the one before it has been running
+# that long; zero, the default, sends them all together.
 # A `serves` caps a replica at the hardest class of request it serves, and everything
 # easier than it. An endpoint or upstream that names none serves anything, as it always did.
 [[upstream]]

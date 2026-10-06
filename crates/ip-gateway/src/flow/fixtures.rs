@@ -271,6 +271,7 @@ pub(super) fn rule(target: Endpoint) -> RouteRule {
         target: RouteTarget::new(target),
         strategy: ip_core::Strategy::default(),
         hedge: ip_core::Hedge::default(),
+        hedge_delay: ip_core::HedgeDelay::default(),
     }
 }
 

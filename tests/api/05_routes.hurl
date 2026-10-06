@@ -59,6 +59,7 @@ x-ip-csrf: 1
   "key": {"protocol": "https", "host": "gateway.local", "port": 443, "path": "/replicated"},
   "strategy": "ratio",
   "hedge": 2,
+  "hedge_delay": 250,
   "target": [
     {"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1", "weight": 3, "serves": "hard"},
     {"protocol": "https", "host": "two.example.com", "port": 443, "path": "/v1"},
@@ -72,6 +73,7 @@ HTTP 200
 [Asserts]
 jsonpath "$[?(@.key.path == '/replicated')].strategy" nth 0 == "ratio"
 jsonpath "$[?(@.key.path == '/replicated')].hedge" nth 0 == 2
+jsonpath "$[?(@.key.path == '/replicated')].hedge_delay" nth 0 == 250
 jsonpath "$[?(@.key.path == '/replicated')].target[0].weight" nth 0 == 3
 jsonpath "$[?(@.key.path == '/replicated')].target[0].serves" nth 0 == "hard"
 jsonpath "$[?(@.key.path == '/replicated')].target[1].weight" nth 0 == 1
@@ -92,6 +94,7 @@ HTTP 200
 [Asserts]
 jsonpath "$[?(@.key.path == '/plain')].strategy" nth 0 == "round_robin"
 jsonpath "$[?(@.key.path == '/plain')].hedge" nth 0 == 1
+jsonpath "$[?(@.key.path == '/plain')].hedge_delay" count == 0
 jsonpath "$[?(@.key.path == '/plain')].target[0].weight" nth 0 == 1
 
 # A strategy this gateway does not carry is refused rather than stored and ignored.

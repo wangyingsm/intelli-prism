@@ -73,6 +73,7 @@ fn table(rules: usize, target: &str) -> RoutingTable {
             target: RouteTarget::new(endpoint(target, "/v1")),
             strategy: ip_core::Strategy::default(),
             hedge: ip_core::Hedge::default(),
+            hedge_delay: ip_core::HedgeDelay::default(),
         })
         .collect();
     RoutingTable::build(&config, dynamic).unwrap()

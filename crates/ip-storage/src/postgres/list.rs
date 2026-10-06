@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Difficulty, Endpoint, Grant, Hedge, PluginRule, RouteKey, RouteRule, RouteTarget,
-    Strategy, TenantId, Timestamp, UserId, Weight, Weighted,
+    ApiId, Difficulty, Endpoint, Grant, Hedge, HedgeDelay, PluginRule, RouteKey, RouteRule,
+    RouteTarget, Strategy, TenantId, Timestamp, UserId, Weight, Weighted,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -72,6 +72,16 @@ fn hedge(row: &PgRow) -> Result<Hedge, StorageError> {
         detail: format!("{stored} is not a hedge"),
     })?;
     Ok(Hedge::new(across)?)
+}
+
+/// How long a listed rule waits before its next arm, refusing a wait this code cannot hold.
+fn hedge_delay(row: &PgRow) -> Result<HedgeDelay, StorageError> {
+    let stored: i64 = row.get("hedge_delay");
+    let millis = u16::try_from(stored).map_err(|_| StorageError::Malformed {
+        entity: Entity::Route,
+        detail: format!("{stored} is not a hedge delay"),
+    })?;
+    Ok(HedgeDelay::new(millis))
 }
 
 #[async_trait]
@@ -161,7 +171,7 @@ impl ListStore for PostgresStore {
     async fn list_routes(&self, page: Page) -> Result<Vec<Listed<RouteRule>>, StorageError> {
         let rows = sqlx::query(
             "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-             r.created_at, r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight, \
+             r.created_at, r.strategy, r.hedge, r.hedge_delay, t.protocol, t.host, t.port, t.path, t.weight, \
              t.serves FROM \
              (SELECT * FROM routes WHERE created_at > $1 \
               ORDER BY created_at DESC, row_id DESC LIMIT $2 OFFSET $3) r \
@@ -196,6 +206,7 @@ impl ListStore for PostgresStore {
                     target: RouteTarget::from_weighted(vec![target])?,
                     strategy: strategy(row)?,
                     hedge: hedge(row)?,
+                    hedge_delay: hedge_delay(row)?,
                 },
                 created_at: created_at(row)?,
             });

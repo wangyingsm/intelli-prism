@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Difficulty, Endpoint, Hedge, RouteKey, RouteRule, RouteTarget, Strategy, Timestamp,
-    Weight, Weighted,
+    ApiId, Difficulty, Endpoint, Hedge, HedgeDelay, RouteKey, RouteRule, RouteTarget, Strategy,
+    Timestamp, Weight, Weighted,
 };
 use sqlx::{Row, SqliteConnection};
 
@@ -16,10 +16,12 @@ impl RouteStore for SqliteStore {
         let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
         let route_row_id: i64 = sqlx::query_scalar(
             "INSERT INTO routes \
-             (api_id, key_protocol, key_host, key_port, key_path, strategy, hedge, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             (api_id, key_protocol, key_host, key_port, key_path, strategy, hedge, hedge_delay, \
+             created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
-             api_id = excluded.api_id, strategy = excluded.strategy, hedge = excluded.hedge \
+             api_id = excluded.api_id, strategy = excluded.strategy, hedge = excluded.hedge, \
+             hedge_delay = excluded.hedge_delay \
              RETURNING row_id",
         )
         .bind(rule.api.as_str())
@@ -29,6 +31,7 @@ impl RouteStore for SqliteStore {
         .bind(key.path.as_str())
         .bind(rule.strategy.name())
         .bind(i64::from(rule.hedge.get()))
+        .bind(i64::from(rule.hedge_delay.get()))
         .bind(Timestamp::now().unix_seconds())
         .fetch_one(&mut *transaction)
         .await
@@ -89,7 +92,8 @@ impl RouteStore for SqliteStore {
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
         let endpoint = key.endpoint();
         let rows = sqlx::query(
-            "SELECT r.api_id, r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight, \
+            "SELECT r.api_id, r.strategy, r.hedge, r.hedge_delay, t.protocol, t.host, t.port, \
+             t.path, t.weight, \
              t.serves \
              FROM routes r \
              JOIN route_targets t ON t.route_row_id = r.row_id \
@@ -114,6 +118,7 @@ impl RouteStore for SqliteStore {
             target: RouteTarget::from_weighted(targets)?,
             strategy: strategy_of(first)?,
             hedge: hedge_of(first)?,
+            hedge_delay: hedge_delay_of(first)?,
         }))
     }
 
@@ -128,7 +133,7 @@ pub(super) async fn read_routes(
 ) -> Result<Vec<RouteRule>, StorageError> {
     let rows = sqlx::query(
         "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-         r.strategy, r.hedge, t.protocol, t.host, t.port, t.path, t.weight, t.serves FROM routes r \
+         r.strategy, r.hedge, r.hedge_delay, t.protocol, t.host, t.port, t.path, t.weight, t.serves FROM routes r \
          JOIN route_targets t ON t.route_row_id = r.row_id \
          ORDER BY r.key_host, r.key_path, r.key_protocol, r.key_port, t.position",
     )
@@ -161,6 +166,7 @@ pub(super) async fn read_routes(
             target: RouteTarget::from_weighted(vec![endpoint])?,
             strategy: strategy_of(row)?,
             hedge: hedge_of(row)?,
+            hedge_delay: hedge_delay_of(row)?,
         });
     }
     Ok(rules)
@@ -203,6 +209,16 @@ fn hedge_of(row: &sqlx::sqlite::SqliteRow) -> Result<Hedge, StorageError> {
         detail: format!("{stored} is not a hedge"),
     })?;
     Ok(Hedge::new(across)?)
+}
+
+/// How long a stored rule waits before its next arm, refusing a wait this code cannot hold.
+fn hedge_delay_of(row: &sqlx::sqlite::SqliteRow) -> Result<HedgeDelay, StorageError> {
+    let stored: i64 = row.get("hedge_delay");
+    let millis = u16::try_from(stored).map_err(|_| StorageError::Malformed {
+        entity: Entity::Route,
+        detail: format!("{stored} is not a hedge delay"),
+    })?;
+    Ok(HedgeDelay::new(millis))
 }
 
 #[cfg(test)]
@@ -300,6 +316,51 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A wait past the width this code holds, written around the driver into a rule's delay.
+    #[tokio::test]
+    async fn a_stored_hedge_delay_this_code_cannot_hold_is_refused_on_read() {
+        let store = store().await;
+        store
+            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE routes SET hedge_delay = 70000")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .route(&rule("gateway.local", "/v1", "api.example.com").key)
+                .await,
+            Err(StorageError::Malformed {
+                entity: Entity::Route,
+                ..
+            })
+        ));
+    }
+
+    /// A listed rule carrying the same impossible wait is refused the same way.
+    #[tokio::test]
+    async fn a_listed_hedge_delay_this_code_cannot_hold_is_refused_on_read() {
+        use crate::list::ListStore;
+        let store = store().await;
+        store
+            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE routes SET hedge_delay = 70000")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.list_routes(crate::Page::default()).await,
+            Err(StorageError::Malformed {
+                entity: Entity::Route,
+                ..
+            })
+        ));
     }
 
     /// A class no endpoint serves, written around the driver into an endpoint's ceiling.

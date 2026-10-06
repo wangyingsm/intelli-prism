@@ -318,6 +318,7 @@ mod tests {
             target: RouteTarget::new(endpoint("api.example.com")),
             strategy: ip_core::Strategy::default(),
             hedge: ip_core::Hedge::default(),
+            hedge_delay: ip_core::HedgeDelay::default(),
         }
     }
 

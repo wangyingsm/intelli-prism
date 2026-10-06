@@ -1,6 +1,6 @@
 use ip_core::{
-    AbsPath, ApiId, Difficulty, Endpoint, Hedge, Host, Port, Protocol, RouteKey, RouteRule,
-    RouteTarget, Strategy, Weight, Weighted,
+    AbsPath, ApiId, Difficulty, Endpoint, Hedge, HedgeDelay, Host, Port, Protocol, RouteKey,
+    RouteRule, RouteTarget, Strategy, Weight, Weighted,
 };
 
 use crate::error::{Entity, StorageError};
@@ -23,6 +23,7 @@ pub(crate) fn rule(host: &str, path: &str, upstream: &str) -> RouteRule {
         target: RouteTarget::new(route_endpoint(Protocol::Https, upstream, 443, path)),
         strategy: ip_core::Strategy::default(),
         hedge: Hedge::default(),
+        hedge_delay: HedgeDelay::default(),
     }
 }
 
@@ -67,6 +68,7 @@ pub(crate) async fn a_route_key_carries_every_part_of_the_tuple(store: &impl Rou
         )),
         strategy: ip_core::Strategy::default(),
         hedge: Hedge::default(),
+        hedge_delay: HedgeDelay::default(),
     };
     store.put_route(secure).await.unwrap();
     store.put_route(plain).await.unwrap();
@@ -89,6 +91,7 @@ pub(crate) async fn every_protocol_survives_a_round_trip(store: &impl RouteStore
                 target: RouteTarget::new(route_endpoint(protocol, "api.example.com", 443, "/v1")),
                 strategy: ip_core::Strategy::default(),
                 hedge: Hedge::default(),
+                hedge_delay: HedgeDelay::default(),
             })
             .await
             .unwrap();
@@ -223,6 +226,47 @@ pub(crate) async fn rewriting_a_rule_replaces_its_hedge(store: &impl RouteStore)
     assert_eq!(
         store.route(&rule.key).await.unwrap().unwrap().hedge.get(),
         2
+    );
+}
+
+/// One rule that waits a quarter of a second between arms, the delay round-tripping onto
+/// the row and out of the paged list alike.
+pub(crate) async fn a_rule_keeps_the_hedge_delay_it_was_stored_with(store: &impl RouteStore) {
+    let mut waited = rule("gateway.local", "/waited", "api.example.com");
+    waited.hedge = Hedge::new(2).unwrap();
+    waited.hedge_delay = HedgeDelay::new(250);
+    store.put_route(waited.clone()).await.unwrap();
+
+    let read = store.route(&waited.key).await.unwrap().unwrap();
+    assert_eq!(read, waited);
+    assert_eq!(read.hedge_delay.get(), 250);
+    assert_eq!(store.routes().await.unwrap(), vec![waited]);
+}
+
+pub(crate) async fn a_rule_stored_without_a_hedge_delay_sends_arms_together(
+    store: &impl RouteStore,
+) {
+    let plain = rule("gateway.local", "/v1", "api.example.com");
+    store.put_route(plain.clone()).await.unwrap();
+    let read = store.route(&plain.key).await.unwrap().unwrap();
+    assert_eq!(read.hedge_delay, HedgeDelay::NONE);
+    assert!(read.hedge_delay.is_none());
+}
+
+pub(crate) async fn rewriting_a_rule_replaces_its_hedge_delay(store: &impl RouteStore) {
+    let mut rule = rule("gateway.local", "/v1", "api.example.com");
+    store.put_route(rule.clone()).await.unwrap();
+    rule.hedge_delay = HedgeDelay::new(50);
+    store.put_route(rule.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .route(&rule.key)
+            .await
+            .unwrap()
+            .unwrap()
+            .hedge_delay
+            .get(),
+        50
     );
 }
 

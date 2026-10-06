@@ -288,6 +288,7 @@ model = "claude-opus-5"
             target: RouteTarget::new(endpoint(Protocol::Https, target_host, 443, target_path)),
             strategy: ip_core::Strategy::default(),
             hedge: ip_core::Hedge::default(),
+            hedge_delay: ip_core::HedgeDelay::default(),
         }
     }
 
