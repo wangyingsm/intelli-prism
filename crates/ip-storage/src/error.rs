@@ -135,6 +135,8 @@ mod tests {
             (Entity::Plugin, "plugin"),
             (Entity::PluginRule, "plugin rule"),
             (Entity::RuleRevision, "rule revision"),
+            (Entity::Usage, "usage"),
+            (Entity::Limit, "limit"),
         ] {
             assert_eq!(entity.to_string(), name);
         }
