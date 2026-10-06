@@ -172,6 +172,37 @@ a rule must have somewhere to send a request.
 span carries the same. An answer out of the cache names none, having reached none. And the row
 says how many endpoints the request was raced across, one when it was not raced at all.
 
+### Choosing an endpoint by the difficulty of the request
+
+- Five difficulty classes order what the gateway carries: `easy`, `routine`, `median`, `hard`,
+`research`. The order is the whole mechanism — the least capable endpoint that can serve a request
+means nothing until requests and endpoints sit in one order.
+- Every endpoint declares a ceiling rather than a set: the hardest class it serves, and with it
+every class below. A set would let an endpoint serve `easy` and `hard` but not `median`, which is
+no real machine. An endpoint that declares no ceiling serves any class but yields to every
+endpoint that declared one, taking a class only when nothing which named a ceiling can carry it.
+- Dispatch narrows, then the strategy decides: a class selects the lowest tier whose ceilings
+carry it, and within that tier the rule's own strategy picks as it always did. Classification
+chooses the tier, never the endpoint.
+- When no endpoint can serve the class asked, the most capable one answers rather than the request
+being refused: an ambitious label costs a dispatch, never a failure.
+- The class comes from the request itself, named in `x-ip-difficulty`, or from a request header
+processor that sets one, which is how a classifier of one's own plugs in. A request that names no
+class goes across every endpoint behind the rule, exactly as it did before any of this: the
+unclassified path is the old path, unchanged.
+- A chat turn stays on the endpoint it landed on. The caller names the turn with `x-ip-turn` when
+it sends one; otherwise the turn is recognised from the conversation, by a hash of its system
+prompt and first user message, which every request of the conversation repeats unchanged. That is
+the same prefix the upstream providers cache prompts on, so an affinity keyed on it keeps their
+cache warm too, saving input tokens and not merely dispatch.
+- A compaction ends a turn, caught whichever way it hides: a rewritten opening gives the
+conversation a new anchor, and one that keeps its opening shrinks the count of messages, which
+every turn keeps alongside where it landed.
+- Where a turn landed is kept in the system cache under a short time to live; a memory that
+cannot answer costs the affinity and never the request.
+- Each usage row names the class it was dispatched at. An answer out of the cache carries it too,
+since the class is the request's own and says nothing about who answered it.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -222,6 +253,18 @@ rewritten rule starts again at its first endpoint. Only that rule's, and only th
 spread.
 - **A published rule set that cannot be built leaves a node on the rules it has.** It keeps serving
 and retries, so nodes can serve different revisions while one of them cannot build the newest.
+- **The level-1 classifier is not built.** The class must be named by the caller or set by a
+header processor; nothing classifies a request on its own yet. Every routing mechanism around it
+is in place and waiting: the taxonomy, the ceilings, the narrowing, the stickiness and the
+recording. This is a missing input, not a missing feature.
+- **A request is held in memory, up to 1 MiB, whenever turn affinity is configured.** Deriving a
+turn's anchor needs the opening of the body, so a request that would once have streamed through is
+now buffered to that limit; before M11 only a hedged or cached request held anything of its body.
+There is no configuration key to turn it off. The trade was taken deliberately for M11 and is
+recorded here, not re-argued.
+- **A client that sends its own `x-ip-turn` gets no compaction detection.** A marked request never
+has its body read, so no message count is kept for it and neither test for a compaction can fire.
+Such a client must change its turn id when it compacts, or its turn never ends.
 
 ## To be implemented
 
@@ -246,12 +289,13 @@ would make most requests cost one; the single largest improvement left in hedgin
 - A report of what the gateway actually spent on the upstream: the usage row says how many arms
 went out and a quota counts one, which is the ruling, but nothing yet adds up the arms into a
 bill to show an operator.
-- Difficulty classification into `easy`, `routine`, `median`, `hard`, `research`, with a local
-decision tree first and an external arbiter LLM when confidence is low.
-- Endpoint capability matching, so a request goes to the least capable endpoint that can serve it.
-- Chat turn stickiness, so one classification serves a whole turn.
-- Self learning: fold an arbiter's summary and reasoning back into the decision tree, plus the
-best-effort endpoint that asks every upstream and aggregates or picks one.
+- The classifier itself: a small local model naming each request's difficulty class, with an
+external arbiter asked when its confidence is low. The taxonomy and all the routing it feeds are
+already in place — the class has only to be named for everything downstream to work — so what is
+left is the naming, not the machinery.
+- Self learning: fold an arbiter's summary and reasoning back into the small local model that
+named the class in the first place, plus the best-effort endpoint that asks every upstream and
+aggregates or picks one.
 
 ### Semantic cache
 
