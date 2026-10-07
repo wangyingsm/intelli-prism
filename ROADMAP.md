@@ -117,6 +117,10 @@ visible and a request rate still counts it.
 - `GET /_ip/usage`, newest first and paged, narrowed by tenant, user and api. The system
 administrator reads every tenant; anyone else names a tenant and must hold `Observer` in it,
 which a tenant owner does by standing.
+- `GET /_ip/usage/summary`, one window of the same narrowing answered as two numbers: how
+many requests were answered, and how many went upstream. The difference is what hedging
+spent. An answer out of the cache raises the first number and not the second, having sent
+nothing.
 - `[usage] retention` sweeps away rows past their keeping on a timer, and keeps every row when
 it is unset.
 - The records of the last requests answered are waited for before the process ends.
@@ -153,6 +157,13 @@ endpoints at once. The count is capped at three and clamped to the endpoints a r
 a race is across what is live, at least one. The first successful answer wins; a failure on one arm
 does not end the race, and the arms that lose are abandoned, paying back the load each had claimed
 and reporting no latency of their own, so the least-load scores do not skew.
+- A raced rule may also name `hedge_delay`, a wait in milliseconds between starting one arm and
+starting the next. The default, zero, starts them together as before; a failed arm starts its
+successor at once rather than waiting. A rule that races nothing keeps the wait it was given and
+never spends it, so a rule raised to hedged later already carries its pacing.
+- A rule whose first endpoint is healthy asks the upstream for one request rather than one per
+arm, and the usage row counts the arms that actually went out, so the saving is visible in the
+rows rather than only promised by the wait.
 - A race is refused when the request cannot be sent more than once, and the request goes once
 instead, to the one endpoint the strategy would have chosen: a body declared past what the gateway
 will hold in memory, a body that declares no length, since an unknown size cannot be checked against
@@ -265,6 +276,10 @@ recorded here, not re-argued.
 - **A client that sends its own `x-ip-turn` gets no compaction detection.** A marked request never
 has its body read, so no message count is kept for it and neither test for a compaction can fire.
 Such a client must change its turn id when it compacts, or its turn never ends.
+- **A hedge's wait is a fixed duration per rule, tuned by hand.** It is read against what an
+endpoint actually takes, and a delay set too short spends the arms the staggering was meant to
+save. The adaptive version would need a latency distribution the gateway does not keep, which is
+why it was not built.
 
 ## To be implemented
 
@@ -283,12 +298,6 @@ it, but nothing removes it either until a sweep of unowned plugins exists.
 
 ### Intelligent routing, what is left of it
 
-- Staggering the arms of a hedge: they start together today, so a hedged rule asks the upstream
-for one request per arm, every time. Delaying the later arms until the first is later than usual
-would make most requests cost one; the single largest improvement left in hedging.
-- A report of what the gateway actually spent on the upstream: the usage row says how many arms
-went out and a quota counts one, which is the ruling, but nothing yet adds up the arms into a
-bill to show an operator.
 - The classifier itself: a small local model naming each request's difficulty class, with an
 external arbiter asked when its confidence is low. The taxonomy and all the routing it feeds are
 already in place — the class has only to be named for everything downstream to work — so what is
