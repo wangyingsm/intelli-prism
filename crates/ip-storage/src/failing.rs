@@ -360,7 +360,7 @@ impl UsageStore for FailingStore {
     async fn sent_upstream(
         &self,
         filter: &UsageFilter,
-        moment: Timestamp,
+        moment: Option<Timestamp>,
     ) -> Result<SpentArms, StorageError> {
         self.answering()?;
         self.inner.sent_upstream(filter, moment).await

@@ -121,7 +121,7 @@ impl UsageStore for SqliteStore {
     async fn sent_upstream(
         &self,
         filter: &UsageFilter,
-        moment: Timestamp,
+        moment: Option<Timestamp>,
     ) -> Result<SpentArms, StorageError> {
         let row = sqlx::query(
             "SELECT COUNT(*), \
@@ -132,7 +132,7 @@ impl UsageStore for SqliteStore {
                AND (?3 IS NULL OR user_id = ?3) \
                AND (?4 IS NULL OR api_id = ?4)",
         )
-        .bind(moment.unix_seconds())
+        .bind(moment.map_or(i64::MIN, |moment| moment.unix_seconds()))
         .bind(filter.tenant.as_ref().map(TenantId::as_str))
         .bind(filter.user.as_ref().map(UserId::as_str))
         .bind(filter.api.as_ref().map(ApiId::as_str))

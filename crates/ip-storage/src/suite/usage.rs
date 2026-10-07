@@ -452,7 +452,7 @@ pub(crate) async fn a_cache_hit_raises_what_was_answered_not_what_was_sent(
     let sums = store
         .sent_upstream(
             &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
-            Timestamp::from_unix_seconds(0).unwrap(),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
         )
         .await
         .unwrap();
@@ -469,7 +469,7 @@ pub(crate) async fn what_was_sent_upstream_counts_one_per_request_when_none_race
     let sums = store
         .sent_upstream(
             &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
-            Timestamp::from_unix_seconds(0).unwrap(),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
         )
         .await
         .unwrap();
@@ -491,7 +491,7 @@ pub(crate) async fn what_was_sent_upstream_adds_the_arms_of_a_raced_request(
     let sums = store
         .sent_upstream(
             &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
-            Timestamp::from_unix_seconds(0).unwrap(),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
         )
         .await
         .unwrap();
@@ -505,7 +505,7 @@ pub(crate) async fn what_was_sent_upstream_over_nobody_is_nothing(store: &impl U
     let sums = store
         .sent_upstream(
             &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
-            Timestamp::from_unix_seconds(0).unwrap(),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
         )
         .await
         .unwrap();
@@ -525,7 +525,7 @@ pub(crate) async fn what_was_sent_upstream_narrows_to_the_filter(store: &impl Us
     let acme = store
         .sent_upstream(
             &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
-            Timestamp::from_unix_seconds(0).unwrap(),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
         )
         .await
         .unwrap();
@@ -533,7 +533,7 @@ pub(crate) async fn what_was_sent_upstream_narrows_to_the_filter(store: &impl Us
     let whole = store
         .sent_upstream(
             &UsageFilter::default(),
-            Timestamp::from_unix_seconds(0).unwrap(),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
         )
         .await
         .unwrap();
@@ -549,7 +549,7 @@ pub(crate) async fn what_was_sent_upstream_after_a_moment_excludes_the_moment(
     let since = store
         .sent_upstream(
             &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
-            far_future(),
+            Some(far_future()),
         )
         .await
         .unwrap();
@@ -557,7 +557,7 @@ pub(crate) async fn what_was_sent_upstream_after_a_moment_excludes_the_moment(
     let all = store
         .sent_upstream(
             &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
-            Timestamp::from_unix_seconds(0).unwrap(),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
         )
         .await
         .unwrap();

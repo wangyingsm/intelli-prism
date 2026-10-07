@@ -44,3 +44,45 @@ HTTP 204
 # A caller that proved nothing reads nothing.
 GET {{host}}/_ip/usage
 HTTP 401
+
+# The summary of what was spent answers behind the same door as the list it summarizes:
+# the same names, the same owners, and — nothing having been proxied — zero of both
+# numbers.
+
+POST {{host}}/_ip/login
+{"user": "root", "passphrase": "{{passphrase}}"}
+HTTP 204
+
+GET {{host}}/_ip/usage/summary
+HTTP 200
+[Asserts]
+jsonpath "$.answered" == 0
+jsonpath "$.sent" == 0
+jsonpath "$.since" == null
+
+GET {{host}}/_ip/usage/summary?tenant=acme
+HTTP 200
+
+GET {{host}}/_ip/usage/summary?tenant=not%20a%20tenant
+HTTP 422
+
+POST {{host}}/_ip/logout
+x-ip-csrf: 1
+HTTP 204
+
+POST {{host}}/_ip/login
+{"user": "alice", "passphrase": "{{passphrase}}"}
+HTTP 204
+
+GET {{host}}/_ip/usage/summary
+HTTP 422
+
+GET {{host}}/_ip/usage/summary?tenant=globex
+HTTP 403
+
+POST {{host}}/_ip/logout
+x-ip-csrf: 1
+HTTP 204
+
+GET {{host}}/_ip/usage/summary
+HTTP 401

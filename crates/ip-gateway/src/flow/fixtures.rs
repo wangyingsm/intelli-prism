@@ -523,7 +523,7 @@ impl UsageStore for Ledger {
     async fn sent_upstream(
         &self,
         _: &ip_storage::UsageFilter,
-        _: ip_core::Timestamp,
+        _: Option<ip_core::Timestamp>,
     ) -> Result<ip_storage::SpentArms, StorageError> {
         Ok(ip_storage::SpentArms {
             answered: 0,

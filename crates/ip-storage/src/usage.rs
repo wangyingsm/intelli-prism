@@ -150,6 +150,7 @@ pub trait UsageStore: Send + Sync {
     /// How many requests the rows matching `filter` answered since `moment`, the moment
     /// itself included, and how many arms those requests went out on — one query, so the
     /// two numbers describe one snapshot rather than a window two calls could straddle.
+    /// None opens the window at the beginning, as an absent `after` does for a list.
     ///
     /// `sent` sums the arms only over rows `served` says the upstream answered: a cache
     /// hit writes an arms count of one without sending anything, and counting it would
@@ -157,6 +158,6 @@ pub trait UsageStore: Send + Sync {
     async fn sent_upstream(
         &self,
         filter: &UsageFilter,
-        moment: Timestamp,
+        moment: Option<Timestamp>,
     ) -> Result<SpentArms, StorageError>;
 }

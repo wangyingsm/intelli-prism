@@ -10,7 +10,7 @@ use ip_core::{
     ApiId, Capability, CapabilityScope, Difficulty, Hedge, Latency, Served, TenantId, Timestamp,
     UserId,
 };
-use ip_storage::{Usage, UsageFilter};
+use ip_storage::{SpentArms, Usage, UsageFilter};
 
 use super::{Paged, store_refusal};
 use crate::manage::Manager;
@@ -21,7 +21,9 @@ type Refusal = Box<Response<Body>>;
 
 /// What every request cost, under the prefix the router nests it at.
 pub fn router() -> Router<AppState> {
-    Router::new().route("/", get(list))
+    Router::new()
+        .route("/", get(list))
+        .route("/summary", get(summary))
 }
 
 /// One recorded request, as the api reports it.
@@ -81,6 +83,67 @@ impl From<Usage> for UsageView {
             latency_ms: Latency::millis(usage.latency),
             created_at: usage.created_at,
         }
+    }
+}
+
+/// What a window of requests answered and cost, as the api reports it. Both numbers raw:
+/// a ratio, a percentage or a "saving" is one subtraction the caller makes in whichever
+/// frame fits the question, never one this api invents.
+#[derive(Debug, serde::Serialize)]
+pub struct SpendView {
+    /// Requests answered — every row in the window, an answer out of the cache included.
+    pub answered: u64,
+    /// Requests that went upstream: the arms the rows the upstream answered carried.
+    /// Past `answered` by exactly what hedging spent, and no cache hit inflates it.
+    pub sent: u64,
+    /// What the window was asked open from, in seconds since the unix epoch; null when
+    /// it opened with everything.
+    pub since: Option<i64>,
+}
+
+impl SpendView {
+    /// The two sums over an open window.
+    fn everything(sums: SpentArms) -> Self {
+        Self {
+            answered: sums.answered,
+            sent: sums.sent,
+            since: None,
+        }
+    }
+
+    /// The two sums over a window that opens at `since`.
+    fn since(sums: SpentArms, since: Timestamp) -> Self {
+        Self {
+            answered: sums.answered,
+            sent: sums.sent,
+            since: Some(since.unix_seconds()),
+        }
+    }
+}
+
+/// What was answered and what it cost upstream, for one narrowing of one window — the
+/// summary of what the list spells out.
+///
+/// The same authorization as the list, the same rules for naming a tenant, the same meaning
+/// for an absent `after`, and no paging: a sum has no page, so of the list's query only
+/// `after` is read — and the whole `Paged` is taken anyway, so the window cannot drift.
+async fn summary(
+    State(state): State<AppState>,
+    manager: Manager,
+    Narrowed(narrowing): Narrowed,
+    Paged(page): Paged,
+) -> Response<Body> {
+    let filter = match filter_for(&state, &manager, narrowing).await {
+        Ok(filter) => filter,
+        Err(refusal) => return *refusal,
+    };
+    // The window opens where the list's page opens: no moment named, no floor kept.
+    match state.store().sent_upstream(&filter, page.after()).await {
+        Ok(sums) => match page.after() {
+            Some(after) => Json(SpendView::since(sums, after)).into_response(),
+            None => Json(SpendView::everything(sums)).into_response(),
+        },
+        Err(error) => store_refusal(error),
     }
 }
 
@@ -287,11 +350,21 @@ mod tests {
     }
 
     async fn read(router: &Router, state: &AppState, caller: &str, query: &str) -> Response<Body> {
+        read_at(router, state, caller, "/_ip/usage", query).await
+    }
+
+    async fn read_at(
+        router: &Router,
+        state: &AppState,
+        caller: &str,
+        path: &str,
+        query: &str,
+    ) -> Response<Body> {
         router
             .clone()
             .oneshot(request(
                 "GET",
-                &format!("/_ip/usage{query}"),
+                &format!("{path}{query}"),
                 &cookie_of(state, &user(caller)).await,
                 None,
             ))
@@ -443,6 +516,102 @@ mod tests {
         let router = crate::routes::router(state.clone());
         let refused = read(&router, &state, "root", "?tenant=NOT%20A%20TENANT").await;
         assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// What one window answered and cost, for whoever the query names.
+    async fn summary_of(
+        router: &Router,
+        state: &AppState,
+        caller: &str,
+        query: &str,
+    ) -> serde_json::Value {
+        let read = read_at(router, state, caller, "/_ip/usage/summary", query).await;
+        let body = body_of(read).await;
+        eprintln!("BODY {body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_tenant_reads_its_own_spend() {
+        let state = state_over_shared(store().await);
+        let router = crate::routes::router(state.clone());
+        let sums = summary_of(&router, &state, "alice", "?tenant=acme").await;
+        assert_eq!(sums["answered"], 2);
+        assert_eq!(sums["sent"], 2);
+        assert!(sums["since"].is_null(), "an open window grew a floor");
+    }
+
+    #[tokio::test]
+    async fn the_administrator_reads_another_tenants_spend() {
+        let state = state_over_shared(store().await);
+        let router = crate::routes::router(state.clone());
+        let sums = summary_of(&router, &state, "root", "?tenant=other").await;
+        assert_eq!(
+            (sums["answered"].as_u64(), sums["sent"].as_u64()),
+            (Some(1), Some(1))
+        );
+        let all = summary_of(&router, &state, "root", "").await;
+        assert_eq!(all["answered"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_may_not_read_another_tenants_spend() {
+        let state = state_over_shared(store().await);
+        let router = crate::routes::router(state.clone());
+        let refused = read(&router, &state, "alice", "?tenant=other").await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_window_narrows_the_answer() {
+        let store = store().await;
+        let state = state_over_shared(store);
+        let router = crate::routes::router(state.clone());
+        // The list and the summary open their windows the same way: a moment ahead of
+        // every row leaves nothing, and the floor of the clock leaves everything.
+        let future = Timestamp::now().unix_seconds() + 3_600;
+        let sums = summary_of(&router, &state, "root", &format!("?after={future}")).await;
+        assert_eq!(
+            (sums["answered"].as_u64(), sums["sent"].as_u64()),
+            (Some(0), Some(0))
+        );
+        assert_eq!(sums["since"], future);
+    }
+
+    #[tokio::test]
+    async fn hedged_rows_cost_more_than_the_gateway_answered() {
+        let store = store().await;
+        store
+            .record_usage(NewUsage {
+                raced_across: Hedge::new(3).unwrap(),
+                ..spent("acme", "alice", "anthropic")
+            })
+            .await
+            .unwrap();
+        store
+            .record_usage(NewUsage {
+                served: Served::Cache,
+                served_by: None,
+                ..spent("acme", "bob", "anthropic")
+            })
+            .await
+            .unwrap();
+        let state = state_over_shared(store);
+        let router = crate::routes::router(state.clone());
+        let sums = summary_of(&router, &state, "alice", "?tenant=acme").await;
+        // Four answered — the cached one among them — and 1+1+3 sent past three rows,
+        // the cached one paying nothing.
+        assert_eq!(sums["answered"], 4);
+        assert_eq!(sums["sent"], 5);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_gives_a_500_not_a_wrong_number() {
+        let state = state_over_shared(store().await);
+        state.store_failure().answer_only(1);
+        let router = crate::routes::router(state.clone());
+        let failed = read(&router, &state, "alice", "?tenant=acme").await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

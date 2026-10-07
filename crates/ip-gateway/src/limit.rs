@@ -365,7 +365,7 @@ pub(crate) mod tests {
         async fn sent_upstream(
             &self,
             _: &UsageFilter,
-            _: Timestamp,
+            _: Option<Timestamp>,
         ) -> Result<ip_storage::SpentArms, ip_storage::StorageError> {
             Ok(ip_storage::SpentArms {
                 answered: 0,

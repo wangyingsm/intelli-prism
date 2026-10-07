@@ -92,7 +92,7 @@ mod tests {
         async fn sent_upstream(
             &self,
             _: &ip_storage::UsageFilter,
-            _: Timestamp,
+            _: Option<Timestamp>,
         ) -> Result<ip_storage::SpentArms, StorageError> {
             unreachable!("the sweeper counts nothing")
         }
