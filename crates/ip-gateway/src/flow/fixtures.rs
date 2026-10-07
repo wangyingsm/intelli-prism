@@ -519,6 +519,17 @@ impl UsageStore for Ledger {
     ) -> Result<u64, StorageError> {
         Ok(0)
     }
+
+    async fn sent_upstream(
+        &self,
+        _: &ip_storage::UsageFilter,
+        _: ip_core::Timestamp,
+    ) -> Result<ip_storage::SpentArms, StorageError> {
+        Ok(ip_storage::SpentArms {
+            answered: 0,
+            sent: 0,
+        })
+    }
 }
 
 /// An upstream that answers a stream of events, one frame each.

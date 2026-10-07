@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, Difficulty, Hedge, ModelName, Replica, TenantId, Timestamp, Tokens, TraceId,
-    TurnId, UserId,
+    ApiId, Counted, Difficulty, Hedge, ModelName, Replica, Served, TenantId, Timestamp, Tokens,
+    TraceId, TurnId, UserId,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
@@ -9,7 +9,7 @@ use sqlx::sqlite::SqliteRow;
 use super::SqliteStore;
 use crate::codec::{latency, served as served_of, served_name, token_count};
 use crate::error::{Entity, StorageError};
-use crate::usage::{NewUsage, Usage, UsageFilter, UsageRowId, UsageStore};
+use crate::usage::{NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
 
 #[async_trait]
 impl UsageStore for SqliteStore {
@@ -112,6 +112,40 @@ impl UsageStore for SqliteStore {
             .await
             .map_err(StorageError::backend)?;
         Ok(u64::try_from(spent).unwrap_or(0))
+    }
+
+    /// How many requests the rows matching `filter` answered since `moment`, and how many
+    /// arms went out for them. `sent` takes its sum where `served` is the upstream: a
+    /// cached answer carries an arms count of one without having sent anything, and every
+    /// row — the cache's included — is an answered request.
+    async fn sent_upstream(
+        &self,
+        filter: &UsageFilter,
+        moment: Timestamp,
+    ) -> Result<SpentArms, StorageError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*), \
+               COALESCE(SUM(CASE WHEN served = ?5 THEN raced_across ELSE 0 END), 0) \
+               FROM usage \
+             WHERE created_at >= ?1 \
+               AND (?2 IS NULL OR tenant_id = ?2) \
+               AND (?3 IS NULL OR user_id = ?3) \
+               AND (?4 IS NULL OR api_id = ?4)",
+        )
+        .bind(moment.unix_seconds())
+        .bind(filter.tenant.as_ref().map(TenantId::as_str))
+        .bind(filter.user.as_ref().map(UserId::as_str))
+        .bind(filter.api.as_ref().map(ApiId::as_str))
+        .bind(served_name(Served::Upstream))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StorageError::backend)?;
+        let answered: i64 = row.get(0);
+        let sent: i64 = row.get(1);
+        Ok(SpentArms {
+            answered: u64::try_from(answered).unwrap_or(0),
+            sent: u64::try_from(sent).unwrap_or(0),
+        })
     }
 
     async fn sweep_usage(&self, moment: Timestamp) -> Result<u64, StorageError> {

@@ -1,11 +1,15 @@
 use ip_core::{
     ApiId, Counted, Difficulty, Hedge, Host, Latency, ModelName, Port, Replica, Served, TenantId,
-    TokenCount, Tokens, TraceId, TurnId, UserId,
+    Timestamp, TokenCount, Tokens, TraceId, TurnId, UserId,
 };
 
 use crate::list::Page;
 use crate::store::Backend;
 use crate::usage::{NewUsage, UsageFilter, UsageRowId, UsageStore};
+
+pub(crate) fn far_future() -> Timestamp {
+    Timestamp::from_unix_seconds(4_000_000_000).unwrap()
+}
 
 /// One request as the gateway would record it, answered by the upstream.
 pub(crate) fn spent() -> NewUsage {
@@ -429,4 +433,133 @@ pub(crate) async fn a_row_says_what_class_it_was_dispatched_at(store: &impl Back
     assert_eq!(unclassed.dispatched_class, None);
     let read = store.usage(unclassed.row_id).await.unwrap().unwrap();
     assert_eq!(read.dispatched_class, None);
+}
+
+/// A cache hit raises the count of answered requests and leaves the arms paid for
+/// alone: the hit carries an arms count of one — what the type says when nothing was
+/// raced — and it went nowhere. The sum takes its arms only where `served` is the
+/// upstream, which is the one thing a reader is bound to get wrong here.
+pub(crate) async fn a_cache_hit_raises_what_was_answered_not_what_was_sent(
+    store: &impl UsageStore,
+) {
+    store.record_usage(spent()).await.unwrap();
+    let hit = NewUsage {
+        served: Served::Cache,
+        served_by: None,
+        ..spent()
+    };
+    store.record_usage(hit).await.unwrap();
+    let sums = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            Timestamp::from_unix_seconds(0).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sums.answered, 2);
+    assert_eq!(sums.sent, 1);
+}
+
+/// Rows that never raced: arms and requests are the same count, one each.
+pub(crate) async fn what_was_sent_upstream_counts_one_per_request_when_none_raced(
+    store: &impl UsageStore,
+) {
+    store.record_usage(spent()).await.unwrap();
+    store.record_usage(spent()).await.unwrap();
+    let sums = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            Timestamp::from_unix_seconds(0).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sums.answered, 2);
+    assert_eq!(sums.sent, 2);
+}
+
+/// Rows that raced: the arms exceed the requests by exactly the extra arms they went
+/// out on.
+pub(crate) async fn what_was_sent_upstream_adds_the_arms_of_a_raced_request(
+    store: &impl UsageStore,
+) {
+    store.record_usage(spent()).await.unwrap();
+    let raced = NewUsage {
+        raced_across: Hedge::new(3).unwrap(),
+        ..spent()
+    };
+    store.record_usage(raced).await.unwrap();
+    let sums = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            Timestamp::from_unix_seconds(0).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sums.answered, 2);
+    assert_eq!(sums.sent, 4);
+}
+
+/// Nothing recorded at all: zero answered, zero sent — nothing to divide and nothing
+/// to sum.
+pub(crate) async fn what_was_sent_upstream_over_nobody_is_nothing(store: &impl UsageStore) {
+    let sums = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            Timestamp::from_unix_seconds(0).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sums.answered, 0);
+    assert_eq!(sums.sent, 0);
+}
+
+/// The filter narrows both counts the way it narrows a list: what another tenant
+/// spent stands outside this tenant's window.
+pub(crate) async fn what_was_sent_upstream_narrows_to_the_filter(store: &impl UsageStore) {
+    store.record_usage(spent()).await.unwrap();
+    let other = NewUsage {
+        tenant: TenantId::new("other-tenant").unwrap(),
+        ..spent()
+    };
+    store.record_usage(other).await.unwrap();
+    let acme = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            Timestamp::from_unix_seconds(0).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!((acme.answered, acme.sent), (1, 1));
+    let whole = store
+        .sent_upstream(
+            &UsageFilter::default(),
+            Timestamp::from_unix_seconds(0).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(whole.answered, 2);
+}
+
+/// The moment opens the window: nothing beyond it counts, whatever the clock has done
+/// while the test ran.
+pub(crate) async fn what_was_sent_upstream_after_a_moment_excludes_the_moment(
+    store: &impl UsageStore,
+) {
+    store.record_usage(spent()).await.unwrap();
+    let since = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            far_future(),
+        )
+        .await
+        .unwrap();
+    assert_eq!((since.answered, since.sent), (0, 0));
+    let all = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            Timestamp::from_unix_seconds(0).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!((all.answered, all.sent), (1, 1));
 }

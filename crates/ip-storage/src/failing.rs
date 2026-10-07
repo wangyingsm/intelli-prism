@@ -17,7 +17,7 @@ use crate::plugin::{NewPlugin, Plugin, PluginOwner, PluginRecord, PluginRuleStor
 use crate::revision::{RevisionStore, RuleRevision, RuleSet};
 use crate::route::RouteStore;
 use crate::store::{Backend, GrantStore, MembershipStore, TenantStore, UserStore};
-use crate::usage::{NewUsage, Usage, UsageFilter, UsageRowId, UsageStore};
+use crate::usage::{NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
 
 /// A store that answers like the one it wraps until the calls it was given run out, and
 /// refuses every call after that.
@@ -355,6 +355,15 @@ impl UsageStore for FailingStore {
     ) -> Result<u64, StorageError> {
         self.answering()?;
         self.inner.spent(filter, counted, moment).await
+    }
+
+    async fn sent_upstream(
+        &self,
+        filter: &UsageFilter,
+        moment: Timestamp,
+    ) -> Result<SpentArms, StorageError> {
+        self.answering()?;
+        self.inner.sent_upstream(filter, moment).await
     }
 }
 

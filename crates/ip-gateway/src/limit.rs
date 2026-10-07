@@ -361,6 +361,17 @@ pub(crate) mod tests {
             }
             Ok(self.0)
         }
+
+        async fn sent_upstream(
+            &self,
+            _: &UsageFilter,
+            _: Timestamp,
+        ) -> Result<ip_storage::SpentArms, ip_storage::StorageError> {
+            Ok(ip_storage::SpentArms {
+                answered: 0,
+                sent: 0,
+            })
+        }
     }
 
     fn tenant() -> TenantId {

@@ -88,6 +88,14 @@ mod tests {
         ) -> Result<u64, StorageError> {
             unreachable!("the sweeper counts nothing")
         }
+
+        async fn sent_upstream(
+            &self,
+            _: &ip_storage::UsageFilter,
+            _: Timestamp,
+        ) -> Result<ip_storage::SpentArms, StorageError> {
+            unreachable!("the sweeper counts nothing")
+        }
     }
 
     fn config(retention: Option<u64>) -> UsageConfig {

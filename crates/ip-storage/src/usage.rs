@@ -88,6 +88,20 @@ pub struct NewUsage {
     pub latency: Latency,
 }
 
+/// Requests answered and requests paid for, in one snapshot of the rows a filter picks.
+///
+/// `sent` is the one number that cannot be got by adding the columns up: a row served
+/// out of the cache still carries the arms count its type says when nothing was raced,
+/// which is one, and one cached answer is not one request the upstream was billed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpentArms {
+    /// Requests answered — cache included, which is every row.
+    pub answered: u64,
+    /// Requests that actually went upstream: the arms of the rows `served` says were
+    /// answered there.
+    pub sent: u64,
+}
+
 /// Which recorded requests a list is narrowed to, each part admitting everything when unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageFilter {
@@ -132,4 +146,17 @@ pub trait UsageStore: Send + Sync {
         counted: Counted,
         moment: Timestamp,
     ) -> Result<u64, StorageError>;
+
+    /// How many requests the rows matching `filter` answered since `moment`, the moment
+    /// itself included, and how many arms those requests went out on — one query, so the
+    /// two numbers describe one snapshot rather than a window two calls could straddle.
+    ///
+    /// `sent` sums the arms only over rows `served` says the upstream answered: a cache
+    /// hit writes an arms count of one without sending anything, and counting it would
+    /// inflate the very bill this reports.
+    async fn sent_upstream(
+        &self,
+        filter: &UsageFilter,
+        moment: Timestamp,
+    ) -> Result<SpentArms, StorageError>;
 }
