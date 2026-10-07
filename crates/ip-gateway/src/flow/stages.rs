@@ -500,6 +500,12 @@ async fn send_arm(
 ///
 /// The arms are polled together on the task the flow already runs on: they stay inside the
 /// request's span, and cancelling a losing arm is a matter of dropping the future it is in.
+///
+/// A rule that asks to be raced names no wait, and every arm goes out at once exactly as
+/// it always has. A rule that named a wait starts the first arm and releases each later
+/// one only when that wait has run out with nothing acceptable answered — or at once,
+/// without waiting out its remainder, once an arm has been lost. An arm the wait never
+/// released is abandoned like a losing one, which is right for an arm that never went out.
 async fn race(
     context: RequestContext,
     upstream: &dyn Upstream,
@@ -507,6 +513,14 @@ async fn race(
     request: Request<GatewayBody>,
     dispatching: &Dispatching<'_>,
 ) -> Result<Flow<Forwarded>, GatewayError> {
+    // Where an arm of the race went: an answer, all started arms answered, or the wait
+    // for the next arm ran out.
+    enum Settled {
+        Answered((usize, Result<Response<GatewayBody>, GatewayError>)),
+        Finished,
+        Waited,
+    }
+
     // The body leaves once per arm, so it is held in hand once for the whole race; collecting
     // what is already bytes is cheap.
     let (mut parts, body) = request.into_parts();
@@ -514,29 +528,85 @@ async fn race(
     // The same work on every arm, so it runs once, on the parts every arm is aimed from.
     strip_hop_by_hop(&mut parts.headers);
     let mut arms = dispatcher.choose_many(dispatching, dispatching.resolution().rule().hedge);
+    let delay = dispatching.resolution().rule().hedge_delay;
+    // The arms not started yet, first to last. Empty is every rule that named no wait,
+    // and those arms all go out below with nothing awaited, exactly as they always did.
+    let mut waiting: std::collections::VecDeque<usize> = if delay.is_none() {
+        Vec::new()
+    } else {
+        (1..arms.len()).collect()
+    }
+    .into();
     let mut racing = FuturesUnordered::new();
+    let mut started = 0usize;
     for (at, arm) in arms.iter().enumerate() {
-        if at + 1 == arms.len() {
+        if at > 0 && !waiting.is_empty() {
             continue;
         }
         let sent = aim(parts.clone(), from_bytes(buffered.clone()), arm.endpoint())?;
         racing.push(send_arm(at, upstream, sent));
+        started += 1;
     }
-    // The last arm takes the parts that were already in hand, so it needs no clone.
-    let last = arms.len() - 1;
-    let sent = aim(parts, from_bytes(buffered.clone()), arms[last].endpoint())?;
-    racing.push(send_arm(last, upstream, sent));
+    let wait = std::time::Duration::from_millis(delay.get().into());
+    // The wait for the next arm to start, counted from the start of the arm before it
+    // and re-armed whenever one goes out. None while no arm is waiting, and the loop
+    // below is then exactly the loop that has always raced.
+    let mut timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> =
+        (!waiting.is_empty()).then(|| Box::pin(tokio::time::sleep(wait)));
+    macro_rules! release_one {
+        () => {
+            if let Some(at) = waiting.pop_front() {
+                let sent = aim(
+                    parts.clone(),
+                    from_bytes(buffered.clone()),
+                    arms[at].endpoint(),
+                )?;
+                racing.push(send_arm(at, upstream, sent));
+                started += 1;
+                timer = (!waiting.is_empty()).then(|| Box::pin(tokio::time::sleep(wait)));
+            }
+        };
+    }
     let mut answered = vec![false; arms.len()];
     let mut winner: Option<(usize, Response<GatewayBody>)> = None;
     let mut first_failure: Option<(usize, Result<Response<GatewayBody>, GatewayError>)> = None;
-    while let Some((at, outcome)) = racing.next().await {
-        answered[at] = true;
-        if answers_acceptably(&outcome) {
-            winner = Some((at, outcome.expect("an acceptable answer is a response")));
-            break;
-        }
-        if first_failure.is_none() {
-            first_failure = Some((at, outcome));
+    // For as long as an arm waits, one started arm is always running: the wait is armed
+    // only when the first is out, every later one is pushed the moment its predecessor is
+    // popped, and every answer that could empty `racing` releases and re-arms or
+    // disarms in the same step. So `racing` empty says `waiting` is empty too — and
+    // with it, the wait is disarmed and the race is over.
+    loop {
+        // The arms already running and the wait for the next arm are awaited together,
+        // and whichever comes first is handled.
+        let settled = match timer.as_mut() {
+            None => match racing.next().await {
+                Some(outcome) => Settled::Answered(outcome),
+                None => Settled::Finished,
+            },
+            Some(sleep) => tokio::select! {
+                outcome = racing.next() => match outcome {
+                    Some(outcome) => Settled::Answered(outcome),
+                    None => Settled::Finished,
+                },
+                () = sleep => Settled::Waited,
+            },
+        };
+        match settled {
+            Settled::Waited => release_one!(),
+            Settled::Finished => break,
+            Settled::Answered((at, outcome)) => {
+                answered[at] = true;
+                if answers_acceptably(&outcome) {
+                    winner = Some((at, outcome.expect("an acceptable answer is a response")));
+                    break;
+                }
+                if first_failure.is_none() {
+                    first_failure = Some((at, outcome));
+                }
+                // A lost arm will now never answer, so the next one goes out at once
+                // rather than after the remainder of a wait whose reason has gone.
+                release_one!();
+            }
         }
     }
     for (at, arm) in arms.iter_mut().enumerate() {
@@ -554,10 +624,11 @@ async fn race(
     drop(racing);
     let served = Replica::of(endpoint);
     Span::current().record("served", field::display(&served));
-    // The number the row will say is what left the gateway, not what the rule asked: the
-    // dispatcher never chooses past the rule's hedge, which a count of endpoints already means.
+    // The number the row will say is the number of arms that actually started: not what
+    // the rule asked for, and not even what the dispatcher held out to be raced — a
+    // wait the first answer beat keeps its arm in the gateway, and out of the bill.
     let raced = Hedge::new(
-        u8::try_from(arms.len())
+        u8::try_from(started)
             .unwrap_or(HEDGE_MOST)
             .clamp(1, HEDGE_MOST),
     )

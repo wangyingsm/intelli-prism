@@ -360,7 +360,7 @@ mod tests {
     use http::HeaderValue;
     use http::StatusCode;
     use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-    use ip_core::{Hedge, Served, TokenCount, Tokens};
+    use ip_core::{Hedge, RouteKey, Served, TokenCount, Tokens};
 
     use bytes::Bytes;
     use std::collections::HashMap;
@@ -1570,6 +1570,179 @@ mod tests {
                 "three.example.com:443",
             ],
             "the second race neither started at the landing nor raced the rest"
+        );
+    }
+    #[tokio::test]
+    async fn an_answer_inside_the_delay_never_starts_the_second_arm() {
+        let (recorder, mut recorded) = Ledger::new();
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(delayed_table(400), ProcessorChain::new(), upstream.clone())
+            .recording(recorder);
+
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        let row = recorded.recv().await.unwrap();
+        // The first arm answered well inside the wait, so the second never went out, and
+        // the row says one: what left the gateway, not what the rule asked for.
+        assert_eq!(hosts_of(&upstream).len(), 1);
+        assert_eq!(row.raced_across, Hedge::default());
+    }
+
+    #[tokio::test]
+    async fn an_arm_slower_than_the_delay_sees_the_next_one_start() {
+        let (recorder, mut recorded) = Ledger::new();
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::from_millis(250),
+                    status: StatusCode::OK,
+                    body: "one",
+                    fail: false,
+                },
+            ),
+            (
+                "two.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::ZERO,
+                    status: StatusCode::OK,
+                    body: "two",
+                    fail: false,
+                },
+            ),
+        ]);
+        let gateway = Gateway::new(delayed_table(40), ProcessorChain::new(), upstream.clone())
+            .recording(recorder);
+
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        // The first arm was still holding when the wait ran out, the second started at
+        // once the wait said to, answered at once, and won.
+        assert_eq!(body_of(answered).await, "two");
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(row.raced_across, Hedge::new(2).unwrap());
+        assert_eq!(hosts_of(&upstream).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_arm_that_fails_starts_the_next_without_waiting() {
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::ZERO,
+                    status: StatusCode::OK,
+                    body: "one",
+                    fail: true,
+                },
+            ),
+            (
+                "two.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::from_millis(30),
+                    status: StatusCode::OK,
+                    body: "two",
+                    fail: false,
+                },
+            ),
+        ]);
+        let gateway = Gateway::new(
+            delayed_table(3_000),
+            ProcessorChain::new(),
+            upstream.clone(),
+        );
+
+        // The wait is three seconds and the answer arrives in far less: a lost arm is
+        // information, not a reason to wait. The margin is wide enough for a loaded
+        // machine and narrow enough to show the wait was never kept.
+        let started = std::time::Instant::now();
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(body_of(answered).await, "two");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_500),
+            "a lost arm made the race wait out its delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_default_delay_still_starts_every_arm_at_once() {
+        let (recorder, mut recorded) = Ledger::new();
+        // No delay in the rule at all: the regression guard for the path nearly all
+        // traffic takes, which must behave exactly as it did before waits existed.
+        let gateway = Gateway::new(
+            hedged_replicated_table(ip_core::Strategy::RoundRobin, Hedge::new(2).unwrap()),
+            ProcessorChain::new(),
+            FakeUpstream::answering("pong"),
+        )
+        .recording(recorder);
+
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        // Both arms went out together — the row says two whether or not the first won.
+        assert_eq!(
+            recorded.recv().await.unwrap().raced_across,
+            Hedge::new(2).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arm_that_never_starts_gives_its_load_back() {
+        let upstream = FakeUpstream::answering_each(&[
+            (
+                "one.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::from_millis(30),
+                    status: StatusCode::OK,
+                    body: "one",
+                    fail: false,
+                },
+            ),
+            (
+                "two.example.com:443",
+                Behaviour {
+                    delay: std::time::Duration::ZERO,
+                    status: StatusCode::OK,
+                    body: "two",
+                    fail: false,
+                },
+            ),
+        ]);
+        let table = delayed_table(400);
+        let gateway = Gateway::new(table.clone(), ProcessorChain::new(), upstream);
+
+        // The first arm answers inside the wait, so the second is chosen, held for the
+        // whole wait, and never started. What it claimed at the choosing is what it owes
+        // back at the abandoning, and the plan's own counters are the only place that
+        // shows it: round-robin rotates the choosing, so no traffic decision consults a
+        // score, and a claim kept by an arm that never went out would sit on its
+        // endpoint unseen.
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        let key = RouteKey::new(endpoint(
+            Protocol::Http,
+            "gateway.local",
+            8080,
+            "/anthropic",
+        ));
+        let resolution = table.resolve(&key).expect("the rule stands");
+        assert_eq!(
+            resolution.plan().in_flight(),
+            vec![0; 2],
+            "an arm that never went out kept its claim"
         );
     }
 

@@ -337,6 +337,20 @@ pub(super) fn hedged_table(
     RoutingTable::from_rules(vec![rule])
 }
 
+/// A table whose one rule stands behind two endpoints and waits `delay_millis` between
+/// the arms of a raced request.
+pub(super) fn delayed_table(delay_millis: u16) -> RoutingTable {
+    let mut rule = rule(endpoint(Protocol::Https, "one.example.com", 443, "/v1"));
+    rule.hedge = ip_core::Hedge::new(2).unwrap();
+    rule.hedge_delay = ip_core::HedgeDelay::new(delay_millis);
+    rule.target = RouteTarget::from_endpoints(vec![
+        endpoint(Protocol::Https, "one.example.com", 443, "/v1"),
+        endpoint(Protocol::Https, "two.example.com", 443, "/v1"),
+    ])
+    .unwrap();
+    RoutingTable::from_rules(vec![rule])
+}
+
 /// A table whose one rule stands behind the hosts named, each with the ceiling given.
 pub(super) fn ceiled_table(behind: &[(&str, Option<ip_core::Difficulty>)]) -> RoutingTable {
     let mut rule = rule(endpoint(

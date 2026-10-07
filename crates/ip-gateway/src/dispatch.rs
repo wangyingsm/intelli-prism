@@ -200,6 +200,16 @@ impl Plan {
         &self.live.at
     }
 
+    /// Test only: the requests each endpoint is carrying right now, by endpoint index —
+    /// what a chosen arm claimed and its drop owes back.
+    #[cfg(test)]
+    pub fn in_flight(&self) -> Vec<u32> {
+        self.load
+            .iter()
+            .map(|load| load.in_flight.load(std::sync::atomic::Ordering::Relaxed))
+            .collect()
+    }
+
     /// Where a request naming this class may go: every live endpoint when it names none.
     fn tier(&self, class: Option<Difficulty>) -> &Tier {
         match class {
