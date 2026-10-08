@@ -689,6 +689,9 @@ pub enum Difficulty {
 }
 
 impl Difficulty {
+    /// How many classes there are — the width every distribution is read at.
+    pub const COUNT: usize = Self::ALL.len();
+
     /// The five classes, in the order of the total order.
     pub const ALL: [Difficulty; 5] = [
         Difficulty::Easy,

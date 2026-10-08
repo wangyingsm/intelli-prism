@@ -11,6 +11,7 @@ keywords = ["llm", "ai", "proxy", "gateway"]
 categories = ["network-programming", "web-programming::http-server"]
 
 [dependencies]
+ip-classify = { path = "crates/ip-classify" }
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 getrandom.workspace = true

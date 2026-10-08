@@ -1358,6 +1358,7 @@ dependencies = [
  "http-body-util",
  "ip-auth",
  "ip-cache",
+ "ip-classify",
  "ip-config",
  "ip-core",
  "ip-gateway",
@@ -1411,6 +1412,14 @@ dependencies = [
  "sled",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "ip-classify"
+version = "0.1.0"
+dependencies = [
+ "ip-core",
+ "thiserror",
 ]
 
 [[package]]
