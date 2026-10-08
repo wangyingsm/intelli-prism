@@ -253,10 +253,21 @@ impl Flow<BodyProcessed> {
             opening = Opening::read(&bytes);
             request = Request::from_parts(parts, from_bytes(bytes));
         }
-        let taken = taken_turn(self.context.turn.as_ref(), opening, class);
-        let landed = remembered(turns, &self.context, taken.as_ref()).await;
+        let marked = self.context.turn.clone();
+        let landed = remembered(turns, &self.context, marked.as_ref(), opening.as_ref()).await;
+        let taken = taken_turn(
+            marked.as_ref(),
+            opening,
+            class,
+            landed.as_ref().and_then(|verdict| verdict.class),
+        );
+        // The turn's remembered class fills a silence and never overrules a statement: a
+        // request that named its own class dispatches at it as ever. No staleness check
+        // sits here on purpose — a compaction ends the turn from the opening (§429), and
+        // the fresh turn holds no verdict to be stale.
+        let dispatch_class = class.or(landed.as_ref().and_then(|verdict| verdict.class));
         let dispatching =
-            Dispatching::new(&resolution, class).landed_on(landed.as_ref().map(|v| &v.endpoint));
+            Dispatching::new(&resolution, dispatch_class).remembered_from(landed.as_ref());
         if raced == Hedge::NONE {
             let chosen = dispatcher.choose(&dispatching);
             let served = Replica::of(chosen.endpoint());
@@ -275,10 +286,19 @@ impl Flow<BodyProcessed> {
                     response,
                     served,
                     raced: Hedge::default(),
+                    class: dispatch_class,
                 },
             });
         }
-        let outcome = race(self.context, upstream, dispatcher, request, &dispatching).await?;
+        let outcome = race(
+            self.context,
+            upstream,
+            dispatcher,
+            request,
+            &dispatching,
+            dispatch_class,
+        )
+        .await?;
         remember(
             turns,
             &outcome.context,
@@ -297,6 +317,7 @@ fn taken_turn(
     marked: Option<&TurnId>,
     opening: Option<Opening>,
     class: Option<Difficulty>,
+    remembered: Option<Difficulty>,
 ) -> Option<Taken> {
     let id = match (marked, &opening) {
         (Some(marked), _) => marked.clone(),
@@ -305,7 +326,9 @@ fn taken_turn(
     };
     Some(Taken {
         id,
-        class,
+        // The verdict keeps the class that served the turn: what this request named, or
+        // the turn's own for a silence, which is a re-remembering and not a forgetting.
+        class: class.or(remembered),
         messages: opening.map(|opening| opening.messages),
     })
 }
@@ -315,6 +338,10 @@ fn taken_turn(
 /// trusts the next request and compares nothing.
 struct Taken {
     id: TurnId,
+    /// What the request named, if it named one — never the turn's own remembered class,
+    /// which arrives to the verdict through `remember`'s answer instead. Left as it is by
+    /// a silence that nothing answered at, so re-remembering a turn keeps the class it was
+    /// dispatched at; the verdict gains a class from a dispatch, and loses none.
     class: Option<Difficulty>,
     messages: Option<usize>,
 }
@@ -325,15 +352,24 @@ struct Taken {
 async fn remembered(
     turns: Option<&TurnAffinity>,
     context: &RequestContext,
-    taken: Option<&Taken>,
+    marked: Option<&TurnId>,
+    opening: Option<&Opening>,
 ) -> Option<Verdict> {
-    let (turns, taken) = (turns?, taken?);
-    let verdict = turns
-        .landed(context.authority.identity(), &taken.id)
-        .await?;
-    // A history that has shrunk under the turn's landing is a compaction, and a compaction
-    // starts a turn rather than continuing one.
-    verdict.continues(taken.messages).then_some(verdict)
+    let turns = turns?;
+    // The turn is one the request takes part in, verdict or no verdict: the same anchor
+    // the taken turn will name.
+    let id = match (marked, opening) {
+        (Some(marked), _) => marked.clone(),
+        (None, Some(opening)) => opening.anchor.clone(),
+        (None, None) => return None,
+    };
+    let verdict = turns.landed(context.authority.identity(), &id).await?;
+    // A read before there is a `Taken` cannot hold the count itself: the opening's, if
+    // the body was read, stands for it, and the same test the landing used runs below
+    // when `remember` weighs the next write.
+    verdict
+        .continues(opening.map(|opening| opening.messages))
+        .then_some(verdict)
 }
 
 /// Keeps where this request was answered as where its turn lands from now on, which the next
@@ -381,6 +417,14 @@ fn asked_class(request: &Request<GatewayBody>) -> Result<Option<Difficulty>, Gat
 }
 
 impl Flow<Forwarded> {
+    /// What the request was dispatched at, as the routing and the turn together settled
+    /// it: what the caller named, or what the turn remembered for a silence. The record
+    /// takes this, not the bare header reading, so a remembered class is recorded as the
+    /// class it was dispatched at.
+    pub fn class(&self) -> Option<Difficulty> {
+        self.held.class
+    }
+
     /// Runs the response header chain.
     pub async fn process_response_headers(
         mut self,
@@ -512,6 +556,7 @@ async fn race(
     dispatcher: &Dispatcher,
     request: Request<GatewayBody>,
     dispatching: &Dispatching<'_>,
+    class: Option<Difficulty>,
 ) -> Result<Flow<Forwarded>, GatewayError> {
     // Where an arm of the race went: an answer, all started arms answered, or the wait
     // for the next arm ran out.
@@ -641,6 +686,7 @@ async fn race(
             response,
             served,
             raced,
+            class,
         },
     })
 }

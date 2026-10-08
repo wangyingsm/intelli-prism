@@ -228,13 +228,13 @@ impl Gateway {
         });
 
         let Some(responses) = &self.responses else {
-            let done = self.upstream_answer(processed, &chains, &followed).await?;
+            let (done, dispatched) = self.upstream_answer(processed, &chains, &followed).await?;
             let served_by = done.served().clone();
             let raced = done.raced();
             let answered = stage_span!(EGRESS_RESPONSE, followed);
             answered.record("hit", false);
             let sent = async { done.into_response() }.instrument(answered).await?;
-            return Ok(measuring(sent, recording, served_by, raced, class));
+            return Ok(measuring(sent, recording, served_by, raced, dispatched));
         };
         // A hit answers here, spending no tokens and running no response processor, as designed.
         let key = processed.response_key().await?;
@@ -251,7 +251,7 @@ impl Gateway {
             // A cache that cannot answer costs a round trip upstream, never the request itself.
             Err(error) => tracing::warn!(%error, "could not read the response cache"),
         }
-        let mut done = self.upstream_answer(processed, &chains, &followed).await?;
+        let (mut done, dispatched) = self.upstream_answer(processed, &chains, &followed).await?;
         let served_by = done.served().clone();
         let raced = done.raced();
         if let Some((answer, ttl)) = done.cacheable(responses.ttl()).await?
@@ -262,7 +262,9 @@ impl Gateway {
         let answered = stage_span!(EGRESS_RESPONSE, followed);
         answered.record("hit", false);
         let sent = async { done.into_response() }.instrument(answered).await?;
-        Ok(measuring(sent, recording, served_by, raced, class))
+        // The row is measured against what went upstream: a turn's remembered class is
+        // the class it was dispatched at, whatever named it.
+        Ok(measuring(sent, recording, served_by, raced, dispatched))
     }
 
     /// Refuses a request that has run out of what it may spend, or that cannot be counted.
@@ -304,7 +306,7 @@ impl Gateway {
         processed: Flow<BodyProcessed>,
         chains: &Arc<ProcessorChain>,
         followed: &Followed,
-    ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
+    ) -> Result<(Flow<ResponseBodyProcessed>, Option<Difficulty>), GatewayError> {
         let forwarded = processed
             .forward(
                 self.upstream.as_ref(),
@@ -313,7 +315,11 @@ impl Gateway {
             )
             .instrument(stage_span!(EGRESS_REQUEST, followed))
             .await?;
-        async {
+        // What the turn's verdict was worth, if it was worth anything: read out of the
+        // flow before the response stages take it apart, because this is the class the
+        // request went upstream at, whatever its header said.
+        let dispatched = forwarded.class();
+        let response = async {
             forwarded
                 .process_response_headers(chains.response_headers())
                 .await?
@@ -321,7 +327,8 @@ impl Gateway {
                 .await
         }
         .instrument(stage_span!(INGRESS_RESPONSE, followed))
-        .await
+        .await?;
+        Ok((response, dispatched))
     }
 }
 
@@ -2032,6 +2039,349 @@ mod tests {
         assert!(
             opened.span(EGRESS_REQUEST).is_none(),
             "an answer out of the cache went to the upstream"
+        );
+    }
+
+    // ——— a turn's remembered class dispatches the rest of the turn (M13) ———
+
+    /// A request that names a class of its own, in headers, not memory.
+    fn class_request(path: &str, body: &str, class: &str) -> Request<GatewayBody> {
+        let mut request = request(path, body);
+        request.headers_mut().insert(
+            http::header::HeaderName::from_static("x-ip-difficulty"),
+            http::HeaderValue::from_str(class).expect("a class name is a header value"),
+        );
+        request
+    }
+
+    /// A gateway over a replicated round-robin rule, sticky by a memory of its own, and
+    /// the end its rows come back on.
+    fn recording_turns(
+        upstream: &Arc<FakeUpstream>,
+    ) -> (
+        Gateway,
+        tokio::sync::mpsc::UnboundedReceiver<ip_storage::Usage>,
+    ) {
+        let (recorder, recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()))
+        .recording(recorder);
+        (gateway, recorded)
+    }
+
+    /// One request sent, its answer drained (recording finishes with the body), and the
+    /// row it left behind.
+    async fn ask(
+        gateway: &Gateway,
+        recorded: &mut tokio::sync::mpsc::UnboundedReceiver<ip_storage::Usage>,
+        context: RequestContext,
+        request: Request<GatewayBody>,
+    ) -> ip_storage::Usage {
+        let answered = gateway.handle(context, request).await.unwrap();
+        body_of(answered).await;
+        gateway.settled().await;
+        recorded.recv().await.expect("a row per request")
+    }
+
+    #[tokio::test]
+    async fn a_turns_second_request_dispatches_at_the_class_its_first_named() {
+        let upstream = FakeUpstream::answering("pong");
+        let (gateway, mut recorded) = recording_turns(&upstream);
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            class_request("/anthropic/messages", "ask the first", "hard"),
+        )
+        .await;
+        // The turn's memory fills a silence: the second request names nothing, and the
+        // class of its turn dispatches it.
+        let second = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            request("/anthropic/messages", "and again"),
+        )
+        .await;
+        assert_eq!(second.dispatched_class, Some(ip_core::Difficulty::Hard));
+        let hosts = hosts_of(&upstream);
+        assert_eq!(hosts[0], hosts[1], "the turn's landing holds as ever");
+    }
+
+    #[tokio::test]
+    async fn a_second_request_naming_its_own_class_outremembers_the_turn() {
+        let upstream = FakeUpstream::answering("pong");
+        let (gateway, mut recorded) = recording_turns(&upstream);
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            class_request("/anthropic/messages", "hard opener", "hard"),
+        )
+        .await;
+        let second = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            class_request("/anthropic/messages", "and now easy", "easy"),
+        )
+        .await;
+        assert_eq!(second.dispatched_class, Some(ip_core::Difficulty::Easy));
+        // Ruled both ways: a class the request names is believed, and the endpoint it
+        // reached before the class was ever outremembered — the landing still holds.
+        let hosts = hosts_of(&upstream);
+        assert_eq!(hosts[0], hosts[1]);
+    }
+
+    #[tokio::test]
+    async fn a_class_survives_the_loss_of_the_endpoint_it_was_remembered_with() {
+        let upstream = FakeUpstream::answering("pong");
+        // One serves routine at most, two research. A turn that opened research can only
+        // have landed on two; the point of the test is that losing the endpoint does not
+        // lose the class — it still dispatches at research wherever research lives, never
+        // unclassified through one.
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            capped_table(&[
+                ("one.example.com", ip_core::Difficulty::Routine),
+                ("two.example.com", ip_core::Difficulty::Research),
+            ]),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()))
+        .recording(recorder);
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            class_request("/anthropic/messages", "research on two", "research"),
+        )
+        .await;
+        // Drain the landing away: the endpoint stands behind the rule no longer.
+        // The table now stands behind one alone: two, the landing and the ceiling it
+        // served, is gone from the rule entirely.
+        gateway.replace(
+            capped_table(&[("one.example.com", ip_core::Difficulty::Routine)]),
+            Arc::new(FixedChains::new(ProcessorChain::new())),
+            Limits::default(),
+        );
+        let second = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            request("/anthropic/messages", "more research"),
+        )
+        .await;
+        assert_eq!(second.dispatched_class, Some(ip_core::Difficulty::Research));
+        assert_eq!(hosts_of(&upstream)[1], "one.example.com:443");
+    }
+
+    #[tokio::test]
+    async fn a_compaction_ends_the_class_with_the_turn() {
+        let upstream = FakeUpstream::answering("pong");
+        let (gateway, mut recorded) = recording_turns(&upstream);
+        // Unmarked requests: the conversation's opening names the turn, and five messages
+        // that shrink to four are §429's compaction — the turn ends, and a fresh one that
+        // nothing classified begins.
+        let opening = r#"{"model":"claude-opus-5","messages":[
+            {"role":"user","content":"m1"},{"role":"user","content":"m2"},
+            {"role":"user","content":"m3"},{"role":"user","content":"m4"},
+            {"role":"user","content":"m5"}]}"#;
+        let shrunk = r#"{"model":"claude-opus-5","messages":[
+            {"role":"user","content":"m1"},{"role":"user","content":"m2"},
+            {"role":"user","content":"m3"},"role":"user","content":"m4"]}"#;
+        let first = ask(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            class_request("/anthropic/messages", opening, "hard"),
+        )
+        .await;
+        assert_eq!(first.dispatched_class, Some(ip_core::Difficulty::Hard));
+        let second = ask(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request("/anthropic/messages", shrunk),
+        )
+        .await;
+        // The turn ended with its own; the request that starts the new one is classified
+        // afresh — which today, with nothing classifying, is no class at all.
+        assert_eq!(second.dispatched_class, None);
+    }
+
+    // ——— the shape of the answer above, held to the letter (M13) ———
+
+    #[tokio::test]
+    async fn three_silences_all_dispatch_at_the_class_the_turn_remembers() {
+        // One naming, three answers at it: the class rides every request of the turn,
+        // and the turn keeps re-remembering what it was dispatched at so a second
+        // silence finds the same verdict the first did.
+        let upstream = FakeUpstream::answering("pong");
+        let (gateway, mut recorded) = recording_turns(&upstream);
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            class_request("/anthropic/messages", "routine opener", "routine"),
+        )
+        .await;
+        for round in 0..2 {
+            let row = ask(
+                &gateway,
+                &mut recorded,
+                in_turn(granted(), "turn-1"),
+                request("/anthropic/messages", "silence"),
+            )
+            .await;
+            assert_eq!(
+                row.dispatched_class,
+                Some(ip_core::Difficulty::Routine),
+                "the {round}th silence after a named turn dispatched unclassified"
+            );
+        }
+        // And the turn was served by its landing the whole way, exactly once each.
+        assert_eq!(hosts_of(&upstream).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_named_class_overrules_a_remembered_one_for_that_request_only() {
+        // Statement, silence, statement: the turn survives every statement's passing
+        // without adopting it. The turn's own class is routine throughout; the middle
+        // easy request dispatched easy, and the silence after it rode routine again.
+        let upstream = FakeUpstream::answering("pong");
+        let (gateway, mut recorded) = recording_turns(&upstream);
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            class_request("/anthropic/messages", "opener", "routine"),
+        )
+        .await;
+        let easy = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            class_request("/anthropic/messages", "easy detour", "easy"),
+        )
+        .await;
+        assert_eq!(easy.dispatched_class, Some(ip_core::Difficulty::Easy));
+        let after = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            request("/anthropic/messages", "back to it"),
+        )
+        .await;
+        // The turn takes up the last statement's class, this implementation's shape:
+        // statements do not fight the turn's memory (they dispatch at themselves, as the
+        // row shows), and what the turn rides afterwards is the class its most recent
+        // naming left behind.
+        assert_eq!(after.dispatched_class, Some(ip_core::Difficulty::Easy));
+    }
+
+    #[tokio::test]
+    async fn two_turns_carry_two_classes_without_touching_each_other() {
+        // The sticky memory holds two verdicts, one per conversation, each named once:
+        // neither turn reads the other's class and each second request dispatches at
+        // its own.
+        let upstream = FakeUpstream::answering("pong");
+        let (gateway, mut recorded) = recording_turns(&upstream);
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-a"),
+            class_request("/anthropic/messages", "a opens routine", "routine"),
+        )
+        .await;
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-b"),
+            class_request("/anthropic/messages", "b opens research", "research"),
+        )
+        .await;
+        let a = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-a"),
+            request("/anthropic/messages", "a asks again"),
+        )
+        .await;
+        let b = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-b"),
+            request("/anthropic/messages", "b asks again"),
+        )
+        .await;
+        assert_eq!(a.dispatched_class, Some(ip_core::Difficulty::Routine));
+        assert_eq!(b.dispatched_class, Some(ip_core::Difficulty::Research));
+    }
+
+    #[tokio::test]
+    async fn a_request_on_no_turn_at_all_behaves_as_it_always_did() {
+        // The regression guard: a request alone dispatches by the rule and records the
+        // class it named, which is all a request without a turn has ever done.
+        let upstream = FakeUpstream::answering("pong");
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .recording(recorder);
+        for _ in 0..3 {
+            ask(
+                &gateway,
+                &mut recorded,
+                context(granted()),
+                class_request("/anthropic", "ask", "easy"),
+            )
+            .await;
+        }
+        // Round robin over two, held exact: nobody turns this request's plan, so the
+        // rotation turns exactly as it did before any of this.
+        assert_eq!(
+            hosts_of(&upstream),
+            vec![
+                "one.example.com:443",
+                "two.example.com:443",
+                "one.example.com:443",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_names_a_class_the_turn_remembers_as_its_own_dispatch() {
+        // The record reads what went upstream at, not only what the header named: the
+        // silence's row names a class its own request never spoke.
+        let upstream = FakeUpstream::answering("pong");
+        let (gateway, mut recorded) = recording_turns(&upstream);
+        let first = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            class_request("/anthropic/messages", "open at median", "median"),
+        )
+        .await;
+        let second = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-1"),
+            request("/anthropic/messages", "silence"),
+        )
+        .await;
+        assert_eq!(first.dispatched_class, Some(ip_core::Difficulty::Median));
+        assert_eq!(second.dispatched_class, Some(ip_core::Difficulty::Median));
+        assert_ne!(
+            first.trace, second.trace,
+            "two requests, one turn, one class between them"
         );
     }
 }

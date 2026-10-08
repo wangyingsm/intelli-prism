@@ -133,6 +133,10 @@ pub struct Answered {
     /// How many endpoints the request was raced across; one is what happened when it was not
     /// raced at all.
     pub raced: Hedge,
+    /// What it was dispatched at — the request's own class, or the turn's for a silence.
+    /// The record's `dispatched_class`, and the reason the context speaks for the class
+    /// after forward rather than the header reading alone.
+    pub class: Option<Difficulty>,
 }
 
 /// The upstream answered.

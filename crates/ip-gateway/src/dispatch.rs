@@ -10,6 +10,8 @@ use std::time::Instant;
 use http::HeaderMap;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use ip_core::{Difficulty, Endpoint, Hedge, Replica, Strategy, Weighted};
+
+use crate::turns::Verdict;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -281,7 +283,8 @@ struct Answered {
 pub struct Dispatching<'a> {
     /// The rule that matched, and the endpoints it stands behind.
     resolution: &'a Resolution,
-    /// The class the caller named, if it named one. Nothing narrows an unclassified request.
+    /// The class this request dispatches at: what it named, or what its turn's verdict
+    /// remember for a silence. Nothing narrows a request with neither.
     class: Option<Difficulty>,
     /// Where this request's turn landed before, if it marked a turn and the memory kept one.
     landed: Option<&'a Replica>,
@@ -297,13 +300,18 @@ impl<'a> Dispatching<'a> {
         }
     }
 
-    /// Where the turn this request belongs to landed last time, which is where it goes again
-    /// as long as that endpoint still stands behind the rule, unsunk and able to carry what
-    /// is asked now. It replaces what the strategy would have picked, for this request only:
-    /// a turn is not consulted over an endpoint that cannot serve it.
+    /// What the turn this request belongs to remembers of where it landed: the endpoint
+    /// goes ahead of the choosing as long as it still stands behind the rule. The class
+    /// is not read from here — `class` arrives already resolved, the caller having let
+    /// the request's own word win over the turn's — and the verdict's class outlives the
+    /// endpoint it was remembered with: the request is still as hard as it was, whatever
+    /// serves it now.
     #[must_use]
-    pub fn landed_on(self, landed: Option<&'a Replica>) -> Self {
-        Self { landed, ..self }
+    pub fn remembered_from(self, verdict: Option<&'a Verdict>) -> Self {
+        Self {
+            landed: verdict.map(|verdict| &verdict.endpoint),
+            ..self
+        }
     }
 
     /// The rule that matched, and the endpoints it stands behind.
@@ -1596,8 +1604,13 @@ mod tests {
         class: Option<Difficulty>,
         landed_on: &Replica,
     ) -> String {
+        let verdict = Verdict {
+            class: None,
+            messages: None,
+            endpoint: landed_on.clone(),
+        };
         let chosen =
-            dispatcher.choose(&Dispatching::new(resolution, class).landed_on(Some(landed_on)));
+            dispatcher.choose(&Dispatching::new(resolution, class).remembered_from(Some(&verdict)));
         chosen.endpoint().host.as_str().to_owned()
     }
 
@@ -1636,7 +1649,7 @@ mod tests {
             let hosts = (0..6)
                 .map(|_| {
                     dispatcher
-                        .choose(&Dispatching::new(&resolution, None).landed_on(None))
+                        .choose(&Dispatching::new(&resolution, None).remembered_from(None))
                         .endpoint()
                         .host
                         .as_str()
@@ -1831,7 +1844,11 @@ mod tests {
         );
         let raced = dispatcher
             .choose_many(
-                &Dispatching::new(&resolution, None).landed_on(Some(&replica("two.example.com"))),
+                &Dispatching::new(&resolution, None).remembered_from(Some(&Verdict {
+                    class: None,
+                    messages: None,
+                    endpoint: replica("two.example.com"),
+                })),
                 Hedge::new(3).unwrap(),
             )
             .iter()
@@ -1857,7 +1874,11 @@ mod tests {
         let (dispatcher, _folding) = Dispatcher::new();
         let raced = dispatcher
             .choose_many(
-                &Dispatching::new(&resolution, None).landed_on(Some(&replica("two.example.com"))),
+                &Dispatching::new(&resolution, None).remembered_from(Some(&Verdict {
+                    class: None,
+                    messages: None,
+                    endpoint: replica("two.example.com"),
+                })),
                 Hedge::new(2).unwrap(),
             )
             .iter()

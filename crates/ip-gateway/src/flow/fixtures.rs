@@ -296,6 +296,29 @@ pub(super) fn replicated_table(strategy: ip_core::Strategy) -> RoutingTable {
     RoutingTable::from_rules(vec![rule])
 }
 
+/// A table whose one rule stands behind the hosts named, each capped at the class named
+/// alongside it; an endpoint that serves a class serves every class below it.
+pub(super) fn capped_table(behind: &[(&str, ip_core::Difficulty)]) -> RoutingTable {
+    let mut rule = rule(endpoint(
+        Protocol::Https,
+        behind.first().expect("a rule stands behind something").0,
+        443,
+        "/v1",
+    ));
+    rule.target = RouteTarget::from_weighted(
+        behind
+            .iter()
+            .map(|(host, ceiling)| ip_core::Weighted {
+                endpoint: endpoint(Protocol::Https, host, 443, "/v1"),
+                serves: Some(*ceiling),
+                ..ip_core::Weighted::new(endpoint(Protocol::Https, host, 443, "/v1"))
+            })
+            .collect(),
+    )
+    .unwrap();
+    RoutingTable::from_rules(vec![rule])
+}
+
 /// A table whose one rule stands behind two endpoints, dispatched to by `strategy`, and raced
 /// across `hedge` of them.
 pub(super) fn hedged_replicated_table(
@@ -406,6 +429,7 @@ pub(super) fn context(authority: Authority) -> RequestContext {
         listen: "127.0.0.1:8080".parse().unwrap(),
         trace: TraceId::generate().unwrap(),
         turn: None,
+        // Unclassified until forward says otherwise, which is where the class is read from.
     }
 }
 
