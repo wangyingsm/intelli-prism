@@ -7,6 +7,9 @@
 
 pub mod error;
 
+#[cfg(feature = "runtime")]
+pub mod runtime;
+
 use ip_core::Difficulty;
 
 pub use error::ClassifyError;
