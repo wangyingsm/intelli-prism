@@ -2194,7 +2194,7 @@ mod tests {
             {"role":"user","content":"m5"}]}"#;
         let shrunk = r#"{"model":"claude-opus-5","messages":[
             {"role":"user","content":"m1"},{"role":"user","content":"m2"},
-            {"role":"user","content":"m3"},"role":"user","content":"m4"]}"#;
+            {"role":"user","content":"m3"},{"role":"user","content":"m4"}]}"#;
         let first = ask(
             &gateway,
             &mut recorded,
