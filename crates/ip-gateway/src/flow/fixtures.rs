@@ -296,6 +296,51 @@ pub(super) fn replicated_table(strategy: ip_core::Strategy) -> RoutingTable {
     RoutingTable::from_rules(vec![rule])
 }
 
+/// A judge that answers a fixed class for every text handed to it, counting the calls
+/// and remembering the last one — the flow tests must not need an artefact, and "was the
+/// turn classified once?" is a question about counts, not about weights.
+#[derive(Debug, Default)]
+pub struct CountingClassifier {
+    /// The class every text gets; `None` is a judge that never commits.
+    pub answer: std::sync::Mutex<Option<ip_core::Difficulty>>,
+    calls: std::sync::atomic::AtomicUsize,
+    /// The last text handed over, for the leak assertions.
+    pub last: std::sync::Mutex<String>,
+}
+
+impl CountingClassifier {
+    /// A judge that names `class` for everything and says how often it was asked.
+    #[must_use]
+    pub fn naming(class: ip_core::Difficulty) -> Self {
+        Self {
+            answer: std::sync::Mutex::new(Some(class)),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            last: std::sync::Mutex::new(String::new()),
+        }
+    }
+
+    /// A judge that refuses everything: the shape of an error or a sub-margin answer,
+    /// which the flow must read as "unclassified" and move on.
+    #[must_use]
+    pub fn silent() -> Self {
+        Self::default()
+    }
+
+    /// How many times it has been asked.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::Classifier for CountingClassifier {
+    fn classify(&self, text: &str) -> Option<ip_core::Difficulty> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.last.lock().unwrap() = text.to_owned();
+        *self.answer.lock().unwrap()
+    }
+}
+
 /// A table whose one rule stands behind the hosts named, each capped at the class named
 /// alongside it; an endpoint that serves a class serves every class below it.
 pub(super) fn capped_table(behind: &[(&str, ip_core::Difficulty)]) -> RoutingTable {

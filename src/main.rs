@@ -1,5 +1,6 @@
 mod admin;
 mod auth;
+mod classify;
 mod cli;
 mod cookie;
 mod error;

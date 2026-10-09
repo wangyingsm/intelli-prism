@@ -52,9 +52,7 @@ const DEFAULT_LIBRARY: &str = "libonnxruntime.so";
 pub struct Classifier {
     session: ort::session::Session,
     tokenizer: tokenizers::Tokenizer,
-    temperature: Temperature,
-    /// The artefact's own input cap, from `gate.json`: the length it was trained at.
-    max_length: usize,
+    gate: Gate,
 }
 
 /// One answer: the distribution over the five classes, and what producing it cost.
@@ -132,9 +130,14 @@ impl Classifier {
         Ok(Self {
             session,
             tokenizer,
-            temperature: artifact.temperature,
-            max_length: artifact.max_length,
+            gate: artifact,
         })
+    }
+
+    /// The artefact's manifest, as read at open.
+    #[must_use]
+    pub fn gate(&self) -> &Gate {
+        &self.gate
     }
 
     /// The path the runtime library was searched for under `ORT_DYLIB_PATH`, if set.
@@ -167,8 +170,8 @@ impl Classifier {
     pub fn classify_ids(&mut self, ids: &[i64]) -> Result<Classification, ClassifyError> {
         let started = Instant::now();
         let mut ids = ids.to_vec();
-        if ids.len() > self.max_length {
-            ids.drain(1..ids.len() - self.max_length + 1);
+        if ids.len() > self.gate.max_length {
+            ids.drain(1..ids.len() - self.gate.max_length + 1);
         }
         let width = ids.len();
         let attention = vec![1i64; width];
@@ -194,7 +197,7 @@ impl Classifier {
             return Err(ClassifyError::WrongOutput { got: logits.len() });
         }
         let as_doubles: Vec<f64> = logits.iter().copied().map(f64::from).collect();
-        let distribution = Distribution::softmax(&as_doubles, self.temperature)?;
+        let distribution = Distribution::softmax(&as_doubles, self.gate.temperature)?;
         Ok(Classification {
             distribution,
             took: started.elapsed(),
@@ -207,9 +210,14 @@ pub const DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 
 /// What the artefact's `gate.json` carries: figures fitted at training that belong
 /// beside the weights, never configured, never guessed in code.
-struct Gate {
-    temperature: Temperature,
-    max_length: usize,
+#[derive(Debug, Clone)]
+pub struct Gate {
+    /// The fitted divisor between logits and exponentials.
+    pub temperature: Temperature,
+    /// The length the model was trained at, which is the length the runtime cuts to.
+    pub max_length: usize,
+    /// The class order the graph's outputs are in, as named.
+    pub classes: Vec<String>,
 }
 
 /// Reads the two figures: refuse an unreadable file as itself, and a missing figure
@@ -231,9 +239,23 @@ fn read_gate(path: &Path) -> Result<Gate, ClassifyError> {
         .and_then(|length| usize::try_from(length).ok())
         .filter(|length| *length > 2)
         .ok_or_else(unreadable)?;
+    let classes = value
+        .get("classes")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<String>>()
+        })
+        .filter(|names| !names.is_empty())
+        .ok_or_else(unreadable)?;
+    // The exporter writes a `version`; nothing reads it yet.
     Ok(Gate {
         temperature,
         max_length,
+        classes,
     })
 }
 #[cfg(all(test, feature = "runtime"))]
@@ -317,7 +339,7 @@ mod tests {
             [
                 // model.onnx deliberately absent; the other two claim a real directory.
                 ("tokenizer.json", b"{}".as_slice()),
-                ("gate.json", br#"{"temperature": 1.3, "max_length": 256}"#),
+                ("gate.json", br#"{"temperature": 1.3, "max_length": 256, "classes": ["easy", "routine", "median", "hard", "research"], "version": 1}"#),
                 ("stray.txt", b"".as_slice()),
             ],
         );
@@ -391,7 +413,7 @@ mod tests {
             [
                 ("model.onnx", b"unused".as_slice()),
                 ("tokenizer.json", b"{}".as_slice()),
-                ("gate.json", br#"{"temperature": 1.3, "max_length": 256}"#),
+                ("gate.json", br#"{"temperature": 1.3, "max_length": 256, "classes": ["easy", "routine", "median", "hard", "research"], "version": 1}"#),
             ],
         );
         let error = Classifier::open(&dir).expect_err("an absent library cannot load a classifier");
@@ -413,7 +435,7 @@ mod tests {
             [
                 ("model.onnx", b"unused".as_slice()),
                 ("tokenizer.json", b"{}".as_slice()),
-                ("gate.json", br#"{"temperature": 1.3, "max_length": 256}"#),
+                ("gate.json", br#"{"temperature": 1.3, "max_length": 256, "classes": ["easy", "routine", "median", "hard", "research"], "version": 1}"#),
             ],
         );
         let error = Classifier::open(&dir).err();
@@ -464,7 +486,7 @@ mod tests {
                     "tokenizer.json",
                     br#"{"version":"1.0","truncation":null,"padding":null,"model":{"type":"WordPiece","vocab":{"[CLS]":0,"[SEP]":1,"[PAD]":2,"unknown":3},"unk_token":"unknown","continuing_subword_prefix":"","max_input_chars_per_word":100},"post_processor":null,"pre_tokenizer":null}"#,
                 ),
-                ("gate.json", br#"{"temperature": 1.3, "max_length": 256}"#),
+                ("gate.json", br#"{"temperature": 1.3, "max_length": 256, "classes": ["easy", "routine", "median", "hard", "research"], "version": 1}"#),
             ],
         );
         let error = Classifier::open(&dir).err();
@@ -557,7 +579,7 @@ mod tests {
             eprintln!("SKIPPED: {ARTIFACT_ENV} is unset");
             return;
         };
-        let keep = classifier.max_length;
+        let keep = classifier.gate().max_length;
         let vocab = classifier.tokenizer.get_vocab_size(true);
         // A raw id vector of exact `cap + 1`: one in, one less out, whatever any
         // tokenizer decides to merge. Cap going in means cap unchanged comes back —

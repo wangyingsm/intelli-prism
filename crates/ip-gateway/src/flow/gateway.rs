@@ -20,6 +20,7 @@ use super::headers::set_length;
 use super::record::{Limiting, Pending, Recording};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
+use crate::classifier::Classifier;
 use crate::dispatch::Dispatcher;
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::limit::{Asking, Decision, Limiter, Limits};
@@ -57,6 +58,9 @@ pub struct Gateway {
     dispatcher: Arc<Dispatcher>,
     /// Where the turns that pass through are kept to the endpoints they landed on.
     turns: Option<TurnAffinity>,
+    /// The local judge of a turn's opening, when one is configured: consulted for a turn
+    /// that names no class and remembers none, once.
+    classifier: Option<Arc<dyn Classifier>>,
     pending: Pending,
 }
 
@@ -101,6 +105,7 @@ impl Gateway {
             // Nothing folds what this one learns until a caller supplies one that is folded for.
             dispatcher: Arc::new(Dispatcher::new().0),
             turns: None,
+            classifier: None,
             pending: Pending::default(),
         }
     }
@@ -147,6 +152,14 @@ impl Gateway {
     /// `x-ip-turn` is dispatched as though none of this were configured.
     pub fn sticky_turns(mut self, turns: Arc<dyn Cache>) -> Self {
         self.turns = Some(TurnAffinity::new(turns, &self.pending));
+        self
+    }
+
+    /// Asks this judge what a new turn's opening is, when nothing else has said: the
+    /// class it names rides the dispatch and the turn's memory, and the rest of the turn
+    /// costs nothing. Refused, silent or broken, it leaves a request unclassified.
+    pub fn classifying(mut self, classifier: Arc<dyn Classifier>) -> Self {
+        self.classifier = Some(classifier);
         self
     }
 
@@ -312,6 +325,7 @@ impl Gateway {
                 self.upstream.as_ref(),
                 &self.dispatcher,
                 self.turns.as_ref(),
+                self.classifier.clone(),
             )
             .instrument(stage_span!(EGRESS_REQUEST, followed))
             .await?;
@@ -2071,6 +2085,277 @@ mod tests {
         .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()))
         .recording(recorder);
         (gateway, recorded)
+    }
+
+    // ——— classification: asked once, trusted once, never in the way (M13) ———
+
+    /// The opening this conversation carries, so the leak assertion knows what to look
+    /// for in everything that comes back.
+    const OPENING_PROMPT: &str = "please audit the quarterly accounts for me";
+
+    /// A conversation body with a system prompt of its own — every conversation has a
+    /// different opening, and so does every turn worth telling apart.
+    fn conversation_with_system(system: &str, turns: &[(&str, &str)]) -> String {
+        let messages = turns
+            .iter()
+            .map(|(role, content)| format!("{{\"role\": \"{role}\", \"content\": \"{content}\"}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{\"model\": \"claude\", \"system\": \"{system}\", \"messages\": [{messages}]}}")
+    }
+
+    /// A gateway over a replicated round-robin rule, sticky by a memory of its own,
+    /// judged by `judge`, and the end its rows come back on.
+    fn judged_turns(
+        upstream: &Arc<FakeUpstream>,
+        judge: Arc<crate::flow::fixtures::CountingClassifier>,
+    ) -> (
+        Gateway,
+        tokio::sync::mpsc::UnboundedReceiver<ip_storage::Usage>,
+        Arc<ip_cache::SledCache>,
+    ) {
+        let (recorder, recorded) = Ledger::new();
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(
+            replicated_table(ip_core::Strategy::RoundRobin),
+            ProcessorChain::new(),
+            upstream.clone(),
+        )
+        .sticky_turns(cache.clone())
+        .classifying(judge)
+        .recording(recorder);
+        (gateway, recorded, cache)
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_is_classified_once_and_the_rest_of_it_costs_nothing() {
+        let upstream = FakeUpstream::answering("pong");
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded, _memory) = judged_turns(&upstream, judge.clone());
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-audit"),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(judge.calls(), 1, "a new turn is classified once");
+        let second = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-audit"),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system(
+                    "you audit accounts",
+                    &[
+                        ("user", OPENING_PROMPT),
+                        ("assistant", "pong"),
+                        ("user", "and now?"),
+                    ],
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            judge.calls(),
+            1,
+            "the turn remembers, so nothing is asked again"
+        );
+        assert_eq!(
+            second.dispatched_class,
+            Some(ip_core::Difficulty::Hard),
+            "and the turn's remembered class rides the second request"
+        );
+    }
+
+    /// The economics of the feature, unmarked: a conversation that never claims a
+    /// turn is still the same turn request to request, and its judged class rides the
+    /// second request from memory rather than a second forward pass.
+    #[tokio::test]
+    async fn an_unmarked_conversation_is_classified_once_and_remembered() {
+        let upstream = FakeUpstream::answering("pong");
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded, _memory) = judged_turns(&upstream, judge.clone());
+        ask(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(judge.calls(), 1, "a new conversation is classified once");
+        let second = ask(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            judge.calls(),
+            1,
+            "the judged conversation answers from memory"
+        );
+        assert_eq!(
+            second.dispatched_class,
+            Some(ip_core::Difficulty::Hard),
+            "and it dispatches at the class that conversation earned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_names_its_class_is_never_classified() {
+        let upstream = FakeUpstream::answering("pong");
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Easy,
+        ));
+        let (gateway, mut recorded, _memory) = judged_turns(&upstream, judge.clone());
+        ask(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            class_request(
+                "/anthropic/messages",
+                &conversation(&[("user", "I say hard")]),
+                "hard",
+            ),
+        )
+        .await;
+        assert_eq!(
+            judge.calls(),
+            0,
+            "a statement is believed, not double-checked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_judge_that_refuses_leaves_the_request_unclassified() {
+        let upstream = FakeUpstream::answering("pong");
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded, _memory) = judged_turns(&upstream, judge.clone());
+        let row = ask(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation(&[("user", "anything will do")]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            row.dispatched_class, None,
+            "refused means unclassified, as today"
+        );
+        assert_eq!(judge.calls(), 1, "it was still asked once");
+    }
+
+    #[tokio::test]
+    async fn a_body_without_a_conversation_is_not_classified() {
+        let upstream = FakeUpstream::answering("pong");
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded, _memory) = judged_turns(&upstream, judge.clone());
+        ask(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                "{\"model\": \"claude\", \"prompt\": \"a plain completion\"}",
+            ),
+        )
+        .await;
+        assert_eq!(
+            judge.calls(),
+            0,
+            "a body without a first user turn asks no question"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_opening_reaches_the_judge_and_nothing_written_afterwards() {
+        let upstream = FakeUpstream::answering("pong");
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded, memory) = judged_turns(&upstream, judge.clone());
+        ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-leak"),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        // The judge saw it — that is the whole point of the seam.
+        assert!(judge.last.lock().unwrap().contains(OPENING_PROMPT));
+        // The row does not carry it, and the second request proves the verdict came
+        // back from memory: the judge is never asked again.
+        let second = ask(
+            &gateway,
+            &mut recorded,
+            in_turn(granted(), "turn-leak"),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system(
+                    "you audit accounts",
+                    &[
+                        ("user", OPENING_PROMPT),
+                        ("assistant", "pong"),
+                        ("user", "next"),
+                    ],
+                ),
+            ),
+        )
+        .await;
+        assert!(
+            !format!("{second:?}").contains(OPENING_PROMPT),
+            "a row that repeats a prompt"
+        );
+        assert_eq!(
+            judge.calls(),
+            1,
+            "the verdict rode back from memory, not the judge"
+        );
+        // And the memory itself, read back as stored bytes: the verdict is the digest
+        // and its counts, and neither of the prompts that made them. The row's Debug
+        // could not betray a prompt even if the verdict carried one — Opening hides
+        // its text by hand — so this is the assertion that actually guards the leak.
+        let stored = memory
+            .get(&crate::turns::key(
+                granted().identity(),
+                &TurnId::new("turn-leak").unwrap(),
+            ))
+            .await
+            .expect("the cache answers")
+            .expect("the turn's verdict is stored");
+        let stored = String::from_utf8_lossy(&stored);
+        assert!(
+            !stored.contains(OPENING_PROMPT),
+            "the verdict repeats the prompt"
+        );
+        assert!(
+            !stored.contains("you audit accounts"),
+            "the verdict repeats the system prompt"
+        );
     }
 
     /// One request sent, its answer drained (recording finishes with the body), and the

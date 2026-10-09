@@ -16,6 +16,7 @@ use super::headers::{aim, authority_of, is_event_stream, rewrite, set_length, st
 use super::run::{collect, run_body, run_headers};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, freshness, response_key};
+use crate::classifier::{CLASSIFY_DEADLINE, Classifier};
 use crate::dispatch::{Dispatcher, Dispatching, may_hold, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{HeaderProcessor, ProcessorChain};
@@ -232,6 +233,7 @@ impl Flow<BodyProcessed> {
         upstream: &dyn Upstream,
         dispatcher: &Dispatcher,
         turns: Option<&TurnAffinity>,
+        classifier: Option<Arc<dyn Classifier>>,
     ) -> Result<Flow<Forwarded>, GatewayError> {
         let Routed {
             request,
@@ -239,33 +241,59 @@ impl Flow<BodyProcessed> {
             class,
         } = self.held;
         let raced = may_race(request.headers(), resolution.rule().hedge);
+        let marked = self.context.turn.clone();
         let unmarked = turns.is_some() && self.context.turn.is_none();
-        let mut request = request;
+        // An unmarked turn lives in its opening, so the opening is read for it.
+        let reads_opening = unmarked && may_hold(request.headers());
         let mut opening = None;
-        // The body is held here when the turn's opening has to be read out of it: only for
-        // an unmarked request, and only when a memory is configured that would read it. A
-        // race makes its own buffer below — for a request whose opening was read here that
-        // is a second collect over bytes already in memory, cheap for the reasons `race`
-        // gives.
-        if unmarked && may_hold(request.headers()) {
+        let mut request = request;
+        if reads_opening {
             let (parts, body) = request.into_parts();
             let bytes = collect(StageName::BodyRead, body).await?;
             opening = Opening::read(&bytes);
             request = Request::from_parts(parts, from_bytes(bytes));
         }
-        let marked = self.context.turn.clone();
+        // A marked request reads its memory before its body, so warm turns keep
+        // streaming; only a read naming no class makes the body worth collecting.
+        let ask_cold_memory = !reads_opening
+            && marked.is_some()
+            && class.is_none()
+            && classifier.is_some()
+            && turns.is_some()
+            && may_hold(request.headers());
         let landed = remembered(turns, &self.context, marked.as_ref(), opening.as_ref()).await;
-        let taken = taken_turn(
-            marked.as_ref(),
-            opening,
-            class,
-            landed.as_ref().and_then(|verdict| verdict.class),
-        );
-        // The turn's remembered class fills a silence and never overrules a statement: a
-        // request that named its own class dispatches at it as ever. No staleness check
-        // sits here on purpose — a compaction ends the turn from the opening (§429), and
-        // the fresh turn holds no verdict to be stale.
-        let dispatch_class = class.or(landed.as_ref().and_then(|verdict| verdict.class));
+        let settled = landed
+            .as_ref()
+            .is_some_and(|verdict| verdict.class.is_some());
+        if ask_cold_memory && !settled {
+            let (parts, body) = request.into_parts();
+            let bytes = collect(StageName::BodyRead, body).await?;
+            opening = Opening::read(&bytes);
+            request = Request::from_parts(parts, from_bytes(bytes));
+        }
+        // A verdict naming no class is as silent as an empty memory.
+        let remembered_class = landed.as_ref().and_then(|verdict| verdict.class);
+        // Named, else remembered, else judged — each fills only the silence before it.
+        let classified = match (class, remembered_class, opening.as_ref(), classifier) {
+            (None, None, Some(opening), Some(judge)) => {
+                let text = opening.text.clone();
+                // Weights, not a future: off the task, under the clock the trait keeps.
+                match tokio::time::timeout(
+                    CLASSIFY_DEADLINE,
+                    tokio::task::spawn_blocking(move || judge.classify(&text)),
+                )
+                .await
+                {
+                    Ok(Ok(answer)) => answer,
+                    // A judge whose own task died, and a judge too slow to speak.
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        // What the judge named belongs to the turn, not the request.
+        let dispatch_class = class.or(remembered_class).or(classified);
+        let taken = taken_turn(marked.as_ref(), opening, class, dispatch_class);
         let dispatching =
             Dispatching::new(&resolution, dispatch_class).remembered_from(landed.as_ref());
         if raced == Hedge::NONE {
@@ -872,7 +900,7 @@ mod tests {
         let upstream = FakeUpstream::answering("pong");
         let (dispatcher, _folding) = Dispatcher::new();
         let flow = flow
-            .forward(upstream.as_ref(), &dispatcher, None)
+            .forward(upstream.as_ref(), &dispatcher, None, None)
             .await
             .unwrap();
         assert_eq!(flow.stage(), StageName::Route);
@@ -996,7 +1024,7 @@ mod tests {
             .await
             .unwrap();
         let flow = flow
-            .forward(upstream.as_ref(), &dispatcher, None)
+            .forward(upstream.as_ref(), &dispatcher, None, None)
             .await
             .unwrap();
         let flow = flow

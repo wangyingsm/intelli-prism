@@ -48,6 +48,13 @@ pub enum ConfigError {
     #[error("temperature {value} is outside {min} to {max}")]
     Temperature { value: f64, min: f32, max: f32 },
 
+    /// A difficulty confidence that is not a margin.
+    #[error("difficulty confidence {value} is not between 0 and 1")]
+    DifficultyConfidence {
+        /// What the file asked for.
+        value: f64,
+    },
+
     /// A trace sampling ratio that is not a share.
     #[error("sample ratio {value} is not between 0 and 1")]
     SampleRatio {

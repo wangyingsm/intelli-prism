@@ -2,6 +2,7 @@
 
 pub mod body;
 pub mod cache;
+pub mod classifier;
 pub mod dispatch;
 pub mod error;
 pub mod flow;
@@ -17,6 +18,7 @@ pub mod upstream;
 
 pub use body::{BoxError, GatewayBody};
 pub use cache::{CachedResponse, Freshness, ResponseCache, freshness, response_key};
+pub use classifier::{CLASSIFY_DEADLINE, Classifier};
 pub use dispatch::{Chosen, Dispatcher};
 pub use error::{GatewayError, GatewayErrorKind, ProcessorError, RouteError, UpstreamError};
 pub use flow::{Flow, Gateway, RequestContext};

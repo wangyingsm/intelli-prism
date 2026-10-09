@@ -111,13 +111,24 @@ impl Verdict {
 
 /// What the opening of one request says about it: the anchor its conversation is known by,
 /// and how much conversation there is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written and leaves `text` out: this type travels with the request, and
+/// its text is what the user typed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Opening {
     /// The conversation's anchor: a digest of the system prompt and the first user message,
     /// which every request of the conversation repeats unchanged.
     pub anchor: TurnId,
     /// How many messages the request carries, the whole exchange and not just the opening.
     pub messages: usize,
+    /// The text the anchor was digested from — the system prompt and the first user
+    /// message, joined for a reader that reads rather than hashes: the classifier.
+    ///
+    /// It is the caller's prompt, and it lives exactly as long as one request: the
+    /// verdict written to the cache holds the digest and the count, never this. Debug
+    /// hides it so a log line or a `{inspect:?}` cannot carry a user's words by
+    /// accident.
+    pub text: String,
 }
 
 impl Opening {
@@ -144,8 +155,9 @@ impl Opening {
         let value = serde_json::from_slice::<Value>(body).ok()?;
         let messages = value.get("messages")?.as_array()?;
         let user = first_with_role(messages, "user")?;
+        let system = system_of(&value);
         let mut hasher = Sha256::new();
-        hash_field(&mut hasher, system_of(&value));
+        hash_field(&mut hasher, system);
         // A serialised json value never holds a raw NUL, so it cannot fuse the two halves.
         hasher.update([0u8]);
         hash_field(&mut hasher, user.get("content"));
@@ -154,7 +166,35 @@ impl Opening {
         Some(Self {
             anchor,
             messages: messages.len(),
+            text: opening_text(system, user.get("content")),
         })
+    }
+}
+
+impl std::fmt::Debug for Opening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opening")
+            .field("anchor", &self.anchor)
+            .field("messages", &self.messages)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The anchor's two halves as readable text: whatever of them a body carries, each rendered
+/// as plain text — json blocks included, which a classifier reads past anyway.
+fn opening_text(system: Option<&Value>, user: Option<&Value>) -> String {
+    let half = |field: Option<&Value>| match field {
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    };
+    let (system, user) = (half(system), half(user));
+    if system.is_empty() {
+        user
+    } else if user.is_empty() {
+        system
+    } else {
+        format!("{system}\n\n{user}")
     }
 }
 
@@ -239,7 +279,7 @@ impl TurnAffinity {
 
 /// A turn belongs to one caller under one tenant; another caller's turn, though its id were
 /// somehow the same, is not it.
-fn key(identity: &Identity, turn: &TurnId) -> CacheKey {
+pub(crate) fn key(identity: &Identity, turn: &TurnId) -> CacheKey {
     CacheKey::new(
         CacheLevel::System,
         &format!("turn:{}:{}:{}", identity.tenant, identity.user, turn),

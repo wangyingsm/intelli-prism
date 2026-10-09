@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::Deserialize;
 use url::Url;
 
 use crate::error::ConfigError;
@@ -32,6 +33,29 @@ pub struct Config {
     /// The upstream llm endpoints that can be routed to.
     #[serde(default, rename = "upstream")]
     pub upstreams: Vec<UpstreamConfig>,
+    /// The local judge of a turn's opening. Absent, nothing is ever classified and
+    /// every request dispatches as it did before the judge existed.
+    #[serde(default)]
+    pub difficulty: Option<DifficultyConfig>,
+}
+
+/// The gate between a request and a class: where the weights live, and how sure the
+/// judge must be before it commits to the class it names.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DifficultyConfig {
+    /// The directory the model was exported to: `model.onnx`, `tokenizer.json` and
+    /// `gate.json` together are the whole artefact.
+    pub artifact: std::path::PathBuf,
+    /// How far the top class must stand over the runner-up for the class to be acted
+    /// on. Below it the judge refers, and the request dispatches unclassified — the
+    /// gate is the whole design, so it has no default: the operator chooses, in the
+    /// open, against the validation set the artefact shipped with.
+    pub confidence: f64,
+    /// Where `libonnxruntime` lives, when the build did not find one. The environment's
+    /// `ORT_DYLIB_PATH` answers first.
+    #[serde(default)]
+    pub library: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -58,6 +82,17 @@ impl Config {
             return Err(ConfigError::WeakJwtSecret {
                 len: secret_len,
                 min: JWT_SECRET_MIN_BYTES,
+            });
+        }
+        // A confidence outside 0.0..=1.0 is a mistyped margin, not a decision: the
+        // judgement belongs here, with the rest of the config's shape, where it costs
+        // a parse — not the model's 1.17 GB, which `Confidence::new` would otherwise
+        // have been loaded behind before it ever said so.
+        if let Some(difficulty) = &self.difficulty
+            && !(0.0..=1.0).contains(&difficulty.confidence)
+        {
+            return Err(ConfigError::DifficultyConfidence {
+                value: difficulty.confidence,
             });
         }
         for (index, upstream) in self.upstreams.iter().enumerate() {
@@ -501,6 +536,28 @@ path = "/chat"
             Config::parse(&text),
             Err(ConfigError::WeakJwtSecret { len: 8, min: 32 })
         ));
+    }
+
+    /// A confidence beyond 1 would pass every classification and never refer, and
+    /// finding out only after a gigabyte of weights has loaded is the wrong place to
+    /// learn it — the range check is config shape, not model state.
+    #[test]
+    fn rejects_a_difficulty_confidence_outside_its_range() {
+        let bad = |confidence: &str| {
+            let text = format!(
+                "{FULL}\n[difficulty]\nartifact = \"/var/lib/ip/difficulty\"\nconfidence = {confidence}\n"
+            );
+            Config::parse(&text)
+        };
+        assert!(matches!(
+            bad("1.5"),
+            Err(ConfigError::DifficultyConfidence { value }) if (value - 1.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            bad("-0.1"),
+            Err(ConfigError::DifficultyConfidence { .. })
+        ));
+        assert!(bad("0.4").is_ok());
     }
 
     #[test]

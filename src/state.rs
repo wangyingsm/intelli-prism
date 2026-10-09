@@ -77,6 +77,29 @@ impl AppState {
     /// Opens the configured backend, then builds the routing table, the plugin chains and the
     /// upstream client.
     pub async fn open(config: &Config) -> Result<Self, StartupError> {
+        // The judge first, before any backend is touched: a config that asks through a
+        // build without the feature, or for an artefact that is not one, is refused at
+        // startup — never a silent fall back to serving unclassified, and never a
+        // half-opened process on the way to the refusal.
+        #[cfg(feature = "classifier")]
+        let judge: Option<std::sync::Arc<dyn ip_gateway::Classifier>> =
+            match config.difficulty.as_ref() {
+                Some(difficulty) => Some(std::sync::Arc::new(
+                    crate::classify::RuntimeJudge::open(difficulty)
+                        .map_err(|reason| StartupError::Classifier { reason })?,
+                )),
+                None => None,
+            };
+        #[cfg(not(feature = "classifier"))]
+        let judge: Option<std::sync::Arc<dyn ip_gateway::Classifier>> = {
+            if config.difficulty.is_some() {
+                return Err(StartupError::UnsupportedBackend {
+                    backend: "difficulty classifier",
+                    feature: "classifier",
+                });
+            }
+            None
+        };
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
         let backend: Arc<dyn Backend> = Arc::clone(&store);
@@ -118,6 +141,10 @@ impl AppState {
             .dispatching(Arc::new(dispatcher))
             .sticky_turns(Arc::clone(&cache))
             .with_limits(limits);
+        if let Some(judge) = judge {
+            tracing::info!("classifying the opening of turns that name no class");
+            gateway = gateway.classifying(judge);
+        }
         if let Some(ttl) = config.cache.response_ttl() {
             let responses = ResponseCache::new(Arc::clone(&cache), Ttl::new(ttl.as_duration())?);
             gateway = gateway.caching(responses);
@@ -465,6 +492,75 @@ secret = "0123456789abcdef0123456789abcdef"
         let state = AppState::open(&config).await.unwrap();
         assert_eq!(state.listen(), config.server.listen);
         assert!(state.gateway().table().is_empty());
+    }
+
+    #[cfg(not(feature = "classifier"))]
+    #[tokio::test]
+    async fn a_classifier_this_build_does_not_carry_stops_startup() {
+        let dir = scratch("unbuilt-classifier");
+        let config = Config::parse(&format!(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "/nonexistent/ip.db"
+
+{}
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[difficulty]
+artifact = {artifact:?}
+confidence = 0.4
+"#,
+            sled_cache(&scratch("unopened-classifier-cache")),
+            artifact = dir.display().to_string(),
+        ))
+        .expect("the file itself is well-formed");
+        assert!(matches!(
+            AppState::open(&config).await,
+            Err(StartupError::UnsupportedBackend {
+                backend: "difficulty classifier",
+                feature: "classifier",
+            })
+        ));
+    }
+
+    #[cfg(feature = "classifier")]
+    #[tokio::test]
+    async fn an_artefact_that_is_not_one_stops_startup() {
+        let dir = scratch("no-such-artefact");
+        let config = Config::parse(&format!(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "/nonexistent/ip.db"
+
+{}
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[difficulty]
+artifact = {artifact:?}
+confidence = 0.4
+"#,
+            sled_cache(&scratch("unopened-classifier-cache")),
+            artifact = dir.display().to_string(),
+        ))
+        .expect("the file itself is well-formed");
+        let Err(StartupError::Classifier { reason }) = AppState::open(&config).await else {
+            panic!("a directory with no model in it must refuse startup");
+        };
+        assert!(reason.contains("model.onnx"), "{reason}");
     }
 
     #[cfg(not(feature = "fast-storage"))]

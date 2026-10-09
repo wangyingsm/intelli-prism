@@ -6,8 +6,8 @@ pub mod secret;
 pub mod upstream;
 
 pub use config::{
-    AuthConfig, CacheConfig, Config, JwtConfig, LogLevel, SampleRatio, Seconds, ServerConfig,
-    StorageConfig, TelemetryConfig, UsageConfig,
+    AuthConfig, CacheConfig, Config, DifficultyConfig, JwtConfig, LogLevel, SampleRatio, Seconds,
+    ServerConfig, StorageConfig, TelemetryConfig, UsageConfig,
 };
 pub use error::ConfigError;
 pub use ip_core::ModelName;

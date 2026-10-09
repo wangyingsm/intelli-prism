@@ -62,6 +62,17 @@ pub enum StartupError {
         feature: &'static str,
     },
 
+    /// The difficulty classifier could not be opened — an artefact that is not there,
+    /// a runtime that will not load, a taxonomy that does not match. Startup is the
+    /// only honest place to say so: a gateway configured to classify that cannot must
+    /// not stand up and serve unclassified. The classifier build feature is the door.
+    #[cfg(feature = "classifier")]
+    #[error("the difficulty classifier cannot open: {reason}")]
+    Classifier {
+        /// What the loader refused with.
+        reason: String,
+    },
+
     /// The listener could not take the configured address.
     #[error("cannot listen on {address}")]
     Bind {

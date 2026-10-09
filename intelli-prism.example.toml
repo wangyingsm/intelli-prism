@@ -99,3 +99,17 @@ temperature = 0.7
 # host = "ai.corp.example"
 # port = 443
 # path = "/chat"
+
+# Classify the opening of turns that name no class — optional. The binary must be
+# built with `--features classifier`; a [difficulty] stanza in a build without it
+# is refused at startup rather than ignored. The artifact is a directory holding
+# model.onnx, tokenizer.json and gate.json; confidence is the margin the top class
+# must hold over the runner-up, chosen against the artifact's validation set.
+#
+# The library key points at the ONNX Runtime shared library when the loader's own
+# search cannot find it: this build pairs with ONNX Runtime 1.28.0, the version
+# ort 2.0.0-rc.13 was compiled against.
+#
+# [difficulty]
+# artifact = "/var/lib/intelli-prism/difficulty"
+# confidence = 0.4
