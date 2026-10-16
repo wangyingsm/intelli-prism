@@ -482,6 +482,74 @@ mod tests {
         }
     }
 
+    /// A rule bridging two families, as an operator writes it.
+    fn bridging(caller: &str, upstream: &str) -> String {
+        format!(
+            r#"{{
+                "api": "chat",
+                "key": {{"protocol": "https", "host": "gateway.local", "port": 443, "path": "/v1"}},
+                "caller_speaks": "{caller}",
+                "upstream_speaks": "{upstream}",
+                "target": [
+                    {{"protocol": "https", "host": "one.example.com", "port": 443, "path": "/v1"}}
+                ]
+            }}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rule_is_stored_with_the_dialects_it_bridges() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let stored = call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&bridging("openai", "gemini")),
+        )
+        .await;
+        assert_eq!(stored.status(), StatusCode::NO_CONTENT);
+
+        let listed = listed(&router, &state).await;
+        assert_eq!(listed[0]["caller_speaks"], "openai");
+        assert_eq!(listed[0]["upstream_speaks"], "gemini");
+    }
+
+    /// A rule that bridges nothing reports no dialect keys at all, so a client written
+    /// before this milestone reads exactly what it always read.
+    #[tokio::test]
+    async fn a_rule_bridging_nothing_reports_no_dialects() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&json(&rule("/v1", "one.example.com"))),
+        )
+        .await;
+        let listed = listed(&router, &state).await;
+        assert!(listed[0].get("caller_speaks").is_none(), "{:?}", listed[0]);
+        assert!(listed[0].get("upstream_speaks").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_family_this_gateway_does_not_carry_is_refused() {
+        let state = state_over(store().await);
+        let router = crate::routes::router(state.clone());
+        let refused = call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            Some(&bridging("openai", "cohere")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     #[tokio::test]
     async fn a_rule_is_stored_with_the_hedge_delay_it_names() {
         let state = state_over(store().await);

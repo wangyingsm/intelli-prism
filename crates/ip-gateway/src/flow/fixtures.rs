@@ -286,6 +286,14 @@ pub(super) fn table() -> RoutingTable {
     ))])
 }
 
+/// A table whose one rule bridges two families, or neither when both are the same.
+pub(super) fn bridging_table(caller: ip_core::Dialect, upstream: ip_core::Dialect) -> RoutingTable {
+    let mut rule = rule(endpoint(Protocol::Https, "api.example.com", 443, "/v1"));
+    rule.caller_speaks = Some(caller);
+    rule.upstream_speaks = Some(upstream);
+    RoutingTable::from_rules(vec![rule])
+}
+
 /// A table whose one rule stands behind two endpoints, dispatched to by `strategy`.
 pub(super) fn replicated_table(strategy: ip_core::Strategy) -> RoutingTable {
     let mut rule = rule(endpoint(Protocol::Https, "one.example.com", 443, "/v1"));

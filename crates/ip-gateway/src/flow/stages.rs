@@ -28,6 +28,7 @@ use crate::stage::{
     ResponseBodyProcessed, ResponseHeadersProcessed, Routed, Stage, StageName,
 };
 use crate::table::{Resolution, RoutingTable, request_key};
+use crate::translate::{self, Crossing};
 use crate::turns::{Opening, TurnAffinity, Verdict};
 use crate::upstream::Upstream;
 
@@ -406,6 +407,14 @@ impl Flow<BodyProcessed> {
         let taken = taken_turn(marked.as_ref(), opening, class, dispatched.class());
         let dispatching =
             Dispatching::new(&resolution, dispatched.class()).remembered_from(landed.as_ref());
+        // A rule that bridges two families rewrites the body on its way out. Every
+        // other rule — which is every rule that existed before this — reaches none of
+        // this and forwards the bytes it was handed, untouched.
+        let crossing = Crossing::of(resolution.rule());
+        let mut request = request;
+        if let Some(crossing) = crossing {
+            request = crossed_out(crossing, request).await?;
+        }
         if raced == Hedge::NONE {
             let chosen = dispatcher.choose(&dispatching);
             let served = Replica::of(chosen.endpoint());
@@ -416,6 +425,9 @@ impl Flow<BodyProcessed> {
                 .await
                 .map_err(|error| GatewayError::new(Forwarded::NAME, error.into()))?;
             strip_hop_by_hop(response.headers_mut());
+            if let Some(crossing) = crossing {
+                response = crossed_home(crossing, response).await?;
+            }
             remember(turns, &self.context, taken.as_ref(), &served);
             return Ok(Flow {
                 context: self.context,
@@ -428,7 +440,7 @@ impl Flow<BodyProcessed> {
                 },
             });
         }
-        let outcome = race(
+        let mut outcome = race(
             self.context,
             upstream,
             dispatcher,
@@ -437,6 +449,13 @@ impl Flow<BodyProcessed> {
             dispatched,
         )
         .await?;
+        if let Some(crossing) = crossing {
+            let answered = std::mem::replace(
+                &mut outcome.held.response,
+                Response::new(crate::body::empty()),
+            );
+            outcome.held.response = crossed_home(crossing, answered).await?;
+        }
         remember(
             turns,
             &outcome.context,
@@ -445,6 +464,57 @@ impl Flow<BodyProcessed> {
         );
         Ok(outcome)
     }
+}
+
+/// Rewrites a request into the family its endpoints speak.
+///
+/// The body is held whole to do it, which is the cost of a crossing and is paid by no
+/// other route. A body that is no conversation travels exactly as it arrived: this
+/// layer has nothing to say about an embeddings call that happens to sit behind the
+/// same prefix.
+async fn crossed_out(
+    crossing: Crossing,
+    request: Request<GatewayBody>,
+) -> Result<Request<GatewayBody>, GatewayError> {
+    let (mut parts, body) = request.into_parts();
+    let bytes = collect(StageName::BodyRead, body).await?;
+    let Some((conversation, written, dropped)) = translate::request(crossing, &bytes) else {
+        return Ok(Request::from_parts(parts, from_bytes(bytes)));
+    };
+    // The answer to a streamed request is a stream, and a stream cannot cross yet.
+    // Serving it would mean handing the caller the other family's events verbatim,
+    // which is worse than saying so.
+    if conversation.stream {
+        return Err(GatewayError::new(
+            Forwarded::NAME,
+            GatewayErrorKind::StreamNotCrossed {
+                caller: crossing.from(),
+                upstream: crossing.to(),
+            },
+        ));
+    }
+    if !dropped.is_empty() {
+        tracing::warn!(%dropped, "a request crossed without everything it carried");
+    }
+    set_length(&mut parts.headers, written.len());
+    Ok(Request::from_parts(parts, from_bytes(written.into())))
+}
+
+/// Rewrites an answer into the family its caller speaks, which is the same journey back.
+async fn crossed_home(
+    crossing: Crossing,
+    response: Response<GatewayBody>,
+) -> Result<Response<GatewayBody>, GatewayError> {
+    let (mut parts, body) = response.into_parts();
+    let bytes = collect(StageName::BodyRead, body).await?;
+    let Some((written, dropped)) = translate::answer(crossing, &bytes) else {
+        return Ok(Response::from_parts(parts, from_bytes(bytes)));
+    };
+    if !dropped.is_empty() {
+        tracing::warn!(%dropped, "an answer crossed without everything it carried");
+    }
+    set_length(&mut parts.headers, written.len());
+    Ok(Response::from_parts(parts, from_bytes(written.into())))
 }
 
 /// Which turn a request takes part in, and what that turn's verdict is to leave behind:

@@ -3147,6 +3147,233 @@ mod tests {
         );
     }
 
+    // ——— a route bridges two families (M14) ———
+
+    use ip_core::Dialect;
+
+    /// A gateway whose one rule bridges `caller` to `upstream`, answering with `answer`.
+    fn bridging(
+        caller: Dialect,
+        upstream: Dialect,
+        answer: &'static str,
+    ) -> (Gateway, Arc<FakeUpstream>) {
+        let sent = FakeUpstream::answering(answer);
+        let gateway = Gateway::new(
+            crate::flow::fixtures::bridging_table(caller, upstream),
+            ProcessorChain::new(),
+            sent.clone(),
+        );
+        (gateway, sent)
+    }
+
+    /// What the upstream was actually handed.
+    fn received(upstream: &FakeUpstream) -> Vec<u8> {
+        upstream.seen.lock().unwrap()[0].body.to_vec()
+    }
+
+    const IN_OPENAI: &str = r#"{"model":"shared","max_tokens":50,"messages":[{"role":"system","content":"you audit accounts"},{"role":"user","content":"hello"}]}"#;
+
+    /// The property that quietly rots: a rule that bridges nothing hands the upstream
+    /// the caller's own bytes, not a re-serialisation of them. Translation is a thing
+    /// an operator turns on for a route, never a tax the gateway pays everywhere.
+    #[tokio::test]
+    async fn a_route_that_bridges_nothing_forwards_the_bytes_it_was_handed() {
+        // Spaced and ordered exactly as no writer of ours would write it.
+        let odd = "{ \"messages\" : [ {\"content\":\"hi\",\"role\":\"user\"} ] , \"model\":\"m\" }";
+        for table in [
+            crate::flow::fixtures::table(),
+            crate::flow::fixtures::bridging_table(Dialect::OpenAi, Dialect::OpenAi),
+        ] {
+            let upstream = FakeUpstream::answering(ANSWERED);
+            let gateway = Gateway::new(table, ProcessorChain::new(), upstream.clone());
+            let answered = gateway
+                .handle(context(granted()), request("/anthropic/messages", odd))
+                .await
+                .unwrap();
+            body_of(answered).await;
+            assert_eq!(
+                String::from_utf8(received(&upstream)).unwrap(),
+                odd,
+                "a rule that bridges nothing touched the bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_of_one_family_is_served_by_another() {
+        let answered = r#"{"type":"message","role":"assistant","model":"shared","content":[{"type":"text","text":"forty-two"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#;
+        let (gateway, upstream) = bridging(Dialect::OpenAi, Dialect::Anthropic, answered);
+        let response = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic/messages", IN_OPENAI),
+            )
+            .await
+            .unwrap();
+        let back: serde_json::Value = serde_json::from_str(&body_of(response).await).unwrap();
+
+        let sent: serde_json::Value = serde_json::from_slice(&received(&upstream)).unwrap();
+        assert_eq!(
+            sent["system"],
+            serde_json::json!("you audit accounts"),
+            "the upstream was sent its own family's shape"
+        );
+        assert!(sent.get("choices").is_none());
+        assert_eq!(
+            back["choices"][0]["message"]["content"],
+            serde_json::json!("forty-two"),
+            "and the caller got its own back"
+        );
+        assert_eq!(back["usage"]["prompt_tokens"], serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn every_crossing_carries_a_conversation_both_ways() {
+        let answers = |dialect| match dialect {
+            Dialect::OpenAi => {
+                r#"{"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#
+            }
+            Dialect::Anthropic => {
+                r#"{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#
+            }
+            Dialect::Gemini => {
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#
+            }
+        };
+        for upstream_speaks in [Dialect::Anthropic, Dialect::Gemini] {
+            let (gateway, upstream) =
+                bridging(Dialect::OpenAi, upstream_speaks, answers(upstream_speaks));
+            let response = gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic/messages", IN_OPENAI),
+                )
+                .await
+                .unwrap();
+            let back: serde_json::Value = serde_json::from_str(&body_of(response).await).unwrap();
+            assert_eq!(
+                back["choices"][0]["message"]["content"],
+                serde_json::json!("ok"),
+                "a crossing into {upstream_speaks} did not come home"
+            );
+            assert!(
+                !received(&upstream).is_empty(),
+                "{upstream_speaks} was sent nothing"
+            );
+        }
+    }
+
+    /// A tool call is the thing agent traffic actually sends, and its id is the only
+    /// join between a call and the result that answers it.
+    #[tokio::test]
+    async fn a_tool_call_survives_a_crossing_in_both_directions() {
+        let answered = r#"{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"search","input":{"q":"rust"}}],"stop_reason":"tool_use"}"#;
+        let asked = r#"{"model":"shared","max_tokens":50,"messages":[{"role":"user","content":"search"}],"tools":[{"type":"function","function":{"name":"search","parameters":{"type":"object"}}}]}"#;
+        let (gateway, upstream) = bridging(Dialect::OpenAi, Dialect::Anthropic, answered);
+        let response = gateway
+            .handle(context(granted()), request("/anthropic/messages", asked))
+            .await
+            .unwrap();
+        let back: serde_json::Value = serde_json::from_str(&body_of(response).await).unwrap();
+
+        let sent: serde_json::Value = serde_json::from_slice(&received(&upstream)).unwrap();
+        assert_eq!(sent["tools"][0]["name"], serde_json::json!("search"));
+        assert_eq!(
+            sent["tools"][0]["input_schema"]["type"],
+            serde_json::json!("object")
+        );
+
+        let call = &back["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], serde_json::json!("call_1"));
+        assert_eq!(call["function"]["name"], serde_json::json!("search"));
+        assert_eq!(
+            back["choices"][0]["finish_reason"],
+            serde_json::json!("tool_calls")
+        );
+    }
+
+    /// Not everything behind a prefix is a conversation, and what this layer cannot
+    /// read it must not touch.
+    #[tokio::test]
+    async fn a_body_that_is_no_conversation_crosses_untouched() {
+        let embeddings = r#"{"model":"text-embedding-3-small","input":"some text"}"#;
+        let (gateway, upstream) = bridging(Dialect::OpenAi, Dialect::Gemini, ANSWERED);
+        let answered = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic/messages", embeddings),
+            )
+            .await
+            .unwrap();
+        body_of(answered).await;
+        assert_eq!(String::from_utf8(received(&upstream)).unwrap(), embeddings);
+    }
+
+    /// A translated body is a different size, and a content length that still describes
+    /// the old one is a hang rather than an error.
+    #[tokio::test]
+    async fn a_crossing_restates_how_long_the_body_is() {
+        let (gateway, upstream) = bridging(Dialect::OpenAi, Dialect::Anthropic, ANSWERED);
+        let answered = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic/messages", IN_OPENAI),
+            )
+            .await
+            .unwrap();
+        body_of(answered).await;
+        let seen = upstream.seen.lock().unwrap();
+        let stated: usize = seen[0].headers[http::header::CONTENT_LENGTH]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(stated, seen[0].body.len());
+        assert_ne!(stated, IN_OPENAI.len(), "the body really did change size");
+    }
+
+    /// Until a stream can cross, saying so is better than handing a caller the other
+    /// family's events.
+    #[tokio::test]
+    async fn a_streamed_answer_cannot_cross_yet_and_says_so() {
+        let streaming = r#"{"model":"shared","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+        let (gateway, upstream) = bridging(Dialect::OpenAi, Dialect::Anthropic, ANSWERED);
+        let refused = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic/messages", streaming),
+            )
+            .await
+            .expect_err("a stream cannot cross yet");
+        assert_eq!(refused.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            upstream.seen.lock().unwrap().is_empty(),
+            "nothing was sent upstream to be half-translated"
+        );
+    }
+
+    /// And a stream on a route that bridges nothing is untouched, as it always was.
+    #[tokio::test]
+    async fn a_streamed_answer_on_a_route_that_bridges_nothing_is_served() {
+        let streaming =
+            r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let gateway = Gateway::new(
+            crate::flow::fixtures::table(),
+            ProcessorChain::new(),
+            upstream.clone(),
+        );
+        let answered = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic/messages", streaming),
+            )
+            .await
+            .expect("a stream that crosses nothing is served");
+        body_of(answered).await;
+        assert_eq!(String::from_utf8(received(&upstream)).unwrap(), streaming);
+    }
+
     // ——— the row says which level decided (M13) ———
 
     /// The same conversation as [`opening`], written by the family that calls its

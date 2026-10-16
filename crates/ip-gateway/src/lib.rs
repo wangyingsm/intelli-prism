@@ -14,6 +14,7 @@ pub mod processor;
 mod sse;
 pub mod stage;
 pub mod table;
+mod translate;
 pub mod turns;
 pub mod upstream;
 
