@@ -287,6 +287,11 @@ pub(crate) mod tests {
             !self.0.lock().unwrap().is_empty()
         }
 
+        /// The sum of everything counted, whatever it was counted under.
+        pub(crate) fn spent_total(&self) -> u64 {
+            self.0.lock().unwrap().values().sum()
+        }
+
         fn answering(&self) -> Result<(), CacheError> {
             match *self.1.lock().unwrap() {
                 true => Err(CacheError::backend(std::io::Error::other("told to refuse"))),

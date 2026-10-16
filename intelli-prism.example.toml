@@ -113,3 +113,23 @@ temperature = 0.7
 # [difficulty]
 # artifact = "/var/lib/intelli-prism/difficulty"
 # confidence = 0.4
+
+# Ask a larger model what the margin could not call — optional. The question travels
+# this gateway's own routing: ask_path is resolved under the hostname the caller
+# arrived at, so a gateway serving several hostnames registers this route behind
+# each of them. model is whatever that route's endpoints serve, and upstream names
+# the declared upstream whose api_key the question presents — naming one upstream
+# is deliberate, and a replicated arbitrating route presents that one key.
+#
+# timeout is a tail latency you are choosing: the opening request of an unsure
+# conversation blocks for up to this many seconds — once per conversation, because
+# the ruling is remembered — while every later request of that turn pays nothing.
+# Refused, slow or incoherent, the request is dispatched unclassified. The config
+# accepts 1 to 30 seconds and refuses the rest, because past half a minute the
+# wait turns the arbiter into a dependency of serving.
+#
+# [arbiter]
+# model = "claude-opus-5"
+# ask_path = "/arbiter"
+# upstream = "anthropic"
+# timeout = 2

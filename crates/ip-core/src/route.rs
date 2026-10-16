@@ -675,16 +675,15 @@ impl fmt::Display for HedgeDelay {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Difficulty {
-    /// A common-sense question for simple chat.
+    /// A common-sense question, simple chat, a trivial lookup.
     Easy,
-    /// An agent-driven question with simple tool calls, the loop within three turns.
+    /// A small job needing one or two tool calls, finished in about three turns.
     Routine,
-    /// A simple agent-driven task: a new function in a project, a paper translated.
+    /// A contained task, such as one function with tests, or a document translated.
     Median,
-    /// A complex agent-driven task: a new feature of a project, a new algorithm design.
+    /// A complex task spanning several files, or needing a real design decision.
     Hard,
-    /// A research-level agent-driven task: a thorough analysis of a large codebase, a
-    /// research paper written.
+    /// A research-level task, such as a whole codebase analysed, or a paper written.
     Research,
 }
 
@@ -714,6 +713,29 @@ impl Difficulty {
             Self::Median => "median",
             Self::Hard => "hard",
             Self::Research => "research",
+        }
+    }
+
+    /// This class's own line of the rubric that produced the training labels — every
+    /// word of it, by contract: the classifier's boundaries are whatever these lines
+    /// induced in the labelling model, so the arbiter is asked in exactly these words
+    /// and the type states its taxonomy once. Reword here only together with a
+    /// relabelling run.
+    pub const fn rubric(self) -> &'static str {
+        match self {
+            Self::Easy => "easy: a common-sense question, simple chat, a trivial lookup.",
+            Self::Routine => {
+                "routine: a small job needing one or two tool calls, finished in about three turns."
+            }
+            Self::Median => {
+                "median: a contained task, such as one function with tests, or a document translated."
+            }
+            Self::Hard => {
+                "hard: a complex task spanning several files, or needing a real design decision."
+            }
+            Self::Research => {
+                "research: a research-level task, such as a whole codebase analysed, or a paper written."
+            }
         }
     }
 
@@ -835,6 +857,20 @@ pub struct RouteRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each class's rubric line names its own class: a rubric cannot be attached to
+    /// the wrong variant without this failing, and the prompt is generated from these
+    /// lines.
+    #[test]
+    fn every_rubric_line_names_its_own_class() {
+        for class in Difficulty::ALL {
+            assert!(
+                class.rubric().starts_with(&format!("{}:", class.name())),
+                "{class}'s rubric line does not name it: {}",
+                class.rubric()
+            );
+        }
+    }
 
     fn endpoint(protocol: Protocol, host: &str, port: u16, path: &str) -> Endpoint {
         Endpoint::new(

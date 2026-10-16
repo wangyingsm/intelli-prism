@@ -26,6 +26,20 @@ pub enum ConfigError {
     #[error("upstream {id} is declared more than once")]
     DuplicateUpstream { id: ApiId },
 
+    /// The arbiter's timeout is outside the range in which waiting on it is a delay and
+    /// not a dependency.
+    #[error("the arbiter's timeout of {value} seconds is outside 1 to {limit}")]
+    ArbiterTimeout { value: u64, limit: u64 },
+
+    /// The arbiter's credential names an upstream this configuration never declared.
+    #[error("the arbiter names upstream {id}, which this configuration does not declare")]
+    ArbiterUpstream { id: ApiId },
+
+    /// The upstream the arbiter names carries no credential: every question would go
+    /// out with nothing to present.
+    #[error("the arbiter names upstream {id}, whose api_key is empty")]
+    ArbiterKey { id: ApiId },
+
     /// The jwt secret is too short to sign tokens safely.
     #[error("the jwt secret is {len} bytes, under the {min} byte minimum")]
     WeakJwtSecret { len: usize, min: usize },

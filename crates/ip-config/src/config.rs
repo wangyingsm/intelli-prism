@@ -37,7 +37,45 @@ pub struct Config {
     /// every request dispatches as it did before the judge existed.
     #[serde(default)]
     pub difficulty: Option<DifficultyConfig>,
+    /// The larger model asked what the local margin could not call. Absent, an unsure
+    /// opening is simply unclassified.
+    #[serde(default)]
+    pub arbiter: Option<ArbiterConfig>,
 }
+
+/// The model an unsure opening is arbitrated by, and how hard it is asked: the route
+/// the question travels, the model named in it, and the time it is given before the
+/// request it describes is sent without an answer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArbiterConfig {
+    /// The model the question names: served by the pool the route leads to, asked
+    /// exactly as a caller's request would ask it.
+    pub model: ip_core::ModelName,
+    /// The path the question is resolved by, under the authority the caller arrived
+    /// with: a gateway serving several hostnames needs this route registered behind
+    /// each of them.
+    pub ask_path: ip_core::AbsPath,
+    /// The declared upstream whose credential the question presents. Naming one is
+    /// deliberate: an arbitrating route replicated over several endpoints presents this
+    /// upstream's key all the same.
+    pub upstream: ip_core::ApiId,
+    /// How long the answer is given to arrive before it is abandoned. This is latency
+    /// the opening request of an unsure conversation pays — the turn's first request
+    /// waits it, once, and every later request of that turn pays nothing. Choosing this
+    /// number chooses a tail latency. Two seconds is the default because the arbiter
+    /// improves routing and must never become a dependency of serving.
+    #[serde(default = "default_arbiter_timeout")]
+    pub timeout: Seconds,
+}
+
+fn default_arbiter_timeout() -> Seconds {
+    Seconds::new(2)
+}
+
+/// Past this, waiting on the arbiter is waiting on an outside model instead of being
+/// briefly delayed by one.
+const ARBITER_TIMEOUT_MAX_SECONDS: u64 = 30;
 
 /// The gate between a request and a class: where the weights live, and how sure the
 /// judge must be before it commits to the class it names.
@@ -94,6 +132,42 @@ impl Config {
             return Err(ConfigError::DifficultyConfidence {
                 value: difficulty.confidence,
             });
+        }
+        // A timeout outside a second to half a minute is a shape mistake, refused where
+        // the rest of the config's shape is refused: zero asks the arbiter nothing, and
+        // anything past the limit makes a billed outside model a hard dependency of
+        // serving, which is the one thing an arbiter may never be.
+        if let Some(arbiter) = &self.arbiter {
+            let secs = arbiter.timeout.get();
+            if !(1..=ARBITER_TIMEOUT_MAX_SECONDS).contains(&secs) {
+                return Err(ConfigError::ArbiterTimeout {
+                    value: secs,
+                    limit: ARBITER_TIMEOUT_MAX_SECONDS,
+                });
+            }
+            // The credential the question presents belongs to a declared upstream, so
+            // the reference has to resolve before startup, not at the first question.
+            match self
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.id == arbiter.upstream)
+            {
+                None => {
+                    return Err(ConfigError::ArbiterUpstream {
+                        id: arbiter.upstream.clone(),
+                    });
+                }
+                // An empty key would send an empty credential for the life of the
+                // process, every question refused, arbitration silently off. Checked
+                // for the arbitrating upstream only: the field has been carried and
+                // read by nothing until here, so other upstreams may hold one today.
+                Some(upstream) if upstream.api_key.is_empty() => {
+                    return Err(ConfigError::ArbiterKey {
+                        id: arbiter.upstream.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
         }
         for (index, upstream) in self.upstreams.iter().enumerate() {
             if self.upstreams[..index]
@@ -521,6 +595,60 @@ path = "/chat"
         assert!(config.upstreams[0].route.is_none());
         let key = config.upstreams[0].route_key(config.server.listen).unwrap();
         assert_eq!(key.to_string(), "http://127.0.0.1:8080/anthropic");
+    }
+
+    #[test]
+    fn an_arbiter_defaults_its_wait_to_two_seconds() {
+        let text = format!(
+            "{FULL}\n[arbiter]\nmodel = \"oracle\"\nask_path = \"/arbiter\"\nupstream = \"anthropic\"\n"
+        );
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.arbiter.unwrap().timeout.get(), 2);
+    }
+
+    #[test]
+    fn rejects_an_arbiter_that_is_given_no_time_to_answer() {
+        let text = format!(
+            "{FULL}\n[arbiter]\nmodel = \"oracle\"\nask_path = \"/arbiter\"\nupstream = \"anthropic\"\ntimeout = 0\n"
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::ArbiterTimeout { value: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_an_arbiter_whose_wait_is_a_hard_dependency() {
+        let text = format!(
+            "{FULL}\n[arbiter]\nmodel = \"oracle\"\nask_path = \"/arbiter\"\nupstream = \"anthropic\"\ntimeout = 600\n"
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::ArbiterTimeout { value: 600, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_an_arbiter_whose_upstream_has_no_key_to_present() {
+        let text = format!(
+            "{}\n[arbiter]\nmodel = \"oracle\"\nask_path = \"/arbiter\"\nupstream = \"anthropic\"\n",
+            FULL.replace("sk-secret-value", "")
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::ArbiterKey { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_an_arbiter_naming_an_upstream_that_is_not_declared() {
+        let text = format!(
+            "{FULL}\n[arbiter]\nmodel = \"oracle\"\nask_path = \"/arbiter\"\nupstream = \"nowhere\"\n"
+        );
+        assert!(matches!(
+            Config::parse(&text),
+            Err(ConfigError::ArbiterUpstream { .. })
+        ));
     }
 
     #[test]

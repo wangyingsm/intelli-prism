@@ -13,7 +13,9 @@ use tracing::{Span, field};
 
 use super::RequestContext;
 use super::headers::{aim, authority_of, is_event_stream, rewrite, set_length, strip_hop_by_hop};
+use super::record::Recording;
 use super::run::{collect, run_body, run_headers};
+use crate::arbiter::{ARBITRATING, Arbiter};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, freshness, response_key};
 use crate::classifier::{CLASSIFY_DEADLINE, Classifier};
@@ -31,6 +33,69 @@ use crate::upstream::Upstream;
 
 /// The request header naming the difficulty class the caller asks to be served at.
 const DIFFICULTY: HeaderName = HeaderName::from_static("x-ip-difficulty");
+
+/// How a request leaves the gateway: the upstream machinery it is sent through, the
+/// memory that colours the choice, the judges that fill a silence it left, and the
+/// ledger a call this request causes is recorded to when nothing else would record it.
+/// Built once by the gateway, read by every step of the sending.
+pub struct Egress<'a> {
+    upstream: &'a dyn Upstream,
+    dispatcher: &'a Dispatcher,
+    table: &'a RoutingTable,
+    turns: Option<&'a TurnAffinity>,
+    classifier: Option<Arc<dyn Classifier>>,
+    arbiter: Option<Arc<Arbiter>>,
+    /// A seed for the second row: the arbitrating call is recorded to the causing
+    /// identity's ledger, and has no other route to it.
+    recording: Option<Recording>,
+}
+
+impl<'a> Egress<'a> {
+    /// The sending machinery on its own: no memory, no judges, no ledger.
+    pub fn new(
+        upstream: &'a dyn Upstream,
+        dispatcher: &'a Dispatcher,
+        table: &'a RoutingTable,
+    ) -> Self {
+        Self {
+            upstream,
+            dispatcher,
+            table,
+            turns: None,
+            classifier: None,
+            arbiter: None,
+            recording: None,
+        }
+    }
+
+    /// Where turns remember where they landed.
+    #[must_use]
+    pub fn with_turns(mut self, turns: Option<&'a TurnAffinity>) -> Self {
+        self.turns = turns;
+        self
+    }
+
+    /// The local judge of an opening that names no class.
+    #[must_use]
+    pub fn with_classifier(mut self, classifier: Option<Arc<dyn Classifier>>) -> Self {
+        self.classifier = classifier;
+        self
+    }
+
+    /// The larger model the judge's margin refers to.
+    #[must_use]
+    pub fn with_arbiter(mut self, arbiter: Option<Arc<Arbiter>>) -> Self {
+        self.arbiter = arbiter;
+        self
+    }
+
+    /// The identity a caused call is recorded for, when anything is recorded.
+    #[must_use]
+    pub(super) fn with_recording(mut self, recording: Option<Recording>) -> Self {
+        self.recording = recording;
+        self
+    }
+}
 
 /// A request part way through the dataflow, with the stage it reached in its type.
 ///
@@ -228,18 +293,31 @@ impl Flow<BodyProcessed> {
     /// is, so a marked request never waits on its body; recognising one asks the body, and a
     /// body that may not be held is not read at all — such a request streams through exactly
     /// as it did before any of this, and is simply not sticky.
-    pub async fn forward(
-        self,
-        upstream: &dyn Upstream,
-        dispatcher: &Dispatcher,
-        turns: Option<&TurnAffinity>,
-        classifier: Option<Arc<dyn Classifier>>,
-    ) -> Result<Flow<Forwarded>, GatewayError> {
+    pub async fn forward(self, egress: Egress<'_>) -> Result<Flow<Forwarded>, GatewayError> {
+        let Egress {
+            upstream,
+            dispatcher,
+            table,
+            turns,
+            classifier,
+            arbiter,
+            recording,
+        } = egress;
         let Routed {
             request,
             resolution,
             class,
         } = self.held;
+        // A question the gateway sends itself carries the marker for exactly this step:
+        // both judges stand aside for it. This is the guard against an `ask_path` that
+        // resolves back into this gateway or a peer, where a question found unsure
+        // would arbitrate itself again, over the network, without end; a caller that
+        // marks its own request wins only unclassified treatment of it.
+        let (classifier, arbiter) = if request.headers().contains_key(&ARBITRATING) {
+            (None, None)
+        } else {
+            (classifier, arbiter)
+        };
         let raced = may_race(request.headers(), resolution.rule().hedge);
         let marked = self.context.turn.clone();
         let unmarked = turns.is_some() && self.context.turn.is_none();
@@ -258,7 +336,7 @@ impl Flow<BodyProcessed> {
         let ask_cold_memory = !reads_opening
             && marked.is_some()
             && class.is_none()
-            && classifier.is_some()
+            && (classifier.is_some() || arbiter.is_some())
             && turns.is_some()
             && may_hold(request.headers());
         let landed = remembered(turns, &self.context, marked.as_ref(), opening.as_ref()).await;
@@ -291,8 +369,33 @@ impl Flow<BodyProcessed> {
             }
             _ => None,
         };
-        // What the judge named belongs to the turn, not the request.
-        let dispatch_class = class.or(remembered_class).or(classified);
+        // The margin's second level, asked only where the first said nothing.
+        let arbitrated = match (
+            class,
+            remembered_class,
+            classified,
+            opening.as_ref(),
+            arbiter.as_deref(),
+        ) {
+            (None, None, None, Some(opening), Some(arbiter)) => {
+                arbitrate(
+                    Arbitrating {
+                        context: &self.context,
+                        host: authority_of(&request, self.context.listen),
+                        table,
+                        upstream,
+                        dispatcher,
+                        arbiter,
+                        recording,
+                    },
+                    &opening.text,
+                )
+                .await
+            }
+            _ => None,
+        };
+        // What the judges named belongs to the turn, not the request.
+        let dispatch_class = class.or(remembered_class).or(classified).or(arbitrated);
         let taken = taken_turn(marked.as_ref(), opening, class, dispatch_class);
         let dispatching =
             Dispatching::new(&resolution, dispatch_class).remembered_from(landed.as_ref());
@@ -442,6 +545,230 @@ fn asked_class(request: &Request<GatewayBody>) -> Result<Option<Difficulty>, Gat
     Difficulty::named(named)
         .map(Some)
         .map_err(|error| GatewayError::new(HeadersProcessed::NAME, error.into()))
+}
+
+/// Who and how an arbitrating question is asked: everything an ordinary request would
+/// have, borrowed from the request being waited for.
+struct Arbitrating<'a> {
+    context: &'a RequestContext,
+    host: String,
+    table: &'a RoutingTable,
+    upstream: &'a dyn Upstream,
+    dispatcher: &'a Dispatcher,
+    arbiter: &'a Arbiter,
+    recording: Option<Recording>,
+}
+
+/// Asks the larger model what an opening the local margin could not call is worth: the
+/// question is resolved, chosen and sent like any other request — the same table, the
+/// same chooser, the same client — and abandoned at its own deadline, because a gateway
+/// whose arbiter is down must still serve.
+///
+/// It never enters the flow — it is aimed out of the request in flight — and it carries
+/// [`ARBITRATING`], so a flow that does receive it, an `ask_path` resolving back to this
+/// gateway or a peer, skips both judges for it rather than finding it unsure and asking
+/// again. The call is recorded through [`Recording::arbitrated`] like any other.
+async fn arbitrate(how: Arbitrating<'_>, text: &str) -> Option<Difficulty> {
+    let path = how.arbiter.ask_path().as_str().to_owned();
+    let Ok(key) = request_key(how.context.protocol, &how.host, how.context.listen, &path) else {
+        tracing::warn!("no route key can be built for the arbitrating path; the ask is off");
+        return None;
+    };
+    let Some(resolution) = how.table.resolve(&key) else {
+        tracing::debug!("no route for the arbiter's question");
+        return None;
+    };
+    let chosen = how.dispatcher.choose(&Dispatching::new(&resolution, None));
+    let body = serde_json::json!({
+        "model": how.arbiter.model().as_str(),
+        "messages": [{"role": "user", "content": question(text)}],
+        "max_tokens": 16,
+    });
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(ARBITRATING, http::HeaderValue::from_static("1"));
+    // Both spellings of the key, because one config has to answer either provider and
+    // neither rejects the extra header.
+    let Ok(presented) = http::HeaderValue::from_str(how.arbiter.secret().expose()) else {
+        tracing::warn!(
+            "the arbitrating credential holds a byte no header will take; the ask is off"
+        );
+        return None;
+    };
+    let bearer = http::HeaderValue::from_str(&format!("Bearer {}", how.arbiter.secret().expose()))
+        .expect("a Bearer prefix adds nothing a checked credential cannot carry");
+    headers.insert(http::header::AUTHORIZATION, bearer);
+    headers.insert(http::HeaderName::from_static("x-api-key"), presented);
+    let mut asked = Request::builder()
+        .method(http::Method::POST)
+        .uri(path)
+        .body(from_bytes(body.to_string().into()))
+        .ok()?;
+    *asked.headers_mut() = headers;
+    let (parts, body) = asked.into_parts();
+    let sent = match aim(parts, body, chosen.endpoint()) {
+        Ok(sent) => sent,
+        Err(error) => {
+            tracing::warn!(%error, "the arbitrating endpoint cannot be aimed at; the ask is off");
+            return None;
+        }
+    };
+    let began = std::time::Instant::now();
+    // One deadline over the whole of it — ask, answer, and read: `send` returns when
+    // the headers arrive, and the body is the answer. A half-dead endpoint must not
+    // hold open the very request it was only asked about.
+    let answered =
+        tokio::time::timeout(how.arbiter.timeout(), read_answer(how.upstream, sent)).await;
+    match answered {
+        Err(_elapsed) => {
+            tracing::debug!(
+                "the arbiter did not answer in time; the request goes without a ruling"
+            );
+            None
+        }
+        // The read said why in its own words.
+        Ok(None) => None,
+        Ok(Some((status, answered))) => {
+            let Some(bytes) = answered else {
+                tracing::debug!(%status, "the arbiter refused the question");
+                return None;
+            };
+            // What the question cost is a row whether or not its answer read as one:
+            // a call was made, and someone is paying for it. Recording and parsing sit
+            // outside the deadline — they touch no network.
+            if let Some(recording) = how.recording {
+                recording.arbitrated(
+                    resolution.rule().api.clone(),
+                    chosen.endpoint(),
+                    began,
+                    how.arbiter.model().clone(),
+                    &bytes,
+                );
+            }
+            named_ruling(&bytes)
+        }
+    }
+}
+
+/// The answer's status, and the answer itself when there is one to read: the status is
+/// read before the body, so a refusal does not buffer the bytes it will drop, and the
+/// read runs under the sender's caller — the deadline is the caller of both.
+async fn read_answer(
+    upstream: &dyn Upstream,
+    sent: Request<GatewayBody>,
+) -> Option<(http::StatusCode, Option<bytes::Bytes>)> {
+    let response = match upstream.send(sent).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(%error, "the arbiter could not be reached");
+            return None;
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Some((status, None));
+    }
+    match collect(StageName::BodyRead, response.into_body()).await {
+        Ok(bytes) => Some((status, Some(bytes))),
+        Err(error) => {
+            tracing::debug!(%error, "the arbiter's answer could not be read to its end");
+            None
+        }
+    }
+}
+
+/// The ruling inside an answer, refused whole if it is not one: the arbiter is a
+/// language model, and prose is an answer it will sometimes give. The reply is read from
+/// either dialect a routed endpoint may speak — `choices[0].message.content`, else
+/// `content[0].text` — because this gateway speaks no provider dialect anywhere else and
+/// grows no notion of one here. What does not name a class is not a class, and is said
+/// out loud: a rising count of unreadable replies is a prompt that needs fixing, which an
+/// operator cannot know without being told. Exactly one class names a ruling: a reply
+/// naming two is restating its instructions, not answering. What the reply said is never journalled: it
+/// can echo the opening it was asked about.
+fn named_ruling(bytes: &[u8]) -> Option<Difficulty> {
+    let reply = serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            value["choices"][0]["message"]["content"]
+                .as_str()
+                .or_else(|| value["content"][0]["text"].as_str())
+                .map(str::to_owned)
+        });
+    match reply {
+        Some(reply) => {
+            // Distinct classes named, not the first word that happens to be one: a
+            // model restating its instructions puts class words on the page that are
+            // not its ruling, and only a reply naming exactly one class rules.
+            match named_classes(&reply).as_slice() {
+                [one] => Some(*one),
+                [] => {
+                    tracing::warn!("the arbiter's reply named no class");
+                    None
+                }
+                many => {
+                    let names = many
+                        .iter()
+                        .map(|class| class.name())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tracing::warn!(
+                        classes = names,
+                        "the arbiter's reply named more than one class"
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::warn!("the arbiter's reply could not be read");
+            None
+        }
+    }
+}
+
+/// The distinct classes a reply names, in the order they are found: words are cut to
+/// their alphabetic ends, so `hard.` names hard while `research-level` names nothing —
+/// only the trimmed ends go, and the hyphen inside stays. [`named_ruling`] accepts a
+/// ruling only when exactly one class appears — and it is a real property of the rubric
+/// that quoting a line names only that line's class, which its own test enforces
+/// against this very scan.
+fn named_classes(reply: &str) -> Vec<Difficulty> {
+    let mut named: Vec<Difficulty> = Vec::new();
+    for word in reply.split_whitespace() {
+        let candidate = word.trim_matches(|c: char| !c.is_alphabetic());
+        if let Ok(class) = Difficulty::named(&candidate.to_ascii_lowercase())
+            && !named.contains(&class)
+        {
+            named.push(class);
+        }
+    }
+    named
+}
+
+/// The question, generated from the taxonomy itself: every class with its rubric line,
+/// the work-not-length guard, the one-word instruction, and beneath a delimiter the
+/// opening — data judged, never instruction. A hand-written prompt could drift from
+/// the wording the classifier was trained with; this one cannot, because it reads the
+/// same [`Difficulty::rubric`] lines the labels came from. One user message: the rubric
+/// cannot ride a system field, since no single body shape carries one for both
+/// providers, and the gateway grows no provider dialect for it.
+fn question(text: &str) -> String {
+    let rubric = Difficulty::ALL
+        .iter()
+        .map(|class| class.rubric())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Judge how much work the request below implies for a large language model, \
+         using exactly these definitions:\n\n{rubric}\n\nJudge the work the request \
+         implies, not how long the request is: a short question can imply hard work.\n\
+         Answer with one word, exactly one class name from the definitions above.\n\n\
+         Request under judgement:\n---\n{text}\n---"
+    )
 }
 
 impl Flow<Forwarded> {
@@ -797,6 +1124,39 @@ mod tests {
     use ip_core::Protocol;
     use std::time::Duration;
 
+    /// The property the one-class rule stands on: the rubric line for a class, fed
+    /// through the very scan a reply goes through, names exactly that one class. A
+    /// rewording that put another class's name inside a line — "harder than routine
+    /// work" — would make every quoting reply name two classes and rule nothing,
+    /// paid for and silent; this fails that day instead.
+    #[test]
+    fn every_rubric_line_names_exactly_its_own_class() {
+        for class in Difficulty::ALL {
+            assert_eq!(
+                named_classes(class.rubric()),
+                vec![class],
+                "quoting the {class} line must rule {class} alone"
+            );
+        }
+    }
+
+    /// The scan itself: none, one, a repeated one, two in order, and all five.
+    #[test]
+    fn the_scan_collects_distinct_classes_in_order() {
+        use Difficulty::{Easy, Hard};
+        assert!(named_classes("the weather is fine").is_empty());
+        assert_eq!(named_classes("hard."), vec![Hard]);
+        assert_eq!(named_classes("hard hard again hard"), vec![Hard]);
+        assert_eq!(
+            named_classes("somewhere between easy and hard"),
+            vec![Easy, Hard]
+        );
+        assert_eq!(
+            named_classes("easy routine median hard research"),
+            Difficulty::ALL.to_vec()
+        );
+    }
+
     #[tokio::test]
     async fn a_routed_request_reaches_the_target_with_its_remainder_and_query() {
         let upstream = FakeUpstream::answering("pong");
@@ -900,7 +1260,7 @@ mod tests {
         let upstream = FakeUpstream::answering("pong");
         let (dispatcher, _folding) = Dispatcher::new();
         let flow = flow
-            .forward(upstream.as_ref(), &dispatcher, None, None)
+            .forward(Egress::new(upstream.as_ref(), &dispatcher, &table()))
             .await
             .unwrap();
         assert_eq!(flow.stage(), StageName::Route);
@@ -1024,7 +1384,7 @@ mod tests {
             .await
             .unwrap();
         let flow = flow
-            .forward(upstream.as_ref(), &dispatcher, None, None)
+            .forward(Egress::new(upstream.as_ref(), &dispatcher, &table))
             .await
             .unwrap();
         let flow = flow

@@ -18,11 +18,13 @@ use super::followed::{
 };
 use super::headers::set_length;
 use super::record::{Limiting, Pending, Recording};
+use crate::arbiter::Arbiter;
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
 use crate::classifier::Classifier;
 use crate::dispatch::Dispatcher;
 use crate::error::{GatewayError, GatewayErrorKind};
+use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
 use crate::stage::{Authorized, BodyProcessed, ResponseBodyProcessed, Stage};
@@ -61,6 +63,9 @@ pub struct Gateway {
     /// The local judge of a turn's opening, when one is configured: consulted for a turn
     /// that names no class and remembers none, once.
     classifier: Option<Arc<dyn Classifier>>,
+    /// The larger model asked when the judge's margin fell short, once per turn, under
+    /// a deadline of its own.
+    arbiter: Option<Arc<Arbiter>>,
     pending: Pending,
 }
 
@@ -106,6 +111,7 @@ impl Gateway {
             dispatcher: Arc::new(Dispatcher::new().0),
             turns: None,
             classifier: None,
+            arbiter: None,
             pending: Pending::default(),
         }
     }
@@ -155,9 +161,18 @@ impl Gateway {
         self
     }
 
+    /// Sends the openings the judge cannot call to a larger model, under a deadline of
+    /// its own: what it answers rides the dispatch and the turn's memory like a local
+    /// judgement, and a model that is slow, refusing or incoherent leaves the request
+    /// unclassified.
+    pub fn arbitrating(mut self, arbiter: Arc<Arbiter>) -> Self {
+        self.arbiter = Some(arbiter);
+        self
+    }
+
     /// Asks this judge what a new turn's opening is, when nothing else has said: the
-    /// class it names rides the dispatch and the turn's memory, and the rest of the turn
-    /// costs nothing. Refused, silent or broken, it leaves a request unclassified.
+    /// class it names rides the dispatch and the turn's memory, and the rest of the
+    /// turn costs nothing. Refused, silent or broken, it leaves a request unclassified.
     pub fn classifying(mut self, classifier: Arc<dyn Classifier>) -> Self {
         self.classifier = Some(classifier);
         self
@@ -241,7 +256,15 @@ impl Gateway {
         });
 
         let Some(responses) = &self.responses else {
-            let (done, dispatched) = self.upstream_answer(processed, &chains, &followed).await?;
+            let (done, dispatched) = self
+                .upstream_answer(
+                    processed,
+                    &routing.table,
+                    &chains,
+                    &followed,
+                    recording.clone(),
+                )
+                .await?;
             let served_by = done.served().clone();
             let raced = done.raced();
             let answered = stage_span!(EGRESS_RESPONSE, followed);
@@ -264,7 +287,15 @@ impl Gateway {
             // A cache that cannot answer costs a round trip upstream, never the request itself.
             Err(error) => tracing::warn!(%error, "could not read the response cache"),
         }
-        let (mut done, dispatched) = self.upstream_answer(processed, &chains, &followed).await?;
+        let (mut done, dispatched) = self
+            .upstream_answer(
+                processed,
+                &routing.table,
+                &chains,
+                &followed,
+                recording.clone(),
+            )
+            .await?;
         let served_by = done.served().clone();
         let raced = done.raced();
         if let Some((answer, ttl)) = done.cacheable(responses.ttl()).await?
@@ -317,16 +348,18 @@ impl Gateway {
     async fn upstream_answer(
         &self,
         processed: Flow<BodyProcessed>,
+        table: &RoutingTable,
         chains: &Arc<ProcessorChain>,
         followed: &Followed,
+        recording: Option<Recording>,
     ) -> Result<(Flow<ResponseBodyProcessed>, Option<Difficulty>), GatewayError> {
+        let egress = Egress::new(self.upstream.as_ref(), &self.dispatcher, table)
+            .with_turns(self.turns.as_ref())
+            .with_classifier(self.classifier.clone())
+            .with_arbiter(self.arbiter.clone())
+            .with_recording(recording);
         let forwarded = processed
-            .forward(
-                self.upstream.as_ref(),
-                &self.dispatcher,
-                self.turns.as_ref(),
-                self.classifier.clone(),
-            )
+            .forward(egress)
             .instrument(stage_span!(EGRESS_REQUEST, followed))
             .await?;
         // What the turn's verdict was worth, if it was worth anything: read out of the
@@ -2355,6 +2388,747 @@ mod tests {
         assert!(
             !stored.contains("you audit accounts"),
             "the verdict repeats the system prompt"
+        );
+    }
+
+    // ——— arbitration: the margin's second level (M13) ———
+
+    /// One word of ruling, in the shape an answer arrives in.
+    const RULING: &str = r#"{"choices":[{"message":{"content":"hard"}}]}"#;
+
+    /// A table with the turn's route and a route for the arbitrating question.
+    fn arbitrating_table() -> RoutingTable {
+        let turn = rule(endpoint(
+            ip_core::Protocol::Https,
+            "api.example.com",
+            443,
+            "/v1",
+        ));
+        let ask = ip_core::RouteRule {
+            api: arbitration_api(),
+            key: RouteKey::new(endpoint(
+                ip_core::Protocol::Http,
+                "gateway.local",
+                8080,
+                "/arbiter",
+            )),
+            target: ip_core::RouteTarget::new(endpoint(
+                ip_core::Protocol::Https,
+                "arbiter.example.com",
+                443,
+                "/ask",
+            )),
+            strategy: ip_core::Strategy::default(),
+            hedge: Hedge::default(),
+            hedge_delay: ip_core::HedgeDelay::default(),
+        };
+        RoutingTable::from_rules(vec![turn, ask])
+    }
+
+    /// A gateway over the arbitrating table, sticky, recording, judged by `judge` — and
+    /// arbitrating, when one is configured.
+    fn arbitrating_gateway(
+        judge: Arc<crate::flow::fixtures::CountingClassifier>,
+        upstream: Arc<dyn Upstream>,
+        arbiter: Option<Arbiter>,
+    ) -> (
+        Gateway,
+        tokio::sync::mpsc::UnboundedReceiver<ip_storage::Usage>,
+    ) {
+        let (recorder, recorded) = Ledger::new();
+        let mut gateway = Gateway::new(arbitrating_table(), ProcessorChain::new(), upstream)
+            .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()))
+            .classifying(judge)
+            .recording(recorder);
+        if let Some(arbiter) = arbiter {
+            gateway = gateway.arbitrating(Arc::new(arbiter));
+        }
+        (gateway, recorded)
+    }
+
+    /// The api the arbitrating route alone carries, so its row can be told from the
+    /// caller's traffic in the same ledger.
+    fn arbitration_api() -> ip_core::ApiId {
+        ip_core::ApiId::new("arbitration").unwrap()
+    }
+
+    /// A question about the judge's opening, with the time it is given.
+    fn arbiter(timeout: std::time::Duration) -> Arbiter {
+        Arbiter::new(
+            ip_core::ModelName::new("oracle").unwrap(),
+            ip_core::AbsPath::new("/arbiter").unwrap(),
+            timeout,
+            ip_config::Secret::from("sk-oracle"),
+        )
+    }
+
+    /// An upstream where only the arbitrating endpoint is named, and it answers the same
+    /// way every time; the turn's own route answers with an empty success.
+    fn asking_only(behaviour: Behaviour) -> Arc<FakeUpstream> {
+        FakeUpstream::answering_each(&[("arbiter.example.com:443", behaviour)])
+    }
+
+    /// How many questions the arbitrating endpoint has been sent.
+    fn questions_to(upstream: &FakeUpstream) -> Vec<(String, String)> {
+        upstream
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen.host.starts_with("arbiter."))
+            .map(|seen| {
+                (
+                    seen.uri.clone(),
+                    String::from_utf8_lossy(&seen.body).into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn answered(body: &'static str) -> Behaviour {
+        Behaviour {
+            delay: std::time::Duration::ZERO,
+            status: StatusCode::OK,
+            body,
+            fail: false,
+        }
+    }
+
+    /// One request through an arbitrating gateway: its answer drained, and the caller's
+    /// row out of the ledger — the arbitrating call leaves a row of its own there, told
+    /// apart by the api of the route it travelled, and skipped here.
+    async fn asked(
+        gateway: &Gateway,
+        recorded: &mut tokio::sync::mpsc::UnboundedReceiver<ip_storage::Usage>,
+        context: RequestContext,
+        request: Request<GatewayBody>,
+    ) -> (ip_storage::Usage, Vec<ip_storage::Usage>) {
+        let answered = gateway.handle(context, request).await.unwrap();
+        body_of(answered).await;
+        gateway.settled().await;
+        let mut others = Vec::new();
+        loop {
+            let row = recorded.recv().await.expect("a row per request");
+            if row.api == api() {
+                return (row, others);
+            }
+            others.push(row);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsure_opening_is_arbitrated_and_dispatched_at_the_ruling() {
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge.clone(),
+            upstream.clone(),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            row.dispatched_class,
+            Some(ip_core::Difficulty::Hard),
+            "the turn is dispatched at the ruling it was given"
+        );
+        let asked = questions_to(&upstream);
+        assert_eq!(asked.len(), 1, "the ruling was asked for once");
+        assert!(
+            asked[0].1.contains(OPENING_PROMPT),
+            "the question carries the opening the judge could not call"
+        );
+        assert!(
+            asked[0].1.contains("oracle"),
+            "the question names the arbiter's model"
+        );
+        // The judge counted one ask over the whole exchange: its own, from this
+        // request. The question goes out unjudged and marked, so even an `ask_path`
+        // resolving back here would leave it unjudged — see
+        // `a_marked_question_passes_the_margin_by`.
+        assert_eq!(
+            judge.calls(),
+            1,
+            "the local judge was asked once, not twice"
+        );
+    }
+
+    /// The other dialect: an anthropic endpoint answers `content`, not `choices`, and a
+    /// gateway that reads one shape only would call the other unreadable and classify
+    /// nothing with the shipped example.
+    #[tokio::test]
+    async fn a_ruling_in_the_other_dialect_is_read_as_well() {
+        let upstream = asking_only(Behaviour {
+            delay: std::time::Duration::ZERO,
+            status: StatusCode::OK,
+            body: r#"{"content":[{"type":"text","text":"hard"}]}"#,
+            fail: false,
+        });
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream,
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            row.dispatched_class,
+            Some(ip_core::Difficulty::Hard),
+            "content[0].text is a ruling where choices[0].message.content is"
+        );
+    }
+
+    /// A question that arrives at the flow carrying the arbitrating marker — which is
+    /// what happens when an `ask_path` resolves back into this gateway or a peer — is
+    /// left alone: not judged, not arbitrated, just routed. Without the marker's being
+    /// honoured, such a question would be found unsure and arbitrated again, over the
+    /// network, without bound.
+    #[tokio::test]
+    async fn a_marked_question_passes_the_margin_by() {
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge.clone(),
+            upstream.clone(),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let mut question = request(
+            "/anthropic/messages",
+            &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+        );
+        question.headers_mut().insert(
+            crate::arbiter::ARBITRATING,
+            http::HeaderValue::from_static("1"),
+        );
+        let (row, _) = asked(&gateway, &mut recorded, context(granted()), question).await;
+        assert_eq!(judge.calls(), 0, "a marked question is no opening to judge");
+        assert!(
+            questions_to(&upstream).is_empty(),
+            "a marked question never becomes another question"
+        );
+        assert_eq!(
+            row.dispatched_class, None,
+            "and it is dispatched as it arrived"
+        );
+    }
+
+    /// The arbiter's call is a billed thing asked on a caller's behalf, so it is a row
+    /// where every other call is written — same identity, its own route, endpoint and
+    /// model.
+    #[tokio::test]
+    async fn the_arbiters_call_is_recorded_where_the_answers_are() {
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream,
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, mut asking) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+        // Drain for both rows rather than trusting which the ledger wrote first.
+        while let Ok(extra) = recorded.try_recv() {
+            asking.push(extra);
+        }
+        assert_eq!(
+            asking.len(),
+            1,
+            "one question was asked, one row it leaves, beside the caller's own"
+        );
+        let asking = asking.pop().expect("the arbitrating row");
+        assert_eq!(
+            asking.api,
+            arbitration_api(),
+            "recorded under the route it travelled"
+        );
+        assert_eq!(
+            asking.model.map(|model| model.as_str().to_owned()),
+            Some("oracle".to_owned()),
+            "the model asked by name"
+        );
+        assert_eq!(
+            asking.served,
+            ip_core::Served::Upstream,
+            "an endpoint answered it"
+        );
+        let served_by = format!("{:?}", asking.served_by.expect("which one"));
+        assert!(served_by.contains("arbiter.example.com"), "{served_by}");
+    }
+
+    /// The question presents the arbitrating upstream's credential — both header
+    /// spellings, so one answer serves either provider — and its own marker, and never
+    /// anything the caller carried.
+    /// Chosen policy, not inherited behaviour: the arbitrating call was asked because
+    /// the caller's turn was unsure, and its tokens therefore spend against the
+    /// caller's token limits as the caller's own answer would have.
+    #[tokio::test]
+    async fn the_arbiters_spend_is_the_callers_spend() {
+        let ruling = r#"{"usage":{"prompt_tokens":10,"completion_tokens":1},"choices":[{"message":{"content":"hard"}}]}"#;
+        let upstream = asking_only(answered(ruling));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let counters = Arc::new(crate::limit::tests::Held::default());
+        let limiter = Limiter::new(counters.clone(), Rows::holding(0));
+        let (mut gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream,
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        gateway = gateway
+            .limiting(Arc::new(limiter))
+            .with_limits(Limits::new(vec![allowing(
+                ip_core::Counted::Tokens,
+                ip_core::Period::Month,
+                1_000,
+            )]));
+        let (row, others) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+        let asking = others
+            .into_iter()
+            .find(|row| row.api == arbitration_api())
+            .expect("the arbitrating row");
+        assert_eq!(asking.tokens.total(), 11, "ten in, one out");
+        assert_eq!(
+            counters.spent_total(),
+            11,
+            "the arbiter's tokens spent against the caller's limits, once"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_question_presents_the_upstreams_key() {
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream.clone(),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        let seen = upstream.seen.lock().unwrap();
+        let asked = seen
+            .iter()
+            .find(|seen| seen.host.starts_with("arbiter."))
+            .expect("the question went out");
+        assert_eq!(
+            asked.headers[http::header::AUTHORIZATION].to_str().unwrap(),
+            "Bearer sk-oracle"
+        );
+        assert_eq!(
+            asked.headers["x-api-key"].to_str().unwrap(),
+            "sk-oracle",
+            "spelled both ways, for either provider answers"
+        );
+        assert_eq!(
+            asked.headers[crate::arbiter::ARBITRATING].to_str().unwrap(),
+            "1"
+        );
+    }
+
+    /// An upstream that answers the arbitrating route with a body that never arrives:
+    /// status and headers at once, no frame ever, and the sender held on purpose — a
+    /// half-dead model fails in this shape far more often than before its status line.
+    struct Trickling;
+
+    #[async_trait::async_trait]
+    impl Upstream for Trickling {
+        async fn send(
+            &self,
+            request: Request<GatewayBody>,
+        ) -> Result<Response<GatewayBody>, crate::error::UpstreamError> {
+            let host = request
+                .headers()
+                .get(http::header::HOST)
+                .map(|value| value.to_str().unwrap_or_default().to_owned())
+                .unwrap_or_default();
+            if host.starts_with("arbiter.") {
+                let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                // Holding the sender *is* the stall: drop it and the body would end
+                // cleanly empty. Nothing sends, nothing drops.
+                std::mem::forget(sender);
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .body(http_body_util::BodyExt::boxed_unsync(
+                        crate::body::ChannelBody::new(receiver),
+                    ))
+                    .map_err(|error| crate::error::UpstreamError::new(error.to_string()));
+            }
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(crate::body::from_bytes(bytes::Bytes::from_static(b"pong")))
+                .unwrap())
+        }
+    }
+
+    /// The deadline is over the whole question — ask, answer, read — not just over the
+    /// headers. An arbiter that answers 200 and then trickles is the failure ruling 3
+    /// exists to forbid, and it must cost the caller its opening request only up to the
+    /// timeout, leaving it served and unclassified, with no row for an answer that
+    /// never came.
+    #[tokio::test]
+    async fn a_stalled_answer_is_left_behind_like_a_silent_one() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            Arc::new(Trickling),
+            Some(arbiter(std::time::Duration::from_millis(25))),
+        );
+        let started = std::time::Instant::now();
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway.handle(
+                context(granted()),
+                request(
+                    "/anthropic/messages",
+                    &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+                ),
+            ),
+        )
+        .await
+        .expect("the stalled arbiter ends at its deadline, not at the caller's patience")
+        .expect("the request is served");
+        body_of(answered).await;
+        gateway.settled().await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(900),
+            "the caller waited the arbiter out, not the stall"
+        );
+        let row = recorded.recv().await.expect("the caller's row");
+        assert_eq!(row.dispatched_class, None, "the stall is no ruling");
+        assert!(
+            recorded.try_recv().is_err(),
+            "an answer that never arrived is no call to record"
+        );
+    }
+
+    /// The question asks in the taxonomy's own words: every class's rubric line is in
+    /// it, the work-not-length guard is in it, and the opening sits beneath as the data
+    /// judged. A hand-written prompt could drift from what the classifier was trained
+    /// with; a generated one cannot.
+    #[tokio::test]
+    async fn the_question_asks_in_the_taxonomys_own_words() {
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream.clone(),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        let seen = upstream.seen.lock().unwrap();
+        let asked = seen
+            .iter()
+            .find(|seen| seen.host.starts_with("arbiter."))
+            .expect("the question went out");
+        let asked = String::from_utf8_lossy(&asked.body);
+        for class in ip_core::Difficulty::ALL {
+            assert!(
+                asked.contains(class.rubric()),
+                "the question is missing {class}'s rubric line"
+            );
+        }
+        assert!(
+            asked.contains(
+                "Judge the work the request implies, not how long the request is: \
+                 a short question can imply hard work."
+            ),
+            "the work-not-length guard is part of the contract, whole"
+        );
+        assert!(
+            asked.contains(OPENING_PROMPT),
+            "the opening is what is judged"
+        );
+    }
+
+    /// With the rubric in the prompt, a model that restates its instructions before
+    /// answering puts class words on the page that are not its ruling. A reply naming
+    /// two classes names none.
+    #[tokio::test]
+    async fn a_reply_naming_two_classes_names_none() {
+        let upstream = asking_only(answered(
+            r#"{"choices":[{"message":{"content":"somewhere between easy and hard"}}]}"#,
+        ));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream,
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            row.dispatched_class, None,
+            "easy and hard together is prose, and prose is not a ruling"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confident_opening_never_asks_the_arbiter() {
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge.clone(),
+            upstream.clone(),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (_, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert!(
+            questions_to(&upstream).is_empty(),
+            "a margin that committed never asks"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_arbiter_is_asked_once_per_turn() {
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge.clone(),
+            upstream.clone(),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (_, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        let (second, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            questions_to(&upstream).len(),
+            1,
+            "a ruling is paid for once per conversation, not per request"
+        );
+        assert_eq!(
+            second.dispatched_class,
+            Some(ip_core::Difficulty::Hard),
+            "the turn dispatches at the ruling it already has"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arbiter_that_refuses_leaves_the_request_unclassified() {
+        let upstream = asking_only(Behaviour {
+            delay: std::time::Duration::ZERO,
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: "overloaded",
+            fail: false,
+        });
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream,
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(row.dispatched_class, None, "a refusal is no ruling");
+    }
+
+    #[tokio::test]
+    async fn a_slow_arbiter_is_left_behind() {
+        let upstream = asking_only(Behaviour {
+            delay: std::time::Duration::from_secs(30),
+            status: StatusCode::OK,
+            body: RULING,
+            fail: false,
+        });
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream,
+            Some(arbiter(std::time::Duration::from_millis(25))),
+        );
+        let started = std::time::Instant::now();
+        let (row, others) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the caller waits the arbiter out, not the answer"
+        );
+        assert_eq!(row.dispatched_class, None, "a silence is no ruling");
+        assert!(
+            others.is_empty() && recorded.try_recv().is_err(),
+            "a question outlived by its deadline is no call to record"
+        );
+    }
+
+    #[tokio::test]
+    async fn prose_is_not_a_ruling() {
+        let upstream = asking_only(answered(
+            r#"{"choices":[{"message":{"content":"I would say it depends on the weather"}}]}"#,
+        ));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream,
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            row.dispatched_class, None,
+            "prose that names no class is no class"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_answer_is_not_a_ruling() {
+        let upstream = asking_only(answered("not even json"));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream,
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            row.dispatched_class, None,
+            "an answer that must be parsed apart is no ruling"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_without_an_arbiter_asks_nothing() {
+        let upstream = FakeUpstream::answering("pong");
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(judge, upstream.clone(), None);
+        for _ in 0..2 {
+            let (row, _) = asked(
+                &gateway,
+                &mut recorded,
+                context(granted()),
+                request(
+                    "/anthropic/messages",
+                    &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+                ),
+            )
+            .await;
+            assert_eq!(row.dispatched_class, None);
+        }
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            2,
+            "two requests, two upstream calls, and no questions asked of anything else"
         );
     }
 

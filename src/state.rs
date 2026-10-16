@@ -145,6 +145,27 @@ impl AppState {
             tracing::info!("classifying the opening of turns that name no class");
             gateway = gateway.classifying(judge);
         }
+        // The larger model the judge's margin refers to, when one is configured: asked
+        // through this gateway's own routing, once per turn, and never waited for past
+        // the second its config gives it.
+        if let Some(arbiter) = &config.arbiter {
+            // Parsing already refused an unresolved name; the lookup stays total rather
+            // than unwrapping.
+            let asked = config
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.id == arbiter.upstream)
+                .ok_or(ip_config::ConfigError::ArbiterUpstream {
+                    id: arbiter.upstream.clone(),
+                })?;
+            gateway = gateway.arbitrating(Arc::new(ip_gateway::Arbiter::new(
+                arbiter.model.clone(),
+                arbiter.ask_path.clone(),
+                std::time::Duration::from_secs(arbiter.timeout.get()),
+                asked.api_key.clone(),
+            )));
+            tracing::info!("arbitrating the openings the classifier cannot call");
+        }
         if let Some(ttl) = config.cache.response_ttl() {
             let responses = ResponseCache::new(Arc::clone(&cache), Ttl::new(ttl.as_duration())?);
             gateway = gateway.caching(responses);

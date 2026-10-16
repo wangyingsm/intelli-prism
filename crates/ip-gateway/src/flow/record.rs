@@ -62,6 +62,7 @@ impl Pending {
 }
 
 /// What a request's tokens are counted towards once its answer is done with.
+#[derive(Clone)]
 pub(super) struct Limiting {
     limiter: Arc<Limiter>,
     limits: Limits,
@@ -80,6 +81,10 @@ impl Limiting {
 }
 
 /// What is known about a request before its answer is, and what writes the row when it ends.
+///
+/// Cloneable so that one identity can be recorded twice: the request, and the arbitrating
+/// call this request caused (see [`Recording::arbitrated`]).
+#[derive(Clone)]
 pub(super) struct Recording {
     store: Arc<dyn UsageStore>,
     pending: Pending,
@@ -150,6 +155,45 @@ impl Recording {
             recording: Some(self),
         }
         .boxed_unsync()
+    }
+
+    /// Writes the arbitrating call as a row of its own: the identity is the one that
+    /// caused it — trace, tenant and user are the caller's, and the turn only travels
+    /// when the caller marked one, which an arbitrating opening by definition did not:
+    /// the trace is what pairs the two rows. Nothing else is shared: the row travels
+    /// `api`'s route, reaches `endpoint`, began at `began` and bills as `asked` unless
+    /// the answer echoed a model of its own. `bytes` is the answer, measured not parsed.
+    ///
+    /// The spend policy is chosen, not inherited: an arbitrated row carries the
+    /// caller's limiting, so its tokens count against the caller's token limits —
+    /// the caller caused the spend and pays for it as they would have paid for it
+    /// had they asked the model directly.
+    pub(super) fn arbitrated(
+        mut self,
+        api: ApiId,
+        endpoint: &ip_core::Endpoint,
+        began: Instant,
+        asked: ip_core::ModelName,
+        bytes: &[u8],
+    ) {
+        let mut measuring = Measuring::default();
+        measuring.read(bytes);
+        let measured = measuring.measured();
+        self.api = api;
+        self.started = began;
+        self.write(
+            measured
+                .as_ref()
+                .and_then(|measured| measured.model.clone())
+                .or(Some(asked)),
+            measured.map_or(Tokens::ZERO, |measured| measured.tokens),
+            Serving {
+                source: Served::Upstream,
+                endpoint: Some(Replica::of(endpoint)),
+                arms: Hedge::default(),
+                class: None,
+            },
+        );
     }
 
     /// Writes the row, off the path of the request it belongs to.
