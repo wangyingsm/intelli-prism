@@ -15,6 +15,7 @@
 //! it did.
 
 pub mod answer;
+pub mod anthropic;
 pub mod conversation;
 pub mod error;
 pub mod openai;

@@ -298,6 +298,7 @@ pub fn read_answer(body: &[u8]) -> Result<(Vec<Event>, Dropped), ProtocolError> 
 #[must_use]
 pub fn write_answer(events: &[Event]) -> (Value, Dropped) {
     let gathered = Gathered::of(events);
+    let mut dropped = Dropped::none();
     let mut message = Map::new();
     message.insert("role".to_owned(), json!("assistant"));
     message.insert(
@@ -339,7 +340,12 @@ pub fn write_answer(events: &[Event]) -> (Value, Dropped) {
                 Stop::Length => "length",
                 Stop::ToolUse => "tool_calls",
                 Stop::Filtered => "content_filter",
-                Stop::Other(reason) => reason.as_str(),
+                // This family's reasons are a closed set a client switches on, so one it
+                // never emits is flattened to the ordinary ending rather than passed on.
+                Stop::Other(_) => {
+                    dropped.note("stop_reason");
+                    "stop"
+                }
             }),
         );
     }
@@ -361,7 +367,7 @@ pub fn write_answer(events: &[Event]) -> (Value, Dropped) {
             }),
         );
     }
-    (Value::Object(body), Dropped::none())
+    (Value::Object(body), dropped)
 }
 
 /// One tool call, as this family nests it under a `function` with its arguments as a
