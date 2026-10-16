@@ -214,6 +214,35 @@ cannot answer costs the affinity and never the request.
 - Each usage row names the class it was dispatched at. An answer out of the cache carries it too,
 since the class is the request's own and says nothing about who answered it.
 
+### Naming the difficulty of a request
+
+- Four levels answer in order, and each one fills only the silence before it: what the request
+names in `x-ip-difficulty`, then what its turn remembers, then what the local model says when it
+is confident enough, then the arbiter. A request none of them can call is dispatched
+unclassified, across every endpoint behind the rule, exactly as it went before any of this.
+- The local model is a multilingual encoder — a fine-tuned `mmBERT-base` exported to ONNX —
+running in the gateway's own process. One forward pass over the opening of the conversation, no
+generation and no network, and one artefact answers for English and Chinese rather than one per
+language.
+- What decides whether it commits is a margin, not a confidence: the distance between the two
+likeliest classes. A model can be sure of `hard` with `median` close behind it, and that is
+precisely the ambiguous request, which a raw confidence figure calls settled and a margin does
+not.
+- A turn is classified once. The verdict is written to the turn's memory with the endpoint it
+landed on, so every later request of the conversation is dispatched from memory and costs
+nothing — neither a forward pass nor an arbiter call.
+- The arbiter is a larger model, asked only where the margin fell short, and through this
+gateway's own routing: resolved, dispatched and recorded as any other call is, presenting the
+configured upstream's own credential rather than the caller's. It answers inside a timeout the
+operator sets, and a slow, refused or unreadable reply leaves the request unclassified.
+- The margin threshold is configuration and the temperature travels with the artefact. Raising
+the threshold classifies less traffic and gets more of it right; lowering it classifies more and
+is wrong more often, which is a bill on one side and a misdispatch on the other.
+- Each usage row says which of the four levels decided it, and the usage summary counts them over
+a window. That is how an operator sees what their own traffic does — how much the local model
+carried, how much the arbiter was paid for, how much nothing could decide — and moves the
+threshold on their own evidence.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -264,10 +293,26 @@ rewritten rule starts again at its first endpoint. Only that rule's, and only th
 spread.
 - **A published rule set that cannot be built leaves a node on the rules it has.** It keeps serving
 and retries, so nodes can serve different revisions while one of them cannot build the newest.
-- **The level-1 classifier is not built.** The class must be named by the caller or set by a
-header processor; nothing classifies a request on its own yet. Every routing mechanism around it
-is in place and waiting: the taxonomy, the ceilings, the narrowing, the stickiness and the
-recording. This is a missing input, not a missing feature.
+- **The classifier's artefact is not in this repository and must be supplied.** A directory
+holding the exported model, its tokenizer and its gate, produced by the training spike and
+pointed at by `[difficulty].artifact`. A gateway without one runs with no classifier at all,
+which is a supported configuration and the path every request took before M13.
+- **The classifier needs a build feature and a native runtime.** Only a binary built
+`--features classifier` classifies, and a `[difficulty]` stanza in a build without it is refused
+at startup rather than ignored. The ONNX Runtime library is loaded dynamically, so nothing is
+needed to compile and it must be present to run — the part that surprises whoever packages this.
+- **The model is as accurate as it is, and the margin chooses where that lands.** No figure is
+promised here: a higher threshold classifies less and gets more of it right, the usage summary
+says what an operator's own traffic did, and the threshold is theirs to move. `research` is the
+weakest class, and the one a mistake costs most in — it is dispatched to a model that cannot do
+the work.
+- **An arbiter reply the gateway cannot read leaves the request unclassified.** Prose, a refusal,
+a reply naming two classes or none: each is logged and dispatched without a class rather than
+guessed at. A rising count of them is a prompt that needs fixing, and it is visible in the
+`undecided` count of the usage summary.
+- **A cache hit records no class and no level for a remembered turn.** The response cache answers
+before the turn's memory is consulted, so such a row says only what the request itself named. The
+classifier count is therefore a count of openings judged, not of conversations.
 - **A request is held in memory, up to 1 MiB, whenever turn affinity is configured.** Deriving a
 turn's anchor needs the opening of the body, so a request that would once have streamed through is
 now buffered to that limit; before M11 only a hedged or cached request held anything of its body.
@@ -298,13 +343,12 @@ it, but nothing removes it either until a sweep of unowned plugins exists.
 
 ### Intelligent routing, what is left of it
 
-- The classifier itself: a small local model naming each request's difficulty class, with an
-external arbiter asked when its confidence is low. The taxonomy and all the routing it feeds are
-already in place — the class has only to be named for everything downstream to work — so what is
-left is the naming, not the machinery.
-- Self learning: fold an arbiter's summary and reasoning back into the small local model that
-named the class in the first place, plus the best-effort endpoint that asks every upstream and
-aggregates or picks one.
+- Self learning: fold the arbiter's verdicts back into the local model that could not call them.
+With a trained model rather than a decision tree that is not a code path but a pipeline —
+collecting what the arbiter said, assembling training data, retraining and exporting a new
+artefact — and it is the weight of that pipeline, not a gap in the gateway, that keeps it unbuilt.
+- The best-effort endpoint that asks every upstream and aggregates or picks one. Unrelated to the
+classifier, and unchanged.
 
 ### Semantic cache
 
