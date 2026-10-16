@@ -15,6 +15,23 @@ use ip_core::{Dialect, RouteRule};
 use ip_protocol::{Conversation, Dropped, Event, ProtocolError};
 use serde_json::Value;
 
+/// The header naming what a crossing could not carry, on any answer that lost
+/// something and on no other.
+///
+/// Translation is best-effort by ruling: a request whose tools the target family cannot
+/// express is served without them, and the model answers never knowing it could have
+/// called anything. From the client's side that is indistinguishable from a model that
+/// chose not to. This header is what makes the difference visible without reading the
+/// gateway's journal, which is why it carries a short machine-readable list and not
+/// prose: a client that wants to react to it must be able to.
+///
+/// It is set before the response header chain runs, so a plugin sees it like any other
+/// header and may act on it — rewrite it into an operator's own spelling, or count it.
+/// A plugin that removes it is an operator choosing to, which is theirs to choose; the
+/// gateway's part is to have said so.
+pub(crate) const UNTRANSLATED: http::HeaderName =
+    http::HeaderName::from_static("x-ip-untranslated");
+
 /// The two families a rule carries a request between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Crossing {

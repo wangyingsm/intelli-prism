@@ -3374,6 +3374,108 @@ mod tests {
         assert_eq!(String::from_utf8(received(&upstream)).unwrap(), streaming);
     }
 
+    /// What a crossing could not carry reaches the caller, because a model answering
+    /// without the tools it was sent looks exactly like a model that chose not to call
+    /// one. The ruling is to serve the request anyway; this is what keeps that honest.
+    #[tokio::test]
+    async fn what_a_crossing_could_not_carry_is_named_on_the_answer() {
+        // Gemini joins a result to its call by function name, and this result's call is
+        // nowhere in the conversation, so nothing can name it.
+        let orphaned = r#"{"model":"shared","messages":[{"role":"tool","tool_call_id":"call_1","content":"42"}]}"#;
+        let answered = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#;
+        let (gateway, upstream) = bridging(Dialect::OpenAi, Dialect::Gemini, answered);
+        let response = gateway
+            .handle(context(granted()), request("/anthropic/messages", orphaned))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[crate::translate::UNTRANSLATED]
+                .to_str()
+                .unwrap(),
+            "tool_results"
+        );
+        body_of(response).await;
+
+        let sent: serde_json::Value = serde_json::from_slice(&received(&upstream)).unwrap();
+        assert_eq!(
+            sent["contents"][0]["parts"].as_array().unwrap().len(),
+            0,
+            "and it really was left behind rather than invented"
+        );
+    }
+
+    /// Absence, not emptiness: a header that is always there is a header nobody reads.
+    #[tokio::test]
+    async fn an_answer_that_crossed_whole_names_nothing() {
+        let answered = r#"{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#;
+        let (gateway, _) = bridging(Dialect::OpenAi, Dialect::Anthropic, answered);
+        let response = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic/messages", IN_OPENAI),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response
+                .headers()
+                .get(crate::translate::UNTRANSLATED)
+                .is_none(),
+            "nothing was lost, so nothing is claimed"
+        );
+        body_of(response).await;
+    }
+
+    /// A route that bridges nothing can lose nothing, and says nothing.
+    #[tokio::test]
+    async fn a_route_that_bridges_nothing_names_nothing() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let gateway = Gateway::new(
+            crate::flow::fixtures::table(),
+            ProcessorChain::new(),
+            upstream,
+        );
+        let response = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic/messages", IN_OPENAI),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response
+                .headers()
+                .get(crate::translate::UNTRANSLATED)
+                .is_none()
+        );
+        body_of(response).await;
+    }
+
+    /// One header for the whole request, whichever leg of the journey lost what: the
+    /// request losing its ceiling and the answer losing its stop reason are named
+    /// together, once, not once each.
+    #[tokio::test]
+    async fn the_losses_of_both_legs_are_named_together() {
+        // No ceiling asked for, which the family it crosses into demands; and a stop
+        // reason that family has and this one does not.
+        let no_ceiling = r#"{"model":"shared","messages":[{"role":"user","content":"hello"}]}"#;
+        let answered = r#"{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"stop_sequence"}"#;
+        let (gateway, _) = bridging(Dialect::OpenAi, Dialect::Anthropic, answered);
+        let response = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic/messages", no_ceiling),
+            )
+            .await
+            .unwrap();
+        let named = response.headers()[crate::translate::UNTRANSLATED]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(named, "max_tokens,stop_reason", "both legs, one header");
+        body_of(response).await;
+    }
+
     // ——— the row says which level decided (M13) ———
 
     /// The same conversation as [`opening`], written by the family that calls its

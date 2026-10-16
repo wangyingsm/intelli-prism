@@ -31,6 +31,7 @@ use crate::table::{Resolution, RoutingTable, request_key};
 use crate::translate::{self, Crossing};
 use crate::turns::{Opening, TurnAffinity, Verdict};
 use crate::upstream::Upstream;
+use ip_protocol::Dropped;
 
 /// The request header naming the difficulty class the caller asks to be served at.
 const DIFFICULTY: HeaderName = HeaderName::from_static("x-ip-difficulty");
@@ -412,8 +413,11 @@ impl Flow<BodyProcessed> {
         // this and forwards the bytes it was handed, untouched.
         let crossing = Crossing::of(resolution.rule());
         let mut request = request;
+        let mut lost = Dropped::none();
         if let Some(crossing) = crossing {
-            request = crossed_out(crossing, request).await?;
+            let (crossed, dropped) = crossed_out(crossing, request).await?;
+            request = crossed;
+            lost = dropped;
         }
         if raced == Hedge::NONE {
             let chosen = dispatcher.choose(&dispatching);
@@ -426,7 +430,7 @@ impl Flow<BodyProcessed> {
                 .map_err(|error| GatewayError::new(Forwarded::NAME, error.into()))?;
             strip_hop_by_hop(response.headers_mut());
             if let Some(crossing) = crossing {
-                response = crossed_home(crossing, response).await?;
+                response = crossed_home(crossing, response, lost).await?;
             }
             remember(turns, &self.context, taken.as_ref(), &served);
             return Ok(Flow {
@@ -454,7 +458,7 @@ impl Flow<BodyProcessed> {
                 &mut outcome.held.response,
                 Response::new(crate::body::empty()),
             );
-            outcome.held.response = crossed_home(crossing, answered).await?;
+            outcome.held.response = crossed_home(crossing, answered, lost).await?;
         }
         remember(
             turns,
@@ -475,11 +479,14 @@ impl Flow<BodyProcessed> {
 async fn crossed_out(
     crossing: Crossing,
     request: Request<GatewayBody>,
-) -> Result<Request<GatewayBody>, GatewayError> {
+) -> Result<(Request<GatewayBody>, Dropped), GatewayError> {
     let (mut parts, body) = request.into_parts();
     let bytes = collect(StageName::BodyRead, body).await?;
     let Some((conversation, written, dropped)) = translate::request(crossing, &bytes) else {
-        return Ok(Request::from_parts(parts, from_bytes(bytes)));
+        return Ok((
+            Request::from_parts(parts, from_bytes(bytes)),
+            Dropped::none(),
+        ));
     };
     // The answer to a streamed request is a stream, and a stream cannot cross yet.
     // Serving it would mean handing the caller the other family's events verbatim,
@@ -493,28 +500,40 @@ async fn crossed_out(
             },
         ));
     }
-    if !dropped.is_empty() {
-        tracing::warn!(%dropped, "a request crossed without everything it carried");
-    }
     set_length(&mut parts.headers, written.len());
-    Ok(Request::from_parts(parts, from_bytes(written.into())))
+    Ok((
+        Request::from_parts(parts, from_bytes(written.into())),
+        dropped,
+    ))
 }
 
 /// Rewrites an answer into the family its caller speaks, which is the same journey back.
 async fn crossed_home(
     crossing: Crossing,
     response: Response<GatewayBody>,
+    carried: Dropped,
 ) -> Result<Response<GatewayBody>, GatewayError> {
     let (mut parts, body) = response.into_parts();
     let bytes = collect(StageName::BodyRead, body).await?;
-    let Some((written, dropped)) = translate::answer(crossing, &bytes) else {
-        return Ok(Response::from_parts(parts, from_bytes(bytes)));
+    let mut lost = carried;
+    let written = match translate::answer(crossing, &bytes) {
+        Some((written, dropped)) => {
+            lost.absorb(&dropped);
+            set_length(&mut parts.headers, written.len());
+            from_bytes(written.into())
+        }
+        None => from_bytes(bytes),
     };
-    if !dropped.is_empty() {
-        tracing::warn!(%dropped, "an answer crossed without everything it carried");
+    if !lost.is_empty() {
+        // One line for the whole request, the request's own trace already on the span
+        // this runs inside: a rising count of these is an operator pointing a client at
+        // a route it does not fit, and the count is how they find out.
+        tracing::warn!(%lost, "a request crossed without everything it carried");
+        if let Ok(named) = http::HeaderValue::from_str(&lost.to_string()) {
+            parts.headers.insert(translate::UNTRANSLATED, named);
+        }
     }
-    set_length(&mut parts.headers, written.len());
-    Ok(Response::from_parts(parts, from_bytes(written.into())))
+    Ok(Response::from_parts(parts, written))
 }
 
 /// Which turn a request takes part in, and what that turn's verdict is to leave behind:
