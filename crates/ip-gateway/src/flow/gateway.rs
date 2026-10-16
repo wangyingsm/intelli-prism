@@ -3760,6 +3760,43 @@ mod tests {
         }
     }
 
+    /// The arbiter is asked in whatever family its own route leads to, which is the
+    /// point of asking it through this gateway's routing at all: an arbiter behind a
+    /// Gemini endpoint would refuse a question spelled any other way.
+    #[tokio::test]
+    async fn the_arbiter_is_asked_in_the_dialect_of_its_own_route() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let ruling = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hard"}]},"finishReason":"STOP"}]}"#;
+        let upstream = asking_only(answered(ruling));
+        let (recorder, mut recorded) = Ledger::new();
+        let mut table = arbitrating_table();
+        table = {
+            let mut rules: Vec<ip_core::RouteRule> = table.rules().cloned().collect();
+            for rule in &mut rules {
+                if rule.api == arbitration_api() {
+                    rule.upstream_speaks = Some(ip_core::Dialect::Gemini);
+                }
+            }
+            RoutingTable::from_rules(rules)
+        };
+        let gateway = Gateway::new(table, ProcessorChain::new(), upstream.clone())
+            .sticky_turns(Arc::new(ip_cache::SledCache::temporary().unwrap()))
+            .classifying(judge)
+            .recording(recorder)
+            .arbitrating(Arc::new(arbiter(std::time::Duration::from_secs(5))));
+
+        let (row, _) = asked(&gateway, &mut recorded, context(granted()), opening()).await;
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+
+        let asked_in: serde_json::Value =
+            serde_json::from_str(&questions_to(&upstream)[0].1).unwrap();
+        assert!(
+            asked_in.get("contents").is_some(),
+            "the question was not spelled for the endpoint it went to: {asked_in}"
+        );
+        assert!(asked_in.get("messages").is_none());
+    }
+
     /// A conversation the fixtures above judge, as a caller would send it.
     fn opening() -> Request<GatewayBody> {
         request(

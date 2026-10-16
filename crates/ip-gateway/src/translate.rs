@@ -94,7 +94,10 @@ fn read_conversation(
 }
 
 /// A request body, written as one family spells it.
-fn write_conversation(dialect: Dialect, conversation: &Conversation) -> (Value, Dropped) {
+pub(crate) fn write_conversation(
+    dialect: Dialect,
+    conversation: &Conversation,
+) -> (Value, Dropped) {
     match dialect {
         Dialect::OpenAi => ip_protocol::openai::write(conversation),
         Dialect::Anthropic => ip_protocol::anthropic::write(conversation),

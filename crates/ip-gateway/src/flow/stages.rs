@@ -5,7 +5,8 @@ use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderName, Request, Response};
 use ip_cache::{CacheKey, Ttl};
 use ip_core::{
-    Capability, CapabilityScope, Decider, Difficulty, HEDGE_MOST, Hedge, Replica, RouteKey, TurnId,
+    Capability, CapabilityScope, Decider, Dialect, Difficulty, HEDGE_MOST, Hedge, Replica,
+    RouteKey, TurnId,
 };
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -674,9 +675,9 @@ async fn arbitrate(how: Arbitrating<'_>, text: &str) -> Option<Difficulty> {
     };
     let chosen = how.dispatcher.choose(&Dispatching::new(&resolution, None));
     // Built as a conversation and written by a family's own writer, so the question is
-    // spelled the way the endpoint it travels to expects. Commit 05 gives the route a
-    // dialect to choose that writer by; until then it is asked in the one family this
-    // gateway has always asked in.
+    // spelled the way the endpoint it travels to expects. The arbiter's route says
+    // which family that is, and a route that says nothing is asked in the one family
+    // this gateway has always asked in.
     let asking = ip_protocol::Conversation {
         model: Some(how.arbiter.model().clone()),
         system: None,
@@ -691,7 +692,10 @@ async fn arbitrate(how: Arbitrating<'_>, text: &str) -> Option<Difficulty> {
         },
         stream: false,
     };
-    let (body, _) = ip_protocol::openai::write(&asking);
+    let (body, _) = translate::write_conversation(
+        resolution.rule().upstream_speaks.unwrap_or(Dialect::OpenAi),
+        &asking,
+    );
     let mut headers = http::HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
