@@ -1,10 +1,12 @@
 use ip_core::{
-    AbsPath, ApiId, Difficulty, Endpoint, Hedge, HedgeDelay, Host, Port, Protocol, RouteKey,
-    RouteRule, RouteTarget, Strategy, Weight, Weighted,
+    AbsPath, ApiId, Dialect, Difficulty, Endpoint, Hedge, HedgeDelay, Host, Port, Protocol,
+    RouteKey, RouteRule, RouteTarget, Strategy, Weight, Weighted,
 };
 
 use crate::error::{Entity, StorageError};
+use crate::list::Page;
 use crate::route::RouteStore;
+use crate::store::Backend;
 
 fn route_endpoint(protocol: Protocol, host: &str, port: u16, path: &str) -> Endpoint {
     Endpoint::new(
@@ -24,6 +26,8 @@ pub(crate) fn rule(host: &str, path: &str, upstream: &str) -> RouteRule {
         strategy: ip_core::Strategy::default(),
         hedge: Hedge::default(),
         hedge_delay: HedgeDelay::default(),
+        caller_speaks: None,
+        upstream_speaks: None,
     }
 }
 
@@ -69,6 +73,8 @@ pub(crate) async fn a_route_key_carries_every_part_of_the_tuple(store: &impl Rou
         strategy: ip_core::Strategy::default(),
         hedge: Hedge::default(),
         hedge_delay: HedgeDelay::default(),
+        caller_speaks: None,
+        upstream_speaks: None,
     };
     store.put_route(secure).await.unwrap();
     store.put_route(plain).await.unwrap();
@@ -92,6 +98,8 @@ pub(crate) async fn every_protocol_survives_a_round_trip(store: &impl RouteStore
                 strategy: ip_core::Strategy::default(),
                 hedge: Hedge::default(),
                 hedge_delay: HedgeDelay::default(),
+                caller_speaks: None,
+                upstream_speaks: None,
             })
             .await
             .unwrap();
@@ -241,6 +249,65 @@ pub(crate) async fn a_rule_keeps_the_hedge_delay_it_was_stored_with(store: &impl
     assert_eq!(read, waited);
     assert_eq!(read.hedge_delay.get(), 250);
     assert_eq!(store.routes().await.unwrap(), vec![waited]);
+}
+
+/// Every pairing of families a rule can bridge survives the round trip and the listing,
+/// which is where M10 first went wrong by reading a column and discarding it.
+pub(crate) async fn a_rule_keeps_the_dialects_it_bridges(store: &impl Backend) {
+    for (caller, upstream) in [
+        (Some(Dialect::OpenAi), Some(Dialect::Anthropic)),
+        (Some(Dialect::Anthropic), Some(Dialect::Gemini)),
+        (Some(Dialect::Gemini), Some(Dialect::OpenAi)),
+        (Some(Dialect::OpenAi), Some(Dialect::OpenAi)),
+        (Some(Dialect::OpenAi), None),
+        (None, Some(Dialect::Gemini)),
+    ] {
+        let mut bridging = rule("gateway.local", "/bridged", "api.example.com");
+        bridging.caller_speaks = caller;
+        bridging.upstream_speaks = upstream;
+        store.put_route(bridging.clone()).await.unwrap();
+
+        let read = store.route(&bridging.key).await.unwrap().unwrap();
+        assert_eq!(read, bridging, "{caller:?} to {upstream:?} did not survive");
+        let listed = store.routes().await.unwrap();
+        assert!(
+            listed.contains(&bridging),
+            "{caller:?} to {upstream:?} was lost on the way out of the listing"
+        );
+        // And out of the paged listing, which is a query of its own: M10's mistake was
+        // a column read by one path and discarded by the other.
+        let paged = store.list_routes(Page::default()).await.unwrap();
+        assert!(
+            paged.iter().any(|listed| listed.item == bridging),
+            "{caller:?} to {upstream:?} was lost on the way out of the paged listing"
+        );
+    }
+}
+
+/// A rule written before any of this existed names neither family and translates
+/// nothing, which is what the migration must leave every stored rule doing.
+pub(crate) async fn a_rule_stored_without_dialects_translates_nothing(store: &impl RouteStore) {
+    let plain = rule("gateway.local", "/v1", "api.example.com");
+    assert_eq!(plain.caller_speaks, None);
+    store.put_route(plain.clone()).await.unwrap();
+    let read = store.route(&plain.key).await.unwrap().unwrap();
+    assert_eq!(read.caller_speaks, None);
+    assert_eq!(read.upstream_speaks, None);
+}
+
+/// Rewriting a rule replaces what it bridges, including back to bridging nothing — the
+/// upsert must clear a column, not only set one.
+pub(crate) async fn rewriting_a_rule_replaces_its_dialects(store: &impl RouteStore) {
+    let mut bridging = rule("gateway.local", "/bridged", "api.example.com");
+    bridging.caller_speaks = Some(Dialect::OpenAi);
+    bridging.upstream_speaks = Some(Dialect::Gemini);
+    store.put_route(bridging.clone()).await.unwrap();
+
+    let plain = rule("gateway.local", "/bridged", "api.example.com");
+    store.put_route(plain.clone()).await.unwrap();
+    let read = store.route(&plain.key).await.unwrap().unwrap();
+    assert_eq!(read.caller_speaks, None, "a cleared dialect stayed set");
+    assert_eq!(read.upstream_speaks, None);
 }
 
 pub(crate) async fn a_rule_stored_without_a_hedge_delay_sends_arms_together(

@@ -821,6 +821,55 @@ impl fmt::Display for Decider {
     }
 }
 
+/// A family of provider api, by the shape of the bodies it sends and answers with.
+///
+/// Every family means the same things and spells almost none of them alike, so a
+/// gateway that only forwards bytes can serve any of them and a gateway that reads a
+/// body must know which it is holding. Naming it on a route is what lets a client
+/// written against one family be served by another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Dialect {
+    /// Chat completions: `messages`, a system role, tool calls beside the content.
+    OpenAi,
+    /// Messages: a top-level `system`, content blocks, tool results inside a user turn.
+    Anthropic,
+    /// Generate content: `contents` of `parts`, the model's role spelled `model`.
+    Gemini,
+}
+
+impl Dialect {
+    /// The three families, in no order that means anything.
+    pub const ALL: [Dialect; 3] = [Dialect::OpenAi, Dialect::Anthropic, Dialect::Gemini];
+
+    /// The name it is stored and reported under.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// Reads it back from that name.
+    pub fn named(name: &str) -> Result<Self, CoreError> {
+        match name {
+            "openai" => Ok(Self::OpenAi),
+            "anthropic" => Ok(Self::Anthropic),
+            "gemini" => Ok(Self::Gemini),
+            other => Err(CoreError::UnknownDialect {
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Dialect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// The endpoints a matched request may be sent to, of which there is always at least one.
 ///
 /// Several endpoints stand behind one target when an upstream is replicated. Which one
@@ -913,6 +962,16 @@ pub struct RouteRule {
     /// the rule it always was.
     #[serde(default, skip_serializing_if = "HedgeDelay::is_none")]
     pub hedge_delay: HedgeDelay,
+    /// Which family the callers of this route send. None unless the rule says, which is
+    /// what a rule written before this existed does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_speaks: Option<Dialect>,
+    /// Which family the endpoints behind it speak. The dialects belong to the rule and
+    /// not to an endpoint: endpoints behind one target are replicas of one upstream and
+    /// cannot disagree about what they speak, and a deployment needing two families
+    /// behind one path needs two rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_speaks: Option<Dialect>,
 }
 
 #[cfg(test)]
@@ -1179,6 +1238,8 @@ mod tests {
             strategy: Strategy::default(),
             hedge: Hedge::default(),
             hedge_delay: HedgeDelay::default(),
+            caller_speaks: None,
+            upstream_speaks: None,
         };
         assert_eq!(rule.key.endpoint().host.as_str(), "gateway.local");
         assert_eq!(rule.target.primary().host.as_str(), "api.example.com");
@@ -1272,6 +1333,8 @@ mod tests {
             strategy: Strategy::default(),
             hedge: Hedge::NONE,
             hedge_delay: HedgeDelay::default(),
+            caller_speaks: None,
+            upstream_speaks: None,
         };
         let written = serde_json::to_string(&rule).unwrap();
         assert!(
@@ -1395,6 +1458,60 @@ mod tests {
 
     /// Every level round-trips through the name it is stored under, and one no level
     /// answers to is refused rather than guessed at.
+    /// Every family round-trips through the name it is stored under, and one no family
+    /// answers to is refused rather than guessed at.
+    #[test]
+    fn a_dialect_round_trips_through_its_stored_name() {
+        for dialect in Dialect::ALL {
+            assert_eq!(Dialect::named(dialect.name()).unwrap(), dialect);
+            assert_eq!(dialect.to_string(), dialect.name());
+        }
+        assert!(matches!(
+            Dialect::named("cohere"),
+            Err(CoreError::UnknownDialect { .. })
+        ));
+    }
+
+    /// The name a column stores and the name the api reports are the same word. The
+    /// serde spelling is derived and the stored one is written out, so they are two
+    /// places that must agree — and `openai` is the one a lowercasing rule could have
+    /// turned into `open_ai` without anyone noticing.
+    #[test]
+    fn a_dialect_is_reported_under_the_name_it_is_stored_under() {
+        for dialect in Dialect::ALL {
+            assert_eq!(
+                serde_json::to_string(&dialect).unwrap(),
+                format!("\"{}\"", dialect.name())
+            );
+            assert_eq!(
+                serde_json::from_str::<Dialect>(&format!("\"{}\"", dialect.name())).unwrap(),
+                dialect
+            );
+        }
+        assert_eq!(Dialect::OpenAi.name(), "openai");
+        assert!(serde_json::from_str::<Dialect>("\"open_ai\"").is_err());
+    }
+
+    /// A rule that names neither dialect reads and writes as the rule it always was, so
+    /// nothing stored before this existed changes meaning.
+    #[test]
+    fn a_rule_naming_no_dialect_carries_no_dialect_keys() {
+        let rule = RouteRule {
+            api: ApiId::new("anthropic").unwrap(),
+            key: RouteKey::new(endpoint(Protocol::Https, "api.example.com", 443, "/v1")),
+            target: RouteTarget::new(endpoint(Protocol::Https, "one.example.com", 443, "/v1")),
+            strategy: Strategy::default(),
+            hedge: Hedge::default(),
+            hedge_delay: HedgeDelay::default(),
+            caller_speaks: None,
+            upstream_speaks: None,
+        };
+        let written = serde_json::to_string(&rule).unwrap();
+        assert!(!written.contains("caller_speaks"), "{written}");
+        assert!(!written.contains("upstream_speaks"), "{written}");
+        assert_eq!(serde_json::from_str::<RouteRule>(&written).unwrap(), rule);
+    }
+
     #[test]
     fn a_decider_round_trips_through_its_stored_name() {
         for decider in Decider::ALL {

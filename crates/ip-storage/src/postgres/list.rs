@@ -6,7 +6,7 @@ use ip_core::{
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 
-use crate::codec::{capability, scope, standing};
+use crate::codec::{capability, dialect, scope, standing};
 use crate::list::{ListStore, Listed, Page};
 use crate::model::Membership;
 use crate::plugin::{PluginOwner, PluginRecord};
@@ -171,7 +171,8 @@ impl ListStore for PostgresStore {
     async fn list_routes(&self, page: Page) -> Result<Vec<Listed<RouteRule>>, StorageError> {
         let rows = sqlx::query(
             "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-             r.created_at, r.strategy, r.hedge, r.hedge_delay, t.protocol, t.host, t.port, t.path, t.weight, \
+             r.created_at, r.strategy, r.hedge, r.hedge_delay, r.caller_speaks, \
+             r.upstream_speaks, t.protocol, t.host, t.port, t.path, t.weight, \
              t.serves FROM \
              (SELECT * FROM routes WHERE created_at > $1 \
               ORDER BY created_at DESC, row_id DESC LIMIT $2 OFFSET $3) r \
@@ -207,6 +208,8 @@ impl ListStore for PostgresStore {
                     strategy: strategy(row)?,
                     hedge: hedge(row)?,
                     hedge_delay: hedge_delay(row)?,
+                    caller_speaks: dialect(row.get("caller_speaks"))?,
+                    upstream_speaks: dialect(row.get("upstream_speaks"))?,
                 },
                 created_at: created_at(row)?,
             });

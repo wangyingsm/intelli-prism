@@ -6,6 +6,7 @@ use ip_core::{
 use sqlx::{Row, SqliteConnection};
 
 use super::SqliteStore;
+use crate::codec::{dialect, dialect_name};
 use crate::error::{Entity, StorageError};
 use crate::route::RouteStore;
 
@@ -17,11 +18,13 @@ impl RouteStore for SqliteStore {
         let route_row_id: i64 = sqlx::query_scalar(
             "INSERT INTO routes \
              (api_id, key_protocol, key_host, key_port, key_path, strategy, hedge, hedge_delay, \
-             created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             caller_speaks, upstream_speaks, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
              api_id = excluded.api_id, strategy = excluded.strategy, hedge = excluded.hedge, \
-             hedge_delay = excluded.hedge_delay \
+             hedge_delay = excluded.hedge_delay, \
+             caller_speaks = excluded.caller_speaks, \
+             upstream_speaks = excluded.upstream_speaks \
              RETURNING row_id",
         )
         .bind(rule.api.as_str())
@@ -32,6 +35,8 @@ impl RouteStore for SqliteStore {
         .bind(rule.strategy.name())
         .bind(i64::from(rule.hedge.get()))
         .bind(i64::from(rule.hedge_delay.get()))
+        .bind(dialect_name(rule.caller_speaks))
+        .bind(dialect_name(rule.upstream_speaks))
         .bind(Timestamp::now().unix_seconds())
         .fetch_one(&mut *transaction)
         .await
@@ -92,7 +97,8 @@ impl RouteStore for SqliteStore {
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
         let endpoint = key.endpoint();
         let rows = sqlx::query(
-            "SELECT r.api_id, r.strategy, r.hedge, r.hedge_delay, t.protocol, t.host, t.port, \
+            "SELECT r.api_id, r.strategy, r.hedge, r.hedge_delay, r.caller_speaks, \
+             r.upstream_speaks, t.protocol, t.host, t.port, \
              t.path, t.weight, \
              t.serves \
              FROM routes r \
@@ -119,6 +125,8 @@ impl RouteStore for SqliteStore {
             strategy: strategy_of(first)?,
             hedge: hedge_of(first)?,
             hedge_delay: hedge_delay_of(first)?,
+            caller_speaks: dialect(first.get("caller_speaks"))?,
+            upstream_speaks: dialect(first.get("upstream_speaks"))?,
         }))
     }
 
@@ -133,7 +141,8 @@ pub(super) async fn read_routes(
 ) -> Result<Vec<RouteRule>, StorageError> {
     let rows = sqlx::query(
         "SELECT r.row_id, r.api_id, r.key_protocol, r.key_host, r.key_port, r.key_path, \
-         r.strategy, r.hedge, r.hedge_delay, t.protocol, t.host, t.port, t.path, t.weight, t.serves FROM routes r \
+         r.strategy, r.hedge, r.hedge_delay, r.caller_speaks, r.upstream_speaks, \
+         t.protocol, t.host, t.port, t.path, t.weight, t.serves FROM routes r \
          JOIN route_targets t ON t.route_row_id = r.row_id \
          ORDER BY r.key_host, r.key_path, r.key_protocol, r.key_port, t.position",
     )
@@ -167,6 +176,8 @@ pub(super) async fn read_routes(
             strategy: strategy_of(row)?,
             hedge: hedge_of(row)?,
             hedge_delay: hedge_delay_of(row)?,
+            caller_speaks: dialect(row.get("caller_speaks"))?,
+            upstream_speaks: dialect(row.get("upstream_speaks"))?,
         });
     }
     Ok(rules)
@@ -338,6 +349,36 @@ mod tests {
                 entity: Entity::Route,
                 ..
             })
+        ));
+    }
+
+    /// A family this code does not carry, written around the driver into a rule, is
+    /// refused on the single read and on the listing both.
+    #[tokio::test]
+    async fn a_stored_dialect_this_code_does_not_carry_is_refused_on_read() {
+        use crate::list::ListStore;
+        let store = store().await;
+        store
+            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE routes SET upstream_speaks = 'cohere'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .route(&rule("gateway.local", "/v1", "api.example.com").key)
+                .await,
+            Err(StorageError::Value(
+                ip_core::CoreError::UnknownDialect { .. }
+            ))
+        ));
+        assert!(matches!(
+            store.list_routes(crate::Page::default()).await,
+            Err(StorageError::Value(
+                ip_core::CoreError::UnknownDialect { .. }
+            ))
         ));
     }
 

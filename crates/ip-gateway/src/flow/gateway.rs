@@ -2434,6 +2434,8 @@ mod tests {
             strategy: ip_core::Strategy::default(),
             hedge: Hedge::default(),
             hedge_delay: ip_core::HedgeDelay::default(),
+            caller_speaks: None,
+            upstream_speaks: None,
         };
         RoutingTable::from_rules(vec![turn, ask])
     }

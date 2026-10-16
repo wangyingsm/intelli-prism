@@ -664,6 +664,8 @@ mod tests {
             strategy,
             hedge: ip_core::Hedge::default(),
             hedge_delay: ip_core::HedgeDelay::default(),
+            caller_speaks: None,
+            upstream_speaks: None,
         };
         let table = RoutingTable::from_rules(vec![rule]);
         table
@@ -1490,6 +1492,8 @@ mod tests {
             strategy: Strategy::RoundRobin,
             hedge: ip_core::Hedge::default(),
             hedge_delay: ip_core::HedgeDelay::default(),
+            caller_speaks: None,
+            upstream_speaks: None,
         }]);
         let key = RouteKey::new(endpoint("gateway.local", "/anthropic"));
         let (dispatcher, _folding) = Dispatcher::new();

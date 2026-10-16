@@ -527,6 +527,8 @@ secret = "0123456789abcdef0123456789abcdef"
             strategy: ip_core::Strategy::default(),
             hedge: ip_core::Hedge::default(),
             hedge_delay: ip_core::HedgeDelay::default(),
+            caller_speaks: None,
+            upstream_speaks: None,
         }
     }
 

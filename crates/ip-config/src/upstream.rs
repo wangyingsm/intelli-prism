@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use ip_core::{
-    AbsPath, ApiId, Difficulty, Endpoint, Hedge, HedgeDelay, Host, ModelName, Port, Protocol,
-    RouteKey, RouteRule, RouteTarget, Strategy, Weight, Weighted,
+    AbsPath, ApiId, Dialect, Difficulty, Endpoint, Hedge, HedgeDelay, Host, ModelName, Port,
+    Protocol, RouteKey, RouteRule, RouteTarget, Strategy, Weight, Weighted,
 };
 use url::Url;
 
@@ -43,6 +43,13 @@ pub struct UpstreamConfig {
     /// unless it says otherwise, which serves anything.
     #[serde(default)]
     pub serves: Option<Difficulty>,
+    /// Which provider family the callers of this upstream's route send.
+    #[serde(default)]
+    pub caller_speaks: Option<Dialect>,
+    /// Which family this upstream itself speaks. Naming neither, or naming one family
+    /// on both sides, forwards every body untouched.
+    #[serde(default)]
+    pub upstream_speaks: Option<Dialect>,
     /// Further endpoints this upstream stands behind, beyond `base_url`.
     #[serde(default, rename = "target")]
     pub targets: Vec<UpstreamTarget>,
@@ -146,6 +153,8 @@ impl UpstreamConfig {
             strategy: self.strategy,
             hedge: self.hedge,
             hedge_delay: self.hedge_delay,
+            caller_speaks: self.caller_speaks,
+            upstream_speaks: self.upstream_speaks,
         })
     }
 }
@@ -205,11 +214,31 @@ mod tests {
             hedge_delay: HedgeDelay::default(),
             serves: None,
             targets: Vec::new(),
+            caller_speaks: None,
+            upstream_speaks: None,
         }
     }
 
     fn listen() -> SocketAddr {
         "127.0.0.1:8080".parse().unwrap()
+    }
+
+    /// What an upstream declares it bridges reaches the rule it builds, which is the
+    /// only way a configured upstream can translate at all.
+    #[test]
+    fn what_an_upstream_declares_it_bridges_reaches_its_rule() {
+        let mut declared = upstream("https://api.anthropic.com/v1", None);
+        declared.caller_speaks = Some(Dialect::OpenAi);
+        declared.upstream_speaks = Some(Dialect::Anthropic);
+        let rule = declared.route_rule(listen()).unwrap();
+        assert_eq!(rule.caller_speaks, Some(Dialect::OpenAi));
+        assert_eq!(rule.upstream_speaks, Some(Dialect::Anthropic));
+
+        let plain = upstream("https://api.anthropic.com/v1", None)
+            .route_rule(listen())
+            .unwrap();
+        assert_eq!(plain.caller_speaks, None, "silence declares no bridge");
+        assert_eq!(plain.upstream_speaks, None);
     }
 
     #[test]

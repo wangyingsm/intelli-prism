@@ -80,6 +80,13 @@ pub enum CoreError {
         value: String,
     },
 
+    /// A provider family this application does not carry.
+    #[error("unknown dialect {value:?}")]
+    UnknownDialect {
+        /// The text that named no family.
+        value: String,
+    },
+
     /// A stretch of clock this application does not count over.
     #[error("unknown period {value:?}")]
     UnknownPeriod {

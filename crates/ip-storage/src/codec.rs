@@ -1,8 +1,8 @@
 //! How identity and plugin values are spelled in the columns every sql backend stores them in.
 
 use ip_core::{
-    ApiId, Capability, CapabilityScope, Decider, Latency, PluginOrder, PluginScope, Served,
-    TenantId, TnKey, TokenCount, UserId,
+    ApiId, Capability, CapabilityScope, Decider, Dialect, Latency, PluginOrder, PluginScope,
+    Served, TenantId, TnKey, TokenCount, UserId,
 };
 
 use crate::error::{Entity, StorageError};
@@ -182,6 +182,19 @@ pub(crate) fn decided_by_name(decided_by: Option<Decider>) -> Option<&'static st
 pub(crate) fn decided_by(named: Option<String>) -> Result<Option<Decider>, StorageError> {
     named
         .map(|name| Decider::named(&name))
+        .transpose()
+        .map_err(StorageError::from)
+}
+
+/// The stored name of a provider family.
+pub(crate) fn dialect_name(dialect: Option<Dialect>) -> Option<&'static str> {
+    dialect.map(Dialect::name)
+}
+
+/// Reads a provider family back, refusing a name this code does not carry.
+pub(crate) fn dialect(named: Option<String>) -> Result<Option<Dialect>, StorageError> {
+    named
+        .map(|name| Dialect::named(&name))
         .transpose()
         .map_err(StorageError::from)
 }
