@@ -14,6 +14,7 @@
 //! it is empty, so nothing can quietly lose part of a request without being able to say
 //! it did.
 
+pub mod anchor;
 pub mod answer;
 pub mod anthropic;
 pub mod conversation;

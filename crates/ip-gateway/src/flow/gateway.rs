@@ -3147,6 +3147,113 @@ mod tests {
 
     // ——— the row says which level decided (M13) ———
 
+    /// The same conversation as [`opening`], written by the family that calls its
+    /// messages `contents` — which the gateway could not read at all before M14.
+    fn gemini_opening() -> Request<GatewayBody> {
+        let body = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "you audit accounts"}]},
+            "contents": [{"role": "user", "parts": [{"text": OPENING_PROMPT}]}],
+        });
+        request("/anthropic/messages", &body.to_string())
+    }
+
+    /// A conversation this family sends is judged like any other: before M14 it had no
+    /// opening, so the judge was never asked and the row carried no class at all.
+    #[tokio::test]
+    async fn a_conversation_of_contents_and_parts_is_classified() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded) =
+            arbitrating_gateway(judge.clone(), asking_only(answered(RULING)), None);
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            gemini_opening(),
+        )
+        .await;
+        assert_eq!(judge.calls(), 1, "the judge was given an opening to read");
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+        assert_eq!(row.decided_by, Some(ip_core::Decider::Classifier));
+    }
+
+    /// And arbitrated, when the local margin falls short.
+    #[tokio::test]
+    async fn a_conversation_of_contents_and_parts_is_arbitrated() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            asking_only(answered(RULING)),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            gemini_opening(),
+        )
+        .await;
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+        assert_eq!(row.decided_by, Some(ip_core::Decider::Arbiter));
+    }
+
+    /// And its turn is remembered, so the rest of the conversation costs nothing.
+    #[tokio::test]
+    async fn a_conversation_of_contents_and_parts_rides_its_turn() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded) =
+            arbitrating_gateway(judge.clone(), asking_only(answered(RULING)), None);
+        asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            gemini_opening(),
+        )
+        .await;
+        let (second, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            gemini_opening(),
+        )
+        .await;
+        assert_eq!(judge.calls(), 1, "one judgement across the conversation");
+        assert_eq!(second.decided_by, Some(ip_core::Decider::Turn));
+    }
+
+    /// The arbiter may be any model a route leads to, so its ruling is read whichever
+    /// family answered. Before M14 this function knew two shapes by hand.
+    #[tokio::test]
+    async fn a_ruling_is_read_whichever_family_answers() {
+        for (family, ruling) in [
+            ("openai", RULING),
+            (
+                "anthropic",
+                r#"{"content":[{"type":"text","text":"hard"}]}"#,
+            ),
+            (
+                "gemini",
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hard"}]},"finishReason":"STOP"}]}"#,
+            ),
+        ] {
+            let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+            let (gateway, mut recorded) = arbitrating_gateway(
+                judge,
+                asking_only(answered(ruling)),
+                Some(arbiter(std::time::Duration::from_secs(5))),
+            );
+            let (row, _) = asked(&gateway, &mut recorded, context(granted()), opening()).await;
+            assert_eq!(
+                row.dispatched_class,
+                Some(ip_core::Difficulty::Hard),
+                "{family} answered a ruling the gateway could not read"
+            );
+        }
+    }
+
     /// A conversation the fixtures above judge, as a caller would send it.
     fn opening() -> Request<GatewayBody> {
         request(

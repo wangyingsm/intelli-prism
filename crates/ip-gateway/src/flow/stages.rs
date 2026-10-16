@@ -586,11 +586,25 @@ async fn arbitrate(how: Arbitrating<'_>, text: &str) -> Option<Difficulty> {
         return None;
     };
     let chosen = how.dispatcher.choose(&Dispatching::new(&resolution, None));
-    let body = serde_json::json!({
-        "model": how.arbiter.model().as_str(),
-        "messages": [{"role": "user", "content": question(text)}],
-        "max_tokens": 16,
-    });
+    // Built as a conversation and written by a family's own writer, so the question is
+    // spelled the way the endpoint it travels to expects. Commit 05 gives the route a
+    // dialect to choose that writer by; until then it is asked in the one family this
+    // gateway has always asked in.
+    let asking = ip_protocol::Conversation {
+        model: Some(how.arbiter.model().clone()),
+        system: None,
+        messages: vec![ip_protocol::Message::text(
+            ip_protocol::Role::User,
+            &question(text),
+        )],
+        tools: Vec::new(),
+        sampling: ip_protocol::Sampling {
+            max_tokens: Some(ANSWER_CEILING),
+            ..ip_protocol::Sampling::default()
+        },
+        stream: false,
+    };
+    let (body, _) = ip_protocol::openai::write(&asking);
     let mut headers = http::HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
@@ -687,24 +701,27 @@ async fn read_answer(
     }
 }
 
+/// How many tokens one word of ruling needs, with room for a model that says it in a
+/// short sentence. The reply is scanned for a class name rather than parsed, so a
+/// little prose survives and a lot of it was never an answer.
+const ANSWER_CEILING: u32 = 16;
+
 /// The ruling inside an answer, refused whole if it is not one: the arbiter is a
-/// language model, and prose is an answer it will sometimes give. The reply is read from
-/// either dialect a routed endpoint may speak — `choices[0].message.content`, else
-/// `content[0].text` — because this gateway speaks no provider dialect anywhere else and
-/// grows no notion of one here. What does not name a class is not a class, and is said
-/// out loud: a rising count of unreadable replies is a prompt that needs fixing, which an
-/// operator cannot know without being told. Exactly one class names a ruling: a reply
-/// naming two is restating its instructions, not answering. What the reply said is never journalled: it
-/// can echo the opening it was asked about.
+/// language model, and prose is an answer it will sometimes give. The reply is read
+/// through every family's own reader, so an arbiter may be whatever model a route leads
+/// to rather than one of the two shapes this function once knew by hand. What does not
+/// name a class is not a class, and is said out loud: a rising count of unreadable
+/// replies is a prompt that needs fixing, which an operator cannot know without being
+/// told. Exactly one class names a ruling: a reply naming two is restating its
+/// instructions, not answering. What the reply said is never journalled: it can echo
+/// the opening it was asked about.
 fn named_ruling(bytes: &[u8]) -> Option<Difficulty> {
-    let reply = serde_json::from_slice::<serde_json::Value>(bytes)
+    let reply = ip_protocol::openai::read_answer(bytes)
+        .or_else(|_| ip_protocol::anthropic::read_answer(bytes))
+        .or_else(|_| ip_protocol::gemini::read_answer(bytes))
         .ok()
-        .and_then(|value| {
-            value["choices"][0]["message"]["content"]
-                .as_str()
-                .or_else(|| value["content"][0]["text"].as_str())
-                .map(str::to_owned)
-        });
+        .map(|(events, _)| ip_protocol::Gathered::of(&events).text)
+        .filter(|text| !text.is_empty());
     match reply {
         Some(reply) => {
             // Distinct classes named, not the first word that happens to be one: a

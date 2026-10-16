@@ -1625,6 +1625,7 @@ dependencies = [
  "ip-cache",
  "ip-config",
  "ip-core",
+ "ip-protocol",
  "ip-storage",
  "rustls",
  "serde_json",

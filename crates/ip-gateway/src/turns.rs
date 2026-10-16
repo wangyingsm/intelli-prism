@@ -149,24 +149,28 @@ impl Opening {
     /// all an anchor requires; two clients spelling the same conversation differently are two
     /// turns, and that costs an affinity, not a correctness.
     ///
-    /// A body that is not json, carries no `messages`, or holds no user message — embeddings
-    /// and plain completions fall here — has no opening, and is simply not sticky.
+    /// A body that is not json, carries no conversation any family would send, or holds
+    /// no user turn — embeddings and plain completions fall here — has no opening, and
+    /// is simply not sticky.
+    ///
+    /// Where the two halves live is the only question that differs between families,
+    /// and `ip-protocol` answers it. What is done with them does not differ and has not
+    /// changed: the same two values, hashed as the json they arrived as, so a
+    /// conversation a client is part way through keeps the anchor it already had.
     pub fn read(body: &[u8]) -> Option<Self> {
         let value = serde_json::from_slice::<Value>(body).ok()?;
-        let messages = value.get("messages")?.as_array()?;
-        let user = first_with_role(messages, "user")?;
-        let system = system_of(&value);
+        let found = ip_protocol::anchor::of(&value)?;
         let mut hasher = Sha256::new();
-        hash_field(&mut hasher, system);
+        hash_field(&mut hasher, found.system);
         // A serialised json value never holds a raw NUL, so it cannot fuse the two halves.
         hasher.update([0u8]);
-        hash_field(&mut hasher, user.get("content"));
+        hash_field(&mut hasher, found.opening);
         let anchor = TurnId::new(&hex::encode(hasher.finalize()))
             .unwrap_or_else(|_| unreachable!("a hex digest is exactly what an id takes"));
         Some(Self {
             anchor,
-            messages: messages.len(),
-            text: opening_text(system, user.get("content")),
+            messages: found.messages,
+            text: opening_text(found.system, found.opening),
         })
     }
 }
@@ -196,23 +200,6 @@ fn opening_text(system: Option<&Value>, user: Option<&Value>) -> String {
     } else {
         format!("{system}\n\n{user}")
     }
-}
-
-/// The prompt a conversation opens with, if it opens with one: the top-level `system` field,
-/// else a message whose role is `system`, whose content is the half of the anchor either way.
-fn system_of(value: &Value) -> Option<&Value> {
-    if let Some(system) = value.get("system") {
-        return Some(system);
-    }
-    let messages = value.get("messages")?.as_array()?;
-    first_with_role(messages, "system")?.get("content")
-}
-
-/// The first entry with this role, if there is one.
-fn first_with_role<'a>(messages: &'a [Value], role: &str) -> Option<&'a Value> {
-    messages
-        .iter()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some(role))
 }
 
 /// One half of the anchor, written as its serialised value; a missing half as the null it is.
@@ -428,6 +415,92 @@ mod tests {
 
     fn anchor_of(body: &str) -> Option<TurnId> {
         Opening::read(body.as_bytes()).map(|opening| opening.anchor)
+    }
+
+    /// The anchor is live state: it is the key a conversation's endpoint and class are
+    /// kept under, and a client part way through one has no idea the gateway was
+    /// upgraded. These digests were computed from the code that read `messages` by
+    /// hand, before any of this crate existed, and they must not move again.
+    #[test]
+    fn an_anchor_a_client_already_holds_does_not_move() {
+        let spoken = "what did we spend in march?";
+        for (family, body, expected) in [
+            (
+                "openai",
+                serde_json::json!({"messages": [
+                    {"role": "system", "content": "you audit accounts"},
+                    {"role": "user", "content": spoken},
+                ]}),
+                "2b15d9a6063363d444b8d04971ee497389129b41f95bb08ce083a07afa14dc66",
+            ),
+            (
+                "anthropic",
+                serde_json::json!({
+                    "system": "you audit accounts",
+                    "messages": [{"role": "user", "content": spoken}],
+                }),
+                "2b15d9a6063363d444b8d04971ee497389129b41f95bb08ce083a07afa14dc66",
+            ),
+            (
+                "no instruction",
+                serde_json::json!({"messages": [{"role": "user", "content": spoken}]}),
+                "6b26e1a1ab55c0b5586daabefe32e8667f473a64e6d2bb540c59b7e9da53e3c1",
+            ),
+        ] {
+            let read = anchor_of(&body.to_string()).expect("an opening");
+            assert_eq!(read.as_str(), expected, "{family}'s anchor moved");
+        }
+    }
+
+    /// The family the gateway could not read at all: `contents` of `parts`, which found
+    /// no `messages` and so was never sticky, never classified and never arbitrated.
+    #[test]
+    fn a_conversation_of_contents_and_parts_is_anchored_too() {
+        let body = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "you audit accounts"}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "what did we spend?"}]},
+                {"role": "model", "parts": [{"text": "on what?"}]},
+            ],
+        });
+        let opening = Opening::read(body.to_string().as_bytes()).expect("an opening");
+        assert_eq!(opening.messages, 2);
+        assert!(
+            opening.text.contains("you audit accounts")
+                && opening.text.contains("what did we spend"),
+            "the classifier is given both halves to read: {}",
+            opening.text
+        );
+
+        // And it is one conversation across its turns, which is what stickiness needs.
+        let later = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "you audit accounts"}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "what did we spend?"}]},
+                {"role": "model", "parts": [{"text": "on what?"}]},
+                {"role": "user", "parts": [{"text": "in march"}]},
+            ],
+        });
+        assert_eq!(
+            anchor_of(&later.to_string()),
+            Some(opening.anchor),
+            "the opening repeats unchanged, so the anchor does"
+        );
+    }
+
+    /// Reading three families must not start finding conversations in bodies that are
+    /// not conversations.
+    #[test]
+    fn a_body_that_is_no_conversation_still_has_no_opening() {
+        for body in [
+            serde_json::json!({"model": "text-embedding-3-small", "input": "some text"}),
+            serde_json::json!({"messages": []}),
+            serde_json::json!({"contents": []}),
+            serde_json::json!({"prompt": "an old completion"}),
+        ] {
+            assert_eq!(Opening::read(body.to_string().as_bytes()), None, "{body}");
+        }
+        assert_eq!(Opening::read(b"not json"), None);
     }
 
     #[test]
