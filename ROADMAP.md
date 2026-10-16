@@ -232,9 +232,10 @@ not.
 landed on, so every later request of the conversation is dispatched from memory and costs
 nothing — neither a forward pass nor an arbiter call.
 - The arbiter is a larger model, asked only where the margin fell short, and through this
-gateway's own routing: resolved, dispatched and recorded as any other call is, presenting the
-configured upstream's own credential rather than the caller's. It answers inside a timeout the
-operator sets, and a slow, refused or unreadable reply leaves the request unclassified.
+gateway's own routing: resolved, dispatched and recorded as any other call is, asked in the
+family its own route leads to, and presenting the configured upstream's own credential rather
+than the caller's. It answers inside a timeout the operator sets, and a slow, refused or
+unreadable reply leaves the request unclassified.
 - The margin threshold is configuration and the temperature travels with the artefact. Raising
 the threshold classifies less traffic and gets more of it right; lowering it classifies more and
 is wrong more often, which is a bill on one side and a misdispatch on the other.
@@ -242,6 +243,26 @@ is wrong more often, which is a bill on one side and a misdispatch on the other.
 a window. That is how an operator sees what their own traffic does — how much the local model
 carried, how much the arbiter was paid for, how much nothing could decide — and moves the
 threshold on their own evidence.
+
+### Speaking every family's api
+
+- A route may say which family its callers send and which its endpoints speak, and a client
+written against one is then served by another without knowing. The three carried are the
+OpenAI, Anthropic and Gemini shapes of a conversation.
+- Everything goes through one canonical conversation rather than between families pairwise: a
+reader and a writer each, so a fourth family is one of each rather than one pair per family
+already carried.
+- A route naming one family on both sides, or naming neither, forwards the bytes it was handed
+untouched — not re-serialised, not normalised. Translation is a thing an operator turns on for
+a route and never a cost paid by every request.
+- An answer crosses as it arrives, event by event, so a streaming client pays nothing in
+latency for the crossing and sees its own family's events throughout.
+- The model a caller names is carried across and never remapped. A mapping would be the gateway
+guessing which model of another family an operator meant, and an upstream refusing a name it
+does not know is the clearer answer.
+- Reading all three families is also what lets everything that reads a request body work on any
+of them. Before this, a conversation of `contents` and `parts` had no turn anchor, so it got no
+stickiness, no class and no arbiter, and nothing said so.
 
 ## Shipped with a caveat
 
@@ -310,6 +331,23 @@ the work.
 a reply naming two classes or none: each is logged and dispatched without a class rather than
 guessed at. A rising count of them is a prompt that needs fixing, and it is visible in the
 `undecided` count of the usage summary.
+- **A translation is best-effort, and what it cannot carry is dropped.** The request is served
+without it, the answer names what went in `x-ip-untranslated`, and a warning is logged. The
+alternative was refusing a request a client cannot change; the cost of this choice is a billed
+answer that did not see everything it was sent.
+- **A streamed crossing cannot name what it dropped.** Headers go out before the body does, so
+there is no header left to set by the time a stream is being translated. What the request lost
+is logged, and a streaming caller cannot see it.
+- **A crossing that is not streamed holds the request and the answer whole.** Only on routes
+that bridge two families, and only until each is rewritten — but it is memory a passthrough
+route never uses.
+- **Multimodal content does not cross.** Images and other non-text parts are dropped and named
+like anything else this pass cannot carry; the text of the message goes on without them.
+- **Two calls to one function in a turn pair by order when Gemini is involved.** That family
+identifies a tool call by the function's name where the others carry an id, so the gateway
+synthesises one from the name and the position. Answers arriving in a different order from the
+calls would pair wrongly — which Gemini itself cannot express either, so it is a limit of the
+protocol rather than of the crossing.
 - **A cache hit records no class and no level for a remembered turn.** The response cache answers
 before the turn's memory is consulted, so such a row says only what the request itself named. The
 classifier count is therefore a count of openings judged, not of conversations.

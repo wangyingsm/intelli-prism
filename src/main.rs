@@ -89,11 +89,35 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
+    const EXAMPLE: &str = include_str!("../intelli-prism.example.toml");
+
     /// The shipped example must stay loadable, or it teaches a format the server rejects.
     #[test]
     fn the_example_configuration_parses() {
-        let config =
-            ip_config::Config::parse(include_str!("../intelli-prism.example.toml")).unwrap();
+        let config = ip_config::Config::parse(EXAMPLE).unwrap();
         assert_eq!(config.upstreams.len(), 1);
+    }
+
+    /// And the keys it only shows commented must parse when an operator uncomments
+    /// them, which is the whole reason they are written out rather than described.
+    #[test]
+    fn the_keys_the_example_only_shows_commented_parse_when_taken_up() {
+        let taken: String = EXAMPLE
+            .lines()
+            .map(|line| match line.trim_start().strip_prefix("# ") {
+                Some(rest)
+                    if rest.starts_with("caller_speaks =")
+                        || rest.starts_with("upstream_speaks =") =>
+                {
+                    rest
+                }
+                _ => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = ip_config::Config::parse(&taken).expect("the example's own keys parse");
+        let upstream = &config.upstreams[0];
+        assert_eq!(upstream.caller_speaks, Some(ip_core::Dialect::OpenAi));
+        assert_eq!(upstream.upstream_speaks, Some(ip_core::Dialect::Anthropic));
     }
 }
