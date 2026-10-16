@@ -7,7 +7,9 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use super::SqliteStore;
-use crate::codec::{latency, served as served_of, served_name, token_count};
+use crate::codec::{
+    decided_by, decided_by_name, latency, served as served_of, served_name, token_count,
+};
 use crate::error::{Entity, StorageError};
 use crate::usage::{NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
 
@@ -17,8 +19,8 @@ impl UsageStore for SqliteStore {
         let row = sqlx::query(
             "INSERT INTO usage (trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across, dispatched_class) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             created_at, raced_across, dispatched_class, decided_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              RETURNING row_id, created_at",
         )
         .bind(usage.trace.to_hex())
@@ -46,6 +48,7 @@ impl UsageStore for SqliteStore {
         .bind(Timestamp::now().unix_seconds())
         .bind(i64::from(usage.raced_across.get()))
         .bind(usage.dispatched_class.map(Difficulty::name))
+        .bind(decided_by_name(usage.decided_by))
         .fetch_one(&self.pool)
         .await
         .map_err(StorageError::backend)?;
@@ -63,6 +66,7 @@ impl UsageStore for SqliteStore {
             served_by: usage.served_by,
             raced_across: usage.raced_across,
             dispatched_class: usage.dispatched_class,
+            decided_by: usage.decided_by,
             latency: usage.latency,
             created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
         })
@@ -72,7 +76,7 @@ impl UsageStore for SqliteStore {
         let row = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across, dispatched_class FROM usage WHERE row_id = ?",
+             created_at, raced_across, dispatched_class, decided_by FROM usage WHERE row_id = ?",
         )
         .bind(row_id.get())
         .fetch_optional(&self.pool)
@@ -222,6 +226,7 @@ pub(super) fn recorded(row: SqliteRow) -> Result<Usage, StorageError> {
         served_by: served_by(&row)?,
         raced_across: raced_across(&row)?,
         dispatched_class: dispatched_class(&row)?,
+        decided_by: decided_by(row.get("decided_by"))?,
         latency: latency(row.get("latency_ms"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })
@@ -325,6 +330,50 @@ mod tests {
             store.usage(row_id).await,
             Err(StorageError::Value(
                 ip_core::CoreError::UnknownDifficulty { .. }
+            ))
+        ));
+    }
+
+    /// A level this code does not carry, written around the driver into a row, is
+    /// refused on the single read.
+    #[tokio::test]
+    async fn a_stored_decider_this_code_does_not_carry_is_refused_on_read() {
+        let store = store().await;
+        let row_id = store.record_usage(spent()).await.unwrap().row_id;
+        sqlx::query("UPDATE usage SET decided_by = 'impossible' WHERE row_id = ?")
+            .bind(row_id.get())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.usage(row_id).await,
+            Err(StorageError::Value(
+                ip_core::CoreError::UnknownDecider { .. }
+            ))
+        ));
+    }
+
+    /// A listed row carrying the same impossible level is refused the same way, which is
+    /// where a column read and then discarded would go unnoticed.
+    #[tokio::test]
+    async fn a_listed_decider_this_code_does_not_carry_is_refused_on_read() {
+        use crate::list::ListStore;
+        let store = store().await;
+        let row_id = store.record_usage(spent()).await.unwrap().row_id;
+        sqlx::query("UPDATE usage SET decided_by = 'impossible' WHERE row_id = ?")
+            .bind(row_id.get())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .list_usage(
+                    &crate::usage::UsageFilter::default(),
+                    crate::Page::default()
+                )
+                .await,
+            Err(StorageError::Value(
+                ip_core::CoreError::UnknownDecider { .. }
             ))
         ));
     }

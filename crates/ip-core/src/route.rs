@@ -760,6 +760,67 @@ impl fmt::Display for Difficulty {
     }
 }
 
+/// Which level of the margin named the class a request was dispatched at.
+///
+/// The four are declared in the order they are consulted, and each fills only the
+/// silence before it. A request nothing could decide has no decider at all, which is
+/// why every row holds this behind an option.
+///
+/// It is what makes a threshold tunable from a gateway's own traffic rather than from a
+/// spike's figures: how often the local judge was sure, how often the arbiter was paid
+/// for, how often neither could say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decider {
+    /// The request named its own class in a header.
+    Request,
+    /// The turn remembered the class it was already dispatched at.
+    Turn,
+    /// The local classifier judged the turn's opening, and its margin held.
+    Classifier,
+    /// The larger model was asked what the local margin could not call.
+    Arbiter,
+}
+
+impl Decider {
+    /// The four levels, in the order they are consulted.
+    pub const ALL: [Decider; 4] = [
+        Decider::Request,
+        Decider::Turn,
+        Decider::Classifier,
+        Decider::Arbiter,
+    ];
+
+    /// The name it is stored and reported under.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Turn => "turn",
+            Self::Classifier => "classifier",
+            Self::Arbiter => "arbiter",
+        }
+    }
+
+    /// Reads it back from that name.
+    pub fn named(name: &str) -> Result<Self, CoreError> {
+        match name {
+            "request" => Ok(Self::Request),
+            "turn" => Ok(Self::Turn),
+            "classifier" => Ok(Self::Classifier),
+            "arbiter" => Ok(Self::Arbiter),
+            other => Err(CoreError::UnknownDecider {
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Decider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// The endpoints a matched request may be sent to, of which there is always at least one.
 ///
 /// Several endpoints stand behind one target when an upstream is replicated. Which one
@@ -1330,6 +1391,38 @@ mod tests {
             Difficulty::named("epic"),
             Err(CoreError::UnknownDifficulty { .. })
         ));
+    }
+
+    /// Every level round-trips through the name it is stored under, and one no level
+    /// answers to is refused rather than guessed at.
+    #[test]
+    fn a_decider_round_trips_through_its_stored_name() {
+        for decider in Decider::ALL {
+            assert_eq!(Decider::named(decider.name()).unwrap(), decider);
+            assert_eq!(decider.to_string(), decider.name());
+        }
+        assert!(matches!(
+            Decider::named("vibes"),
+            Err(CoreError::UnknownDecider { .. })
+        ));
+    }
+
+    /// The name a column stores and the name the api reports are the same word. They
+    /// are written in two places — `name` and the serde rename — and a row saying
+    /// `classifier` that reads out as something else is a report nobody can join.
+    #[test]
+    fn a_decider_is_reported_under_the_name_it_is_stored_under() {
+        for decider in Decider::ALL {
+            assert_eq!(
+                serde_json::to_string(&decider).unwrap(),
+                format!("\"{}\"", decider.name())
+            );
+            assert_eq!(
+                serde_json::from_str::<Decider>(&format!("\"{}\"", decider.name())).unwrap(),
+                decider
+            );
+        }
+        assert!(serde_json::from_str::<Decider>("\"vibes\"").is_err());
     }
 
     #[test]

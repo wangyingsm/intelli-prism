@@ -210,6 +210,8 @@ impl Recording {
             served_by: serving.endpoint,
             raced_across: serving.arms,
             dispatched_class: serving.class,
+            // The gateway says which level decided in the commit after the column's.
+            decided_by: None,
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;

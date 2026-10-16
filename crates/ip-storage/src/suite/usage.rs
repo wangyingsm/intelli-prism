@@ -1,6 +1,6 @@
 use ip_core::{
-    ApiId, Counted, Difficulty, Hedge, Host, Latency, ModelName, Port, Replica, Served, TenantId,
-    Timestamp, TokenCount, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Decider, Difficulty, Hedge, Host, Latency, ModelName, Port, Replica, Served,
+    TenantId, Timestamp, TokenCount, Tokens, TraceId, TurnId, UserId,
 };
 
 use crate::list::Page;
@@ -28,6 +28,7 @@ pub(crate) fn spent() -> NewUsage {
         }),
         raced_across: Hedge::default(),
         dispatched_class: None,
+        decided_by: None,
         latency: Latency::from_millis(1_250),
     }
 }
@@ -433,6 +434,33 @@ pub(crate) async fn a_row_says_what_class_it_was_dispatched_at(store: &impl Back
     assert_eq!(unclassed.dispatched_class, None);
     let read = store.usage(unclassed.row_id).await.unwrap().unwrap();
     assert_eq!(read.dispatched_class, None);
+}
+
+/// Each of the four levels round-trips onto a row and out of the paged list, and a row
+/// nothing could decide carries neither class nor decider. The tuning an operator does
+/// with this column is only as good as every level reading back as the one that ruled.
+pub(crate) async fn a_row_says_which_level_decided_its_class(store: &impl Backend) {
+    for decider in Decider::ALL {
+        let decided = NewUsage {
+            dispatched_class: Some(Difficulty::Hard),
+            decided_by: Some(decider),
+            ..spent()
+        };
+        let recorded = store.record_usage(decided).await.unwrap();
+        let read = store.usage(recorded.row_id).await.unwrap().unwrap();
+        assert_eq!(read.decided_by, Some(decider), "{decider} read back wrong");
+        let listed = store
+            .list_usage(&UsageFilter::default(), Page::default())
+            .await
+            .unwrap();
+        assert_eq!(listed.first(), Some(&recorded), "{decider} listed wrong");
+    }
+
+    let undecided = store.record_usage(spent()).await.unwrap();
+    assert_eq!(undecided.dispatched_class, None);
+    assert_eq!(undecided.decided_by, None);
+    let read = store.usage(undecided.row_id).await.unwrap().unwrap();
+    assert_eq!(read.decided_by, None);
 }
 
 /// A cache hit raises the count of answered requests and leaves the arms paid for

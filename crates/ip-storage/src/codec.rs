@@ -1,8 +1,8 @@
 //! How identity and plugin values are spelled in the columns every sql backend stores them in.
 
 use ip_core::{
-    ApiId, Capability, CapabilityScope, Latency, PluginOrder, PluginScope, Served, TenantId, TnKey,
-    TokenCount, UserId,
+    ApiId, Capability, CapabilityScope, Decider, Latency, PluginOrder, PluginScope, Served,
+    TenantId, TnKey, TokenCount, UserId,
 };
 
 use crate::error::{Entity, StorageError};
@@ -171,6 +171,19 @@ pub(crate) fn served(name: &str) -> Result<Served, StorageError> {
             detail: format!("unknown answer source {other:?}"),
         }),
     }
+}
+
+/// The stored name of which level named a row's class.
+pub(crate) fn decided_by_name(decided_by: Option<Decider>) -> Option<&'static str> {
+    decided_by.map(Decider::name)
+}
+
+/// Reads back which level named a row's class, refusing a name this code does not carry.
+pub(crate) fn decided_by(named: Option<String>) -> Result<Option<Decider>, StorageError> {
+    named
+        .map(|name| Decider::named(&name))
+        .transpose()
+        .map_err(StorageError::from)
 }
 
 /// Reads a stored token count back.

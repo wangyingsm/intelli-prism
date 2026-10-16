@@ -7,7 +7,9 @@ use sqlx::Row;
 use sqlx::postgres::PgRow;
 
 use super::PostgresStore;
-use crate::codec::{latency, served as served_of, served_name, token_count};
+use crate::codec::{
+    decided_by, decided_by_name, latency, served as served_of, served_name, token_count,
+};
 use crate::error::{Entity, StorageError};
 use crate::usage::{NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
 
@@ -17,8 +19,8 @@ impl UsageStore for PostgresStore {
         let row = sqlx::query(
             "INSERT INTO usage (trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across, dispatched_class) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+             created_at, raced_across, dispatched_class, decided_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
              RETURNING row_id, created_at",
         )
         .bind(usage.trace.to_hex())
@@ -46,6 +48,7 @@ impl UsageStore for PostgresStore {
         .bind(Timestamp::now().unix_seconds())
         .bind(i64::from(usage.raced_across.get()))
         .bind(usage.dispatched_class.map(Difficulty::name))
+        .bind(decided_by_name(usage.decided_by))
         .fetch_one(&self.pool)
         .await
         .map_err(StorageError::backend)?;
@@ -63,6 +66,7 @@ impl UsageStore for PostgresStore {
             served_by: usage.served_by,
             raced_across: usage.raced_across,
             dispatched_class: usage.dispatched_class,
+            decided_by: usage.decided_by,
             latency: usage.latency,
             created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
         })
@@ -72,7 +76,7 @@ impl UsageStore for PostgresStore {
         let row = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across, dispatched_class FROM usage WHERE row_id = $1",
+             created_at, raced_across, dispatched_class, decided_by FROM usage WHERE row_id = $1",
         )
         .bind(row_id.get())
         .fetch_optional(&self.pool)
@@ -222,6 +226,7 @@ pub(super) fn recorded(row: PgRow) -> Result<Usage, StorageError> {
         served_by: served_by(&row)?,
         raced_across: raced_across(&row)?,
         dispatched_class: dispatched_class(&row)?,
+        decided_by: decided_by(row.get("decided_by"))?,
         latency: latency(row.get("latency_ms"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })

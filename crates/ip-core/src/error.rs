@@ -73,6 +73,13 @@ pub enum CoreError {
         value: String,
     },
 
+    /// A level of the margin this application does not carry.
+    #[error("unknown decider {value:?}")]
+    UnknownDecider {
+        /// The text that named no level.
+        value: String,
+    },
+
     /// A stretch of clock this application does not count over.
     #[error("unknown period {value:?}")]
     UnknownPeriod {

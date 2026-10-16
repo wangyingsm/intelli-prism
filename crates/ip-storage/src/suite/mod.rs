@@ -222,6 +222,7 @@ macro_rules! backend_suite {
             a_row_says_which_endpoint_behind_the_rule_answered,
             a_row_says_how_many_endpoints_it_was_raced_across,
             a_row_says_what_class_it_was_dispatched_at,
+            a_row_says_which_level_decided_its_class,
             a_row_the_cache_answered_names_no_endpoint,
             a_cache_hit_raises_what_was_answered_not_what_was_sent,
             what_was_sent_upstream_counts_one_per_request_when_none_raced,
