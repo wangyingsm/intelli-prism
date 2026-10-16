@@ -1,9 +1,7 @@
 use http::StatusCode;
 use ip_cache::CacheError;
 use ip_config::ConfigError;
-use ip_core::{
-    Allowance, Capability, CoreError, Counted, Dialect, Period, Protocol, RouteKey, Timestamp,
-};
+use ip_core::{Allowance, Capability, CoreError, Counted, Period, Protocol, RouteKey, Timestamp};
 use ip_storage::StorageError;
 
 use crate::stage::StageName;
@@ -93,7 +91,6 @@ impl GatewayError {
             GatewayErrorKind::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
             GatewayErrorKind::Spent { .. } => StatusCode::TOO_MANY_REQUESTS,
             GatewayErrorKind::Unmeasured { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            GatewayErrorKind::StreamNotCrossed { .. } => StatusCode::NOT_IMPLEMENTED,
         }
     }
 
@@ -176,17 +173,6 @@ pub enum GatewayErrorKind {
     Unmeasured {
         /// Why it could not be.
         detail: String,
-    },
-
-    /// A route that bridges two families was asked for a streamed answer, which it
-    /// cannot carry across yet. Said out loud rather than served as the other family's
-    /// events, which no client of this one could read.
-    #[error("a streamed answer cannot yet cross from {caller} to {upstream}")]
-    StreamNotCrossed {
-        /// What the caller speaks.
-        caller: Dialect,
-        /// What the endpoints behind the rule speak.
-        upstream: Dialect,
     },
 }
 

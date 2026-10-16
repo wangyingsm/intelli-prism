@@ -8,6 +8,8 @@ use tokio::sync::mpsc;
 use crate::body::{BoxError, ChannelBody, GatewayBody};
 use crate::error::ProcessorError;
 use crate::processor::BodyProcessor;
+use ip_core::Dialect;
+use ip_protocol::{Reading, Writing};
 
 /// Events a slow caller may leave waiting before the upstream read is held back.
 const BUFFERED_EVENTS: usize = 16;
@@ -80,6 +82,84 @@ async fn forward_events(
         }
     }
     true
+}
+
+/// Carries a streamed answer across two families, event by event as they arrive.
+///
+/// Nothing is held back: each of the upstream's events becomes canonical events and
+/// those become the caller's own, which go out at once. A crossing therefore costs a
+/// client no time to first token, which is the whole reason this exists rather than
+/// buffering the answer and translating it whole.
+pub(crate) fn crossed_events(body: GatewayBody, caller: Dialect, upstream: Dialect) -> GatewayBody {
+    let (sender, receiver) = mpsc::channel(BUFFERED_EVENTS);
+    tokio::spawn(cross(body, caller, upstream, sender));
+    ChannelBody::new(receiver).boxed_unsync()
+}
+
+async fn cross(mut body: GatewayBody, caller: Dialect, upstream: Dialect, sender: Sender) {
+    let mut reading = Reading::new(upstream);
+    let mut writing = Writing::new(caller);
+    let mut pending = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        pending.extend_from_slice(&data);
+        if !cross_events(&mut pending, false, &mut reading, &mut writing, &sender).await {
+            return;
+        }
+    }
+    if !cross_events(&mut pending, true, &mut reading, &mut writing, &sender).await {
+        return;
+    }
+    // A family that never said it had finished a tool call still asked for one.
+    for event in reading.end() {
+        if !send_event(&writing.event(&event), &sender).await {
+            return;
+        }
+    }
+    send_event(&writing.end(), &sender).await;
+}
+
+/// Crosses every complete event waiting in the buffer. False once the stream has to stop.
+async fn cross_events(
+    pending: &mut BytesMut,
+    at_end: bool,
+    reading: &mut Reading,
+    writing: &mut Writing,
+    sender: &Sender,
+) -> bool {
+    while let Some(end) = event_end(pending, at_end) {
+        let block = pending.split_to(end);
+        // Only a whole event is converted, so no split can land inside a character.
+        let Ok(text) = std::str::from_utf8(&block) else {
+            continue;
+        };
+        for event in reading.event(text) {
+            if !send_event(&writing.event(&event), sender).await {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Sends one family's event text on, when there is any. False once the caller is gone.
+async fn send_event(text: &str, sender: &Sender) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    sender
+        .send(Ok(Frame::data(Bytes::from(text.to_owned()))))
+        .await
+        .is_ok()
 }
 
 /// Sends what is left of an unfinished event on untouched, since a client discards it anyway.

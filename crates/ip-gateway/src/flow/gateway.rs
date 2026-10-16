@@ -752,10 +752,10 @@ mod tests {
     /// An anthropic answer, and the same answer as the events of a stream.
     const ANSWERED: &str =
         r#"{"model":"claude-opus-5","usage":{"input_tokens":120,"output_tokens":30}}"#;
-    const EVENTS: [&str; 3] = [
-        "event: message_start\ndata: {\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":120}}}\n\n",
-        "event: content_block_delta\ndata: {\"delta\":{\"text\":\"hi\"}}\n\n",
-        "event: message_delta\ndata: {\"usage\":{\"output_tokens\":30}}\n\n",
+    const EVENTS: [&[u8]; 3] = [
+        b"event: message_start\ndata: {\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":120}}}\n\n",
+        b"event: content_block_delta\ndata: {\"delta\":{\"text\":\"hi\"}}\n\n",
+        b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":30}}\n\n",
     ];
 
     #[tokio::test]
@@ -799,7 +799,10 @@ mod tests {
             .unwrap();
         assert!(recorded.try_recv().is_err(), "recorded before it was sent");
 
-        assert_eq!(body_of(answered).await, EVENTS.concat());
+        assert_eq!(
+            body_of(answered).await,
+            String::from_utf8(EVENTS.concat()).unwrap()
+        );
         let row = recorded.recv().await.unwrap();
         assert_eq!(
             row.tokens,
@@ -3332,24 +3335,196 @@ mod tests {
         assert_ne!(stated, IN_OPENAI.len(), "the body really did change size");
     }
 
-    /// Until a stream can cross, saying so is better than handing a caller the other
-    /// family's events.
+    /// A gateway bridging two families over a streaming upstream.
+    fn bridging_stream(
+        caller: Dialect,
+        upstream: Dialect,
+        events: &'static [&'static [u8]],
+    ) -> Gateway {
+        Gateway::new(
+            crate::flow::fixtures::bridging_table(caller, upstream),
+            ProcessorChain::new(),
+            Arc::new(crate::flow::fixtures::Streaming(events)),
+        )
+    }
+
+    /// Everything a caller is sent, as one string.
+    async fn streamed(gateway: &Gateway, body: &str) -> String {
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", body))
+            .await
+            .expect("a streamed answer");
+        body_of(answered).await
+    }
+
+    const STREAMING: &str = r#"{"model":"shared","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+
+    /// The commit this milestone is judged on: an answer crosses as it arrives, in the
+    /// caller's own events.
     #[tokio::test]
-    async fn a_streamed_answer_cannot_cross_yet_and_says_so() {
-        let streaming = r#"{"model":"shared","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
-        let (gateway, upstream) = bridging(Dialect::OpenAi, Dialect::Anthropic, ANSWERED);
-        let refused = gateway
+    async fn a_streamed_answer_crosses_into_the_callers_own_events() {
+        let gateway = bridging_stream(
+            Dialect::OpenAi,
+            Dialect::Anthropic,
+            &[
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude\",\"usage\":{\"input_tokens\":9,\"output_tokens\":0}}}\n\n",
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"forty-\"}}\n\n",
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"two\"}}\n\n",
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":9,\"output_tokens\":2}}\n\n",
+            ],
+        );
+        let sent = streamed(&gateway, STREAMING).await;
+
+        assert!(sent.contains("\"model\":\"claude\""), "{sent}");
+        assert!(sent.contains("\"content\":\"forty-\""), "{sent}");
+        assert!(sent.contains("\"content\":\"two\""), "{sent}");
+        assert!(sent.contains("\"finish_reason\":\"stop\""), "{sent}");
+        assert!(sent.contains("\"completion_tokens\":2"), "{sent}");
+        assert!(sent.ends_with("data: [DONE]\n\n"), "{sent}");
+        assert!(
+            !sent.contains("content_block_delta"),
+            "the other family's events reached the caller: {sent}"
+        );
+    }
+
+    /// The boundary bug this is most likely to have: an event is not a chunk. The same
+    /// answer delivered whole, per byte, and split mid-event must read the same.
+    #[tokio::test]
+    async fn how_the_bytes_arrive_does_not_change_what_was_said() {
+        const WHOLE: &[u8] = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"héllo\"}]}}]}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n".as_bytes();
+        let one = bridging_stream(Dialect::OpenAi, Dialect::Gemini, &[WHOLE]);
+        // Split inside the first event's json, and again inside a multibyte character.
+        let split = bridging_stream(
+            Dialect::OpenAi,
+            Dialect::Gemini,
+            &[
+                b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"h\xc3",
+                b"\xa9llo\"}]}}]}\n",
+                b"\ndata: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n",
+            ],
+        );
+        let whole = streamed(&one, STREAMING).await;
+        let piecemeal = streamed(&split, STREAMING).await;
+        assert_eq!(whole, piecemeal, "the framing changed what was said");
+        assert!(whole.contains("héllo"), "{whole}");
+    }
+
+    /// A tool call arrives in fragments and leaves whole, with its id intact.
+    #[tokio::test]
+    async fn a_streamed_tool_call_is_put_back_together() {
+        let gateway = bridging_stream(
+            Dialect::Anthropic,
+            Dialect::OpenAi,
+            &[
+                b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]}}]}\n\n",
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n",
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"rust\\\"}\"}}]}}]}\n\n",
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                b"data: [DONE]\n\n",
+            ],
+        );
+        let sent = streamed(&gateway, STREAMING).await;
+        assert!(sent.contains("\"id\":\"call_1\""), "{sent}");
+        assert!(sent.contains("\"name\":\"search\""), "{sent}");
+        assert!(
+            sent.contains("rust"),
+            "the arguments were not reassembled: {sent}"
+        );
+        assert!(sent.contains("\"stop_reason\":\"tool_use\""), "{sent}");
+    }
+
+    /// An upstream that sends what it has and then says nothing more, without ending.
+    /// A buffering translator waits here forever; a streaming one has already spoken.
+    struct Halting(&'static [&'static [u8]]);
+
+    #[async_trait::async_trait]
+    impl crate::upstream::Upstream for Halting {
+        async fn send(
+            &self,
+            _: Request<GatewayBody>,
+        ) -> Result<Response<GatewayBody>, crate::error::UpstreamError> {
+            let (sender, receiver) = tokio::sync::mpsc::channel(self.0.len() + 1);
+            for part in self.0 {
+                sender
+                    .send(Ok(http_body::Frame::data(bytes::Bytes::from_static(part))))
+                    .await
+                    .unwrap();
+            }
+            // Holding the sender is the halt: the stream never ends on its own.
+            std::mem::forget(sender);
+            Ok(Response::builder()
+                .header(http::header::CONTENT_TYPE, "text/event-stream")
+                .body(http_body_util::BodyExt::boxed_unsync(
+                    crate::body::ChannelBody::new(receiver),
+                ))
+                .unwrap())
+        }
+    }
+
+    /// A crossing must not cost a caller its first token. The upstream never finishes,
+    /// so only a translator that works event by event can answer at all — a test that
+    /// merely compared bytes would pass against one that buffered.
+    #[tokio::test]
+    async fn a_crossing_costs_the_caller_no_time_to_first_token() {
+        use http_body_util::BodyExt;
+        let gateway = Gateway::new(
+            crate::flow::fixtures::bridging_table(Dialect::OpenAi, Dialect::Anthropic),
+            ProcessorChain::new(),
+            Arc::new(Halting(&[
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n",
+            ])),
+        );
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            gateway.handle(
+                context(granted()),
+                request("/anthropic/messages", STREAMING),
+            ),
+        )
+        .await
+        .expect("the headers came back without waiting for the body")
+        .unwrap();
+
+        let mut body = answered.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("the first token reached the caller before the upstream finished")
+            .expect("a frame")
+            .unwrap();
+        let first = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(first.contains("first"), "{first}");
+    }
+
+    /// What a crossed stream cost still reaches the row. The counts are read off the
+    /// answer as it goes out, which is now the caller's family rather than the
+    /// upstream's — so a crossing that forgot to carry them would be a bill that
+    /// vanished.
+    #[tokio::test]
+    async fn a_crossed_stream_still_says_what_it_cost() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            crate::flow::fixtures::bridging_table(Dialect::OpenAi, Dialect::Anthropic),
+            ProcessorChain::new(),
+            Arc::new(crate::flow::fixtures::Streaming(&[
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude\",\"usage\":{\"input_tokens\":120,\"output_tokens\":0}}}\n\n",
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":120,\"output_tokens\":30}}\n\n",
+            ])),
+        )
+        .recording(recorder);
+        let answered = gateway
             .handle(
                 context(granted()),
-                request("/anthropic/messages", streaming),
+                request("/anthropic/messages", STREAMING),
             )
             .await
-            .expect_err("a stream cannot cross yet");
-        assert_eq!(refused.status(), StatusCode::NOT_IMPLEMENTED);
-        assert!(
-            upstream.seen.lock().unwrap().is_empty(),
-            "nothing was sent upstream to be half-translated"
-        );
+            .unwrap();
+        body_of(answered).await;
+        gateway.settled().await;
+
+        let row = recorded.recv().await.expect("a row");
+        assert_eq!(row.tokens.input.get(), 120);
+        assert_eq!(row.tokens.output.get(), 30);
     }
 
     /// And a stream on a route that bridges nothing is untouched, as it always was.

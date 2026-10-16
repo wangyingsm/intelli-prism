@@ -22,7 +22,7 @@ use crate::classifier::{CLASSIFY_DEADLINE, Classifier};
 use crate::dispatch::{Dispatcher, Dispatching, may_hold, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{HeaderProcessor, ProcessorChain};
-use crate::sse::stream_chunks;
+use crate::sse::{crossed_events, stream_chunks};
 use crate::stage::{
     Answered, Authorized, BodyProcessed, Dispatched, Forwarded, HeadersProcessed, Received,
     ResponseBodyProcessed, ResponseHeadersProcessed, Routed, Stage, StageName,
@@ -482,24 +482,12 @@ async fn crossed_out(
 ) -> Result<(Request<GatewayBody>, Dropped), GatewayError> {
     let (mut parts, body) = request.into_parts();
     let bytes = collect(StageName::BodyRead, body).await?;
-    let Some((conversation, written, dropped)) = translate::request(crossing, &bytes) else {
+    let Some((_conversation, written, dropped)) = translate::request(crossing, &bytes) else {
         return Ok((
             Request::from_parts(parts, from_bytes(bytes)),
             Dropped::none(),
         ));
     };
-    // The answer to a streamed request is a stream, and a stream cannot cross yet.
-    // Serving it would mean handing the caller the other family's events verbatim,
-    // which is worse than saying so.
-    if conversation.stream {
-        return Err(GatewayError::new(
-            Forwarded::NAME,
-            GatewayErrorKind::StreamNotCrossed {
-                caller: crossing.from(),
-                upstream: crossing.to(),
-            },
-        ));
-    }
     set_length(&mut parts.headers, written.len());
     Ok((
         Request::from_parts(parts, from_bytes(written.into())),
@@ -514,6 +502,16 @@ async fn crossed_home(
     carried: Dropped,
 ) -> Result<Response<GatewayBody>, GatewayError> {
     let (mut parts, body) = response.into_parts();
+    // A streamed answer is crossed as it arrives: holding it whole to translate it
+    // would cost the caller every second the model spends thinking.
+    if is_event_stream(&parts.headers) {
+        if !carried.is_empty() {
+            tracing::warn!(lost = %carried, "a request crossed without everything it carried");
+        }
+        parts.headers.remove(CONTENT_LENGTH);
+        let crossed = crossed_events(body, crossing.from(), crossing.to());
+        return Ok(Response::from_parts(parts, crossed));
+    }
     let bytes = collect(StageName::BodyRead, body).await?;
     let mut lost = carried;
     let written = match translate::answer(crossing, &bytes) {

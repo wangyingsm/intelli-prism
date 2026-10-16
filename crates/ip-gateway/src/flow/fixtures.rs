@@ -613,8 +613,9 @@ impl UsageStore for Ledger {
     }
 }
 
-/// An upstream that answers a stream of events, one frame each.
-pub(super) struct Streaming(pub(super) &'static [&'static str]);
+/// An upstream that answers a stream of events, one frame each. Frames are bytes
+/// rather than text because a real one may split a character in half.
+pub(super) struct Streaming(pub(super) &'static [&'static [u8]]);
 
 #[async_trait::async_trait]
 impl Upstream for Streaming {
@@ -625,9 +626,7 @@ impl Upstream for Streaming {
         let (sender, receiver) = tokio::sync::mpsc::channel(self.0.len() + 1);
         for part in self.0 {
             sender
-                .send(Ok(http_body::Frame::data(Bytes::from_static(
-                    part.as_bytes(),
-                ))))
+                .send(Ok(http_body::Frame::data(Bytes::from_static(part))))
                 .await
                 .unwrap();
         }
