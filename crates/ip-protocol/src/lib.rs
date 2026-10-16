@@ -18,6 +18,7 @@ pub mod answer;
 pub mod anthropic;
 pub mod conversation;
 pub mod error;
+pub mod gemini;
 pub mod openai;
 
 pub use answer::{Event, Gathered, Stop};
