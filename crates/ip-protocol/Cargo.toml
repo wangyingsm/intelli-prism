@@ -1,0 +1,13 @@
+[package]
+name = "ip-protocol"
+description = "One shape every provider family's conversations are read into and written back out of"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ip-core.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

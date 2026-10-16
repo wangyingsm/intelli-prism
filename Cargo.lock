@@ -1655,6 +1655,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-protocol"
+version = "0.1.0"
+dependencies = [
+ "ip-core",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "ip-storage"
 version = "0.1.0"
 dependencies = [
