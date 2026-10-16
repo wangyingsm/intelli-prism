@@ -463,6 +463,46 @@ pub(crate) async fn a_row_says_which_level_decided_its_class(store: &impl Backen
     assert_eq!(read.decided_by, None);
 }
 
+/// The summary counts each level over the window, and the five counts add up to the
+/// requests answered — which is the arithmetic an operator tunes a threshold with, and
+/// which only holds while every row either names a level or names no class at all.
+pub(crate) async fn the_summary_counts_what_each_level_decided(store: &impl UsageStore) {
+    for (level, many) in [
+        (Some(Decider::Request), 1),
+        (Some(Decider::Turn), 4),
+        (Some(Decider::Classifier), 3),
+        (Some(Decider::Arbiter), 2),
+        (None, 5),
+    ] {
+        for _ in 0..many {
+            let row = NewUsage {
+                dispatched_class: level.map(|_| Difficulty::Hard),
+                decided_by: level,
+                ..spent()
+            };
+            store.record_usage(row).await.unwrap();
+        }
+    }
+    let sums = store
+        .sent_upstream(&UsageFilter::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(sums.decided.request, 1);
+    assert_eq!(sums.decided.turn, 4);
+    assert_eq!(sums.decided.classifier, 3);
+    assert_eq!(sums.decided.arbiter, 2);
+    assert_eq!(sums.decided.undecided, 5);
+    assert_eq!(
+        sums.decided.request
+            + sums.decided.turn
+            + sums.decided.classifier
+            + sums.decided.arbiter
+            + sums.decided.undecided,
+        sums.answered,
+        "every answered request is decided by one level or by none"
+    );
+}
+
 /// A cache hit raises the count of answered requests and leaves the arms paid for
 /// alone: the hit carries an arms count of one — what the type says when nothing was
 /// raced — and it went nowhere. The sum takes its arms only where `served` is the

@@ -2,7 +2,7 @@ use std::fmt;
 
 use http::{Request, Response};
 
-use ip_core::{Difficulty, Hedge, Replica};
+use ip_core::{Decider, Difficulty, Hedge, Replica};
 
 use crate::body::GatewayBody;
 use crate::table::Resolution;
@@ -133,10 +133,47 @@ pub struct Answered {
     /// How many endpoints the request was raced across; one is what happened when it was not
     /// raced at all.
     pub raced: Hedge,
-    /// What it was dispatched at — the request's own class, or the turn's for a silence.
-    /// The record's `dispatched_class`, and the reason the context speaks for the class
-    /// after forward rather than the header reading alone.
-    pub class: Option<Difficulty>,
+    /// What it was dispatched at and which level of the margin said so. The record's
+    /// `dispatched_class` and `decided_by`, and the reason the context speaks for the
+    /// class after forward rather than the header reading alone.
+    pub dispatched: Dispatched,
+}
+
+/// What a request was dispatched at, and which level of the margin named it.
+///
+/// The two are one value because they are settled together, at the single point of
+/// precedence, and a row carrying a class no level named — or a level that named no
+/// class — would be a row nobody can count. Held so that such a pair cannot be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dispatched(Option<(Difficulty, Decider)>);
+
+impl Dispatched {
+    /// Nothing named a class, which is how every request went before any of this.
+    pub const NONE: Self = Self(None);
+
+    /// The class `decided_by` named.
+    #[must_use]
+    pub const fn at(class: Difficulty, decided_by: Decider) -> Self {
+        Self(Some((class, decided_by)))
+    }
+
+    /// The class the request was dispatched at, when one was named.
+    #[must_use]
+    pub const fn class(self) -> Option<Difficulty> {
+        match self.0 {
+            Some((class, _)) => Some(class),
+            None => None,
+        }
+    }
+
+    /// The level that named it, when one did.
+    #[must_use]
+    pub const fn decided_by(self) -> Option<Decider> {
+        match self.0 {
+            Some((_, decided_by)) => Some(decided_by),
+            None => None,
+        }
+    }
 }
 
 /// The upstream answered.

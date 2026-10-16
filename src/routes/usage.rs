@@ -7,10 +7,10 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ip_core::{
-    ApiId, Capability, CapabilityScope, Difficulty, Hedge, Latency, Served, TenantId, Timestamp,
-    UserId,
+    ApiId, Capability, CapabilityScope, Decider, Difficulty, Hedge, Latency, Served, TenantId,
+    Timestamp, UserId,
 };
-use ip_storage::{SpentArms, Usage, UsageFilter};
+use ip_storage::{Decided, SpentArms, Usage, UsageFilter};
 
 use super::{Paged, store_refusal};
 use crate::manage::Manager;
@@ -56,9 +56,13 @@ pub struct UsageView {
     /// How many endpoints behind the rule it was raced across; one is what it was before
     /// anything raced.
     pub raced_across: Hedge,
-    /// The difficulty class the request was dispatched at, absent when it named none.
+    /// The difficulty class the request was dispatched at, absent when nothing named one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatched_class: Option<Difficulty>,
+    /// Which level of the margin named that class — the request, its turn's memory, the
+    /// local classifier or the arbiter — absent where there is no class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<Decider>,
     /// How long the caller waited, in milliseconds.
     pub latency_ms: u32,
     /// When it was recorded, in seconds since the unix epoch.
@@ -80,6 +84,7 @@ impl From<Usage> for UsageView {
             served_by: usage.served_by.map(|replica| replica.to_string()),
             raced_across: usage.raced_across,
             dispatched_class: usage.dispatched_class,
+            decided_by: usage.decided_by,
             latency_ms: Latency::millis(usage.latency),
             created_at: usage.created_at,
         }
@@ -96,9 +101,42 @@ pub struct SpendView {
     /// Requests that went upstream: the arms the rows the upstream answered carried.
     /// Past `answered` by exactly what hedging spent, and no cache hit inflates it.
     pub sent: u64,
+    /// How many of the window's requests each level of the margin decided, and how many
+    /// nothing could. The five add up to `answered`.
+    pub decided: DecidedView,
     /// What the window was asked open from, in seconds since the unix epoch; null when
     /// it opened with everything.
     pub since: Option<i64>,
+}
+
+/// How many requests of a window each level of the margin decided, as the api reports
+/// it. Counts and nothing else: what the local model carried and what the arbiter cost
+/// are the caller's subtractions, in whichever frame fits the question.
+#[derive(Debug, serde::Serialize)]
+pub struct DecidedView {
+    /// Requests that named their own class.
+    pub request: u64,
+    /// Requests dispatched at the class their turn remembered.
+    pub turn: u64,
+    /// Openings the local classifier judged — its real call rate, with no remembered
+    /// verdict inflating it.
+    pub classifier: u64,
+    /// Openings the arbiter was paid to rule on.
+    pub arbiter: u64,
+    /// Requests nothing could decide, dispatched unclassified.
+    pub undecided: u64,
+}
+
+impl From<Decided> for DecidedView {
+    fn from(decided: Decided) -> Self {
+        Self {
+            request: decided.request,
+            turn: decided.turn,
+            classifier: decided.classifier,
+            arbiter: decided.arbiter,
+            undecided: decided.undecided,
+        }
+    }
 }
 
 impl SpendView {
@@ -107,6 +145,7 @@ impl SpendView {
         Self {
             answered: sums.answered,
             sent: sums.sent,
+            decided: sums.decided.into(),
             since: None,
         }
     }
@@ -116,6 +155,7 @@ impl SpendView {
         Self {
             answered: sums.answered,
             sent: sums.sent,
+            decided: sums.decided.into(),
             since: Some(since.unix_seconds()),
         }
     }
@@ -388,6 +428,7 @@ mod tests {
             api: ApiId::new("anthropic").unwrap(),
             raced_across: Hedge::new(2).unwrap(),
             dispatched_class: Some(Difficulty::Hard),
+            decided_by: Some(Decider::Classifier),
             ..spent("other", "dave", "anthropic")
         };
         store.record_usage(count).await.unwrap();
@@ -407,6 +448,7 @@ mod tests {
         assert_eq!(row["served_by"], "one.example.com:443");
         assert_eq!(row["raced_across"], 2);
         assert_eq!(row["dispatched_class"], "hard");
+        assert_eq!(row["decided_by"], "classifier");
         assert_eq!(row["latency_ms"], 1250);
         assert_eq!(row["turn"], "turn-1");
         assert!(row["created_at"].is_number(), "a time is not a number");
@@ -421,6 +463,7 @@ mod tests {
                 .get("dispatched_class")
                 .is_none()
         );
+        assert!(listed.as_array().unwrap()[1].get("decided_by").is_none());
     }
 
     #[tokio::test]
@@ -539,6 +582,10 @@ mod tests {
         let sums = summary_of(&router, &state, "alice", "?tenant=acme").await;
         assert_eq!(sums["answered"], 2);
         assert_eq!(sums["sent"], 2);
+        assert_eq!(
+            sums["decided"]["undecided"], 2,
+            "the counts are narrowed to the tenant like everything else"
+        );
         assert!(sums["since"].is_null(), "an open window grew a floor");
     }
 
@@ -560,6 +607,68 @@ mod tests {
         let state = state_over_shared(store().await);
         let router = crate::routes::router(state.clone());
         let refused = read(&router, &state, "alice", "?tenant=other").await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// What the summary exists for: how much of a window the local model carried, how
+    /// much the arbiter was paid for, and how much nothing could decide. A tenant reads
+    /// its own counts, an administrator reads anyone's, and nobody reads another
+    /// tenant's — the same authorization as every other number on this router, asserted
+    /// again because this is a new field on it.
+    #[tokio::test]
+    async fn the_summary_counts_what_each_level_decided() {
+        let store = store().await;
+        for (level, many) in [
+            (Decider::Request, 1),
+            (Decider::Turn, 4),
+            (Decider::Classifier, 3),
+            (Decider::Arbiter, 2),
+        ] {
+            for _ in 0..many {
+                store
+                    .record_usage(NewUsage {
+                        dispatched_class: Some(Difficulty::Hard),
+                        decided_by: Some(level),
+                        ..spent("acme", "alice", "anthropic")
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        let state = state_over_shared(store);
+        let router = crate::routes::router(state.clone());
+
+        let sums = summary_of(&router, &state, "alice", "?tenant=acme").await;
+        let decided = &sums["decided"];
+        assert_eq!(decided["request"], 1);
+        assert_eq!(decided["turn"], 4);
+        assert_eq!(decided["classifier"], 3, "the real local call rate");
+        assert_eq!(decided["arbiter"], 2);
+        assert_eq!(decided["undecided"], 2, "the two rows the fixture seeded");
+        let counted: u64 = ["request", "turn", "classifier", "arbiter", "undecided"]
+            .iter()
+            .map(|level| decided[*level].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            counted,
+            sums["answered"].as_u64().unwrap(),
+            "every answered request is decided by one level or by none"
+        );
+
+        // The administrator reads anyone's, and sees the other tenant's row besides.
+        let all = summary_of(&router, &state, "root", "").await;
+        assert_eq!(all["decided"]["classifier"], 3);
+        assert_eq!(all["decided"]["undecided"], 3);
+
+        // And a tenant still reads nobody else's.
+        let refused = read_at(
+            &router,
+            &state,
+            "alice",
+            "/_ip/usage/summary",
+            "?tenant=other",
+        )
+        .await;
         assert_eq!(refused.status(), StatusCode::FORBIDDEN);
     }
 

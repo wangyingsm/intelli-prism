@@ -5,7 +5,7 @@ use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderName, Request, Response};
 use ip_cache::{CacheKey, Ttl};
 use ip_core::{
-    Capability, CapabilityScope, Difficulty, HEDGE_MOST, Hedge, Replica, RouteKey, TurnId,
+    Capability, CapabilityScope, Decider, Difficulty, HEDGE_MOST, Hedge, Replica, RouteKey, TurnId,
 };
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -24,7 +24,7 @@ use crate::error::{GatewayError, GatewayErrorKind};
 use crate::processor::{HeaderProcessor, ProcessorChain};
 use crate::sse::stream_chunks;
 use crate::stage::{
-    Answered, Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received,
+    Answered, Authorized, BodyProcessed, Dispatched, Forwarded, HeadersProcessed, Received,
     ResponseBodyProcessed, ResponseHeadersProcessed, Routed, Stage, StageName,
 };
 use crate::table::{Resolution, RoutingTable, request_key};
@@ -394,11 +394,18 @@ impl Flow<BodyProcessed> {
             }
             _ => None,
         };
-        // What the judges named belongs to the turn, not the request.
-        let dispatch_class = class.or(remembered_class).or(classified).or(arbitrated);
-        let taken = taken_turn(marked.as_ref(), opening, class, dispatch_class);
+        // What the judges named belongs to the turn, not the request. The level that
+        // named it is settled here with the class, in one expression, so a row can
+        // never say a class one level named and a level that did not name it.
+        let dispatched = class
+            .map(|class| Dispatched::at(class, Decider::Request))
+            .or_else(|| remembered_class.map(|class| Dispatched::at(class, Decider::Turn)))
+            .or_else(|| classified.map(|class| Dispatched::at(class, Decider::Classifier)))
+            .or_else(|| arbitrated.map(|class| Dispatched::at(class, Decider::Arbiter)))
+            .unwrap_or(Dispatched::NONE);
+        let taken = taken_turn(marked.as_ref(), opening, class, dispatched.class());
         let dispatching =
-            Dispatching::new(&resolution, dispatch_class).remembered_from(landed.as_ref());
+            Dispatching::new(&resolution, dispatched.class()).remembered_from(landed.as_ref());
         if raced == Hedge::NONE {
             let chosen = dispatcher.choose(&dispatching);
             let served = Replica::of(chosen.endpoint());
@@ -417,7 +424,7 @@ impl Flow<BodyProcessed> {
                     response,
                     served,
                     raced: Hedge::default(),
-                    class: dispatch_class,
+                    dispatched,
                 },
             });
         }
@@ -427,7 +434,7 @@ impl Flow<BodyProcessed> {
             dispatcher,
             request,
             &dispatching,
-            dispatch_class,
+            dispatched,
         )
         .await?;
         remember(
@@ -772,12 +779,12 @@ fn question(text: &str) -> String {
 }
 
 impl Flow<Forwarded> {
-    /// What the request was dispatched at, as the routing and the turn together settled
-    /// it: what the caller named, or what the turn remembered for a silence. The record
-    /// takes this, not the bare header reading, so a remembered class is recorded as the
-    /// class it was dispatched at.
-    pub fn class(&self) -> Option<Difficulty> {
-        self.held.class
+    /// What the request was dispatched at and which level settled it: what the caller
+    /// named, or what the turn remembered for a silence, or what a judge said. The
+    /// record takes this, not the bare header reading, so a remembered class is
+    /// recorded as the class it was dispatched at, by the turn that remembered it.
+    pub fn dispatched(&self) -> Dispatched {
+        self.held.dispatched
     }
 
     /// Runs the response header chain.
@@ -911,7 +918,7 @@ async fn race(
     dispatcher: &Dispatcher,
     request: Request<GatewayBody>,
     dispatching: &Dispatching<'_>,
-    class: Option<Difficulty>,
+    dispatched: Dispatched,
 ) -> Result<Flow<Forwarded>, GatewayError> {
     // Where an arm of the race went: an answer, all started arms answered, or the wait
     // for the next arm ran out.
@@ -1041,7 +1048,7 @@ async fn race(
             response,
             served,
             raced,
-            class,
+            dispatched,
         },
     })
 }

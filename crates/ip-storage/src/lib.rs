@@ -60,4 +60,4 @@ pub use transaction::plugin_upload::{
 pub use transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 pub use transaction::{IdentityDialect, PluginDialect};
-pub use usage::{NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
+pub use usage::{Decided, NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};

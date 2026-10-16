@@ -59,6 +59,13 @@ HTTP 200
 jsonpath "$.answered" == 0
 jsonpath "$.sent" == 0
 jsonpath "$.since" == null
+# The shape of the per-level counts, which is what a client would break on; this
+# ledger is empty, so what they add up to is the gateway suite's subject.
+jsonpath "$.decided.request" == 0
+jsonpath "$.decided.turn" == 0
+jsonpath "$.decided.classifier" == 0
+jsonpath "$.decided.arbiter" == 0
+jsonpath "$.decided.undecided" == 0
 
 GET {{host}}/_ip/usage/summary?tenant=acme
 HTTP 200

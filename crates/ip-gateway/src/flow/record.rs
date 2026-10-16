@@ -10,9 +10,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
-use ip_core::{
-    ApiId, Difficulty, Hedge, Latency, Replica, Served, TenantId, Tokens, TraceId, TurnId, UserId,
-};
+use ip_core::{ApiId, Hedge, Latency, Replica, Served, TenantId, Tokens, TraceId, TurnId, UserId};
 use ip_storage::{NewUsage, UsageStore};
 
 use tokio::sync::Notify;
@@ -21,6 +19,7 @@ use super::followed::Followed;
 use crate::body::{BoxError, GatewayBody};
 use crate::limit::{Asking, Limiter, Limits};
 use crate::measure::{Measuring, measure};
+use crate::stage::Dispatched;
 
 /// The records still being written, so a shutdown can wait for them.
 ///
@@ -123,8 +122,9 @@ impl Recording {
     ///
     /// No endpoint is named, because none was reached; nothing was raced either, so the row
     /// says of it what it says of every answer nothing asked of an endpoint: one endpoint.
-    /// The class is kept all the same, because it is the request's own, not the answer's.
-    pub(super) fn out_of_the_cache(self, body: &Bytes, class: Option<Difficulty>) {
+    /// The class is kept all the same, and so is the level that named it: who answered
+    /// says nothing about how hard the request was treated as, or about who said so.
+    pub(super) fn out_of_the_cache(self, body: &Bytes, dispatched: Dispatched) {
         let model = measure(body).and_then(|measured| measured.model);
         self.write(
             model,
@@ -133,7 +133,7 @@ impl Recording {
                 source: Served::Cache,
                 endpoint: None,
                 arms: Hedge::default(),
-                class,
+                dispatched,
             },
         );
     }
@@ -144,14 +144,14 @@ impl Recording {
         body: GatewayBody,
         served_by: Replica,
         raced: Hedge,
-        class: Option<Difficulty>,
+        dispatched: Dispatched,
     ) -> GatewayBody {
         Measured {
             inner: body,
             measuring: Measuring::default(),
             served_by: Some(served_by),
             raced,
-            class,
+            dispatched,
             recording: Some(self),
         }
         .boxed_unsync()
@@ -191,7 +191,7 @@ impl Recording {
                 source: Served::Upstream,
                 endpoint: Some(Replica::of(endpoint)),
                 arms: Hedge::default(),
-                class: None,
+                dispatched: Dispatched::NONE,
             },
         );
     }
@@ -209,9 +209,8 @@ impl Recording {
             served: serving.source,
             served_by: serving.endpoint,
             raced_across: serving.arms,
-            dispatched_class: serving.class,
-            // The gateway says which level decided in the commit after the column's.
-            decided_by: None,
+            dispatched_class: serving.dispatched.class(),
+            decided_by: serving.dispatched.decided_by(),
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;
@@ -241,9 +240,10 @@ struct Serving {
     /// How many endpoints it was raced across; one is what it was when nothing was reached and
     /// when it was not raced at all.
     arms: Hedge,
-    /// What class it was dispatched at: the request's own, kept by a cache answer too, since
-    /// who answered it says nothing about how hard it was treated as.
-    class: Option<Difficulty>,
+    /// What class it was dispatched at and which level named it: the request's own, kept
+    /// by a cache answer too, since who answered says nothing about how hard it was
+    /// treated as, or about who decided that.
+    dispatched: Dispatched,
 }
 
 /// A body that measures what passes, and records it when the last of it has.
@@ -252,7 +252,7 @@ struct Measured {
     measuring: Measuring,
     served_by: Option<Replica>,
     raced: Hedge,
-    class: Option<Difficulty>,
+    dispatched: Dispatched,
     recording: Option<Recording>,
 }
 
@@ -274,7 +274,7 @@ impl Measured {
                 source: Served::Upstream,
                 endpoint: self.served_by.take(),
                 arms: self.raced,
-                class: self.class,
+                dispatched: self.dispatched,
             },
         );
     }

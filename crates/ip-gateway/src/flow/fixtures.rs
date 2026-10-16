@@ -596,6 +596,7 @@ impl UsageStore for Ledger {
         _: Option<ip_core::Timestamp>,
     ) -> Result<ip_storage::SpentArms, StorageError> {
         Ok(ip_storage::SpentArms {
+            decided: ip_storage::Decided::default(),
             answered: 0,
             sent: 0,
         })

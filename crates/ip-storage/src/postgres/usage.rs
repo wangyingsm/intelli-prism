@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, Difficulty, Hedge, ModelName, Replica, Served, TenantId, Timestamp, Tokens,
-    TraceId, TurnId, UserId,
+    ApiId, Counted, Decider, Difficulty, Hedge, ModelName, Replica, Served, TenantId, Timestamp,
+    Tokens, TraceId, TurnId, UserId,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -11,7 +11,7 @@ use crate::codec::{
     decided_by, decided_by_name, latency, served as served_of, served_name, token_count,
 };
 use crate::error::{Entity, StorageError};
-use crate::usage::{NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
+use crate::usage::{Decided, NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
 
 #[async_trait]
 impl UsageStore for PostgresStore {
@@ -129,7 +129,12 @@ impl UsageStore for PostgresStore {
     ) -> Result<SpentArms, StorageError> {
         let row = sqlx::query(
             "SELECT COUNT(*), \
-               COALESCE(SUM(CASE WHEN served = $5 THEN raced_across ELSE 0 END), 0)::bigint \
+               COALESCE(SUM(CASE WHEN served = $5 THEN raced_across ELSE 0 END), 0)::bigint, \
+               COUNT(decided_by) FILTER (WHERE decided_by = $6), \
+               COUNT(decided_by) FILTER (WHERE decided_by = $7), \
+               COUNT(decided_by) FILTER (WHERE decided_by = $8), \
+               COUNT(decided_by) FILTER (WHERE decided_by = $9), \
+               COUNT(*) FILTER (WHERE decided_by IS NULL) \
                FROM usage \
              WHERE created_at >= $1 \
                AND ($2 IS NULL OR tenant_id = $2) \
@@ -141,14 +146,27 @@ impl UsageStore for PostgresStore {
         .bind(filter.user.as_ref().map(UserId::as_str))
         .bind(filter.api.as_ref().map(ApiId::as_str))
         .bind(served_name(Served::Upstream))
+        .bind(decided_by_name(Some(Decider::Request)))
+        .bind(decided_by_name(Some(Decider::Turn)))
+        .bind(decided_by_name(Some(Decider::Classifier)))
+        .bind(decided_by_name(Some(Decider::Arbiter)))
         .fetch_one(&self.pool)
         .await
         .map_err(StorageError::backend)?;
         let answered: i64 = row.get(0);
         let sent: i64 = row.get(1);
+        let counted = |at: usize| u64::try_from(row.get::<i64, _>(at)).unwrap_or(0);
         Ok(SpentArms {
             answered: u64::try_from(answered).unwrap_or(0),
             sent: u64::try_from(sent).unwrap_or(0),
+            // Columns two to six, in the order the levels were bound above.
+            decided: Decided {
+                request: counted(2),
+                turn: counted(3),
+                classifier: counted(4),
+                arbiter: counted(5),
+                undecided: counted(6),
+            },
         })
     }
 

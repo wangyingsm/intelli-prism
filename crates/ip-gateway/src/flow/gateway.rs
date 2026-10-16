@@ -5,7 +5,7 @@ use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use ip_auth::Authority;
 use ip_cache::Cache;
-use ip_core::{Difficulty, Hedge, Protocol, Replica, TraceId, TurnId};
+use ip_core::{Decider, Hedge, Protocol, Replica, TraceId, TurnId};
 use ip_storage::UsageStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use crate::error::{GatewayError, GatewayErrorKind};
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
-use crate::stage::{Authorized, BodyProcessed, ResponseBodyProcessed, Stage};
+use crate::stage::{Authorized, BodyProcessed, Dispatched, ResponseBodyProcessed, Stage};
 use crate::table::RoutingTable;
 use crate::turns::TurnAffinity;
 use crate::upstream::Upstream;
@@ -235,8 +235,13 @@ impl Gateway {
         .await;
         let (mut processed, chains, api) = taken?;
         // Read once here, where the header chain left it, so both answers — the cache's and
-        // the upstream's — record the same class the request was dispatched at.
-        let class = processed.class();
+        // the upstream's — record the same class the request was dispatched at. Nothing
+        // but the request itself has named one at this point, which is why a cache hit
+        // records the request as the level that decided.
+        let named = processed
+            .class()
+            .map(|class| Dispatched::at(class, Decider::Request))
+            .unwrap_or(Dispatched::NONE);
         let asking = Asking {
             tenant: followed.tenant.clone(),
             user: followed.user.clone(),
@@ -279,7 +284,7 @@ impl Gateway {
                 let answered = stage_span!(EGRESS_RESPONSE, followed);
                 answered.record("hit", true);
                 if let Some(recording) = recording {
-                    recording.out_of_the_cache(hit.body(), class);
+                    recording.out_of_the_cache(hit.body(), named);
                 }
                 return Ok(answered.in_scope(|| answer_with(hit)));
             }
@@ -352,7 +357,7 @@ impl Gateway {
         chains: &Arc<ProcessorChain>,
         followed: &Followed,
         recording: Option<Recording>,
-    ) -> Result<(Flow<ResponseBodyProcessed>, Option<Difficulty>), GatewayError> {
+    ) -> Result<(Flow<ResponseBodyProcessed>, Dispatched), GatewayError> {
         let egress = Egress::new(self.upstream.as_ref(), &self.dispatcher, table)
             .with_turns(self.turns.as_ref())
             .with_classifier(self.classifier.clone())
@@ -364,8 +369,8 @@ impl Gateway {
             .await?;
         // What the turn's verdict was worth, if it was worth anything: read out of the
         // flow before the response stages take it apart, because this is the class the
-        // request went upstream at, whatever its header said.
-        let dispatched = forwarded.class();
+        // request went upstream at, whatever its header said, and the level that named it.
+        let dispatched = forwarded.dispatched();
         let response = async {
             forwarded
                 .process_response_headers(chains.response_headers())
@@ -385,13 +390,16 @@ fn measuring(
     recording: Option<Recording>,
     served_by: Replica,
     raced: Hedge,
-    class: Option<Difficulty>,
+    dispatched: Dispatched,
 ) -> Response<GatewayBody> {
     let Some(recording) = recording else {
         return response;
     };
     let (parts, body) = response.into_parts();
-    Response::from_parts(parts, recording.measuring(body, served_by, raced, class))
+    Response::from_parts(
+        parts,
+        recording.measuring(body, served_by, raced, dispatched),
+    )
 }
 
 /// Answers from what the cache held, without any stage after the request body running.
@@ -925,6 +933,11 @@ mod tests {
         assert_eq!(hit.served, Served::Cache);
         assert_eq!(hit.served_by, None, "a cache answer reached no endpoint");
         assert_eq!(hit.dispatched_class, Some(ip_core::Difficulty::Hard));
+        assert_eq!(
+            hit.decided_by,
+            Some(ip_core::Decider::Request),
+            "who answered says nothing about who decided"
+        );
     }
 
     /// A class that cannot be read is refused where the header chain ends, before anything
@@ -3129,6 +3142,93 @@ mod tests {
             upstream.seen.lock().unwrap().len(),
             2,
             "two requests, two upstream calls, and no questions asked of anything else"
+        );
+    }
+
+    // ——— the row says which level decided (M13) ———
+
+    /// A conversation the fixtures above judge, as a caller would send it.
+    fn opening() -> Request<GatewayBody> {
+        request(
+            "/anthropic/messages",
+            &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_class_the_request_named_is_decided_by_the_request() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Easy,
+        ));
+        let (gateway, mut recorded) =
+            arbitrating_gateway(judge.clone(), asking_only(answered(RULING)), None);
+        let mut named = opening();
+        named
+            .headers_mut()
+            .insert("x-ip-difficulty", HeaderValue::from_static("hard"));
+        let (row, _) = asked(&gateway, &mut recorded, context(granted()), named).await;
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+        assert_eq!(row.decided_by, Some(ip_core::Decider::Request));
+        assert_eq!(
+            judge.calls(),
+            0,
+            "a request that named its class is judged by nothing"
+        );
+    }
+
+    /// The rule a reader gets wrong: the second request of a turn is decided by the
+    /// turn, not by the classifier that ran for the first. Counting classifier rows is
+    /// how an operator reads their real local call rate, and a remembered verdict
+    /// recorded as a classifier call would inflate it by the length of every
+    /// conversation.
+    #[tokio::test]
+    async fn a_remembered_class_is_decided_by_the_turn_not_the_judge_that_named_it() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::naming(
+            ip_core::Difficulty::Hard,
+        ));
+        let (gateway, mut recorded) =
+            arbitrating_gateway(judge.clone(), asking_only(answered(RULING)), None);
+        let (first, _) = asked(&gateway, &mut recorded, context(granted()), opening()).await;
+        assert_eq!(first.dispatched_class, Some(ip_core::Difficulty::Hard));
+        assert_eq!(
+            first.decided_by,
+            Some(ip_core::Decider::Classifier),
+            "the opening was judged locally"
+        );
+
+        let (second, _) = asked(&gateway, &mut recorded, context(granted()), opening()).await;
+        assert_eq!(second.dispatched_class, Some(ip_core::Difficulty::Hard));
+        assert_eq!(
+            second.decided_by,
+            Some(ip_core::Decider::Turn),
+            "the turn remembered it; the judge was not asked again"
+        );
+        assert_eq!(judge.calls(), 1, "one judgement across the conversation");
+    }
+
+    #[tokio::test]
+    async fn a_class_the_arbiter_ruled_is_decided_by_the_arbiter() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            asking_only(answered(RULING)),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        let (row, _) = asked(&gateway, &mut recorded, context(granted()), opening()).await;
+        assert_eq!(row.dispatched_class, Some(ip_core::Difficulty::Hard));
+        assert_eq!(row.decided_by, Some(ip_core::Decider::Arbiter));
+    }
+
+    #[tokio::test]
+    async fn a_request_nothing_could_decide_records_neither() {
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) =
+            arbitrating_gateway(judge, asking_only(answered(RULING)), None);
+        let (row, _) = asked(&gateway, &mut recorded, context(granted()), opening()).await;
+        assert_eq!(row.dispatched_class, None);
+        assert_eq!(
+            row.decided_by, None,
+            "no class, and so no level that named one"
         );
     }
 

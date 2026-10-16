@@ -102,6 +102,29 @@ pub struct SpentArms {
     /// Requests that actually went upstream: the arms of the rows `served` says were
     /// answered there.
     pub sent: u64,
+    /// How many of them each level of the margin decided.
+    pub decided: Decided,
+}
+
+/// How many of a window's requests each level of the margin decided, and how many it
+/// could not.
+///
+/// The five add up to the requests answered, because every row either names a level or
+/// names no class at all. They are counts and nothing else: what fraction of traffic the
+/// local model carried, and what the arbiter cost, are subtractions the caller makes in
+/// whichever frame fits the question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Decided {
+    /// Requests that named their own class.
+    pub request: u64,
+    /// Requests dispatched at the class their turn remembered.
+    pub turn: u64,
+    /// Openings the local classifier judged, which is its real call rate.
+    pub classifier: u64,
+    /// Openings the arbiter was paid to rule on.
+    pub arbiter: u64,
+    /// Requests nothing could decide, dispatched unclassified.
+    pub undecided: u64,
 }
 
 /// Which recorded requests a list is narrowed to, each part admitting everything when unset.
