@@ -244,6 +244,27 @@ a window. That is how an operator sees what their own traffic does — how much 
 carried, how much the arbiter was paid for, how much nothing could decide — and moves the
 threshold on their own evidence.
 
+### Getting the classifier's artefact
+
+- The weights are published separately from the gateway and fetched deliberately, once, by an
+operator. The gateway itself never reaches the network to get them: a process that pulled a binary
+at startup would undo the thing this product is sold on, and it is the first thing a security
+review stops at.
+- `intelli-prism model fetch` downloads and verifies; `intelli-prism model verify` checks an
+artefact already on the machine and touches nothing. An air-gapped install — carry the artefact in,
+verify it, serve with no route out — is a supported path and the one the fetch is a convenience
+against, not the other way round.
+- Verification is not a flag and cannot be turned off. Weights whose digest is not the one their
+manifest names are deleted rather than left where a gateway would find them.
+- Each quantization carries its own manifest: its own fitted temperature, its own measured margin
+table, its own checksum. The gateway refuses to start on a manifest it cannot reconcile, because a
+build running another build's calibration misroutes silently, and silent is worse than stopped.
+- A container image carrying the model is published alongside the plain one, so an air-gapped
+deployment moves one artefact instead of two. The plain image carries no classifier and does not
+grow.
+- What the model does, how well, in which languages and where it is weak is in `MODEL_CARD.md`;
+how it was built and what would improve it is in `DATASET_CARD.md`.
+
 ### Speaking every family's api
 
 - A route may say which family its callers send and which its endpoints speak, and a client

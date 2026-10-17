@@ -1,0 +1,133 @@
+# intelli-prism difficulty classifier
+
+A small multilingual encoder that reads the opening of a conversation and says how much work it
+implies, in five ordinal classes: `easy`, `routine`, `median`, `hard`, `research`. One forward pass,
+no generation, no network. It exists so a gateway can send cheap requests to cheap models without
+sending the hard ones there too.
+
+## What it offers, which is a trade and not a number
+
+Overall accuracy is **67.6%**, and on its own that figure describes the model badly. The classifier
+does not have to answer: it reports a distribution, and the gateway acts only when the top class
+leads the runner-up by a margin the operator sets. Everything below that margin is handed to a
+larger model to arbitrate.
+
+So the thing on offer is a choice of operating point:
+
+| margin | right when it answers | share of traffic it answers for |
+|---|---|---|
+| 0.2 | 73.0% | 79.1% |
+| 0.4 | 78.7% | 58.8% |
+| 0.6 | 83.9% | 36.8% |
+
+Read that as: *keep four requests in five local and be right about three in four*, or *keep one in
+three local and be right about five in six*. The rest costs an arbiter call. Which trade is worth
+making depends on the price gap between your endpoints and what a misroute costs you, which is why
+the threshold is configuration and not a constant.
+
+Figures are for the **embed8** build on a held-out test split of 741 examples. Latencies are one
+classification of one text on this project's own cpu, measured through the same script for every
+build; the gateway's own runtime answers somewhat faster still.
+
+## Per build
+
+Three quantizations of the same weights. Each carries its own fitted temperature and its own margin
+table, because quantizing shifts the logit distribution and a gate calibrated for one build is
+wrong for another.
+
+| | fp32 | int8 | **embed8** (default) |
+|---|---|---|---|
+| size on disk | 1265 MB | 343 MB | 675 MB |
+| accuracy | 67.6% | 66.0% | 67.5% |
+| expected calibration error | 0.034 | 0.044 | 0.035 |
+| fitted temperature | 1.30 | 1.20 | **1.30** |
+| one classification, warm | 26.6 ms | 17.5 ms | 26.3 ms |
+| right at margin 0.4 | 78.8% | 74.6% | 78.7% |
+
+**embed8** quantizes the embedding matrix only — where almost all the size is, and the part that
+quantizes most safely. It halves the download for a tenth of a point of accuracy and keeps the fp32
+calibration exactly.
+
+**int8** is offered for deployments that need the smaller download or the faster pass and will
+re-tune their threshold for it. It costs
+**4.2 points at margin 0.4**, which is the operating point most deployments will use, and it does
+not degrade evenly — see below.
+
+## Per language
+
+| | English | Chinese |
+|---|---|---|
+| fp32 | 71.3% | 64.3% |
+| embed8 | 71.0% | 64.3% |
+| int8 | 70.7% | 61.7% |
+
+Chinese is consistently about seven points behind English. Quantizing to int8 costs Chinese a
+further 2.6 points against English's 0.6 — four times as much — which is a reason to prefer embed8
+on bilingual traffic.
+
+## Per class
+
+| | fp32 | int8 | embed8 | test examples |
+|---|---|---|---|---|
+| easy | 77% | 68% | 77% | 164 |
+| routine | 69% | 73% | 68% | 210 |
+| median | 62% | 56% | 61% | 179 |
+| hard | 69% | 74% | 69% | 156 |
+| **research** | **38%** | **28%** | **38%** | 32 |
+
+`research` is by far the weakest class, and it is the class a mistake costs most in: a
+research-grade request sent to a cheap endpoint is answered badly by a model that cannot do the
+work, which is the failure this classifier exists to prevent. It is also the rarest class in
+training — 326 of 7439 examples — and that is the likeliest reason. Treat a `research` prediction as
+informative and a *non*-`research` prediction as weak evidence.
+
+Note that int8 does not degrade uniformly: it moves the decision boundary toward the middle classes,
+gaining on `routine` and `hard` while losing on `easy`, `median` and `research`.
+
+## What it is
+
+- A fine-tune of [`jhu-clsp/mmBERT-base`](https://huggingface.co/jhu-clsp/mmBERT-base), a
+  multilingual encoder, trained on soft labels — the distribution a judge drew over five samples,
+  not a single class — so that genuinely ambiguous requests teach the model to be uncertain rather
+  than to guess. That uncertainty is what the margin gate reads.
+- 256 tokens of input: the system instruction and the first user message, which is all a gateway
+  has before it must route.
+- Exported to ONNX, run on CPU in the gateway's own process. Nothing leaves the machine.
+
+## What it is not for
+
+It classifies **how much work a request implies**. It is not a quality classifier, not a safety or
+moderation classifier, and not an intent classifier, and it should not be repurposed as any of them.
+It has no notion of whether a request is harmful, well-formed or worth answering.
+
+It also judges the *opening* of a conversation. A turn that becomes hard after ten exchanges is not
+something this sees.
+
+## Known limits
+
+- **Synthetic training data only.** Requests were generated by a local model across ten domains in
+  two languages. Real traffic will differ, and nobody has measured by how much.
+- **Two languages.** English and Chinese. The base model is multilingual, so a third language will
+  produce *something*, but it is untested and should be assumed worse.
+- **Ten domains.** A request unlike any of them — legal drafting, medicine, hardware design — is
+  outside what was trained and outside what was measured.
+- **`research` is weak**, as above, and was measured on 32 test examples, so even that 38% is a
+  figure with wide error bars.
+- The labelling ceiling is **79%** (see the dataset card), so a model in the high sixties overall is
+  nearer the achievable limit than it first appears. That is a statement about how ambiguous the
+  task is, not an excuse.
+
+## Licence
+
+This project's own contribution — the fine-tune, the dataset, the export and calibration scripts,
+and these cards — is dual licensed **MIT or Apache-2.0**, matching the gateway.
+
+The base model is `jhu-clsp/mmBERT-base` and its own licence governs the weights this derives from.
+**That licence must be confirmed and honoured before these weights are published**; a derivative
+cannot be licensed more freely than what it derives from. The same question applies to the dataset,
+whose labels are the outputs of another model — see the dataset card.
+
+## Rebuilding it
+
+Training, export, quantization and calibration are scripts, and the figures above are reproduced by
+running them. See the dataset card for the data and the method.
