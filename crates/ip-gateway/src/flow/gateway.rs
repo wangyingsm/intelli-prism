@@ -24,6 +24,7 @@ use crate::cache::{CachedResponse, ResponseCache};
 use crate::classifier::Classifier;
 use crate::dispatch::Dispatcher;
 use crate::error::{GatewayError, GatewayErrorKind};
+use crate::filter::Filtering;
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
@@ -66,6 +67,9 @@ pub struct Gateway {
     /// The larger model asked when the judge's margin fell short, once per turn, under
     /// a deadline of its own.
     arbiter: Option<Arc<Arbiter>>,
+    /// What must not leave a request, when an operator has said: applied to every body
+    /// the gateway may hold, after the plugin chain and before the response key.
+    filtering: Option<Arc<Filtering>>,
     pending: Pending,
 }
 
@@ -112,6 +116,7 @@ impl Gateway {
             turns: None,
             classifier: None,
             arbiter: None,
+            filtering: None,
             pending: Pending::default(),
         }
     }
@@ -170,6 +175,14 @@ impl Gateway {
         self
     }
 
+    /// Takes out of every request body what an operator said must not leave, and says
+    /// on the answer what was taken. A body the gateway may not hold goes unscanned and
+    /// the answer says that too.
+    pub fn filtering(mut self, filtering: Arc<Filtering>) -> Self {
+        self.filtering = Some(filtering);
+        self
+    }
+
     /// Asks this judge what a new turn's opening is, when nothing else has said: the
     /// class it names rides the dispatch and the turn's memory, and the rest of the
     /// turn costs nothing. Refused, silent or broken, it leaves a request unclassified.
@@ -217,6 +230,7 @@ impl Gateway {
         let followed = Followed::of(&context);
         let taking_in = stage_span!(INGRESS_REQUEST, followed);
 
+        let filtering = self.filtering.clone();
         let taken = async {
             let authorized = Flow::received(context, request).authorize(&routing.table)?;
             let api = authorized.resolution().rule().api.clone();
@@ -227,7 +241,7 @@ impl Gateway {
             let processed = authorized
                 .process_headers(chains.request_headers())
                 .await?
-                .process_body(&chains)
+                .process_body(&chains, filtering.as_deref())
                 .await?;
             Ok::<_, GatewayError>((processed, chains, api))
         }
@@ -4289,5 +4303,154 @@ mod tests {
             first.trace, second.trace,
             "two requests, one turn, one class between them"
         );
+    }
+
+    // ——— what must not leave ———
+
+    /// A gateway that takes out of every request what the defaults say must not leave.
+    fn filtering_gateway(upstream: Arc<FakeUpstream>) -> Gateway {
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        Gateway::new(table(), ProcessorChain::new(), upstream)
+            .filtering(Arc::new(crate::filter::Filtering::new(detectors)))
+    }
+
+    fn went_upstream(upstream: &FakeUpstream) -> String {
+        let seen = upstream.seen.lock().unwrap();
+        String::from_utf8_lossy(&seen.last().expect("something went upstream").body).into_owned()
+    }
+
+    /// The whole point: the upstream never sees it.
+    #[tokio::test]
+    async fn a_secret_does_not_reach_the_upstream() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = filtering_gateway(upstream.clone());
+        let answer = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"my key is sk-abcdefghij1234"}"#),
+            )
+            .await
+            .unwrap();
+        let sent = went_upstream(&upstream);
+        assert!(
+            !sent.contains("sk-abcdefghij1234"),
+            "the key went out: {sent}"
+        );
+        assert!(sent.contains("[redacted:openai-key:1]"));
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "openai-key=1"
+        );
+    }
+
+    /// A clean body must go out as the bytes that arrived. Re-serialising it would move
+    /// the turn anchor of every request the day the filter was switched on.
+    #[tokio::test]
+    async fn a_clean_body_reaches_the_upstream_byte_for_byte() {
+        let body = r#"{"q":"refactor the retry loop",  "n":1}"#;
+        let upstream = FakeUpstream::answering("pong");
+        let answer = filtering_gateway(upstream.clone())
+            .handle(context(granted()), request("/anthropic", body))
+            .await
+            .unwrap();
+        assert_eq!(went_upstream(&upstream), body, "the bytes were rewritten");
+        assert!(
+            answer.headers().get(crate::filter::REDACTED).is_none(),
+            "a clean request says nothing"
+        );
+    }
+
+    /// The ruling: the filter runs before the response key is taken, so what is cached
+    /// is what was redacted. Two requests differing only in their secret are one entry,
+    /// and nothing unredacted can ever be served from the cache.
+    #[tokio::test]
+    async fn the_cache_is_keyed_on_what_was_redacted() {
+        let upstream = FakeUpstream::answering("pong");
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .filtering(Arc::new(crate::filter::Filtering::new(detectors)))
+            .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()));
+        for key in ["sk-aaaaaaaaaabbbbb1111", "sk-ccccccccccddddd2222"] {
+            gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic", &format!(r#"{{"q":"key {key}"}}"#)),
+                )
+                .await
+                .unwrap();
+        }
+        let seen = upstream.seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "both redact to one body, so the second was a cache hit"
+        );
+    }
+
+    /// The filter runs after the plugin chain, so a plugin cannot introduce a secret
+    /// into a body the floor has already walked past.
+    #[tokio::test]
+    async fn a_secret_a_plugin_added_is_still_taken_out() {
+        struct Injects;
+        #[async_trait::async_trait]
+        impl crate::processor::BodyProcessor for Injects {
+            fn order(&self) -> ip_core::PluginOrder {
+                ip_core::PluginOrder::new(1)
+            }
+            async fn process(&self, _: Bytes) -> Result<Bytes, crate::error::ProcessorError> {
+                Ok(Bytes::from(r#"{"q":"sk-abcdefghij1234"}"#))
+            }
+        }
+        let upstream = FakeUpstream::answering("pong");
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let chain = ProcessorChain::new().with_request_body(Arc::new(Injects));
+        let gateway = Gateway::new(table(), chain, upstream.clone())
+            .filtering(Arc::new(crate::filter::Filtering::new(detectors)));
+        gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"clean"}"#),
+            )
+            .await
+            .unwrap();
+        let sent = went_upstream(&upstream);
+        assert!(
+            !sent.contains("sk-abcdefghij1234"),
+            "a plugin smuggled one past: {sent}"
+        );
+    }
+
+    /// A body the gateway may not hold cannot be filtered, and the answer says so
+    /// rather than letting an operator believe it was looked at.
+    #[tokio::test]
+    async fn a_body_that_may_not_be_held_goes_unscanned_and_says_so() {
+        let upstream = FakeUpstream::answering("pong");
+        let mut asking = request("/anthropic", r#"{"q":"sk-abcdefghij1234"}"#);
+        asking
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("99999999"));
+        let answer = filtering_gateway(upstream.clone())
+            .handle(context(granted()), asking)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "unscanned: not held"
+        );
+    }
+
+    /// A gateway with no filter configured behaves exactly as it did before any of
+    /// this: the body is untouched and the answer carries no header.
+    #[tokio::test]
+    async fn a_gateway_with_no_filter_changes_nothing() {
+        let body = r#"{"q":"my key is sk-abcdefghij1234"}"#;
+        let upstream = FakeUpstream::answering("pong");
+        let answer = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .handle(context(granted()), request("/anthropic", body))
+            .await
+            .unwrap();
+        assert_eq!(went_upstream(&upstream), body);
+        assert!(answer.headers().get(crate::filter::REDACTED).is_none());
     }
 }

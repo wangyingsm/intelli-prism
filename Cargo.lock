@@ -1643,6 +1643,7 @@ dependencies = [
  "ip-cache",
  "ip-config",
  "ip-core",
+ "ip-filter",
  "ip-protocol",
  "ip-storage",
  "rustls",

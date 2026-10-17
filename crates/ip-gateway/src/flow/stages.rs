@@ -23,6 +23,7 @@ use crate::cache::{CachedResponse, Freshness, freshness, response_key};
 use crate::classifier::{CLASSIFY_DEADLINE, Classifier};
 use crate::dispatch::{Dispatcher, Dispatching, may_hold, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
+use crate::filter::{self, Filtered, Filtering, Unscanned};
 use crate::processor::{HeaderProcessor, ProcessorChain};
 use crate::sse::{crossed_events, stream_chunks};
 use crate::stage::{
@@ -206,6 +207,7 @@ impl Flow<Received> {
                 request: self.held,
                 resolution,
                 class: None,
+                filtered: Filtered::default(),
             },
         })
     }
@@ -244,10 +246,17 @@ impl Flow<Authorized> {
 }
 
 impl Flow<HeadersProcessed> {
-    /// Runs the request body chain, or leaves the body untouched when there is none.
+    /// Runs the request body chain, or leaves the body untouched when there is none,
+    /// and then takes out of it whatever the operator's filter says must not leave.
+    ///
+    /// The filter runs *after* the chain so that nothing a plugin adds to a body can be
+    /// smuggled past a floor that has already walked it, and before this stage ends so
+    /// that the response key taken next is over what was redacted rather than over what
+    /// arrived.
     pub async fn process_body(
         mut self,
         processors: &ProcessorChain,
+        filtering: Option<&Filtering>,
     ) -> Result<Flow<BodyProcessed>, GatewayError> {
         let body = run_body(
             BodyProcessed::NAME,
@@ -259,10 +268,38 @@ impl Flow<HeadersProcessed> {
             set_length(self.held.request.headers_mut(), bytes.len());
             *self.held.request.body_mut() = from_bytes(bytes);
         }
+        if let Some(filtering) = filtering {
+            self.held.filtered = self.filter(filtering).await?;
+        }
         Ok(Flow {
             context: self.context,
             held: self.held,
         })
+    }
+
+    /// Reads the body, takes out what must not leave, and puts back what is left.
+    ///
+    /// A body the gateway may not hold is not read at all. Filtering it would mean
+    /// buffering what was promised to stream, so it goes on unscanned and the answer
+    /// says so: an operator can see the hole rather than assume there is none.
+    async fn filter(&mut self, filtering: &Filtering) -> Result<Filtered, GatewayError> {
+        if !may_hold(self.held.request.headers()) {
+            tracing::debug!("a body that may not be held went out unscanned");
+            return Ok(Filtered::Unscanned(Unscanned::NotHeld));
+        }
+        let body = std::mem::replace(self.held.request.body_mut(), crate::body::empty());
+        let bytes = collect(StageName::BodyRead, body).await?;
+        let (rewritten, filtered) = filtering.over(&bytes);
+        match rewritten {
+            // Clean, so the bytes that arrived are the bytes that go on: re-serialising
+            // one would move every request's turn anchor the day this was switched on.
+            None => *self.held.request.body_mut() = from_bytes(bytes),
+            Some(rewritten) => {
+                set_length(self.held.request.headers_mut(), rewritten.len());
+                *self.held.request.body_mut() = from_bytes(rewritten);
+            }
+        }
+        Ok(filtered)
     }
 }
 
@@ -311,6 +348,7 @@ impl Flow<BodyProcessed> {
             request,
             resolution,
             class,
+            filtered,
         } = self.held;
         // A question the gateway sends itself carries the marker for exactly this step:
         // both judges stand aside for it. This is the guard against an `ask_path` that
@@ -434,6 +472,7 @@ impl Flow<BodyProcessed> {
             if let Some(crossing) = crossing {
                 response = crossed_home(crossing, response, lost).await?;
             }
+            filter::say(response.headers_mut(), &filtered);
             remember(turns, &self.context, taken.as_ref(), &served);
             return Ok(Flow {
                 context: self.context,
@@ -462,6 +501,7 @@ impl Flow<BodyProcessed> {
             );
             outcome.held.response = crossed_home(crossing, answered, lost).await?;
         }
+        filter::say(outcome.held.response.headers_mut(), &filtered);
         remember(
             turns,
             &outcome.context,
@@ -1451,7 +1491,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(flow.stage(), StageName::HeaderProcess);
-        let flow = flow.process_body(&processors).await.unwrap();
+        let flow = flow.process_body(&processors, None).await.unwrap();
         assert_eq!(flow.stage(), StageName::BodyProcess);
         let upstream = FakeUpstream::answering("pong");
         let (dispatcher, _folding) = Dispatcher::new();
@@ -1576,7 +1616,7 @@ mod tests {
             .process_headers(processors.request_headers())
             .await
             .unwrap()
-            .process_body(&processors)
+            .process_body(&processors, None)
             .await
             .unwrap();
         let flow = flow

@@ -5,6 +5,7 @@ use http::{Request, Response};
 use ip_core::{Decider, Difficulty, Hedge, Replica};
 
 use crate::body::GatewayBody;
+use crate::filter::Filtered;
 use crate::table::Resolution;
 
 /// Where in the dataflow a request had got to.
@@ -90,6 +91,10 @@ pub struct Routed {
     /// honoured, which is how an operator plugs in a classifier of their own — and before
     /// any limit is counted, so a value the gateway cannot read is refused unbilled.
     pub class: Option<Difficulty>,
+    /// What the filter took out of the body, which the answer reports and the ledger
+    /// counts. Settled at the body stage and carried from there, because the filter runs
+    /// where the body is in hand and the answer is built two stages later.
+    pub filtered: Filtered,
 }
 
 /// The request has arrived and nothing has touched it.
