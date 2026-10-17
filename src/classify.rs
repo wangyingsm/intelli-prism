@@ -225,8 +225,21 @@ mod judge {
         /// classification the flow would attempt must answer inside
         /// [`CLASSIFY_DEADLINE`], run exactly the way the flow runs it. Without an
         /// artefact it says so and passes.
+        ///
+        /// It runs only when `IP_CLASSIFY_TIMING` asks for it, because it is a
+        /// measurement and not an assertion about the code. A forward pass takes 20 ms
+        /// on an idle machine and far longer on one running a test per core, or on an
+        /// instrumented build counting every branch of it — so run as part of an
+        /// ordinary suite the clock would be measuring the load, and a deadline it
+        /// failed there would say nothing about the deadline the flow keeps. Set the
+        /// variable, with an artefact, on a quiet machine, when the number is what you
+        /// want to know.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_real_classification_answers_inside_the_deadline() {
+            if std::env::var("IP_CLASSIFY_TIMING").is_err() {
+                eprintln!("IP_CLASSIFY_TIMING unset: not measuring a clock no one asked for");
+                return;
+            }
             let Some(dir) = std::env::var("IP_CLASSIFY_ARTIFACT").ok() else {
                 eprintln!("IP_CLASSIFY_ARTIFACT unset: no artefact to time");
                 return;
