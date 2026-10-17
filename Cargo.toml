@@ -16,6 +16,9 @@ axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 getrandom.workspace = true
 http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "ring", "webpki-roots", "tls12"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "tokio"] }
 ip-auth = { version = "0.1.0", path = "crates/ip-auth" }
 ip-cache = { version = "0.1.0", path = "crates/ip-cache", default-features = false }
 ip-config = { version = "0.1.0", path = "crates/ip-config" }
@@ -61,6 +64,8 @@ zeroize = "1.9.0"
 
 [dev-dependencies]
 async-trait = "0.1.92"
+hex.workspace = true
+sha2.workspace = true
 bytes = "1.12.1"
 http-body-util = "0.1.5"
 ip-cache = { version = "0.1.0", path = "crates/ip-cache", features = ["standalone-cache", "testing"] }

@@ -117,12 +117,7 @@ impl Classifier {
         let builder = ort::init_from(&candidate)
             .map_err(|error| ClassifyError::RuntimeMissing(format!("{candidate:?}: {error}")))?;
         let _environment = builder.commit();
-        let artifact = read_gate(&gate)?;
-        let named = std::fs::read_to_string(&gate)
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|value| text_at(&value, "checksum"));
-        check_weights(named.as_deref(), &model)?;
+        let artifact = Gate::read(&gate, &model)?;
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|error| {
             ClassifyError::ArtifactUnreadable(format!("{}: {error}", tokenizer_path.display()))
         })?;
@@ -259,6 +254,29 @@ pub struct Gate {
     /// The artefact's own version, which is not the gateway's and is never pinned by
     /// it: a better model drops in without a release.
     pub model_version: Option<String>,
+}
+
+impl Gate {
+    /// Reads a manifest and proves the weights beside it are the ones it speaks for.
+    ///
+    /// One entry point for both callers that need it: the runtime opening an artefact
+    /// to serve from, and the CLI checking one an operator carried in by hand. They
+    /// must agree about what a valid artefact is, and the way to guarantee that is for
+    /// there to be one answer.
+    ///
+    /// # Errors
+    ///
+    /// A manifest that will not read, a schema this build does not carry, or weights
+    /// whose digest is not the one named.
+    pub fn read(manifest: &Path, model: &Path) -> Result<Self, ClassifyError> {
+        let gate = read_gate(manifest)?;
+        let text = std::fs::read_to_string(manifest)
+            .map_err(|_| ClassifyError::ArtifactUnreadable(manifest.display().to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|_| ClassifyError::ArtifactUnreadable(manifest.display().to_string()))?;
+        check_weights(text_at(&value, "checksum").as_deref(), model)?;
+        Ok(gate)
+    }
 }
 
 /// Reads the two figures: refuse an unreadable file as itself, and a missing figure

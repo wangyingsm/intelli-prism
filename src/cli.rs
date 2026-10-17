@@ -27,6 +27,50 @@ pub enum Command {
         #[command(subcommand)]
         command: AdminCommand,
     },
+
+    /// Get the classifier's artefact onto this machine, or check one already here.
+    ///
+    /// The gateway itself never fetches anything: reaching the internet at startup
+    /// would undo the one thing this product claims. Getting the model is a thing an
+    /// operator does once, deliberately, before serving.
+    Model {
+        /// Which to do.
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+}
+
+/// Getting an artefact, or proving the one that is here.
+#[derive(Debug, Subcommand)]
+pub enum ModelCommand {
+    /// Check an artefact already on this machine, reaching nothing.
+    ///
+    /// This is the air-gapped path, and it is the primary one: an operator may carry
+    /// the artefact in on a disk and never give this machine a route out.
+    Verify {
+        /// The artefact directory to check.
+        #[arg(long)]
+        at: PathBuf,
+    },
+
+    /// Download an artefact, verify it, and place it where configuration expects.
+    Fetch {
+        /// Where from: a directory on this machine, an `https://` prefix, or a
+        /// repository as `hf:owner/name` or `ms:owner/name`.
+        ///
+        /// Both hosts are first class. The model is half Chinese and Hugging Face is
+        /// slow from much of Asia, so the mirror is a source and not a fallback.
+        #[arg(long)]
+        from: String,
+
+        /// The artefact directory to write.
+        #[arg(long)]
+        into: PathBuf,
+
+        /// Replace an artefact already there, which a running gateway may be serving.
+        #[arg(long)]
+        replace: bool,
+    },
 }
 
 /// A task that writes to the store without going through the api.
@@ -105,6 +149,83 @@ mod tests {
     #[test]
     fn create_without_a_user_is_refused() {
         assert!(parse(&["intelli-prism", "admin", "create"]).is_err());
+    }
+
+    #[test]
+    fn verifying_names_only_where_to_look() {
+        let cli = parse(&[
+            "intelli-prism",
+            "model",
+            "verify",
+            "--at",
+            "/srv/difficulty",
+        ])
+        .unwrap();
+        let Some(Command::Model {
+            command: ModelCommand::Verify { at },
+        }) = cli.command
+        else {
+            panic!("expected verify");
+        };
+        assert_eq!(at, PathBuf::from("/srv/difficulty"));
+    }
+
+    #[test]
+    fn fetching_names_where_from_and_where_to() {
+        let cli = parse(&[
+            "intelli-prism",
+            "model",
+            "fetch",
+            "--from",
+            "hf:owner/name",
+            "--into",
+            "/srv/difficulty",
+            "--replace",
+        ])
+        .unwrap();
+        let Some(Command::Model {
+            command:
+                ModelCommand::Fetch {
+                    from,
+                    into,
+                    replace,
+                },
+        }) = cli.command
+        else {
+            panic!("expected fetch");
+        };
+        assert_eq!(from, "hf:owner/name");
+        assert_eq!(into, PathBuf::from("/srv/difficulty"));
+        assert!(replace);
+    }
+
+    /// Nothing turns verification off, so there is no flag to find that would.
+    #[test]
+    fn no_flag_skips_the_checking() {
+        for skipping in ["--no-verify", "--skip-verify", "--force", "--insecure"] {
+            assert!(
+                parse(&[
+                    "intelli-prism",
+                    "model",
+                    "fetch",
+                    "--from",
+                    "hf:a/b",
+                    "--into",
+                    "/srv",
+                    skipping,
+                ])
+                .is_err(),
+                "{skipping} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn fetching_without_saying_where_from_or_to_is_refused() {
+        assert!(parse(&["intelli-prism", "model", "fetch", "--into", "/srv"]).is_err());
+        assert!(parse(&["intelli-prism", "model", "fetch", "--from", "hf:a/b"]).is_err());
+        assert!(parse(&["intelli-prism", "model", "verify"]).is_err());
+        assert!(parse(&["intelli-prism", "model"]).is_err());
     }
 
     #[test]

@@ -5,6 +5,8 @@ mod cli;
 mod cookie;
 mod error;
 mod manage;
+#[cfg(feature = "classifier")]
+mod model;
 mod routes;
 mod rules;
 mod state;
@@ -31,8 +33,31 @@ async fn main() -> Result<(), StartupError> {
             let passphrase = admin::ask_passphrase()?;
             admin::run(command, &cli.config, &passphrase).await
         }
+        Some(Command::Model { command }) => asked_of_the_model(command).await,
         None => serve(&cli.config).await,
     }
+}
+
+/// Getting or checking the classifier's artefact, when this build carries one.
+///
+/// A build without the classifier cannot use an artefact, so fetching one would leave
+/// an operator with hundreds of megabytes and a gateway that ignores them. It is
+/// refused the same way a `[difficulty]` stanza is, naming the feature that carries it.
+#[cfg(feature = "classifier")]
+async fn asked_of_the_model(command: cli::ModelCommand) -> Result<(), StartupError> {
+    model::run(command).await
+}
+
+#[cfg(not(feature = "classifier"))]
+#[expect(
+    clippy::unused_async,
+    reason = "the same shape as the build that carries it"
+)]
+async fn asked_of_the_model(_: cli::ModelCommand) -> Result<(), StartupError> {
+    Err(StartupError::UnsupportedBackend {
+        backend: "difficulty classifier",
+        feature: "classifier",
+    })
 }
 
 /// Opens everything the configuration names and serves until the kernel says to stop.

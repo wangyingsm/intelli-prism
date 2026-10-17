@@ -17,6 +17,13 @@ pub enum StartupError {
         detail: String,
     },
 
+    /// The classifier's artefact could not be got, or is not the one it claims.
+    #[error("{detail}")]
+    Artefact {
+        /// What was wrong with it.
+        detail: String,
+    },
+
     /// A passphrase or an identity was refused.
     #[error(transparent)]
     Auth(#[from] ip_auth::AuthError),
