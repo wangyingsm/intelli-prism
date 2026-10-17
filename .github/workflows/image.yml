@@ -1,0 +1,126 @@
+name: image
+
+# A built image nobody started is not evidence, so both tags are started here and
+# asked what they are before either is called good.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plain:
+    name: the gateway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: plain
+          load: true
+          tags: intelli-prism:plain
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: it runs, and carries no classifier
+        run: |
+          set -euo pipefail
+          docker run --rm intelli-prism:plain --version
+          # Asking it to fetch a model must say the build does not carry one, rather
+          # than quietly doing nothing or pulling hundreds of megabytes it would
+          # ignore. The plain image stays plain, and this is what proves it.
+          if docker run --rm intelli-prism:plain model verify --at /nowhere; then
+            echo "the plain image accepted a model command" >&2
+            exit 1
+          fi
+
+      - name: how big it is
+        run: |
+          docker image inspect intelli-prism:plain --format '{{.Size}}' |
+            awk '{printf "plain image: %.0f MB\n", $1 / 1000000}'
+
+  classifier:
+    name: the gateway with a classifier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Public sources only: the weights and the inference runtime are fetched here
+      # with no token, and the build itself is handed them rather than reaching out.
+      - name: the inference runtime
+        env:
+          ORT_VERSION: '1.28.0'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          mkdir -p runtime
+          tar -xzf ort.tgz --strip-components=2 -C runtime \
+            "onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}"
+
+      - name: the weights
+        env:
+          MODEL_FROM: ${{ vars.MODEL_FROM }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MODEL_FROM}" ]; then
+            echo "::notice::no MODEL_FROM is configured, so there is nothing to build against yet"
+            echo 'skip=true' >> "${GITHUB_ENV}"
+            exit 0
+          fi
+          mkdir -p model
+          for file in gate.json config.json tokenizer.json model.onnx; do
+            curl -fsSL -o "model/${file}" "${MODEL_FROM}/${file}"
+          done
+
+      - name: build
+        if: env.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: classifier
+          load: true
+          tags: intelli-prism:classifier
+          build-contexts: |
+            model=./model
+            runtime=./runtime
+          build-args: |
+            MODEL_BUILD=${{ vars.MODEL_BUILD }}
+            MODEL_VERSION=${{ vars.MODEL_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The build already refused a mislabelled artefact; this asks the finished image
+      # the same question from outside, which is what an operator can do too.
+      - name: it says which model it carries, without being started
+        if: env.skip != 'true'
+        run: |
+          set -euo pipefail
+          docker image inspect intelli-prism:classifier \
+            --format '{{index .Config.Labels "ai.intelli-prism.model.build"}}' \
+            | grep -qx "${{ vars.MODEL_BUILD }}"
+
+      - name: it starts, and the classifier in it is the one labelled
+        if: env.skip != 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm intelli-prism:classifier model verify --at /opt/intelli-prism/difficulty \
+            | tee said.txt
+          grep -q "build *${{ vars.MODEL_BUILD }}" said.txt
+
+      - name: how big it is
+        if: env.skip != 'true'
+        run: |
+          docker image inspect intelli-prism:classifier --format '{{.Size}}' |
+            awk '{printf "classifier image: %.0f MB\n", $1 / 1000000}'

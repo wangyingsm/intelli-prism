@@ -1,0 +1,16 @@
+# Build output, which is rebuilt inside the image and is tens of gigabytes besides.
+target/
+
+# Local state and working notes that are no part of what the image serves.
+.git/
+.github/
+coding-plan/
+logs/
+graph.drsg*
+CLAUDE.md
+RTK.md
+*.db
+*.db-*
+
+# A configuration an operator mounts; baking one in would ship someone's own.
+intelli-prism.toml
