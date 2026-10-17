@@ -25,9 +25,11 @@ pub mod error;
 pub mod kind;
 pub mod redact;
 pub mod secret;
+pub mod stream;
 
 pub use detect::{Detectors, Finding};
 pub use error::FilterError;
 pub use kind::Kind;
 pub use redact::{Redaction, redact};
 pub use secret::{Check, Match, Secret};
+pub use stream::Trickle;

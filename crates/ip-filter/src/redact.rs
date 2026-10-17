@@ -62,6 +62,11 @@ impl Redaction {
         self.counted.is_empty()
     }
 
+    /// Counts one more of this kind.
+    pub(crate) fn count(&mut self, kind: &Kind) {
+        *self.counted.entry(kind.clone()).or_insert(0) += 1;
+    }
+
     /// What was redacted, as a header or a log line says it: `api-key=2, email=1`, the
     /// kinds in a settled order so two gateways word it the same way.
     #[must_use]
@@ -80,14 +85,14 @@ impl Redaction {
 /// Nothing here is returned, logged or stored: it exists only so that the same address
 /// twice in one conversation reads as the same person to the model.
 #[derive(Default)]
-struct Tally {
+pub(crate) struct Tally {
     given: HashMap<(Kind, String), usize>,
     next: HashMap<Kind, usize>,
 }
 
 impl Tally {
     /// The placeholder for this value, the same one every time it is asked for.
-    fn placeholder(&mut self, kind: &Kind, value: &str) -> String {
+    pub(crate) fn placeholder(&mut self, kind: &Kind, value: &str) -> String {
         let key = (kind.clone(), value.to_owned());
         let at = if let Some(at) = self.given.get(&key) {
             *at
