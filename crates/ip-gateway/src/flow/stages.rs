@@ -289,7 +289,8 @@ impl Flow<HeadersProcessed> {
         }
         let body = std::mem::replace(self.held.request.body_mut(), crate::body::empty());
         let bytes = collect(StageName::BodyRead, body).await?;
-        let (rewritten, filtered) = filtering.over(&bytes);
+        let tenant = &self.context.authority.identity().tenant;
+        let (rewritten, filtered) = filtering.over(tenant, &bytes);
         match rewritten {
             // Clean, so the bytes that arrived are the bytes that go on: re-serialising
             // one would move every request's turn anchor the day this was switched on.
@@ -1021,8 +1022,12 @@ impl Flow<ResponseHeadersProcessed> {
             if let Some(filtering) = filtering {
                 self.held.response.headers_mut().remove(CONTENT_LENGTH);
                 let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
-                *self.held.response.body_mut() =
-                    filtered_events(body, self.held.speaks, Arc::clone(filtering));
+                *self.held.response.body_mut() = filtered_events(
+                    body,
+                    self.held.speaks,
+                    Arc::clone(filtering),
+                    self.context.authority.identity().tenant.clone(),
+                );
                 // What a stream gave up is not known when its headers go out, so the
                 // header says it was looked at and the count goes to the log.
                 self.held.filtered.absorb(&if filtering.window() == 0 {
@@ -1062,7 +1067,8 @@ impl Flow<ResponseHeadersProcessed> {
     async fn filter_answer(&mut self, filtering: &Filtering) -> Result<Filtered, GatewayError> {
         let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
         let bytes = collect(StageName::ResponseBodyRead, body).await?;
-        let (rewritten, filtered) = filtering.over(&bytes);
+        let tenant = &self.context.authority.identity().tenant;
+        let (rewritten, filtered) = filtering.over(tenant, &bytes);
         match rewritten {
             None => *self.held.response.body_mut() = from_bytes(bytes),
             Some(rewritten) => {

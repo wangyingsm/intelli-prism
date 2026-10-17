@@ -171,16 +171,28 @@ impl AppState {
         if let Some(filter) = &config.filter {
             let secrets = filter.secrets()?;
             // A secret that will not compile is a fault in the configuration, and reads as one.
-            let detectors =
-                ip_filter::Detectors::of(&secrets).map_err(ip_config::ConfigError::from)?;
+            let compile = |secrets: &[ip_filter::Secret]| {
+                ip_filter::Detectors::of(secrets).map_err(ip_config::ConfigError::from)
+            };
             let named = secrets
                 .iter()
                 .map(|secret| secret.kind.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            gateway = gateway.filtering(Arc::new(
-                ip_gateway::Filtering::new(detectors).holding(filter.window),
-            ));
+            let mut filtering =
+                ip_gateway::Filtering::new(compile(&secrets)?).holding(filter.window);
+            // Built once, per tenant that asked for anything, so a request only ever
+            // looks one up. Each set is the floor and that tenant's own together.
+            for tenant in filter.named_tenants() {
+                let theirs = filter.secrets_for(tenant)?;
+                filtering = filtering.and_tenant(tenant.clone(), compile(&theirs)?);
+                tracing::info!(
+                    tenant = %tenant,
+                    secrets = theirs.len(),
+                    "a tenant asked for more than the floor"
+                );
+            }
+            gateway = gateway.filtering(Arc::new(filtering));
             tracing::info!(
                 secrets = named,
                 window = filter.window,

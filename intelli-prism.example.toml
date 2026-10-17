@@ -195,3 +195,18 @@ temperature = 0.7
 # kind = "account"
 # regexp = '\b[0-9]{13,19}\b'
 # check = "luhn"
+
+# What one tenant wants looked for beyond the floor. Added to it, never instead of it:
+# a tenant block naming nothing leaves the floor exactly as it was, and there is no way
+# to write one that takes anything out of it. That is what makes the floor a floor.
+#
+# Resolved once at startup, per tenant named here, so a request only ever looks one up.
+# A tenant not named here is scanned for the floor.
+#
+# [[filter.tenant]]
+# tenant = "acme"
+# shipped = ["email"]
+#
+# [[filter.tenant.secret]]
+# kind = "acme-id"
+# prefix = "ACME-"

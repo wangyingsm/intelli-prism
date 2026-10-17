@@ -10,10 +10,11 @@
 //! already walked past, and *before* the response key is taken, so what is cached is
 //! what was redacted rather than what arrived.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName};
+use ip_core::TenantId;
 use ip_filter::{Detectors, Redaction, WINDOW, redact};
 
 /// The header an answer carries to say what was taken out of its request.
@@ -136,21 +137,44 @@ impl Filtered {
 
 /// The secrets in force, and the scan that applies them.
 ///
-/// One set for now. The floor an operator configures and the rules a tenant adds to it
-/// resolve to one of these per request.
+/// A floor every request passes through, and whatever a tenant asked for on top of it.
+/// Both are resolved once, at startup, so choosing a request's detectors is a lookup
+/// rather than a build: a filter that compiled expressions per request would be paid
+/// for on the hot path by every caller.
+///
+/// A tenant's set is built from the floor's secrets *and* its own, so there is no
+/// arrangement of configuration in which a tenant is scanned for less than the floor.
+/// That is structural rather than checked.
 pub struct Filtering {
-    detectors: Detectors,
+    floor: Detectors,
+    tenants: HashMap<TenantId, Detectors>,
     window: usize,
 }
 
 impl Filtering {
-    /// Filters with these, holding back [`WINDOW`] characters of a streamed answer.
+    /// Filters every request with these, holding back [`WINDOW`] characters of a
+    /// streamed answer.
     #[must_use]
-    pub const fn new(detectors: Detectors) -> Self {
+    pub fn new(floor: Detectors) -> Self {
         Self {
-            detectors,
+            floor,
+            tenants: HashMap::new(),
             window: WINDOW,
         }
+    }
+
+    /// Adds what one tenant asked for. These are the tenant's whole set — the floor's
+    /// secrets and its own together — so the caller builds them that way round.
+    #[must_use]
+    pub fn and_tenant(mut self, tenant: TenantId, detectors: Detectors) -> Self {
+        self.tenants.insert(tenant, detectors);
+        self
+    }
+
+    /// The secrets looked for on this tenant's requests.
+    #[must_use]
+    pub fn detectors_for(&self, tenant: &TenantId) -> &Detectors {
+        self.tenants.get(tenant).unwrap_or(&self.floor)
     }
 
     /// Holds this many characters of a streamed answer instead.
@@ -162,12 +186,6 @@ impl Filtering {
     pub const fn holding(mut self, window: usize) -> Self {
         self.window = window;
         self
-    }
-
-    /// The secrets in force.
-    #[must_use]
-    pub const fn detectors(&self) -> &Detectors {
-        &self.detectors
     }
 
     /// How much of a streamed answer is held back.
@@ -182,11 +200,11 @@ impl Filtering {
     /// arrived: re-serialising one would move the turn anchor of every request the day
     /// the filter was switched on, and cost the upstream's own prompt cache with it.
     #[must_use]
-    pub fn over(&self, bytes: &[u8]) -> (Option<Bytes>, Filtered) {
+    pub fn over(&self, tenant: &TenantId, bytes: &[u8]) -> (Option<Bytes>, Filtered) {
         let Ok(body) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return (None, Filtered::unscanned(Unscanned::NotJson));
         };
-        match redact(&self.detectors, &body) {
+        match redact(self.detectors_for(tenant), &body) {
             None => (None, Filtered::clean()),
             Some((rewritten, found)) => (
                 Some(Bytes::from(rewritten.to_string())),
@@ -217,10 +235,14 @@ mod tests {
         Filtering::new(Detectors::defaults().unwrap())
     }
 
+    fn whoever() -> TenantId {
+        TenantId::new("acme").unwrap()
+    }
+
     #[test]
     fn a_clean_body_is_not_rewritten_and_says_nothing() {
         let body = br#"{"messages":[{"content":"refactor the retry loop"}]}"#;
-        let (rewritten, filtered) = filtering().over(body);
+        let (rewritten, filtered) = filtering().over(&whoever(), body);
         assert!(
             rewritten.is_none(),
             "the bytes that arrived are the bytes that go"
@@ -232,7 +254,7 @@ mod tests {
     #[test]
     fn a_body_holding_a_secret_comes_back_without_it() {
         let body = br#"{"messages":[{"content":"my key is sk-abcdefghij1234"}]}"#;
-        let (rewritten, filtered) = filtering().over(body);
+        let (rewritten, filtered) = filtering().over(&whoever(), body);
         let sent = String::from_utf8(rewritten.expect("rewritten").to_vec()).unwrap();
         assert!(!sent.contains("sk-abcdefghij1234"));
         assert!(sent.contains("[redacted:openai-key:1]"));
@@ -242,7 +264,8 @@ mod tests {
 
     #[test]
     fn a_body_that_is_not_json_is_said_to_be_unscanned() {
-        let (rewritten, filtered) = filtering().over(b"sk-abcdefghij1234 in plain text");
+        let (rewritten, filtered) =
+            filtering().over(&whoever(), b"sk-abcdefghij1234 in plain text");
         assert!(rewritten.is_none());
         assert_eq!(filtered, Filtered::unscanned(Unscanned::NotJson));
         assert_eq!(filtered.said().unwrap(), "unscanned: not json");
@@ -261,7 +284,7 @@ mod tests {
         say(&mut headers, &Filtered::clean());
         assert!(headers.get(REDACTED).is_none());
 
-        let (_, filtered) = filtering().over(br#"{"a":"ada@example.com"}"#);
+        let (_, filtered) = filtering().over(&whoever(), br#"{"a":"ada@example.com"}"#);
         say(&mut headers, &filtered);
         assert_eq!(headers.get(REDACTED).unwrap(), "email=1");
     }
@@ -272,7 +295,7 @@ mod tests {
     fn a_header_value_is_always_one_a_header_can_hold() {
         let detectors = Detectors::of(&Secret::defaults()).unwrap();
         let body = br#"{"a":"ada@example.com sk-abcdefghij1234 4242424242424242"}"#;
-        let (_, filtered) = Filtering::new(detectors).over(body);
+        let (_, filtered) = Filtering::new(detectors).over(&whoever(), body);
         let said = filtered.said().unwrap();
         assert!(http::HeaderValue::from_str(&said).is_ok(), "{said}");
         assert!(!said.contains('\n') && !said.contains('\r'));
@@ -281,7 +304,7 @@ mod tests {
     #[test]
     fn filtering_with_nothing_declared_leaves_every_body_clean() {
         let none = Filtering::new(Detectors::of(&[]).unwrap());
-        let (rewritten, filtered) = none.over(br#"{"a":"sk-abcdefghij1234"}"#);
+        let (rewritten, filtered) = none.over(&whoever(), br#"{"a":"sk-abcdefghij1234"}"#);
         assert!(rewritten.is_none());
         assert_eq!(filtered, Filtered::clean());
     }

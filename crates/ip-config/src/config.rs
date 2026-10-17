@@ -76,6 +76,28 @@ pub struct FilterConfig {
     /// event, which is most often nothing at all.
     #[serde(default = "held_back")]
     pub window: usize,
+    /// What one tenant wants looked for beyond the floor. Added to it, never instead
+    /// of it.
+    #[serde(default, rename = "tenant")]
+    pub tenants: Vec<TenantFilterConfig>,
+}
+
+/// One tenant's own secrets, on top of the floor every tenant passes through.
+///
+/// A tenant may ask for more to be looked for. Nothing here takes anything out of the
+/// floor: naming no secrets at all leaves the floor exactly as it was, which is what
+/// makes it a floor rather than a default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantFilterConfig {
+    /// Whose these are.
+    pub tenant: ip_core::TenantId,
+    /// Shipped secrets this tenant wants beyond the floor's.
+    #[serde(default)]
+    pub shipped: Vec<String>,
+    /// Secrets of this tenant's own.
+    #[serde(default, rename = "secret")]
+    pub secrets: Vec<ip_filter::Secret>,
 }
 
 /// The window an operator who says nothing gets, which is the gateway's own default.
@@ -112,6 +134,42 @@ impl FilterConfig {
         };
         secrets.extend(self.secrets.iter().cloned());
         Ok(secrets)
+    }
+
+    /// Everything in force for one tenant: the floor, and then whatever that tenant
+    /// asked for on top of it.
+    ///
+    /// The floor comes first and is never consulted about: a tenant naming nothing
+    /// gets exactly the floor, and a tenant naming something gets the floor and that.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::UnknownSecret`] when the tenant names a shipped secret that does
+    /// not exist.
+    pub fn secrets_for(
+        &self,
+        tenant: &ip_core::TenantId,
+    ) -> Result<Vec<ip_filter::Secret>, ConfigError> {
+        let mut secrets = self.secrets()?;
+        let Some(theirs) = self.tenants.iter().find(|one| &one.tenant == tenant) else {
+            return Ok(secrets);
+        };
+        for name in &theirs.shipped {
+            secrets.push(ip_filter::Secret::default_named(name).ok_or_else(|| {
+                ConfigError::UnknownSecret {
+                    value: name.clone(),
+                    carried: ip_filter::Secret::default_names().join(", "),
+                }
+            })?);
+        }
+        secrets.extend(theirs.secrets.iter().cloned());
+        Ok(secrets)
+    }
+
+    /// Every tenant that asked for something of its own.
+    #[must_use]
+    pub fn named_tenants(&self) -> Vec<&ip_core::TenantId> {
+        self.tenants.iter().map(|one| &one.tenant).collect()
     }
 }
 
@@ -929,5 +987,102 @@ model = "claude-sonnet-5"
     fn a_configuration_with_no_filter_section_has_none() {
         let config = Config::parse(FULL).unwrap();
         assert!(config.filter.is_none());
+    }
+
+    const WITH_TENANTS: &str = r#"
+        shipped = ["email"]
+
+        [[secret]]
+        kind = "corp-token"
+        prefix = "MYCORP-"
+
+        [[tenant]]
+        tenant = "acme"
+        shipped = ["credit-card"]
+
+        [[tenant.secret]]
+        kind = "acme-id"
+        prefix = "ACME-"
+
+        [[tenant]]
+        tenant = "quiet"
+        "#;
+
+    fn named(raw: &str) -> ip_core::TenantId {
+        ip_core::TenantId::new(raw).unwrap()
+    }
+
+    fn kinds_for(filter: &FilterConfig, tenant: &str) -> Vec<String> {
+        filter
+            .secrets_for(&named(tenant))
+            .unwrap()
+            .iter()
+            .map(|one| one.kind.as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_tenants_own_secrets_come_after_the_floors() {
+        let filter: FilterConfig = toml::from_str(WITH_TENANTS).unwrap();
+        assert_eq!(
+            kinds_for(&filter, "acme"),
+            vec!["email", "corp-token", "credit-card", "acme-id"]
+        );
+    }
+
+    /// The property that makes a floor a floor. A tenant that asks for nothing is
+    /// scanned for everything the floor names, and there is no way to write a tenant
+    /// block that takes anything out of it.
+    #[test]
+    fn a_tenant_that_asks_for_nothing_still_gets_the_whole_floor() {
+        let filter: FilterConfig = toml::from_str(WITH_TENANTS).unwrap();
+        let floor = kinds_for(&filter, "nobody-configured-me");
+        assert_eq!(floor, vec!["email", "corp-token"]);
+        assert_eq!(
+            kinds_for(&filter, "quiet"),
+            floor,
+            "a tenant block naming nothing narrows nothing"
+        );
+    }
+
+    /// Every tenant is scanned for at least what the floor names, whatever they wrote.
+    #[test]
+    fn no_tenant_is_scanned_for_less_than_the_floor() {
+        let filter: FilterConfig = toml::from_str(WITH_TENANTS).unwrap();
+        let floor = kinds_for(&filter, "nobody-configured-me");
+        for tenant in ["acme", "quiet", "someone-else"] {
+            let theirs = kinds_for(&filter, tenant);
+            for kind in &floor {
+                assert!(
+                    theirs.contains(kind),
+                    "{tenant} is not scanned for {kind}, which the floor names"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tenant_naming_a_secret_that_does_not_ship_is_refused() {
+        let filter: FilterConfig = toml::from_str(
+            r#"
+            [[tenant]]
+            tenant = "acme"
+            shipped = ["social-security"]
+            "#,
+        )
+        .unwrap();
+        let said = filter.secrets_for(&named("acme")).unwrap_err().to_string();
+        assert!(said.contains("social-security"), "{said}");
+    }
+
+    #[test]
+    fn the_tenants_that_asked_for_something_are_named() {
+        let filter: FilterConfig = toml::from_str(WITH_TENANTS).unwrap();
+        let named: Vec<&str> = filter
+            .named_tenants()
+            .into_iter()
+            .map(ip_core::TenantId::as_str)
+            .collect();
+        assert_eq!(named, vec!["acme", "quiet"]);
     }
 }

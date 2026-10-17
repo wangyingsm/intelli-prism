@@ -9,7 +9,7 @@ use crate::body::{BoxError, ChannelBody, GatewayBody};
 use crate::error::ProcessorError;
 use crate::filter::Filtering;
 use crate::processor::BodyProcessor;
-use ip_core::Dialect;
+use ip_core::{Dialect, TenantId};
 use ip_filter::Trickle;
 use ip_protocol::{Event, Reading, Writing};
 
@@ -169,16 +169,23 @@ pub(crate) fn filtered_events(
     body: GatewayBody,
     speaks: Dialect,
     filtering: Arc<Filtering>,
+    tenant: TenantId,
 ) -> GatewayBody {
     let (sender, receiver) = mpsc::channel(BUFFERED_EVENTS);
-    tokio::spawn(sift(body, speaks, filtering, sender));
+    tokio::spawn(sift(body, speaks, filtering, tenant, sender));
     ChannelBody::new(receiver).boxed_unsync()
 }
 
-async fn sift(mut body: GatewayBody, speaks: Dialect, filtering: Arc<Filtering>, sender: Sender) {
+async fn sift(
+    mut body: GatewayBody,
+    speaks: Dialect,
+    filtering: Arc<Filtering>,
+    tenant: TenantId,
+    sender: Sender,
+) {
     let mut reading = Reading::new(speaks);
     let mut writing = Writing::new(speaks);
-    let mut trickle = Trickle::new(filtering.detectors(), filtering.window());
+    let mut trickle = Trickle::new(filtering.detectors_for(&tenant), filtering.window());
     let mut pending = BytesMut::new();
     let mut going = true;
     while going {

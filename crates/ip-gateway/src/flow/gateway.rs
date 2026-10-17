@@ -4687,4 +4687,65 @@ mod tests {
             "unscanned: not json"
         );
     }
+
+    /// A tenant may ask for more than the floor, and gets the floor as well.
+    #[tokio::test]
+    async fn a_tenant_is_scanned_for_its_own_secrets_and_the_floors() {
+        let floor = ip_filter::Detectors::of(&[ip_filter::Secret::default_named("email").unwrap()])
+            .unwrap();
+        let theirs = ip_filter::Detectors::of(&[
+            ip_filter::Secret::default_named("email").unwrap(),
+            ip_filter::Secret::new(
+                ip_filter::Kind::new("corp-token").unwrap(),
+                ip_filter::Match::Prefix("MYCORP-".to_owned()),
+            ),
+        ])
+        .unwrap();
+        let upstream = FakeUpstream::answering(r#"{"said":"pong"}"#);
+        let gateway =
+            Gateway::new(table(), ProcessorChain::new(), upstream.clone()).filtering(Arc::new(
+                crate::filter::Filtering::new(floor)
+                    .and_tenant(ip_core::TenantId::new("acme").unwrap(), theirs),
+            ));
+        let answer = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"MYCORP-abc123 and ada@example.com"}"#),
+            )
+            .await
+            .unwrap();
+        let sent = went_upstream(&upstream);
+        assert!(!sent.contains("MYCORP-abc123"), "the tenant's own: {sent}");
+        assert!(!sent.contains("ada@example.com"), "and the floor's: {sent}");
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "corp-token=1, email=1"
+        );
+    }
+
+    /// And a tenant nobody configured is scanned for the floor, not for nothing.
+    #[tokio::test]
+    async fn a_tenant_nobody_configured_still_passes_the_floor() {
+        let floor = ip_filter::Detectors::of(&[ip_filter::Secret::default_named("email").unwrap()])
+            .unwrap();
+        let elsewhere = ip_filter::Detectors::of(&[]).unwrap();
+        let upstream = FakeUpstream::answering(r#"{"said":"pong"}"#);
+        let gateway =
+            Gateway::new(table(), ProcessorChain::new(), upstream.clone()).filtering(Arc::new(
+                crate::filter::Filtering::new(floor)
+                    .and_tenant(ip_core::TenantId::new("somebody-else").unwrap(), elsewhere),
+            ));
+        gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"ada@example.com"}"#),
+            )
+            .await
+            .unwrap();
+        let sent = went_upstream(&upstream);
+        assert!(
+            !sent.contains("ada@example.com"),
+            "the floor was skipped: {sent}"
+        );
+    }
 }

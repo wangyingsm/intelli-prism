@@ -205,5 +205,36 @@ mod tests {
         );
         // And they compile, which is what an operator finds out at startup.
         ip_filter::Detectors::of(&secrets).expect("the example's own secrets compile");
+
+        // The tenant block the example shows resolves to the floor and then its own,
+        // and a tenant it does not name is scanned for the floor.
+        let acme = ip_core::TenantId::new("acme").unwrap();
+        let theirs = filter
+            .secrets_for(&acme)
+            .expect("the tenant block resolves");
+        let named: Vec<&str> = theirs.iter().map(|one| one.kind.as_str()).collect();
+        assert_eq!(
+            named,
+            vec![
+                "credit-card",
+                "prc-id",
+                "iban",
+                "private-key",
+                "openai-key",
+                "corp-token",
+                "staff-mail",
+                "account",
+                "email",
+                "acme-id",
+            ],
+            "the floor whole, then what the tenant asked for"
+        );
+        ip_filter::Detectors::of(&theirs).expect("the tenant's own secrets compile");
+        let stranger = ip_core::TenantId::new("stranger").unwrap();
+        assert_eq!(
+            filter.secrets_for(&stranger).unwrap().len(),
+            secrets.len(),
+            "a tenant the example does not name gets the floor, no more and no less"
+        );
     }
 }
