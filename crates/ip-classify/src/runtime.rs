@@ -118,6 +118,11 @@ impl Classifier {
             .map_err(|error| ClassifyError::RuntimeMissing(format!("{candidate:?}: {error}")))?;
         let _environment = builder.commit();
         let artifact = read_gate(&gate)?;
+        let named = std::fs::read_to_string(&gate)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| text_at(&value, "checksum"));
+        check_weights(named.as_deref(), &model)?;
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|error| {
             ClassifyError::ArtifactUnreadable(format!("{}: {error}", tokenizer_path.display()))
         })?;
@@ -208,8 +213,33 @@ impl Classifier {
 /// The environment variable naming the runtime library, if the operator set one.
 pub const DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 
+/// Manifest schemas this build reads. A version outside this list is refused rather
+/// than read for the keys it recognises, because a later shape may mean something
+/// different by the same name. Schema 1 is M13's, which carried no checksum and no
+/// margin table; schema 2 adds them, and which build the weights are.
+pub const SCHEMAS: [u64; 2] = [1, 2];
+
+/// What one threshold was measured to do, on the split this build was tested against.
+///
+/// Advisory, always. The gateway dispatches at the threshold its operator configured
+/// and never at one this table prefers: the table knows a test split, and an operator
+/// may know something about their own traffic that it does not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Measured {
+    /// The margin the top class must hold over the runner-up.
+    pub threshold: f64,
+    /// How often the class it committed to was right, above that margin.
+    pub accuracy: f64,
+    /// What share of requests cleared it and were kept local.
+    pub coverage: f64,
+}
+
 /// What the artefact's `gate.json` carries: figures fitted at training that belong
 /// beside the weights, never configured, never guessed in code.
+///
+/// Two artefacts of the same weights quantized differently are two different gates —
+/// their temperatures are fitted separately and their margin tables measured
+/// separately — so everything here is per build and none of it transfers.
 #[derive(Debug, Clone)]
 pub struct Gate {
     /// The fitted divisor between logits and exponentials.
@@ -218,6 +248,17 @@ pub struct Gate {
     pub max_length: usize,
     /// The class order the graph's outputs are in, as named.
     pub classes: Vec<String>,
+    /// Which build these weights are — `fp32`, `int8`, whatever the export called it.
+    /// Absent in a manifest written before builds were told apart.
+    pub quantization: Option<String>,
+    /// What this build was measured to do at each threshold, worst threshold first or
+    /// in whatever order the export wrote them. Empty when the manifest carries none.
+    pub margin: Vec<Measured>,
+    /// The model this was fine-tuned from, for a card and a log line.
+    pub base: Option<String>,
+    /// The artefact's own version, which is not the gateway's and is never pinned by
+    /// it: a better model drops in without a release.
+    pub model_version: Option<String>,
 }
 
 /// Reads the two figures: refuse an unreadable file as itself, and a missing figure
@@ -251,12 +292,86 @@ fn read_gate(path: &Path) -> Result<Gate, ClassifyError> {
         })
         .filter(|names| !names.is_empty())
         .ok_or_else(unreadable)?;
-    // The exporter writes a `version`; nothing reads it yet.
+    // A schema this build does not read is refused whole; see `SCHEMAS`.
+    let schema = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    if !SCHEMAS.contains(&schema) {
+        return Err(ClassifyError::ArtifactSchema {
+            found: schema,
+            carried: format!("{SCHEMAS:?}"),
+        });
+    }
+    let margin = value
+        .get("margin")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| rows.iter().filter_map(measured).collect())
+        .unwrap_or_default();
     Ok(Gate {
         temperature,
         max_length,
         classes,
+        quantization: text_at(&value, "quantization"),
+        margin,
+        base: text_at(&value, "base"),
+        model_version: text_at(&value, "model_version"),
     })
+}
+
+/// One row of the margin table, or nothing where a row is not one.
+fn measured(row: &serde_json::Value) -> Option<Measured> {
+    Some(Measured {
+        threshold: row.get("threshold")?.as_f64()?,
+        accuracy: row.get("accuracy")?.as_f64()?,
+        coverage: row.get("coverage")?.as_f64()?,
+    })
+}
+
+/// A string field of the manifest, when it carries one.
+fn text_at(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The digest of the weights, read in pieces so a file of any size costs one buffer.
+fn digest(path: &Path) -> Result<String, ClassifyError> {
+    use sha2::Digest;
+    use std::io::Read;
+    let unreadable = || ClassifyError::ArtifactUnreadable(path.display().to_string());
+    let mut file = std::fs::File::open(path).map_err(|_| unreadable())?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| unreadable())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Refuses weights that are not the weights the manifest was written for.
+///
+/// Only when the manifest names a digest: one written before checksums existed has
+/// nothing to disagree with, and refusing it would refuse every artefact built before
+/// this gateway could check.
+fn check_weights(named: Option<&str>, model: &Path) -> Result<(), ClassifyError> {
+    let Some(named) = named else {
+        return Ok(());
+    };
+    let named = named.strip_prefix("sha256:").unwrap_or(named);
+    let found = digest(model)?;
+    if found != named {
+        return Err(ClassifyError::ArtifactChecksum {
+            named: named.to_owned(),
+            found,
+        });
+    }
+    Ok(())
 }
 #[cfg(all(test, feature = "runtime"))]
 mod tests {
@@ -299,6 +414,97 @@ mod tests {
             opened.ok().map(Mutex::new)
         });
         slot.as_ref()?.lock().ok()
+    }
+
+    const FULL: &str = r#"{
+        "version": 2, "temperature": 1.2, "max_length": 256,
+        "classes": ["easy", "routine", "median", "hard", "research"],
+        "quantization": "int8", "checksum": "sha256:deadbeef",
+        "margin": [
+            {"threshold": 0.2, "accuracy": 0.71, "coverage": 0.80},
+            {"threshold": 0.4, "accuracy": 0.75, "coverage": 0.59}
+        ],
+        "base": "jhu-clsp/mmBERT-base", "dataset": "sha256:cafe", "model_version": "3"
+    }"#;
+
+    /// A manifest written to this build's own shape reads back whole. Every field is
+    /// one an operator or a log line needs; none of it transfers between builds.
+    #[test]
+    fn a_manifest_of_this_schema_round_trips() {
+        let dir = artifact_with(
+            "full-gate",
+            [("gate.json", FULL.as_bytes()), ("a", b""), ("b", b"")],
+        );
+        let gate = read_gate(&dir.join("gate.json")).expect("a manifest");
+        assert_eq!(gate.temperature.value(), 1.2);
+        assert_eq!(gate.max_length, 256);
+        assert_eq!(gate.quantization.as_deref(), Some("int8"));
+        assert_eq!(gate.base.as_deref(), Some("jhu-clsp/mmBERT-base"));
+        assert_eq!(gate.model_version.as_deref(), Some("3"));
+        assert_eq!(gate.margin.len(), 2);
+        assert_eq!(gate.margin[0].threshold, 0.2);
+        assert_eq!(gate.margin[1].accuracy, 0.75);
+        assert_eq!(gate.margin[1].coverage, 0.59);
+    }
+
+    /// M13's manifest carried none of this and must still open: a gateway that refused
+    /// every artefact built before it could check them would refuse the one on disk.
+    #[test]
+    fn a_manifest_from_before_any_of_this_still_reads() {
+        let old = br#"{"temperature": 1.3, "max_length": 256, "version": 1,
+            "classes": ["easy", "routine", "median", "hard", "research"]}"#;
+        let dir = artifact_with("old-gate", [("gate.json", old), ("a", b""), ("b", b"")]);
+        let gate = read_gate(&dir.join("gate.json")).expect("a manifest");
+        assert_eq!(gate.quantization, None);
+        assert!(gate.margin.is_empty(), "no table is not a broken table");
+        assert_eq!(gate.model_version, None);
+    }
+
+    /// A schema this build does not read is refused whole rather than read for the
+    /// keys it happens to recognise.
+    #[test]
+    fn a_manifest_schema_this_build_does_not_read_is_refused() {
+        let ahead = br#"{"version": 99, "temperature": 1.3, "max_length": 256,
+            "classes": ["easy", "routine", "median", "hard", "research"]}"#;
+        let dir = artifact_with("ahead-gate", [("gate.json", ahead), ("a", b""), ("b", b"")]);
+        assert!(matches!(
+            read_gate(&dir.join("gate.json")),
+            Err(ClassifyError::ArtifactSchema { found: 99, .. })
+        ));
+    }
+
+    /// Weights that are not the weights the manifest was written for: a truncated
+    /// download, a half-replaced file, an artefact swapped under a deployment. Every
+    /// one of them routes by a gate fitted to something else, silently, unless this
+    /// says so.
+    #[test]
+    fn weights_the_manifest_was_not_written_for_are_refused() {
+        let dir = artifact_with(
+            "checksum",
+            [("model.onnx", b"not the weights"), ("a", b""), ("b", b"")],
+        );
+        let model = dir.join("model.onnx");
+        let named = digest(&model).expect("a digest of what is there");
+
+        check_weights(Some(&named), &model).expect("the digest it actually has");
+        check_weights(Some(&format!("sha256:{named}")), &model).expect("the prefix is optional");
+        let refused = check_weights(Some("sha256:0000"), &model).expect_err("a wrong digest");
+        let ClassifyError::ArtifactChecksum { named: said, found } = refused else {
+            panic!("refused for the wrong reason: {refused}")
+        };
+        assert_eq!(said, "0000");
+        assert_eq!(found, named, "the error says what the file actually is");
+    }
+
+    /// A manifest naming no digest has nothing to disagree with. Refusing it would
+    /// refuse every artefact built before this gateway could check one.
+    #[test]
+    fn weights_no_manifest_speaks_for_are_not_refused() {
+        let dir = artifact_with(
+            "unchecked",
+            [("model.onnx", b"whatever"), ("a", b""), ("b", b"")],
+        );
+        check_weights(None, &dir.join("model.onnx")).expect("nothing claimed, nothing refused");
     }
 
     /// A throwaway artefact directory of the named shape, for the loading-failure

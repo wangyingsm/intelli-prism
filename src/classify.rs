@@ -8,7 +8,7 @@
 
 #[cfg(feature = "classifier")]
 mod judge {
-    use ip_classify::runtime::Classifier as Encoder;
+    use ip_classify::runtime::{Classifier as Encoder, Gate as Manifest, Measured};
     use ip_classify::{Classifier, Confidence, Gate};
     use ip_config::DifficultyConfig;
     use ip_core::Difficulty;
@@ -62,6 +62,8 @@ mod judge {
                 None => Encoder::open(&config.artifact),
             }
             .map_err(|error| error.to_string())?;
+            said(encoder.gate());
+            advise(encoder.gate(), config.confidence);
             let gate = Classifier::new(
                 encoder.gate().temperature,
                 Confidence::new(config.confidence).map_err(|error| error.to_string())?,
@@ -108,6 +110,85 @@ mod judge {
         }
     }
 
+    /// What was loaded, in the one line an operator reads when a gateway comes up.
+    ///
+    /// "Classifier loaded" says nothing worth saying: with two quantizations of one
+    /// model in circulation, each with its own fitted temperature, which one came up
+    /// is the thing an operator needs to be able to check against what they meant to
+    /// deploy.
+    fn said(gate: &Manifest) {
+        let loaded = loaded(gate);
+        tracing::info!(
+            build = loaded.build,
+            temperature = loaded.temperature,
+            model = loaded.model,
+            base = loaded.base,
+            "classifier loaded"
+        );
+    }
+
+    /// What that line says, as values a test can read: an artefact from before builds
+    /// were named still has to produce a line, and a word standing in for an absent
+    /// field is better than a blank an operator reads as a bug.
+    struct Loaded<'a> {
+        build: &'a str,
+        temperature: f64,
+        model: &'a str,
+        base: &'a str,
+    }
+
+    fn loaded(gate: &Manifest) -> Loaded<'_> {
+        Loaded {
+            build: gate.quantization.as_deref().unwrap_or("unnamed"),
+            temperature: gate.temperature.value(),
+            model: gate.model_version.as_deref().unwrap_or("unversioned"),
+            base: gate.base.as_deref().unwrap_or("unnamed"),
+        }
+    }
+
+    /// How far below the best the table knows a threshold may be rated before it is
+    /// worth saying anything. Under this, the difference is a test split's noise.
+    const WORTH_SAYING: f64 = 0.05;
+
+    /// The row nearest the configured threshold and the best row in the table, when
+    /// the first is rated materially worse than the second — and nothing otherwise.
+    ///
+    /// Separated from the saying so it can be tested: a warning nothing asserts is a
+    /// warning that can stop firing without anyone noticing.
+    fn poorly_rated(gate: &Manifest, confidence: f64) -> Option<(&Measured, &Measured)> {
+        let nearest = gate.margin.iter().min_by(|one, two| {
+            (one.threshold - confidence)
+                .abs()
+                .total_cmp(&(two.threshold - confidence).abs())
+        })?;
+        let best = gate
+            .margin
+            .iter()
+            .max_by(|one, two| one.accuracy.total_cmp(&two.accuracy))?;
+        (nearest.accuracy + WORTH_SAYING < best.accuracy).then_some((nearest, best))
+    }
+
+    /// Says so when the artefact's own measurements rate the configured threshold
+    /// poorly, and then dispatches at it anyway.
+    ///
+    /// The table is advisory by ruling. It was measured on a test split; an operator
+    /// may know something about their traffic that the split does not, and a gateway
+    /// that overrode them would be substituting a stranger's data for their judgement.
+    /// Saying nothing, though, leaves a threshold nobody checked looking deliberate.
+    fn advise(gate: &Manifest, confidence: f64) {
+        if let Some((nearest, best)) = poorly_rated(gate, confidence) {
+            tracing::warn!(
+                threshold = confidence,
+                accuracy = nearest.accuracy,
+                coverage = nearest.coverage,
+                better = best.threshold,
+                better_accuracy = best.accuracy,
+                "the configured margin is one this artefact was measured to do poorly at; \
+                 dispatching at it as configured"
+            );
+        }
+    }
+
     impl ip_gateway::Classifier for RuntimeJudge {
         fn classify(&self, text: &str) -> Option<Difficulty> {
             // Busy means now, not eventually; the type says why.
@@ -143,6 +224,111 @@ mod judge {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn manifest(margin: Vec<ip_classify::runtime::Measured>) -> Manifest {
+            Manifest {
+                temperature: ip_classify::Temperature::new(1.3).unwrap(),
+                max_length: 256,
+                classes: all_classes(),
+                quantization: Some("embed8".to_owned()),
+                margin,
+                base: Some("jhu-clsp/mmBERT-base".to_owned()),
+                model_version: Some("1".to_owned()),
+            }
+        }
+
+        fn measured(threshold: f64, accuracy: f64) -> ip_classify::runtime::Measured {
+            ip_classify::runtime::Measured {
+                threshold,
+                accuracy,
+                coverage: 0.5,
+            }
+        }
+
+        /// "Classifier loaded" says nothing worth reading. With two quantizations of
+        /// one model in circulation, each with its own fitted temperature, which one
+        /// came up is the thing an operator checks against what they meant to deploy.
+        #[test]
+        fn the_line_an_operator_reads_names_the_build_and_its_temperature() {
+            let gate = manifest(Vec::new());
+            let named = loaded(&gate);
+            assert_eq!(named.build, "embed8");
+            assert_eq!(named.temperature, 1.3);
+            assert_eq!(named.model, "1");
+            assert_eq!(named.base, "jhu-clsp/mmBERT-base");
+
+            // An artefact from before any of this still produces a line, with a word
+            // where a field would be rather than a blank that reads as a fault.
+            let mut old = manifest(Vec::new());
+            old.quantization = None;
+            old.model_version = None;
+            old.base = None;
+            let named = loaded(&old);
+            assert_eq!(
+                (named.build, named.model, named.base),
+                ("unnamed", "unversioned", "unnamed")
+            );
+            assert_eq!(named.temperature, 1.3, "the temperature is always there");
+        }
+
+        /// A warning on every startup is a warning nobody reads, so what the table
+        /// rates well is passed over in silence.
+        #[test]
+        fn a_threshold_the_artefact_rates_well_is_passed_over_in_silence() {
+            let table = vec![
+                measured(0.2, 0.71),
+                measured(0.4, 0.79),
+                measured(0.6, 0.84),
+            ];
+            let gate = manifest(table);
+            assert!(
+                poorly_rated(&gate, 0.6).is_none(),
+                "the best row is not poor"
+            );
+            assert!(
+                poorly_rated(&gate, 0.4).is_none(),
+                "0.79 against a best of 0.84 is inside a test split's noise"
+            );
+        }
+
+        /// A table the artefact does not carry cannot rate anything, and its absence
+        /// is not a fault: the gateway runs on the operator's threshold either way.
+        #[test]
+        fn a_threshold_no_table_speaks_for_is_passed_over_too() {
+            assert!(poorly_rated(&manifest(Vec::new()), 0.01).is_none());
+        }
+
+        /// A threshold measured far below the best the table knows is named, with the
+        /// row that would do better — and the dispatch still happens at the one the
+        /// operator configured, which is the ruling.
+        #[test]
+        fn a_threshold_the_artefact_rates_poorly_is_said_out_loud() {
+            let gate = manifest(vec![measured(0.2, 0.60), measured(0.6, 0.84)]);
+            let (nearest, best) = poorly_rated(&gate, 0.2).expect("0.60 against 0.84 is poor");
+            assert_eq!(
+                nearest.threshold, 0.2,
+                "the row nearest what was configured"
+            );
+            assert_eq!(best.threshold, 0.6, "and the row that would do better");
+
+            // Advising is not enforcing. That the gateway then runs at the threshold
+            // it was configured with is what `a_real_artifact_opens_and_answers_
+            // through_the_judge` shows, against the artefact's own manifest.
+            advise(&gate, 0.2);
+        }
+
+        /// The nearest row is the nearest, not the one below: a threshold between two
+        /// is rated by whichever it actually sits closest to.
+        #[test]
+        fn the_row_a_threshold_is_rated_by_is_the_nearest_one() {
+            let gate = manifest(vec![measured(0.2, 0.60), measured(0.9, 0.95)]);
+            let (nearest, _) = poorly_rated(&gate, 0.4).expect("0.4 is nearer 0.2 than 0.9");
+            assert_eq!(nearest.threshold, 0.2);
+            assert!(
+                poorly_rated(&gate, 0.8).is_none(),
+                "0.8 is nearest 0.9, which is the best row there is"
+            );
+        }
 
         fn all_classes() -> Vec<String> {
             Difficulty::ALL

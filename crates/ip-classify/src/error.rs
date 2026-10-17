@@ -62,6 +62,34 @@ pub enum ClassifyError {
     #[error("the classifier artefact file {0} is not readable as what it claims")]
     ArtifactUnreadable(String),
 
+    /// The manifest declares a schema this build does not read. Refused rather than
+    /// read for the fields it happens to recognise: a manifest written to a later
+    /// shape may mean something different by the same key, and guessing at it is how
+    /// a gate ends up calibrated for an artefact nobody shipped.
+    #[error(
+        "the classifier artefact declares manifest schema {found}, and this build reads {carried}"
+    )]
+    ArtifactSchema {
+        /// What the manifest said.
+        found: u64,
+        /// What this build knows, listed.
+        carried: String,
+    },
+
+    /// The weights are not the weights the manifest was written for. A truncated
+    /// download, a half-replaced file, an artefact swapped under a running deployment:
+    /// each would route by a gate fitted to something else, which is silent, so this
+    /// is loud instead.
+    #[error(
+        "the classifier weights do not match the manifest: it names {named}, the file is {found}"
+    )]
+    ArtifactChecksum {
+        /// The digest the manifest claims.
+        named: String,
+        /// The digest the file actually has.
+        found: String,
+    },
+
     /// The graph would not open: corrupted, foreign, or built for another runtime.
     #[error("the classifier graph would not open: {0}")]
     GraphRefused(String),
