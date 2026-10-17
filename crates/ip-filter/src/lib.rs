@@ -23,9 +23,11 @@ pub(crate) mod check;
 pub mod detect;
 pub mod error;
 pub mod kind;
+pub mod redact;
 pub mod secret;
 
 pub use detect::{Detectors, Finding};
 pub use error::FilterError;
 pub use kind::Kind;
+pub use redact::{Redaction, redact};
 pub use secret::{Check, Match, Secret};

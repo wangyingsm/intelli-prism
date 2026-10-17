@@ -14,6 +14,7 @@ serde = ["dep:serde"]
 [dependencies]
 thiserror.workspace = true
 regex = "1.13.1"
+serde_json.workspace = true
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
