@@ -7,9 +7,11 @@ use tokio::sync::mpsc;
 
 use crate::body::{BoxError, ChannelBody, GatewayBody};
 use crate::error::ProcessorError;
+use crate::filter::Filtering;
 use crate::processor::BodyProcessor;
 use ip_core::Dialect;
-use ip_protocol::{Reading, Writing};
+use ip_filter::Trickle;
+use ip_protocol::{Event, Reading, Writing};
 
 /// Events a slow caller may leave waiting before the upstream read is held back.
 const BUFFERED_EVENTS: usize = 16;
@@ -149,6 +151,171 @@ async fn cross_events(
         }
     }
     true
+}
+
+/// Takes out of a streamed answer what must not leave, as it streams.
+///
+/// A model writes a secret token by token, so the text is held back a window at a time
+/// and let out behind the stream. Everything that is not text — a tool call, a stop, a
+/// cost — flushes whatever is held first, so nothing a caller reads arrives out of the
+/// order the model said it in.
+///
+/// Events go through the canonical form to be read and written again, so a family's own
+/// fields that the canonical form does not carry are not carried here either. That is
+/// the price of filtering a stream, it applies only when filtering is switched on, and
+/// an event the reader makes nothing of is forwarded exactly as it arrived rather than
+/// dropped.
+pub(crate) fn filtered_events(
+    body: GatewayBody,
+    speaks: Dialect,
+    filtering: Arc<Filtering>,
+) -> GatewayBody {
+    let (sender, receiver) = mpsc::channel(BUFFERED_EVENTS);
+    tokio::spawn(sift(body, speaks, filtering, sender));
+    ChannelBody::new(receiver).boxed_unsync()
+}
+
+async fn sift(mut body: GatewayBody, speaks: Dialect, filtering: Arc<Filtering>, sender: Sender) {
+    let mut reading = Reading::new(speaks);
+    let mut writing = Writing::new(speaks);
+    let mut trickle = Trickle::new(filtering.detectors(), filtering.window());
+    let mut pending = BytesMut::new();
+    let mut going = true;
+    while going {
+        let Some(frame) = body.frame().await else {
+            break;
+        };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        pending.extend_from_slice(&data);
+        going = sift_events(
+            &mut pending,
+            false,
+            &mut reading,
+            &mut writing,
+            &mut trickle,
+            &sender,
+        )
+        .await;
+    }
+    if going {
+        going = sift_events(
+            &mut pending,
+            true,
+            &mut reading,
+            &mut writing,
+            &mut trickle,
+            &sender,
+        )
+        .await;
+    }
+    // Held text goes before anything that ends the answer, and before the reader's own
+    // last word: text a caller never receives is a truncated answer, which is a worse
+    // failure than one that was not filtered.
+    if going {
+        going = send_text(trickle.flush(), &mut writing, &sender).await;
+    }
+    if going {
+        for event in reading.end() {
+            if !send_event(&writing.event(&event), &sender).await {
+                break;
+            }
+        }
+        send_event(&writing.end(), &sender).await;
+    }
+    let found = trickle.found();
+    if !found.is_empty() || trickle.overran() {
+        // The count cannot ride the answer's headers, which went out before its first
+        // event, so this line is where an operator reads what a stream gave up.
+        tracing::info!(
+            redacted = %found.said(),
+            overran = trickle.overran(),
+            "a streamed answer was filtered",
+        );
+    }
+}
+
+/// Filters every complete event waiting in the buffer. False once the stream has to stop.
+async fn sift_events(
+    pending: &mut BytesMut,
+    at_end: bool,
+    reading: &mut Reading,
+    writing: &mut Writing,
+    trickle: &mut Trickle<'_>,
+    sender: &Sender,
+) -> bool {
+    while let Some(end) = event_end(pending, at_end) {
+        let block = pending.split_to(end);
+        // Only a whole event is read, so no split can land inside a character.
+        let Ok(text) = std::str::from_utf8(&block) else {
+            continue;
+        };
+        let read = reading.event(text);
+        if read.is_empty() {
+            // A keep-alive, or something this reader makes nothing of. Either way it is
+            // the upstream's own bytes and they go on as they came.
+            if sender.send(Ok(Frame::data(block.freeze()))).await.is_err() {
+                return false;
+            }
+            continue;
+        }
+        for event in read {
+            if !sift_event(event, writing, trickle, sender).await {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// One canonical event, with its text held back and everything else flushing it first.
+async fn sift_event(
+    event: Event,
+    writing: &mut Writing,
+    trickle: &mut Trickle<'_>,
+    sender: &Sender,
+) -> bool {
+    match event {
+        Event::Text(text) => send_text(trickle.push(&text), writing, sender).await,
+        Event::ToolCall {
+            id,
+            name,
+            arguments,
+        } => {
+            if !send_text(trickle.flush(), writing, sender).await {
+                return false;
+            }
+            let arguments = trickle.value(&arguments).unwrap_or(arguments);
+            let call = Event::ToolCall {
+                id,
+                name,
+                arguments,
+            };
+            send_event(&writing.event(&call), sender).await
+        }
+        other => {
+            if !send_text(trickle.flush(), writing, sender).await {
+                return false;
+            }
+            send_event(&writing.event(&other), sender).await
+        }
+    }
+}
+
+/// Sends text on as an event of its own, when there is any to send.
+async fn send_text(text: String, writing: &mut Writing, sender: &Sender) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    send_event(&writing.event(&Event::Text(text)), sender).await
 }
 
 /// Sends one family's event text on, when there is any. False once the caller is gone.

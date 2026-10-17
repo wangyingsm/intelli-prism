@@ -389,7 +389,7 @@ impl Gateway {
             forwarded
                 .process_response_headers(chains.response_headers())
                 .await?
-                .process_response_body(chains, self.filtering.as_deref())
+                .process_response_body(chains, self.filtering.as_ref())
                 .await
         }
         .instrument(stage_span!(INGRESS_RESPONSE, followed))
@@ -4530,11 +4530,17 @@ mod tests {
         );
     }
 
-    /// A streamed answer is not filtered yet, and the answer says so rather than
-    /// letting an operator believe it was looked at.
+    /// A streamed answer written one token at a time, which is how a model writes a
+    /// key: no single event holds it, and the filter has to join them to see it.
     #[tokio::test]
-    async fn a_streamed_answer_says_it_was_not_scanned() {
-        const STREAMED: [&[u8]; 2] = [b"data: {\"a\":1}\n\n", b"data: [DONE]\n\n"];
+    async fn a_secret_streamed_token_by_token_is_caught() {
+        const STREAMED: [&[u8]; 5] = [
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"my key is sk-\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"abcdefg\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hij1234 and that is all\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            b"data: [DONE]\n\n",
+        ];
         let detectors = ip_filter::Detectors::defaults().unwrap();
         let gateway = Gateway::new(
             table(),
@@ -4551,8 +4557,118 @@ mod tests {
             .unwrap();
         assert_eq!(
             answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "streamed",
+            "the count is not known when the headers go out"
+        );
+        let said = body_of(answer).await;
+        assert!(
+            !said.contains("sk-abcdefghij1234"),
+            "the key streamed out: {said}"
+        );
+        assert!(
+            !said.contains("abcdefghij1234"),
+            "part of it streamed out: {said}"
+        );
+        assert!(said.contains("[redacted:openai-key:1]"), "{said}");
+        assert!(
+            said.contains("and that is all"),
+            "the rest of the answer is lost: {said}"
+        );
+    }
+
+    /// Nothing may be swallowed. Text held back and never sent is an answer the caller
+    /// never finishes reading, which is a worse failure than an unfiltered one.
+    #[tokio::test]
+    async fn a_clean_streamed_answer_arrives_whole() {
+        const STREAMED: [&[u8]; 4] = [
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"the quick \"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"brown fox\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            b"data: [DONE]\n\n",
+        ];
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            Arc::new(Streaming(&STREAMED)),
+        )
+        .filtering(Arc::new(crate::filter::Filtering::new(detectors)));
+        let said = body_of(
+            gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic", r#"{"q":"hello"}"#),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(said.contains("the quick "), "{said}");
+        assert!(said.contains("brown fox"), "{said}");
+        assert!(said.contains("[DONE]"), "the stream never ended: {said}");
+    }
+
+    /// A window of zero holds nothing, so the stream is filtered event by event and
+    /// the header says what that is worth.
+    #[tokio::test]
+    async fn a_stream_with_nothing_held_back_says_it_was_not_scanned() {
+        const STREAMED: [&[u8]; 2] = [
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            b"data: [DONE]\n\n",
+        ];
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            Arc::new(Streaming(&STREAMED)),
+        )
+        .filtering(Arc::new(
+            crate::filter::Filtering::new(detectors).holding(0),
+        ));
+        let answer = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"hello"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
             "unscanned: streamed"
         );
+    }
+
+    /// An event the reader makes nothing of goes on exactly as it arrived. A filter
+    /// that silently eats events is worse than one that misses a secret.
+    #[tokio::test]
+    async fn an_event_the_reader_cannot_place_is_forwarded_untouched() {
+        const STREAMED: [&[u8]; 3] = [
+            b": keep-alive\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            b"data: [DONE]\n\n",
+        ];
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            Arc::new(Streaming(&STREAMED)),
+        )
+        .filtering(Arc::new(crate::filter::Filtering::new(detectors)));
+        let said = body_of(
+            gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic", r#"{"q":"hello"}"#),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            said.contains(": keep-alive"),
+            "the keep-alive was eaten: {said}"
+        );
+        assert!(said.contains("hi"), "{said}");
     }
 
     /// An answer that is not json cannot be walked, and that is said too.

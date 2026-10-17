@@ -25,7 +25,7 @@ use crate::dispatch::{Dispatcher, Dispatching, may_hold, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::filter::{self, Filtered, Filtering, Unscanned};
 use crate::processor::{HeaderProcessor, ProcessorChain};
-use crate::sse::{crossed_events, stream_chunks};
+use crate::sse::{crossed_events, filtered_events, stream_chunks};
 use crate::stage::{
     Answered, Authorized, BodyProcessed, Dispatched, Forwarded, HeadersProcessed, Received,
     ResponseBodyProcessed, ResponseHeadersProcessed, Routed, Stage, StageName,
@@ -452,6 +452,13 @@ impl Flow<BodyProcessed> {
         // other rule — which is every rule that existed before this — reaches none of
         // this and forwards the bytes it was handed, untouched.
         let crossing = Crossing::of(resolution.rule());
+        // What leaves is the caller's family where a rule bridges two, and whatever the
+        // upstream speaks where it does not.
+        let speaks = resolution
+            .rule()
+            .caller_speaks
+            .or(resolution.rule().upstream_speaks)
+            .unwrap_or(Dialect::OpenAi);
         let mut request = request;
         let mut lost = Dropped::none();
         if let Some(crossing) = crossing {
@@ -482,6 +489,7 @@ impl Flow<BodyProcessed> {
                     raced: Hedge::default(),
                     dispatched,
                     filtered,
+                    speaks,
                 },
             });
         }
@@ -502,6 +510,7 @@ impl Flow<BodyProcessed> {
             outcome.held.response = crossed_home(crossing, answered, lost).await?;
         }
         outcome.held.filtered = filtered;
+        outcome.held.speaks = speaks;
         remember(
             turns,
             &outcome.context,
@@ -998,21 +1007,29 @@ impl Flow<ResponseHeadersProcessed> {
     pub async fn process_response_body(
         mut self,
         processors: &ProcessorChain,
-        filtering: Option<&Filtering>,
+        filtering: Option<&Arc<Filtering>>,
     ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
         if is_event_stream(self.held.response.headers()) {
-            // Each event is filtered on its own or not at all, and a secret split
-            // across two of them is seen by neither. Said rather than passed over.
-            if filtering.is_some() {
-                self.held
-                    .filtered
-                    .absorb(&Filtered::unscanned(Unscanned::Streamed));
-            }
             if !processors.response_chunk().is_empty() {
                 self.held.response.headers_mut().remove(CONTENT_LENGTH);
                 let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
                 *self.held.response.body_mut() =
                     stream_chunks(body, processors.response_chunk().to_vec());
+            }
+            // The chunk chain first and the filter after it, as on the request: what a
+            // plugin adds to an event is looked at too.
+            if let Some(filtering) = filtering {
+                self.held.response.headers_mut().remove(CONTENT_LENGTH);
+                let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
+                *self.held.response.body_mut() =
+                    filtered_events(body, self.held.speaks, Arc::clone(filtering));
+                // What a stream gave up is not known when its headers go out, so the
+                // header says it was looked at and the count goes to the log.
+                self.held.filtered.absorb(&if filtering.window() == 0 {
+                    Filtered::unscanned(Unscanned::Streamed)
+                } else {
+                    Filtered::streamed()
+                });
             }
             filter::say(self.held.response.headers_mut(), &self.held.filtered);
             return Ok(Flow {
@@ -1268,6 +1285,7 @@ async fn race(
             raced,
             dispatched,
             filtered: Filtered::clean(),
+            speaks: Dialect::OpenAi,
         },
     })
 }

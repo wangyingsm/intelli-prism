@@ -15,8 +15,10 @@
 //! A match longer than the window outruns it and goes out in pieces. That is what a
 //! window means, it is reported by [`Trickle::overran`], and the remedy is a larger one.
 
+use serde_json::Value;
+
 use crate::detect::{Detectors, Finding};
-use crate::redact::{Redaction, Tally};
+use crate::redact::{Redaction, Tally, with_tally};
 
 /// The most text held at once, whatever the window, so a match that never finishes
 /// cannot grow the carry without end.
@@ -86,6 +88,14 @@ impl<'a> Trickle<'a> {
         let findings = self.detectors.find(&self.carry);
         let boundary = self.carry.len();
         self.release(boundary, &findings)
+    }
+
+    /// A whole value — a tool call's arguments — redacted against this stream's own
+    /// ordinals, or nothing when it held none. Text and tool calls share the numbering,
+    /// so one secret reads as one placeholder wherever in the answer it turns up.
+    #[must_use]
+    pub fn value(&mut self, body: &Value) -> Option<Value> {
+        with_tally(self.detectors, body, &mut self.tally, &mut self.found)
     }
 
     /// What has been replaced so far.

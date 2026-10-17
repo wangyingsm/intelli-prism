@@ -2,7 +2,7 @@ use std::fmt;
 
 use http::{Request, Response};
 
-use ip_core::{Decider, Difficulty, Hedge, Replica};
+use ip_core::{Decider, Dialect, Difficulty, Hedge, Replica};
 
 use crate::body::GatewayBody;
 use crate::filter::Filtered;
@@ -145,6 +145,10 @@ pub struct Answered {
     /// What the filter took out of the request, carried here so the answer's own
     /// filtering adds to it and one header reports the exchange.
     pub filtered: Filtered,
+    /// The family the answer is written in by the time it reaches the response stages:
+    /// the caller's own where a rule bridged two, and the upstream's where it did not.
+    /// A streamed answer has to be read back to be filtered, and this says how.
+    pub speaks: Dialect,
 }
 
 /// What a request was dispatched at, and which level of the margin named it.

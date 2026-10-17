@@ -28,8 +28,8 @@ pub enum Unscanned {
     /// Not json. Every body this gateway is for is json, and walking the strings of
     /// something else would mean guessing where its text begins and ends.
     NotJson,
-    /// Answered as a stream. Each event is filtered on its own, and a secret split
-    /// across two of them is seen by neither.
+    /// Answered as a stream with nothing held back, so each event was filtered alone
+    /// and a secret written across two of them was seen by neither.
     Streamed,
 }
 
@@ -56,6 +56,7 @@ impl Unscanned {
 pub struct Filtered {
     found: Redaction,
     unscanned: BTreeSet<Unscanned>,
+    streamed: bool,
 }
 
 impl Filtered {
@@ -70,7 +71,18 @@ impl Filtered {
     pub fn redacted(found: Redaction) -> Self {
         Self {
             found,
-            unscanned: BTreeSet::new(),
+            ..Self::default()
+        }
+    }
+
+    /// Filtered as it streamed. How much it gave up is not known when the headers go
+    /// out, so the header says only that it was looked at and the count goes to the
+    /// log and the ledger.
+    #[must_use]
+    pub fn streamed() -> Self {
+        Self {
+            streamed: true,
+            ..Self::default()
         }
     }
 
@@ -80,8 +92,8 @@ impl Filtered {
     #[must_use]
     pub fn unscanned(why: Unscanned) -> Self {
         Self {
-            found: Redaction::default(),
             unscanned: [why].into_iter().collect(),
+            ..Self::default()
         }
     }
 
@@ -89,6 +101,7 @@ impl Filtered {
     pub fn absorb(&mut self, other: &Self) {
         self.found.absorb(&other.found);
         self.unscanned.extend(other.unscanned.iter().copied());
+        self.streamed |= other.streamed;
     }
 
     /// What the answer's header should say, or nothing when there is nothing to report.
@@ -100,6 +113,9 @@ impl Filtered {
         let mut parts = Vec::new();
         if !self.found.is_empty() {
             parts.push(self.found.said());
+        }
+        if self.streamed {
+            parts.push("streamed".to_owned());
         }
         parts.extend(self.unscanned.iter().map(|why| why.name().to_owned()));
         (!parts.is_empty()).then(|| parts.join("; "))
@@ -124,13 +140,47 @@ impl Filtered {
 /// resolve to one of these per request.
 pub struct Filtering {
     detectors: Detectors,
+    window: usize,
 }
 
+/// How much of a streamed answer is held back to be looked at.
+///
+/// A secret is written token by token, so it is only seen by holding text until
+/// nothing is still growing into a match. This is what that costs in time to first
+/// token, and it is long enough for every shape that ships except a private key block.
+pub const WINDOW: usize = 256;
+
 impl Filtering {
-    /// Filters with these.
+    /// Filters with these, holding back [`WINDOW`] characters of a streamed answer.
     #[must_use]
     pub const fn new(detectors: Detectors) -> Self {
-        Self { detectors }
+        Self {
+            detectors,
+            window: WINDOW,
+        }
+    }
+
+    /// Holds this many characters of a streamed answer instead.
+    ///
+    /// Zero holds nothing, which filters each event alone: it catches a secret that
+    /// arrives whole in one of them and misses one written across several, which is
+    /// most of them. Honest, and not the default.
+    #[must_use]
+    pub const fn holding(mut self, window: usize) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// The secrets in force.
+    #[must_use]
+    pub const fn detectors(&self) -> &Detectors {
+        &self.detectors
+    }
+
+    /// How much of a streamed answer is held back.
+    #[must_use]
+    pub const fn window(&self) -> usize {
+        self.window
     }
 
     /// The body as it should go on, and what was taken out of it.

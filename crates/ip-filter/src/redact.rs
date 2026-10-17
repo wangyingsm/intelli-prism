@@ -118,15 +118,29 @@ impl Tally {
 /// message rather than what somebody wrote in it.
 #[must_use]
 pub fn redact(detectors: &Detectors, body: &Value) -> Option<(Value, Redaction)> {
+    let mut tally = Tally::default();
+    let mut found = Redaction::default();
+    let rewritten = with_tally(detectors, body, &mut tally, &mut found)?;
+    Some((rewritten, found))
+}
+
+/// The same, numbering against a tally that outlives this body.
+///
+/// A streamed answer redacts its text and its tool calls separately, and one secret
+/// must read as one placeholder across both, so the ordinals are handed in rather than
+/// started afresh.
+pub(crate) fn with_tally(
+    detectors: &Detectors,
+    body: &Value,
+    tally: &mut Tally,
+    found: &mut Redaction,
+) -> Option<Value> {
     // The common request carries no secret at all, so it is asked the cheap question
     // first and never pays for a copy of the tree it does not need.
     if !holds(detectors, body) {
         return None;
     }
-    let mut tally = Tally::default();
-    let mut found = Redaction::default();
-    let rewritten = rewrite(detectors, body, &mut tally, &mut found);
-    Some((rewritten, found))
+    Some(rewrite(detectors, body, tally, found))
 }
 
 /// Whether any string anywhere in this body holds something.
