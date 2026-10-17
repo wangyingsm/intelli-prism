@@ -2912,6 +2912,58 @@ mod tests {
         );
     }
 
+    /// What the operator says and what the caller sent travel in different fields. The
+    /// boundary between them is then the role boundary, which a caller writing inside
+    /// its own text cannot forge — where it could forge any delimiter the two shared
+    /// one message around. Nothing a caller sent reaches the instruction.
+    #[tokio::test]
+    async fn the_instruction_and_the_opening_travel_in_different_fields() {
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream.clone(),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", OPENING_PROMPT)]),
+            ),
+        )
+        .await;
+        let seen = upstream.seen.lock().unwrap();
+        let question = seen
+            .iter()
+            .find(|seen| seen.host.starts_with("arbiter."))
+            .expect("the question went out");
+        let body: serde_json::Value =
+            serde_json::from_slice(&question.body).expect("the question is json");
+        let messages = body["messages"].as_array().expect("it carries messages");
+        assert_eq!(messages.len(), 2, "an instruction and the opening, no more");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        let said = messages[0]["content"].as_str().expect("the instruction");
+        for class in ip_core::Difficulty::ALL {
+            assert!(
+                said.contains(class.rubric()),
+                "{class}'s rubric belongs in the operator's own field"
+            );
+        }
+        assert!(
+            !said.contains(OPENING_PROMPT) && !said.contains("you audit accounts"),
+            "nothing a caller sent may reach the instruction"
+        );
+        assert_eq!(
+            messages[1]["content"].as_str().expect("the opening"),
+            format!("you audit accounts\n\n{OPENING_PROMPT}"),
+            "the user message is the opening and nothing else"
+        );
+    }
+
     /// The question is bounded however long the opening is. The arbiter is asked on the
     /// operator's credential, not the caller's, so a caller that sends a large opening
     /// must not be able to spend a large amount of someone else's money on judging it.
