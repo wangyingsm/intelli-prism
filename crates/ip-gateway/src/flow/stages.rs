@@ -8,6 +8,7 @@ use ip_core::{
     Capability, CapabilityScope, Decider, Dialect, Difficulty, HEDGE_MOST, Hedge, Replica,
     RouteKey, TurnId,
 };
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{Span, field};
@@ -864,6 +865,29 @@ fn named_classes(reply: &str) -> Vec<Difficulty> {
     named
 }
 
+/// How much of an opening is put under judgement. The local classifier rules on 256
+/// tokens and the arbiter is asked the same question, so past this the arbiter is paid
+/// to read a caller's bulk rather than to rule on it. The only bound otherwise is the
+/// mebibyte a held body may be, and that one is about what the gateway keeps in memory,
+/// not about a question sent to a third party on the operator's credential.
+const JUDGED_CEILING: usize = 8 * 1024;
+
+/// The opening as the question carries it: whole, or cut on a character boundary and
+/// told it was cut, so a model does not read a severed sentence as all that was asked.
+fn judged(text: &str) -> Cow<'_, str> {
+    if text.len() <= JUDGED_CEILING {
+        return Cow::Borrowed(text);
+    }
+    let mut end = JUDGED_CEILING;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!(
+        "{}\n[cut here; the rest is not judged]",
+        &text[..end]
+    ))
+}
+
 /// The question, generated from the taxonomy itself: every class with its rubric line,
 /// the work-not-length guard, the one-word instruction, and beneath a delimiter the
 /// opening — data judged, never instruction. A hand-written prompt could drift from
@@ -877,6 +901,7 @@ fn question(text: &str) -> String {
         .map(|class| class.rubric())
         .collect::<Vec<_>>()
         .join("\n");
+    let text = judged(text);
     format!(
         "Judge how much work the request below implies for a large language model, \
          using exactly these definitions:\n\n{rubric}\n\nJudge the work the request \
@@ -1238,6 +1263,45 @@ mod tests {
     use http::{HeaderValue, StatusCode};
     use ip_core::Protocol;
     use std::time::Duration;
+
+    /// An opening within the ceiling is judged whole, and the question carries no
+    /// marker to say otherwise.
+    #[test]
+    fn an_opening_the_ceiling_holds_is_judged_whole() {
+        let text = "x".repeat(JUDGED_CEILING);
+        assert_eq!(judged(&text), text);
+        assert!(!question(&text).contains("cut here"));
+    }
+
+    /// Past the ceiling the question carries the ceiling and no more, which is what
+    /// bounds the bill: the arbiter is asked on the operator's credential, so a caller
+    /// that sends a megabyte must not spend a megabyte of someone else's money.
+    #[test]
+    fn an_opening_past_the_ceiling_is_cut_and_says_so() {
+        let text = "x".repeat(JUDGED_CEILING * 4);
+        let judged = judged(&text);
+        assert!(
+            judged.len() < JUDGED_CEILING + 64,
+            "the cut must bound the question, not merely mark it"
+        );
+        assert!(judged.contains("cut here"));
+        let asked = question(&text);
+        assert!(
+            asked.len() < JUDGED_CEILING + 2048,
+            "the whole question is the rubric plus a bounded opening"
+        );
+    }
+
+    /// The cut lands on a character boundary, so an opening of multi-byte text is cut
+    /// rather than panicking the request it was only asked about.
+    #[test]
+    fn a_cut_falls_between_characters() {
+        // Three bytes each, so the ceiling cannot land on a boundary of its own accord.
+        let text = "难".repeat(JUDGED_CEILING);
+        let judged = judged(&text);
+        assert!(judged.starts_with('难'));
+        assert!(judged.contains("cut here"));
+    }
 
     /// The property the one-class rule stands on: the rubric line for a class, fed
     /// through the very scan a reply goes through, names exactly that one class. A

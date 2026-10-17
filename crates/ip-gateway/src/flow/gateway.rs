@@ -2912,6 +2912,51 @@ mod tests {
         );
     }
 
+    /// The question is bounded however long the opening is. The arbiter is asked on the
+    /// operator's credential, not the caller's, so a caller that sends a large opening
+    /// must not be able to spend a large amount of someone else's money on judging it.
+    /// A held body may be a mebibyte, which bounds what the gateway keeps, not what it
+    /// forwards to a third party.
+    #[tokio::test]
+    async fn a_long_opening_is_judged_on_a_bounded_question() {
+        let long = "please audit the quarterly accounts. ".repeat(2_000);
+        assert!(
+            long.len() > 64 * 1024,
+            "the opening must exceed the ceiling"
+        );
+        let upstream = asking_only(answered(RULING));
+        let judge = Arc::new(crate::flow::fixtures::CountingClassifier::silent());
+        let (gateway, mut recorded) = arbitrating_gateway(
+            judge,
+            upstream.clone(),
+            Some(arbiter(std::time::Duration::from_secs(5))),
+        );
+        asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic/messages",
+                &conversation_with_system("you audit accounts", &[("user", &long)]),
+            ),
+        )
+        .await;
+        let seen = upstream.seen.lock().unwrap();
+        let question = seen
+            .iter()
+            .find(|seen| seen.host.starts_with("arbiter."))
+            .expect("the question went out");
+        assert!(
+            question.body.len() < 16 * 1024,
+            "the question grew with the opening: {} bytes",
+            question.body.len()
+        );
+        assert!(
+            String::from_utf8_lossy(&question.body).contains("cut here"),
+            "a cut opening says it was cut"
+        );
+    }
+
     /// With the rubric in the prompt, a model that restates its instructions before
     /// answering puts class words on the page that are not its ruling. A reply naming
     /// two classes names none.
