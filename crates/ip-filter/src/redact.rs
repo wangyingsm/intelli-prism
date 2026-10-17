@@ -48,6 +48,20 @@ impl Redaction {
         self.counted.values().sum()
     }
 
+    /// Adds another pass's count to this one, so a request and its answer are reported
+    /// as one tally rather than two a caller has to add up.
+    pub fn absorb(&mut self, other: &Self) {
+        for (kind, count) in &other.counted {
+            *self.counted.entry(kind.clone()).or_insert(0) += count;
+        }
+    }
+
+    /// Whether anything was replaced at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.counted.is_empty()
+    }
+
     /// What was redacted, as a header or a log line says it: `api-key=2, email=1`, the
     /// kinds in a settled order so two gateways word it the same way.
     #[must_use]
@@ -356,6 +370,31 @@ mod tests {
     fn a_redaction_that_found_nothing_says_nothing() {
         let empty = Redaction::default();
         assert_eq!(empty.total(), 0);
+        assert!(empty.is_empty());
         assert_eq!(empty.said(), "");
+    }
+
+    /// A request and its answer are one tally, so a caller reads what was taken out of
+    /// the exchange rather than adding two numbers up.
+    #[test]
+    fn two_passes_add_up_to_one_tally() {
+        let going = json!({"content": "ada@example.com and sk-abcdefghij1234"});
+        let coming = json!({"content": "bob@example.org"});
+        let (_, mut found) = redact(&defaults(), &going).unwrap();
+        let (_, back) = redact(&defaults(), &coming).unwrap();
+        found.absorb(&back);
+        assert_eq!(found.counted()[&named("email")], 2);
+        assert_eq!(found.counted()[&named("openai-key")], 1);
+        assert_eq!(found.total(), 3);
+        assert_eq!(found.said(), "email=2, openai-key=1");
+    }
+
+    #[test]
+    fn absorbing_nothing_changes_nothing() {
+        let body = json!({"content": "ada@example.com"});
+        let (_, mut found) = redact(&defaults(), &body).unwrap();
+        let was = found.clone();
+        found.absorb(&Redaction::default());
+        assert_eq!(found, was);
     }
 }

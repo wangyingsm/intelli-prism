@@ -389,7 +389,7 @@ impl Gateway {
             forwarded
                 .process_response_headers(chains.response_headers())
                 .await?
-                .process_response_body(chains)
+                .process_response_body(chains, self.filtering.as_deref())
                 .await
         }
         .instrument(stage_span!(INGRESS_RESPONSE, followed))
@@ -4322,7 +4322,7 @@ mod tests {
     /// The whole point: the upstream never sees it.
     #[tokio::test]
     async fn a_secret_does_not_reach_the_upstream() {
-        let upstream = FakeUpstream::answering("pong");
+        let upstream = FakeUpstream::answering(r#"{"said":"pong"}"#);
         let gateway = filtering_gateway(upstream.clone());
         let answer = gateway
             .handle(
@@ -4348,7 +4348,7 @@ mod tests {
     #[tokio::test]
     async fn a_clean_body_reaches_the_upstream_byte_for_byte() {
         let body = r#"{"q":"refactor the retry loop",  "n":1}"#;
-        let upstream = FakeUpstream::answering("pong");
+        let upstream = FakeUpstream::answering(r#"{"said":"pong"}"#);
         let answer = filtering_gateway(upstream.clone())
             .handle(context(granted()), request("/anthropic", body))
             .await
@@ -4365,7 +4365,7 @@ mod tests {
     /// and nothing unredacted can ever be served from the cache.
     #[tokio::test]
     async fn the_cache_is_keyed_on_what_was_redacted() {
-        let upstream = FakeUpstream::answering("pong");
+        let upstream = FakeUpstream::answering(r#"{"said":"pong"}"#);
         let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
         let detectors = ip_filter::Detectors::defaults().unwrap();
         let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
@@ -4402,7 +4402,7 @@ mod tests {
                 Ok(Bytes::from(r#"{"q":"sk-abcdefghij1234"}"#))
             }
         }
-        let upstream = FakeUpstream::answering("pong");
+        let upstream = FakeUpstream::answering(r#"{"said":"pong"}"#);
         let detectors = ip_filter::Detectors::defaults().unwrap();
         let chain = ProcessorChain::new().with_request_body(Arc::new(Injects));
         let gateway = Gateway::new(table(), chain, upstream.clone())
@@ -4425,7 +4425,7 @@ mod tests {
     /// rather than letting an operator believe it was looked at.
     #[tokio::test]
     async fn a_body_that_may_not_be_held_goes_unscanned_and_says_so() {
-        let upstream = FakeUpstream::answering("pong");
+        let upstream = FakeUpstream::answering(r#"{"said":"pong"}"#);
         let mut asking = request("/anthropic", r#"{"q":"sk-abcdefghij1234"}"#);
         asking
             .headers_mut()
@@ -4445,12 +4445,130 @@ mod tests {
     #[tokio::test]
     async fn a_gateway_with_no_filter_changes_nothing() {
         let body = r#"{"q":"my key is sk-abcdefghij1234"}"#;
-        let upstream = FakeUpstream::answering("pong");
+        let upstream = FakeUpstream::answering(r#"{"said":"pong"}"#);
         let answer = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
             .handle(context(granted()), request("/anthropic", body))
             .await
             .unwrap();
         assert_eq!(went_upstream(&upstream), body);
         assert!(answer.headers().get(crate::filter::REDACTED).is_none());
+    }
+
+    /// The case a request-side filter cannot reach: the model says back something it
+    /// was never sent in this request, out of its own context or another caller's.
+    #[tokio::test]
+    async fn a_secret_in_the_answer_does_not_reach_the_caller() {
+        let upstream = FakeUpstream::answering(r#"{"said":"your key is sk-abcdefghij1234"}"#);
+        let answer = filtering_gateway(upstream.clone())
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"what is my key"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "openai-key=1"
+        );
+        let said = body_of(answer).await;
+        assert!(
+            !said.contains("sk-abcdefghij1234"),
+            "the key came back: {said}"
+        );
+        assert!(said.contains("[redacted:openai-key:1]"));
+    }
+
+    /// One header for the exchange, with the counts added up, rather than one number
+    /// for the way out and another for the way back.
+    #[tokio::test]
+    async fn a_request_and_its_answer_are_reported_as_one_tally() {
+        let upstream = FakeUpstream::answering(r#"{"said":"ask bob@example.org instead"}"#);
+        let answer = filtering_gateway(upstream)
+            .handle(
+                context(granted()),
+                request(
+                    "/anthropic",
+                    r#"{"q":"mail ada@example.com about sk-abcdefghij1234"}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "email=2, openai-key=1"
+        );
+    }
+
+    /// Nothing unredacted may be stored to be served again, so the answer is filtered
+    /// before it is offered to the cache.
+    #[tokio::test]
+    async fn what_is_cached_is_the_redacted_answer() {
+        let upstream = FakeUpstream::answering(r#"{"said":"key sk-abcdefghij1234"}"#);
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .filtering(Arc::new(crate::filter::Filtering::new(detectors)))
+            .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()));
+        for _ in 0..2 {
+            let answer = gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic", r#"{"q":"hello"}"#),
+                )
+                .await
+                .unwrap();
+            let said = body_of(answer).await;
+            assert!(
+                !said.contains("sk-abcdefghij1234"),
+                "served unredacted: {said}"
+            );
+        }
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            1,
+            "the second was served from the cache"
+        );
+    }
+
+    /// A streamed answer is not filtered yet, and the answer says so rather than
+    /// letting an operator believe it was looked at.
+    #[tokio::test]
+    async fn a_streamed_answer_says_it_was_not_scanned() {
+        const STREAMED: [&[u8]; 2] = [b"data: {\"a\":1}\n\n", b"data: [DONE]\n\n"];
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            Arc::new(Streaming(&STREAMED)),
+        )
+        .filtering(Arc::new(crate::filter::Filtering::new(detectors)));
+        let answer = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"hello"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "unscanned: streamed"
+        );
+    }
+
+    /// An answer that is not json cannot be walked, and that is said too.
+    #[tokio::test]
+    async fn an_answer_that_is_not_json_says_it_was_not_scanned() {
+        let upstream = FakeUpstream::answering("plain words, no json");
+        let answer = filtering_gateway(upstream)
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"hello"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "unscanned: not json"
+        );
     }
 }

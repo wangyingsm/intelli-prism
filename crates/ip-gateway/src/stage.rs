@@ -142,6 +142,9 @@ pub struct Answered {
     /// `dispatched_class` and `decided_by`, and the reason the context speaks for the
     /// class after forward rather than the header reading alone.
     pub dispatched: Dispatched,
+    /// What the filter took out of the request, carried here so the answer's own
+    /// filtering adds to it and one header reports the exchange.
+    pub filtered: Filtered,
 }
 
 /// What a request was dispatched at, and which level of the margin named it.

@@ -285,7 +285,7 @@ impl Flow<HeadersProcessed> {
     async fn filter(&mut self, filtering: &Filtering) -> Result<Filtered, GatewayError> {
         if !may_hold(self.held.request.headers()) {
             tracing::debug!("a body that may not be held went out unscanned");
-            return Ok(Filtered::Unscanned(Unscanned::NotHeld));
+            return Ok(Filtered::unscanned(Unscanned::NotHeld));
         }
         let body = std::mem::replace(self.held.request.body_mut(), crate::body::empty());
         let bytes = collect(StageName::BodyRead, body).await?;
@@ -472,7 +472,6 @@ impl Flow<BodyProcessed> {
             if let Some(crossing) = crossing {
                 response = crossed_home(crossing, response, lost).await?;
             }
-            filter::say(response.headers_mut(), &filtered);
             remember(turns, &self.context, taken.as_ref(), &served);
             return Ok(Flow {
                 context: self.context,
@@ -482,6 +481,7 @@ impl Flow<BodyProcessed> {
                     served,
                     raced: Hedge::default(),
                     dispatched,
+                    filtered,
                 },
             });
         }
@@ -501,7 +501,7 @@ impl Flow<BodyProcessed> {
             );
             outcome.held.response = crossed_home(crossing, answered, lost).await?;
         }
-        filter::say(outcome.held.response.headers_mut(), &filtered);
+        outcome.held.filtered = filtered;
         remember(
             turns,
             &outcome.context,
@@ -985,17 +985,36 @@ impl Flow<Forwarded> {
 }
 
 impl Flow<ResponseHeadersProcessed> {
-    /// Runs the response body chain, or leaves the body untouched when there is none.
+    /// Runs the response body chain, or leaves the body untouched when there is none,
+    /// and then takes out of the answer whatever must not leave.
+    ///
+    /// The answer is filtered for the case the request cannot cover: a model echoing
+    /// back what another caller once told it, or repeating a secret out of its own
+    /// context. It runs before the answer is offered to the cache, so nothing
+    /// unredacted is ever stored to be served again.
+    ///
+    /// What the request and the answer each gave up is reported together, once, on the
+    /// way out.
     pub async fn process_response_body(
         mut self,
         processors: &ProcessorChain,
+        filtering: Option<&Filtering>,
     ) -> Result<Flow<ResponseBodyProcessed>, GatewayError> {
-        if is_event_stream(self.held.response.headers()) && !processors.response_chunk().is_empty()
-        {
-            self.held.response.headers_mut().remove(CONTENT_LENGTH);
-            let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
-            *self.held.response.body_mut() =
-                stream_chunks(body, processors.response_chunk().to_vec());
+        if is_event_stream(self.held.response.headers()) {
+            // Each event is filtered on its own or not at all, and a secret split
+            // across two of them is seen by neither. Said rather than passed over.
+            if filtering.is_some() {
+                self.held
+                    .filtered
+                    .absorb(&Filtered::unscanned(Unscanned::Streamed));
+            }
+            if !processors.response_chunk().is_empty() {
+                self.held.response.headers_mut().remove(CONTENT_LENGTH);
+                let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
+                *self.held.response.body_mut() =
+                    stream_chunks(body, processors.response_chunk().to_vec());
+            }
+            filter::say(self.held.response.headers_mut(), &self.held.filtered);
             return Ok(Flow {
                 context: self.context,
                 held: self.held,
@@ -1011,10 +1030,30 @@ impl Flow<ResponseHeadersProcessed> {
             set_length(self.held.response.headers_mut(), bytes.len());
             *self.held.response.body_mut() = from_bytes(bytes);
         }
+        if let Some(filtering) = filtering {
+            let answered = self.filter_answer(filtering).await?;
+            self.held.filtered.absorb(&answered);
+        }
+        filter::say(self.held.response.headers_mut(), &self.held.filtered);
         Ok(Flow {
             context: self.context,
             held: self.held,
         })
+    }
+
+    /// Reads the answer, takes out what must not leave, and puts back what is left.
+    async fn filter_answer(&mut self, filtering: &Filtering) -> Result<Filtered, GatewayError> {
+        let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
+        let bytes = collect(StageName::ResponseBodyRead, body).await?;
+        let (rewritten, filtered) = filtering.over(&bytes);
+        match rewritten {
+            None => *self.held.response.body_mut() = from_bytes(bytes),
+            Some(rewritten) => {
+                set_length(self.held.response.headers_mut(), rewritten.len());
+                *self.held.response.body_mut() = from_bytes(rewritten);
+            }
+        }
+        Ok(filtered)
     }
 }
 
@@ -1228,6 +1267,7 @@ async fn race(
             served,
             raced,
             dispatched,
+            filtered: Filtered::clean(),
         },
     })
 }
@@ -1505,7 +1545,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(flow.stage(), StageName::ResponseHeaderProcess);
-        let flow = flow.process_response_body(&processors).await.unwrap();
+        let flow = flow.process_response_body(&processors, None).await.unwrap();
         assert_eq!(flow.stage(), StageName::ResponseBodyProcess);
         assert_eq!(body_of(flow.into_response().unwrap()).await, "pong");
     }
@@ -1627,7 +1667,7 @@ mod tests {
             .process_response_headers(processors.response_headers())
             .await
             .unwrap()
-            .process_response_body(&processors)
+            .process_response_body(&processors, None)
             .await
             .unwrap();
         assert_eq!(flow.served().host.as_str(), "two.example.com");

@@ -10,6 +10,8 @@
 //! already walked past, and *before* the response key is taken, so what is cached is
 //! what was redacted rather than what arrived.
 
+use std::collections::BTreeSet;
+
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName};
 use ip_filter::{Detectors, Redaction, redact};
@@ -18,7 +20,7 @@ use ip_filter::{Detectors, Redaction, redact};
 pub const REDACTED: HeaderName = HeaderName::from_static("x-ip-redacted");
 
 /// Why a body was not looked at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Unscanned {
     /// Too large to hold, or travelling in a way that forbids holding it. Reading it
     /// would mean buffering what the gateway has already promised to stream.
@@ -26,6 +28,9 @@ pub enum Unscanned {
     /// Not json. Every body this gateway is for is json, and walking the strings of
     /// something else would mean guessing where its text begins and ends.
     NotJson,
+    /// Answered as a stream. Each event is filtered on its own, and a secret split
+    /// across two of them is seen by neither.
+    Streamed,
 }
 
 impl Unscanned {
@@ -35,42 +40,81 @@ impl Unscanned {
         match self {
             Self::NotHeld => "unscanned: not held",
             Self::NotJson => "unscanned: not json",
+            Self::Streamed => "unscanned: streamed",
         }
     }
 }
 
-/// What the filter made of one body.
+/// What the filter made of a request and its answer together.
+///
+/// It accumulates rather than naming one outcome, because a request and the answer to
+/// it are filtered separately and reported once: a caller reads what was taken out of
+/// the exchange, not two numbers to add up. A body that went unscanned is carried
+/// beside the tally rather than instead of it — one direction can be scanned while the
+/// other could not be.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum Filtered {
-    /// Looked at, and there was nothing to take out. The bytes went on untouched, which
-    /// is what keeps the turn anchor where it was.
-    #[default]
-    Clean,
-    /// Looked at, and this much was replaced.
-    Redacted(Redaction),
-    /// Not looked at, and why. Said out loud rather than passed over in silence: a
-    /// filter with a hole an operator cannot see is worse than one they know about.
-    Unscanned(Unscanned),
+pub struct Filtered {
+    found: Redaction,
+    unscanned: BTreeSet<Unscanned>,
 }
 
 impl Filtered {
+    /// Nothing was taken out, and everything was looked at.
+    #[must_use]
+    pub fn clean() -> Self {
+        Self::default()
+    }
+
+    /// This much was replaced.
+    #[must_use]
+    pub fn redacted(found: Redaction) -> Self {
+        Self {
+            found,
+            unscanned: BTreeSet::new(),
+        }
+    }
+
+    /// A body nothing was looked for in, and why. Said out loud rather than passed over
+    /// in silence: a filter with a hole an operator cannot see is worse than one they
+    /// know about.
+    #[must_use]
+    pub fn unscanned(why: Unscanned) -> Self {
+        Self {
+            found: Redaction::default(),
+            unscanned: [why].into_iter().collect(),
+        }
+    }
+
+    /// Adds what another pass found to this one.
+    pub fn absorb(&mut self, other: &Self) {
+        self.found.absorb(&other.found);
+        self.unscanned.extend(other.unscanned.iter().copied());
+    }
+
     /// What the answer's header should say, or nothing when there is nothing to report.
+    ///
+    /// The counts first, then whatever could not be looked at, so the usual case reads
+    /// as a short tally and the exception is visible behind it.
     #[must_use]
     pub fn said(&self) -> Option<String> {
-        match self {
-            Self::Clean => None,
-            Self::Redacted(found) => Some(found.said()),
-            Self::Unscanned(why) => Some(why.name().to_owned()),
+        let mut parts = Vec::new();
+        if !self.found.is_empty() {
+            parts.push(self.found.said());
         }
+        parts.extend(self.unscanned.iter().map(|why| why.name().to_owned()));
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
 
     /// What was replaced, for a ledger that counts it.
     #[must_use]
-    pub const fn redaction(&self) -> Option<&Redaction> {
-        match self {
-            Self::Redacted(found) => Some(found),
-            Self::Clean | Self::Unscanned(_) => None,
-        }
+    pub const fn redaction(&self) -> &Redaction {
+        &self.found
+    }
+
+    /// Whatever was not looked at, and why.
+    #[must_use]
+    pub const fn left_unscanned(&self) -> &BTreeSet<Unscanned> {
+        &self.unscanned
     }
 }
 
@@ -97,13 +141,13 @@ impl Filtering {
     #[must_use]
     pub fn over(&self, bytes: &[u8]) -> (Option<Bytes>, Filtered) {
         let Ok(body) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-            return (None, Filtered::Unscanned(Unscanned::NotJson));
+            return (None, Filtered::unscanned(Unscanned::NotJson));
         };
         match redact(&self.detectors, &body) {
-            None => (None, Filtered::Clean),
+            None => (None, Filtered::clean()),
             Some((rewritten, found)) => (
                 Some(Bytes::from(rewritten.to_string())),
-                Filtered::Redacted(found),
+                Filtered::redacted(found),
             ),
         }
     }
@@ -138,7 +182,7 @@ mod tests {
             rewritten.is_none(),
             "the bytes that arrived are the bytes that go"
         );
-        assert_eq!(filtered, Filtered::Clean);
+        assert_eq!(filtered, Filtered::clean());
         assert_eq!(filtered.said(), None);
     }
 
@@ -150,28 +194,28 @@ mod tests {
         assert!(!sent.contains("sk-abcdefghij1234"));
         assert!(sent.contains("[redacted:openai-key:1]"));
         assert_eq!(filtered.said().unwrap(), "openai-key=1");
-        assert_eq!(filtered.redaction().unwrap().total(), 1);
+        assert_eq!(filtered.redaction().total(), 1);
     }
 
     #[test]
     fn a_body_that_is_not_json_is_said_to_be_unscanned() {
         let (rewritten, filtered) = filtering().over(b"sk-abcdefghij1234 in plain text");
         assert!(rewritten.is_none());
-        assert_eq!(filtered, Filtered::Unscanned(Unscanned::NotJson));
+        assert_eq!(filtered, Filtered::unscanned(Unscanned::NotJson));
         assert_eq!(filtered.said().unwrap(), "unscanned: not json");
     }
 
     #[test]
     fn a_body_that_was_not_held_says_so_rather_than_passing_in_silence() {
-        let filtered = Filtered::Unscanned(Unscanned::NotHeld);
+        let filtered = Filtered::unscanned(Unscanned::NotHeld);
         assert_eq!(filtered.said().unwrap(), "unscanned: not held");
-        assert!(filtered.redaction().is_none());
+        assert!(filtered.redaction().is_empty());
     }
 
     #[test]
     fn the_header_is_set_only_when_there_is_something_to_say() {
         let mut headers = HeaderMap::new();
-        say(&mut headers, &Filtered::Clean);
+        say(&mut headers, &Filtered::clean());
         assert!(headers.get(REDACTED).is_none());
 
         let (_, filtered) = filtering().over(br#"{"a":"ada@example.com"}"#);
@@ -196,6 +240,6 @@ mod tests {
         let none = Filtering::new(Detectors::of(&[]).unwrap());
         let (rewritten, filtered) = none.over(br#"{"a":"sk-abcdefghij1234"}"#);
         assert!(rewritten.is_none());
-        assert_eq!(filtered, Filtered::Clean);
+        assert_eq!(filtered, Filtered::clean());
     }
 }
