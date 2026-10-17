@@ -166,6 +166,27 @@ impl AppState {
             )));
             tracing::info!("arbitrating the openings the classifier cannot call");
         }
+        // The operator's floor: applied to every request and every answer, whoever is
+        // asking, and not reachable by anything a tenant configures.
+        if let Some(filter) = &config.filter {
+            let secrets = filter.secrets()?;
+            // A secret that will not compile is a fault in the configuration, and reads as one.
+            let detectors =
+                ip_filter::Detectors::of(&secrets).map_err(ip_config::ConfigError::from)?;
+            let named = secrets
+                .iter()
+                .map(|secret| secret.kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            gateway = gateway.filtering(Arc::new(
+                ip_gateway::Filtering::new(detectors).holding(filter.window),
+            ));
+            tracing::info!(
+                secrets = named,
+                window = filter.window,
+                "taking out of every request and answer what must not leave"
+            );
+        }
         if let Some(ttl) = config.cache.response_ttl() {
             let responses = ResponseCache::new(Arc::clone(&cache), Ttl::new(ttl.as_duration())?);
             gateway = gateway.caching(responses);

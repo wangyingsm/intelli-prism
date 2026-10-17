@@ -148,3 +148,50 @@ temperature = 0.7
 # ask_path = "/arbiter"
 # upstream = "anthropic"
 # timeout = 2
+
+# What must not leave a request or its answer.
+#
+# Absent, nothing is looked for and every body travels exactly as it did before this
+# existed. Present, every request and every answer is walked, a match is replaced with
+# a placeholder such as [redacted:email:1], and the answer carries x-ip-redacted saying
+# what was taken.
+#
+# This is the operator's floor. It is configuration and not a stored rule because a
+# tenant must not be able to switch off the filter that stops their own data leaving.
+#
+# `shipped` names which of the secrets this build carries are in force. Left out, the
+# ones whose issuer published a check are used — credit-card, prc-id and iban each
+# confirm themselves, so they can be switched on without first measuring what they
+# cost in false positives. The rest are named deliberately or not at all:
+#
+#   private-key  openai-key  github-token  aws-key  google-key
+#   slack-token  iban  prc-id  credit-card  email
+#
+# `window` is how many characters of a streamed answer are held back to be looked at.
+# A model writes a secret token by token, so one is only seen by holding text until
+# nothing is still growing into a match, and that is paid for in time to first token.
+# Zero holds nothing and catches only what arrives whole in one event, which for a
+# streamed secret is most often nothing at all.
+#
+# [filter]
+# shipped = ["credit-card", "prc-id", "iban", "private-key", "openai-key"]
+# window = 256
+
+# Secrets of your own, recognised four ways: `plain` for the exact text, `prefix` for
+# anything beginning with it, `suffix` for anything ending with it, and `regexp`. A
+# prefix or a suffix reaches through the whole token, so "MYCORP-" takes the key it
+# announced and not the seven characters that announced it. `check` is optional and
+# names arithmetic that confirms a match: luhn, prc_id or iban.
+#
+# [[filter.secret]]
+# kind = "corp-token"
+# prefix = "MYCORP-"
+#
+# [[filter.secret]]
+# kind = "staff-mail"
+# suffix = "@corp.example"
+#
+# [[filter.secret]]
+# kind = "account"
+# regexp = '\b[0-9]{13,19}\b'
+# check = "luhn"

@@ -145,4 +145,65 @@ mod tests {
         assert_eq!(upstream.caller_speaks, Some(ip_core::Dialect::OpenAi));
         assert_eq!(upstream.upstream_speaks, Some(ip_core::Dialect::Anthropic));
     }
+
+    /// The whole filter section, uncommented as an operator would take it up.
+    ///
+    /// M15 taught that uncommenting two lines proves almost nothing: it cannot catch a
+    /// key written under the wrong table or a block in the wrong place. This takes the
+    /// section whole — every table and every key from `[filter]` to the end of the
+    /// file — so a misplaced one fails here.
+    #[test]
+    fn the_whole_filter_section_parses_when_taken_up() {
+        let lines: Vec<&str> = EXAMPLE.lines().collect();
+        let from = lines
+            .iter()
+            .position(|line| line.trim_start() == "# [filter]")
+            .expect("the example shows a filter section");
+        let taken: String = lines
+            .iter()
+            .enumerate()
+            .map(|(at, line)| {
+                if at < from {
+                    return (*line).to_owned();
+                }
+                // Only the lines that are toml, never the prose around them: a table
+                // header, or a key and its value.
+                match line.trim_start().strip_prefix("# ") {
+                    Some(rest)
+                        if rest.starts_with('[')
+                            || rest.split_once(" = ").is_some_and(|(name, _)| {
+                                !name.is_empty()
+                                    && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                            }) =>
+                    {
+                        rest.to_owned()
+                    }
+                    _ => (*line).to_owned(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config = ip_config::Config::parse(&taken).expect("the filter section parses");
+        let filter = config.filter.expect("the section is there");
+        assert_eq!(filter.window, 256);
+        let secrets = filter.secrets().expect("every secret it names resolves");
+        let named: Vec<&str> = secrets.iter().map(|one| one.kind.as_str()).collect();
+        assert_eq!(
+            named,
+            vec![
+                "credit-card",
+                "prc-id",
+                "iban",
+                "private-key",
+                "openai-key",
+                "corp-token",
+                "staff-mail",
+                "account",
+            ],
+            "the shipped ones it names, then the operator's own, in order"
+        );
+        // And they compile, which is what an operator finds out at startup.
+        ip_filter::Detectors::of(&secrets).expect("the example's own secrets compile");
+    }
 }

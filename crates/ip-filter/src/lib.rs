@@ -32,4 +32,4 @@ pub use error::FilterError;
 pub use kind::Kind;
 pub use redact::{Redaction, redact};
 pub use secret::{Check, Match, Secret};
-pub use stream::Trickle;
+pub use stream::{Trickle, WINDOW};

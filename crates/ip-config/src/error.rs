@@ -26,6 +26,19 @@ pub enum ConfigError {
     #[error("upstream {id} is declared more than once")]
     DuplicateUpstream { id: ApiId },
 
+    /// The filter names a secret this build does not ship.
+    #[error("no secret ships under the name {value}; this build carries {carried}")]
+    UnknownSecret {
+        /// The name that was asked for.
+        value: String,
+        /// Every name this build does carry.
+        carried: String,
+    },
+
+    /// A secret the operator declared will not compile into something that can scan.
+    #[error(transparent)]
+    Filter(#[from] ip_filter::FilterError),
+
     /// The arbiter's timeout is outside the range in which waiting on it is a delay and
     /// not a dependency.
     #[error("the arbiter's timeout of {value} seconds is outside 1 to {limit}")]

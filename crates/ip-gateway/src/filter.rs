@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName};
-use ip_filter::{Detectors, Redaction, redact};
+use ip_filter::{Detectors, Redaction, WINDOW, redact};
 
 /// The header an answer carries to say what was taken out of its request.
 pub const REDACTED: HeaderName = HeaderName::from_static("x-ip-redacted");
@@ -142,13 +142,6 @@ pub struct Filtering {
     detectors: Detectors,
     window: usize,
 }
-
-/// How much of a streamed answer is held back to be looked at.
-///
-/// A secret is written token by token, so it is only seen by holding text until
-/// nothing is still growing into a match. This is what that costs in time to first
-/// token, and it is long enough for every shape that ships except a private key block.
-pub const WINDOW: usize = 256;
 
 impl Filtering {
     /// Filters with these, holding back [`WINDOW`] characters of a streamed answer.

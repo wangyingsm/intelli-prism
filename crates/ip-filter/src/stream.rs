@@ -24,6 +24,12 @@ use crate::redact::{Redaction, Tally, with_tally};
 /// cannot grow the carry without end.
 const HOLD_MOST: usize = 8 * 1024;
 
+/// How much of a streamed answer is held back when nobody says otherwise.
+///
+/// Longer than every shape that ships except a private key block, and a few words of
+/// latency rather than a paragraph. An operator trading one against the other moves it.
+pub const WINDOW: usize = 256;
+
 /// A redactor that reads text in pieces and lets it out a piece behind.
 ///
 /// The ordinals and the tally span the whole stream, so one secret is one placeholder

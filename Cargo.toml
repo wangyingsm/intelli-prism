@@ -23,6 +23,7 @@ ip-auth = { version = "0.1.0", path = "crates/ip-auth" }
 ip-cache = { version = "0.1.0", path = "crates/ip-cache", default-features = false }
 ip-config = { version = "0.1.0", path = "crates/ip-config" }
 ip-core = { version = "0.1.0", path = "crates/ip-core" }
+ip-filter = { version = "0.1.0", path = "crates/ip-filter" }
 ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }

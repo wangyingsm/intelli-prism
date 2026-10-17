@@ -1515,6 +1515,7 @@ dependencies = [
  "ip-classify",
  "ip-config",
  "ip-core",
+ "ip-filter",
  "ip-gateway",
  "ip-plugin",
  "ip-storage",
@@ -1587,6 +1588,7 @@ name = "ip-config"
 version = "0.1.0"
 dependencies = [
  "ip-core",
+ "ip-filter",
  "serde",
  "subtle",
  "thiserror",

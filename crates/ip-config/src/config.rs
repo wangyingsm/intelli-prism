@@ -41,6 +41,78 @@ pub struct Config {
     /// opening is simply unclassified.
     #[serde(default)]
     pub arbiter: Option<ArbiterConfig>,
+    /// What must not leave a request or its answer. Absent, nothing is looked for and
+    /// every body travels exactly as it did before the filter existed.
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
+}
+
+/// The operator's floor: what must not leave, whoever is asking.
+///
+/// It is configuration and not a stored rule because a tenant must not be able to
+/// switch off the filter that stops their own data leaving. A tenant may add to this;
+/// nothing a tenant does takes anything out of it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilterConfig {
+    /// Which of the secrets that ship are in force, by name.
+    ///
+    /// Left out, the ones whose issuer published a check are used: a card number, a
+    /// resident identity number and an account number each confirm themselves, so they
+    /// can be switched on without first measuring what they cost in false positives.
+    /// The rest — the provider key shapes, the email address — are named deliberately
+    /// or not at all.
+    #[serde(default)]
+    pub shipped: Option<Vec<String>>,
+    /// Secrets of the operator's own, recognised by plain text, a prefix, a suffix or
+    /// an expression. These are added to the shipped ones rather than replacing them.
+    #[serde(default, rename = "secret")]
+    pub secrets: Vec<ip_filter::Secret>,
+    /// How many characters of a streamed answer are held back to be looked at.
+    ///
+    /// A model writes a secret token by token, so one is only seen by holding text
+    /// until nothing is still growing into a match. This is what that costs in time to
+    /// first token. Zero holds nothing and catches only what arrives whole in one
+    /// event, which is most often nothing at all.
+    #[serde(default = "held_back")]
+    pub window: usize,
+}
+
+/// The window an operator who says nothing gets, which is the gateway's own default.
+const fn held_back() -> usize {
+    ip_filter::WINDOW
+}
+
+impl FilterConfig {
+    /// Every secret in force: the shipped ones this names, and the operator's own.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::UnknownSecret`] when it names a shipped secret that does not
+    /// exist, and [`ConfigError::Filter`] when one of its own will not compile.
+    pub fn secrets(&self) -> Result<Vec<ip_filter::Secret>, ConfigError> {
+        let mut secrets = match &self.shipped {
+            // Named deliberately, one at a time.
+            Some(names) => names
+                .iter()
+                .map(|name| {
+                    ip_filter::Secret::default_named(name).ok_or_else(|| {
+                        ConfigError::UnknownSecret {
+                            value: name.clone(),
+                            carried: ip_filter::Secret::default_names().join(", "),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            // Said nothing, so the ones that confirm themselves.
+            None => ip_filter::Secret::defaults()
+                .into_iter()
+                .filter(|secret| secret.check.is_some())
+                .collect(),
+        };
+        secrets.extend(self.secrets.iter().cloned());
+        Ok(secrets)
+    }
 }
 
 /// The model an unsure opening is arbitrated by, and how hard it is asked: the route
@@ -752,5 +824,110 @@ model = "claude-sonnet-5"
         assert!(!rendered.contains("sk-secret-value"));
         assert!(!rendered.contains("0123456789abcdef"));
         assert!(rendered.contains("Secret(redacted)"));
+    }
+
+    /// Said nothing about which secrets are in force, so the ones that confirm
+    /// themselves are. Those are the three that can be switched on without first
+    /// measuring what they cost, which is why they and not the others are the default.
+    #[test]
+    fn a_filter_that_names_nothing_takes_the_ones_that_check_themselves() {
+        let filter: FilterConfig = toml::from_str("").unwrap();
+        let named: Vec<String> = filter
+            .secrets()
+            .unwrap()
+            .iter()
+            .map(|one| one.kind.as_str().to_owned())
+            .collect();
+        assert_eq!(named, vec!["iban", "prc-id", "credit-card"]);
+        assert_eq!(filter.window, ip_filter::WINDOW);
+    }
+
+    #[test]
+    fn a_filter_naming_shipped_secrets_takes_those_and_no_others() {
+        let filter: FilterConfig = toml::from_str(r#"shipped = ["email"]"#).unwrap();
+        let secrets = filter.secrets().unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].kind.as_str(), "email");
+    }
+
+    /// An operator's own are added to the shipped ones, never instead of them: the
+    /// floor is a floor.
+    #[test]
+    fn an_operators_own_secrets_are_added_to_the_shipped_ones() {
+        let filter: FilterConfig = toml::from_str(
+            r#"
+            shipped = ["email"]
+
+            [[secret]]
+            kind = "corp-token"
+            prefix = "MYCORP-"
+            "#,
+        )
+        .unwrap();
+        let named: Vec<String> = filter
+            .secrets()
+            .unwrap()
+            .iter()
+            .map(|one| one.kind.as_str().to_owned())
+            .collect();
+        assert_eq!(named, vec!["email", "corp-token"]);
+    }
+
+    /// Taking none of the shipped ones is a thing an operator may mean.
+    #[test]
+    fn a_filter_may_take_none_of_the_shipped_secrets() {
+        let filter: FilterConfig = toml::from_str(
+            r#"
+            shipped = []
+
+            [[secret]]
+            kind = "corp-token"
+            prefix = "MYCORP-"
+            "#,
+        )
+        .unwrap();
+        let secrets = filter.secrets().unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].kind.as_str(), "corp-token");
+    }
+
+    /// Refusing beats running without it: an operator who asked for a filter and
+    /// silently got none is worse off than one whose gateway will not start.
+    #[test]
+    fn a_filter_naming_a_secret_that_does_not_ship_is_refused_by_name() {
+        let filter: FilterConfig = toml::from_str(r#"shipped = ["social-security"]"#).unwrap();
+        let said = filter.secrets().unwrap_err().to_string();
+        assert!(said.contains("social-security"), "{said}");
+        assert!(
+            said.contains("credit-card"),
+            "it must say what is carried: {said}"
+        );
+    }
+
+    #[test]
+    fn a_filter_whose_own_secret_will_not_compile_is_refused() {
+        let filter: FilterConfig = toml::from_str(
+            r#"
+            [[secret]]
+            kind = "broken"
+            regexp = "([unclosed"
+            "#,
+        )
+        .unwrap();
+        let secrets = filter.secrets().unwrap();
+        let said = ip_filter::Detectors::of(&secrets).unwrap_err().to_string();
+        assert!(said.contains("broken"), "{said}");
+    }
+
+    #[test]
+    fn a_window_an_operator_sets_is_the_window_they_get() {
+        let filter: FilterConfig = toml::from_str("window = 0").unwrap();
+        assert_eq!(filter.window, 0);
+    }
+
+    #[test]
+    fn a_configuration_with_no_filter_section_has_none() {
+        let config = Config::parse(FULL).unwrap();
+        assert!(config.filter.is_none());
     }
 }
