@@ -17,6 +17,11 @@ gateway routes by, and it is published because the model is not reproducible wit
 `research` is heavily under-represented at 326 examples — 4% of the set — and that shows directly
 in the model's weakest class.
 
+The working pool this is drawn from is larger: it also holds 200 research-grade requests written by
+hand rather than generated, which exist because generating that class did not work well. They are
+**excluded from publication** for licence reasons given below, so the set described here is the one
+that is published, not the one that is trained on if those rows are later labelled.
+
 ## How it was made
 
 **Generated.** A local model (`qwen3.8:27b-mtp-q8_0`) was asked for requests across ten domains —
@@ -86,10 +91,24 @@ The 350 comparison labels behind the ceiling figure came from a second judge,
 published.** The number they measure is; the labels themselves are not part of this dataset, so
 everything published here derives from Apache-2.0 outputs alone.
 
+The 200 hand-written research requests are held back for the same reason in the other direction:
+they were written by a model whose terms are neither Apache-2.0 nor silent about what may be built
+from its outputs, so they are not published and nothing labelled from them is either.
+
+None of this is left to whoever runs the upload. `export.py` builds the publishable set from an
+allowlist of writers and judges — a row goes out only when both are known to place no terms on what
+they produced, and an unrecognised judge is held back until someone has read its licence. Run
+`export.py --check` before publishing and it says what is going and what is not.
+
 The base model the classifier fine-tunes is MIT; see the model card.
 
 ## Rebuilding it
 
-`generate.py` writes the candidates, `softlabel.py` labels them, `compare.py` measures the ceiling,
-`train.py` fits the model and its temperature, `export_onnx.py` exports and verifies the graph, and
-`quantize.py` builds the quantizations and refits each one's gate. Each prints what it measured.
+`generate.py` writes the candidates, `softlabel.py` labels them under a named judge, `compare.py`
+measures the ceiling, `ensemble.py` combines several judges into one target, `train.py` fits the
+model and its temperature, `export_onnx.py` exports and verifies the graph, and `quantize.py`
+builds the quantizations and refits each one's gate. Each prints what it measured.
+
+Two more are about what leaves rather than what is built: `seed_research.py` merges the hand-written
+research requests into the pool, recording who wrote each one, and `export.py` builds the set that
+may be published from that record.
