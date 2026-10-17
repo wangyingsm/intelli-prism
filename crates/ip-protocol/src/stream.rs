@@ -106,6 +106,10 @@ impl Reading {
     }
 
     fn openai(&mut self, value: &Value) -> Vec<Event> {
+        // A keep-alive carries none of this family's answer, and does not start one.
+        if value.get("choices").is_none() && value.get("usage").is_none() {
+            return Vec::new();
+        }
         let mut events = self.naming(value.get("model").and_then(Value::as_str));
         let choice = value
             .get("choices")
@@ -239,6 +243,9 @@ impl Reading {
     }
 
     fn gemini(&mut self, value: &Value) -> Vec<Event> {
+        if value.get("candidates").is_none() && value.get("usageMetadata").is_none() {
+            return Vec::new();
+        }
         let mut events = self.naming(value.get("modelVersion").and_then(Value::as_str));
         let candidate = value
             .get("candidates")
@@ -569,4 +576,206 @@ fn counted(value: Option<&Value>) -> TokenCount {
         .and_then(Value::as_u64)
         .and_then(|count| u32::try_from(count).ok())
         .map_or(TokenCount::ZERO, TokenCount::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::answer::Gathered;
+
+    /// Everything one family would send for these events, as its own stream, read back
+    /// into canonical events again. Framing is the gateway's job in production and the
+    /// splitting here stands in for it.
+    fn around(dialect: Dialect, events: &[Event]) -> Vec<Event> {
+        let mut writing = Writing::new(dialect);
+        let mut sent = String::new();
+        for event in events {
+            sent.push_str(&writing.event(event));
+        }
+        sent.push_str(&writing.end());
+
+        let mut reading = Reading::new(dialect);
+        let mut read = Vec::new();
+        for block in sent.split("\n\n").filter(|block| !block.trim().is_empty()) {
+            read.extend(reading.event(block));
+        }
+        read.extend(reading.end());
+        read
+    }
+
+    fn spoken() -> Vec<Event> {
+        vec![
+            Event::Started {
+                model: Some(ModelName::new("shared").unwrap()),
+            },
+            Event::Text("forty-".to_owned()),
+            Event::Text("two".to_owned()),
+            Event::Stopped(Stop::End),
+            Event::Spent(Tokens::new(TokenCount::new(10), TokenCount::new(2))),
+        ]
+    }
+
+    #[test]
+    fn every_family_carries_what_was_said_through_its_own_stream() {
+        for dialect in Dialect::ALL {
+            let gathered = Gathered::of(&around(dialect, &spoken()));
+            assert_eq!(gathered.text, "forty-two", "{dialect} lost the words");
+            assert_eq!(gathered.stop, Some(Stop::End), "{dialect} lost the ending");
+            assert_eq!(
+                gathered.spent.map(|spent| spent.total()),
+                Some(12),
+                "{dialect} lost what it cost"
+            );
+        }
+    }
+
+    #[test]
+    fn two_families_name_the_model_and_the_third_names_it_on_its_chunks() {
+        for dialect in [Dialect::OpenAi, Dialect::Anthropic] {
+            let gathered = Gathered::of(&around(dialect, &spoken()));
+            assert_eq!(
+                gathered.model.map(|model| model.as_str().to_owned()),
+                Some("shared".to_owned()),
+                "{dialect} lost the model"
+            );
+        }
+        // Gemini opens with no event of its own: it names the model on the chunks that
+        // carry content, and a stream this gateway writes carries none to name it on.
+        assert_eq!(
+            Gathered::of(&around(Dialect::Gemini, &spoken())).model,
+            None
+        );
+    }
+
+    fn calling() -> Vec<Event> {
+        vec![
+            Event::ToolCall {
+                id: ToolCallId::new("call_1").unwrap(),
+                name: ToolName::new("search").unwrap(),
+                arguments: json!({"q": "rust"}),
+            },
+            Event::Stopped(Stop::ToolUse),
+        ]
+    }
+
+    #[test]
+    fn every_family_carries_a_tool_call_through_its_own_stream() {
+        for dialect in Dialect::ALL {
+            let read = around(dialect, &calling());
+            let call = read
+                .iter()
+                .find(|event| matches!(event, Event::ToolCall { .. }))
+                .unwrap_or_else(|| panic!("{dialect} lost the call: {read:?}"));
+            let Event::ToolCall {
+                id,
+                name,
+                arguments,
+            } = call
+            else {
+                unreachable!("a call is a call")
+            };
+            assert_eq!(name.as_str(), "search", "{dialect} lost the name");
+            assert_eq!(
+                arguments,
+                &json!({"q": "rust"}),
+                "{dialect} lost the arguments"
+            );
+            match dialect {
+                // Gemini joins a call to its result by the function's name, so an id
+                // put into it does not come back out; one is synthesised instead.
+                Dialect::Gemini => assert_eq!(id.as_str(), "search#0"),
+                _ => assert_eq!(id.as_str(), "call_1", "{dialect} lost the id"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_family_that_wants_a_tool_says_so_in_its_own_words() {
+        for (dialect, expected) in [
+            (Dialect::OpenAi, Stop::ToolUse),
+            (Dialect::Anthropic, Stop::ToolUse),
+            // This family has no reason for wanting a tool: it stops normally and
+            // leaves a call behind, so the crossing back reads an ordinary ending.
+            (Dialect::Gemini, Stop::End),
+        ] {
+            let read = around(dialect, &calling());
+            assert_eq!(
+                Gathered::of(&read).stop,
+                Some(expected.clone()),
+                "{dialect} said the wrong thing about why it stopped"
+            );
+        }
+    }
+
+    #[test]
+    fn every_way_a_family_withholds_an_answer_reads_as_withheld() {
+        for dialect in Dialect::ALL {
+            let withheld = [Event::Stopped(Stop::Filtered)];
+            assert_eq!(
+                Gathered::of(&around(dialect, &withheld)).stop,
+                Some(Stop::Filtered),
+                "{dialect} did not carry a withheld answer"
+            );
+        }
+        for (dialect, length) in
+            Dialect::ALL.map(|dialect| (dialect, [Event::Stopped(Stop::Length)]))
+        {
+            assert_eq!(
+                Gathered::of(&around(dialect, &length)).stop,
+                Some(Stop::Length),
+                "{dialect} did not carry a ceiling it hit"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_that_says_nothing_this_layer_reads_means_nothing() {
+        for dialect in Dialect::ALL {
+            let mut reading = Reading::new(dialect);
+            // A comment, a keep-alive, a shape no family sends, and plain noise.
+            assert!(reading.event(": keeping the connection open").is_empty());
+            assert!(reading.event("event: ping\ndata: {}").is_empty());
+            assert!(reading.event("data: not json at all").is_empty());
+            assert!(reading.event("").is_empty());
+        }
+    }
+
+    /// A family that never said its call was finished still asked for one, and the
+    /// caller is owed it when the stream ends.
+    #[test]
+    fn a_call_left_unfinished_still_reaches_the_caller() {
+        let mut reading = Reading::new(Dialect::Anthropic);
+        let started = reading.event(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"search\"}}",
+        );
+        assert!(started.is_empty(), "a call is not whole when it begins");
+        let ended = reading.end();
+        assert_eq!(ended.len(), 1, "the call was dropped: {ended:?}");
+    }
+
+    /// The one line of a stream that says it is over, which only one family sends.
+    #[test]
+    fn only_the_family_that_ends_its_streams_says_so() {
+        assert_eq!(Writing::new(Dialect::OpenAi).end(), "data: [DONE]\n\n");
+        assert_eq!(Writing::new(Dialect::Gemini).end(), "");
+        // This family closes a message it opened, and closes nothing it did not.
+        assert_eq!(Writing::new(Dialect::Anthropic).end(), "");
+        let mut opened = Writing::new(Dialect::Anthropic);
+        opened.event(&Event::Started { model: None });
+        assert!(opened.end().contains("message_stop"));
+    }
+
+    #[test]
+    fn a_data_line_spread_over_several_is_read_as_one() {
+        let mut reading = Reading::new(Dialect::OpenAi);
+        let events =
+            reading.event("data: {\"choices\":[{\"delta\":\ndata: {\"content\":\"split\"}}]}");
+        assert_eq!(
+            events,
+            vec![
+                Event::Started { model: None },
+                Event::Text("split".to_owned())
+            ]
+        );
+    }
 }

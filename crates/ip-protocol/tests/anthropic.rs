@@ -259,3 +259,110 @@ fn a_body_that_is_not_a_conversation_or_an_answer_is_refused() {
     assert!(anthropic::read(b"not json").is_err());
     assert!(anthropic::read_answer(json!({"type": "message"}).to_string().as_bytes()).is_err());
 }
+
+#[test]
+fn a_body_this_family_would_not_have_sent_is_read_for_what_it_holds() {
+    let bent = json!({
+        "max_tokens": 10,
+        "system": [{"type": "text", "text": "carried"}, {"type": "image", "source": {}}],
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "and this"},
+            {"type": "tool_result", "content": "an answer quoting no call"},
+            {"type": "thinking", "thinking": "a block this pass does not carry"},
+        ]}],
+        "tools": [{"description": "nameless"}],
+        "top_k": 40,
+    });
+    let (conversation, dropped) =
+        anthropic::read(bent.to_string().as_bytes()).expect("a conversation");
+    assert_eq!(
+        dropped.names(),
+        vec![
+            "content_parts",
+            "system_parts",
+            "tool_results",
+            "tools",
+            "top_k"
+        ]
+    );
+    assert_eq!(conversation.system.as_deref(), Some("carried"));
+    assert_eq!(conversation.first_user_text().as_deref(), Some("and this"));
+    assert!(conversation.tools.is_empty());
+}
+
+#[test]
+fn a_tool_result_given_as_blocks_reads_as_its_words() {
+    let body = json!({
+        "max_tokens": 10,
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {}},
+            ]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": "42 "}, {"type": "text", "text": "results"}],
+            }]},
+        ],
+    });
+    let (conversation, dropped) = anthropic::read(body.to_string().as_bytes()).unwrap();
+    assert!(dropped.is_empty(), "{dropped}");
+    assert_eq!(
+        conversation.messages[1].blocks[0],
+        Block::ToolResult {
+            id: ToolCallId::new("toolu_1").unwrap(),
+            content: "42 results".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn a_use_this_family_spells_incompletely_is_refused() {
+    for bent in [
+        json!({"max_tokens": 1, "messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "name": "search"},
+        ]}]}),
+        json!({"max_tokens": 1, "messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1"},
+        ]}]}),
+    ] {
+        assert!(
+            anthropic::read(bent.to_string().as_bytes()).is_err(),
+            "{bent}"
+        );
+    }
+}
+
+#[test]
+fn every_reason_this_family_stops_for_is_carried() {
+    for said in [
+        "end_turn",
+        "max_tokens",
+        "tool_use",
+        "refusal",
+        "stop_sequence",
+    ] {
+        let body = json!({
+            "content": [{"type": "text", "text": "x"}],
+            "stop_reason": said,
+        });
+        let (events, _) = anthropic::read_answer(body.to_string().as_bytes()).unwrap();
+        let (written, _) = anthropic::write_answer(&events);
+        assert_eq!(
+            written["stop_reason"],
+            json!(said),
+            "{said} did not survive"
+        );
+    }
+}
+
+#[test]
+fn an_answer_block_this_pass_does_not_carry_is_named() {
+    let body = json!({
+        "content": [{"type": "text", "text": "said"}, {"type": "thinking", "thinking": "not"}],
+    });
+    let (events, dropped) = anthropic::read_answer(body.to_string().as_bytes()).unwrap();
+    assert_eq!(dropped.names(), vec!["content_parts"]);
+    let (written, _) = anthropic::write_answer(&events);
+    assert_eq!(written["content"][0]["text"], json!("said"));
+}

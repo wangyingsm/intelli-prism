@@ -227,3 +227,90 @@ fn a_body_that_is_not_an_answer_is_refused() {
     assert!(openai::read_answer(json!({"model": "gpt-4o"}).to_string().as_bytes()).is_err());
     assert!(openai::read_answer(b"{").is_err());
 }
+
+#[test]
+fn a_body_this_family_would_not_have_sent_is_read_for_what_it_holds() {
+    let bent = json!({
+        "messages": [
+            {"role": "developer", "content": "a newer word for the instruction"},
+            {"role": "wizard", "content": "a role no family has"},
+            {"role": "tool", "content": "an answer to nothing"},
+            {"role": "assistant", "content": "and a word of its own"},
+        ],
+        "tools": [
+            {"type": "function"},
+            {"type": "function", "function": {"description": "nameless"}},
+        ],
+        "stop": "one sequence, not a list",
+        "max_completion_tokens": 64,
+        "max_tokens": 32,
+    });
+    let (conversation, dropped) =
+        openai::read(bent.to_string().as_bytes()).expect("a conversation");
+    assert_eq!(
+        dropped.names(),
+        vec!["tool_results", "tools"],
+        "what could not be carried was named"
+    );
+    assert_eq!(
+        conversation.system.as_deref(),
+        Some("a newer word for the instruction")
+    );
+    assert_eq!(
+        conversation.sampling.stop,
+        vec!["one sequence, not a list".to_owned()],
+        "one stop sequence is a list of one"
+    );
+    assert_eq!(
+        conversation.sampling.max_tokens,
+        Some(64),
+        "the newer spelling wins where a caller sent both"
+    );
+    assert!(conversation.tools.is_empty(), "neither tool could be named");
+    // The unrecognised role is read as the caller's, which is what it most likely was.
+    assert_eq!(conversation.messages[0].role, Role::User);
+}
+
+#[test]
+fn a_call_this_family_spells_incompletely_is_refused() {
+    let nameless = json!({"messages": [
+        {"role": "assistant", "tool_calls": [{"id": "call_1", "function": {}}]},
+    ]});
+    assert!(openai::read(nameless.to_string().as_bytes()).is_err());
+    let anonymous = json!({"messages": [
+        {"role": "assistant", "tool_calls": [{"function": {"name": "search"}}]},
+    ]});
+    assert!(openai::read(anonymous.to_string().as_bytes()).is_err());
+}
+
+#[test]
+fn every_reason_this_family_stops_for_is_carried() {
+    for (said, back) in [
+        ("stop", "stop"),
+        ("length", "length"),
+        ("tool_calls", "tool_calls"),
+        ("content_filter", "content_filter"),
+        ("function_call", "tool_calls"),
+    ] {
+        let body = json!({
+            "choices": [{"message": {"content": "x"}, "finish_reason": said}],
+        });
+        let (events, _) = openai::read_answer(body.to_string().as_bytes()).unwrap();
+        let (written, _) = openai::write_answer(&events);
+        assert_eq!(
+            written["choices"][0]["finish_reason"],
+            json!(back),
+            "{said} did not survive"
+        );
+    }
+}
+
+#[test]
+fn a_conversation_carrying_only_an_instruction_is_written_back_whole() {
+    let instruction = json!({"messages": [{"role": "system", "content": "stand by"}]});
+    let (conversation, _) = openai::read(instruction.to_string().as_bytes()).expect("a system");
+    assert!(conversation.messages.is_empty());
+    let (written, _) = openai::write(&conversation);
+    assert_eq!(written["messages"][0]["role"], json!("system"));
+    assert!(written.get("model").is_none(), "no model was named");
+}

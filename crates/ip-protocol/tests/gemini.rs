@@ -277,3 +277,108 @@ fn a_body_that_is_not_a_conversation_or_an_answer_is_refused() {
     assert!(gemini::read(b"not json").is_err());
     assert!(gemini::read_answer(json!({"modelVersion": "x"}).to_string().as_bytes()).is_err());
 }
+
+#[test]
+fn a_body_this_family_would_not_have_sent_is_read_for_what_it_holds() {
+    let bent = json!({
+        "contents": [{"role": "user", "parts": [
+            {"text": "carried"},
+            {"functionCall": {"args": {"q": "x"}}},
+            {"functionResponse": {"response": {"r": 1}}},
+            {"inlineData": {"mimeType": "image/png", "data": "..."}},
+        ]}],
+        "tools": [{"functionDeclarations": [{"description": "nameless"}]}],
+        "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT"}],
+    });
+    let (conversation, dropped) =
+        gemini::read(bent.to_string().as_bytes()).expect("a conversation");
+    assert_eq!(
+        dropped.names(),
+        vec!["content_parts", "safetySettings", "tool_results", "tools"]
+    );
+    assert_eq!(conversation.first_user_text().as_deref(), Some("carried"));
+    assert!(conversation.tools.is_empty());
+}
+
+#[test]
+fn a_function_response_crosses_as_json_where_it_was_json_and_as_words_where_it_was_not() {
+    // What this family sends as an object comes back as that object.
+    let object = json!({"contents": [
+        {"role": "model", "parts": [{"functionCall": {"name": "search", "args": {}}}]},
+        {"role": "user", "parts": [{"functionResponse": {"name": "search", "response": {"hits": 2}}}]},
+    ]});
+    let (conversation, _) = gemini::read(object.to_string().as_bytes()).unwrap();
+    let (written, _) = gemini::write(&conversation);
+    assert_eq!(
+        written["contents"][1]["parts"][0]["functionResponse"]["response"],
+        json!({"hits": 2})
+    );
+
+    // And a result another family gave as plain words is given a place to sit.
+    let worded = json!({"messages": [
+        {"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "forty-two"},
+    ]});
+    let (conversation, _) = openai::read(worded.to_string().as_bytes()).unwrap();
+    let (written, dropped) = gemini::write(&conversation);
+    assert!(dropped.is_empty(), "{dropped}");
+    assert_eq!(
+        written["contents"][1]["parts"][0]["functionResponse"]["response"],
+        json!({"result": "forty-two"})
+    );
+}
+
+#[test]
+fn every_reason_this_family_stops_for_is_carried() {
+    for said in ["STOP", "MAX_TOKENS", "SAFETY"] {
+        let body = json!({"candidates": [{
+            "content": {"role": "model", "parts": [{"text": "x"}]},
+            "finishReason": said,
+        }]});
+        let (events, _) = gemini::read_answer(body.to_string().as_bytes()).unwrap();
+        let (written, _) = gemini::write_answer(&events);
+        assert_eq!(
+            written["candidates"][0]["finishReason"],
+            json!(said),
+            "{said} did not survive"
+        );
+    }
+    // A reason only this family gives is kept by its own name rather than guessed at.
+    let other = json!({"candidates": [{"content": {"parts": []}, "finishReason": "OTHER"}]});
+    let (events, _) = gemini::read_answer(other.to_string().as_bytes()).unwrap();
+    let (written, _) = gemini::write_answer(&events);
+    assert_eq!(written["candidates"][0]["finishReason"], json!("OTHER"));
+}
+
+#[test]
+fn an_answer_part_this_pass_does_not_carry_is_named() {
+    let body = json!({"candidates": [{"content": {"parts": [
+        {"text": "said"},
+        {"inlineData": {"mimeType": "image/png", "data": "..."}},
+    ]}}]});
+    let (events, dropped) = gemini::read_answer(body.to_string().as_bytes()).unwrap();
+    assert_eq!(dropped.names(), vec!["content_parts"]);
+    let (written, _) = gemini::write_answer(&events);
+    assert_eq!(
+        written["candidates"][0]["content"]["parts"][0]["text"],
+        json!("said")
+    );
+}
+
+#[test]
+fn an_answer_of_several_candidates_keeps_the_first_and_says_it_dropped_the_rest() {
+    let body = json!({"candidates": [
+        {"content": {"parts": [{"text": "one"}]}},
+        {"content": {"parts": [{"text": "two"}]}},
+    ]});
+    let (events, dropped) = gemini::read_answer(body.to_string().as_bytes()).unwrap();
+    assert_eq!(dropped.names(), vec!["candidates"]);
+    let (written, _) = gemini::write_answer(&events);
+    assert_eq!(written["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        written["candidates"][0]["content"]["parts"][0]["text"],
+        json!("one")
+    );
+}
