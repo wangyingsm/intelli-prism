@@ -122,10 +122,17 @@ something this sees.
 This project's own contribution — the fine-tune, the dataset, the export and calibration scripts,
 and these cards — is dual licensed **MIT or Apache-2.0**, matching the gateway.
 
-The base model is `jhu-clsp/mmBERT-base` and its own licence governs the weights this derives from.
-**That licence must be confirmed and honoured before these weights are published**; a derivative
-cannot be licensed more freely than what it derives from. The same question applies to the dataset,
-whose labels are the outputs of another model — see the dataset card.
+The base model is [`jhu-clsp/mmBERT-base`](https://huggingface.co/jhu-clsp/mmBERT-base), released
+under the **MIT licence**. It is declared in that repository's metadata, which holds no licence
+file and so names no copyright holder to reproduce; what MIT asks for is attribution, and this card
+gives it by naming the base here and citing its paper:
+
+> Marone, Weller, Fleshman, Yang, Lawrie and Van Durme, *mmBERT: A Modern Multilingual Encoder with
+> Annealed Language Learning*, [arXiv:2509.06888](https://arxiv.org/abs/2509.06888), 2025.
+
+A derivative cannot be licensed more freely than what it derives from, and MIT is permissive enough
+that the dual licence above is clean. The dataset's labels are the outputs of an Apache-2.0 model,
+which places no terms on them — see the dataset card.
 
 ## Rebuilding it
 
