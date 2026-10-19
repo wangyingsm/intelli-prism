@@ -32,6 +32,9 @@
 //! pressure a vector can outlive its answer, and the cost of that is one cache read
 //! that finds nothing before the request goes upstream as it would have anyway.
 
+#[cfg(test)]
+mod isolation;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
