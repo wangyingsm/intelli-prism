@@ -285,6 +285,41 @@ does not know is the clearer answer.
 of them. Before this, a conversation of `contents` and `parts` had no turn anchor, so it got no
 stickiness, no class and no arbiter, and nothing said so.
 
+### Taking out what must not leave
+
+- An operator declares what a secret looks like and the gateway takes it out of every request
+body and every answer, replacing it with a placeholder such as `[redacted:email:1]`. The answer
+carries `x-ip-redacted` saying what was taken, counted by kind and never quoted.
+- Four ways of recognising one: plain text, a prefix, a suffix, or an expression. A prefix or a
+suffix reaches through the whole token, so `sk-` takes the key it announced rather than the three
+characters that announced it. Ten shapes ship — provider keys, a PEM block, an email address, a
+card number, a resident identity number, an account number — and an operator takes the ones that
+suit them or writes their own beside them.
+- Where the issuer published a check it is used: Luhn for a card, ISO 7064 mod 11-2 for a resident
+id, mod-97 for an account. Those three are the default, because a kind that confirms itself can be
+switched on without first measuring what it costs in false positives.
+- The floor is configuration and a tenant may only add to it. There is no arrangement of
+configuration in which a tenant is scanned for less than the floor, which is structural rather
+than checked: a tenant's detectors are built from the floor's secrets and its own together.
+- Placeholders are ordinal by first appearance, so one value reads as one placeholder wherever it
+turns up and the model can still tell that two mentions are the same person. They carry no hash of
+what they replaced: a truncated hash is stable, and would hand the upstream a few bits of the very
+thing being hidden.
+- A clean body is forwarded as the bytes that arrived, never re-serialised. The turn anchor is a
+hash of the body, so a filter that rewrote every request would move every turn the day it was
+switched on, and cost the upstream's own prompt cache with it.
+- The filter runs after the plugin chain, so nothing a plugin adds can be smuggled past, and
+before the response key is taken, so what the cache holds is what was redacted.
+- A streamed answer is filtered as it streams, which needs text held back: a model writes a secret
+token by token, and a filter that looks at one event at a time finds nothing at all. The window is
+how much an operator is willing to pay for that in time to first token.
+- What was taken is counted in the usage row, by kind, never by value. A row says nothing where no
+filter looked, and nought where one looked and found nothing: the two are different facts.
+- Tenant and user isolation is audited rather than assumed, in two halves. Every listing a store
+carries is asked whether naming one tenant can return another's rows; every router the management
+api nests is asked whether one tenant's member can reach another's. Both have a tripwire that
+reads the source, so a listing or a router added without a case fails the suite.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -380,6 +415,28 @@ recorded here, not re-argued.
 - **A client that sends its own `x-ip-turn` gets no compaction detection.** A marked request never
 has its body read, so no message count is kept for it and neither test for a compaction can fire.
 Such a client must change its turn id when it compacts, or its turn never ends.
+- **A body the gateway may not hold goes unfiltered, and the answer says so.** Filtering means
+reading, and reading means buffering what was promised to stream. Such a request carries
+`x-ip-redacted: unscanned: not held` rather than passing in silence, and so does a body that is
+not json. An operator can see the hole rather than assume there is none.
+- **A streamed answer costs time to first token to filter.** Text is held back until nothing is
+still growing into a match — 256 characters by default, and `window = 0` holds nothing, which
+catches only a secret arriving whole in one event and is honestly named `unscanned: streamed`. A
+match longer than the window outruns it and goes out in pieces; a PEM block is longer than the
+default.
+- **Filtering a stream normalises its events.** They are read into the canonical conversation and
+written back, so a family's own fields that the canonical form does not carry are not carried
+here either. It applies only when filtering is switched on, and an event the reader makes nothing
+of is forwarded exactly as it arrived rather than dropped.
+- **A streamed answer's tally cannot ride its headers**, which went out before its first event.
+The header says only that the stream was filtered; the count reaches the usage row and the log.
+- **Redaction is one-way.** Nothing is kept that could put a secret back, so a caller whose own
+key was redacted sees the placeholder in the answer. There is no vault to leak and no state to get
+wrong under streaming, which is why it was built this way.
+- **A tenant's own secrets are configuration, not stored rules.** An operator edits them; a tenant
+cannot manage its own through the management api, and the scoping is per tenant rather than the
+user and api narrowing a plugin rule allows. Precomputing a set per tenant is bounded and per
+user and api is not, which is the reason.
 - **A hedge's wait is a fixed duration per rule, tuned by hand.** It is read against what an
 endpoint actually takes, and a delay set too short spends the arms the staggering was meant to
 save. The adaptive version would need a latency distribution the gateway does not keep, which is
@@ -445,8 +502,10 @@ dashboard to read.
 - Logs to open-observe in cluster mode, to a local file standalone. Logs go to the process
 output wherever it runs.
 
-### Security
+### Security, what is left of it
 
-- Builtin processors that filter secrets and personal data out of requests and responses.
-- Tenant and user isolation audited end to end rather than assumed.
 - Optional eBPF rate limiting per source address, Linux only.
+- A tenant managing its own filter rules through the management api, stored rather than
+configured, scoped the way a plugin rule is. The floor it adds to would be unchanged.
+- Scanning a body that is not json, and one too large to hold. Both are reported as unscanned
+today, which is honest and is not the same as covered.
