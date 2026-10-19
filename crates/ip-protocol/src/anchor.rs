@@ -22,6 +22,32 @@ pub struct Anchoring<'a> {
     pub opening: Option<&'a Value>,
     /// How many turns the body holds, which is what a compaction shortens.
     pub messages: usize,
+    /// Whether this is one question on its own or a conversation already under way.
+    pub exchange: Exchange,
+}
+
+/// Whether a body is a single unanswered question, or an exchange in progress.
+///
+/// **This is not `messages == 1`**, and the difference is a whole family wide. The
+/// count is of the body's array, which holds the standing instruction in one family
+/// and not in the other, so the same single question reads as one message written one
+/// way and two written the other:
+///
+/// | body | `messages` | `exchange` |
+/// |---|---|---|
+/// | `{"system": "…", "messages": [user]}` | 1 | `OneQuestion` |
+/// | `{"messages": [system, user]}` | 2 | `OneQuestion` |
+/// | `{"messages": [user, assistant, user]}` | 3 | `Continuing` |
+///
+/// Counting messages to find a single turn therefore switches whatever depends on it
+/// off for most of one family's traffic and leaves the other's working, which is the
+/// kind of bug that gets found in a quarterly report rather than in a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exchange {
+    /// Exactly one user turn, and nothing answered yet: a question standing alone.
+    OneQuestion,
+    /// Several user turns, or an answer already in the body.
+    Continuing,
 }
 
 /// Finds the anchor's two halves, whichever family wrote the body.
@@ -41,6 +67,7 @@ pub fn of(value: &Value) -> Option<Anchoring<'_>> {
                 .or_else(|| with_role(messages, "system", "content")),
             opening: Some(opening),
             messages: messages.len(),
+            exchange: exchange_of(messages, "assistant"),
         });
     }
     if let Some(contents) = value.get("contents").and_then(Value::as_array) {
@@ -51,9 +78,37 @@ pub fn of(value: &Value) -> Option<Anchoring<'_>> {
                 .and_then(|held| held.get("parts")),
             opening: Some(opening),
             messages: contents.len(),
+            exchange: exchange_of(contents, "model"),
         });
     }
     None
+}
+
+/// Whether these entries are one question or an exchange, given what the family calls
+/// the model's own turns — `assistant` where there are messages, `model` where there
+/// are contents.
+///
+/// A tool result is an answer too, whichever way round it is spelled: it can only
+/// exist because the model already asked for it.
+fn exchange_of(entries: &[Value], answerer: &str) -> Exchange {
+    let mut asked = 0usize;
+    for entry in entries {
+        match entry.get("role").and_then(Value::as_str) {
+            // An entry naming no role is the user's, exactly as `with_role` reads it.
+            None => asked += 1,
+            Some("user") => asked += 1,
+            Some(role) if role == answerer || role == "tool" || role == "function" => {
+                return Exchange::Continuing;
+            }
+            // A standing instruction is neither asked nor answered.
+            Some(_) => {}
+        }
+    }
+    if asked == 1 {
+        Exchange::OneQuestion
+    } else {
+        Exchange::Continuing
+    }
 }
 
 /// The named field of the first entry with this role. An entry that names no role at
@@ -106,6 +161,96 @@ mod tests {
             Some(&json!([{"text": "what did we spend?"}]))
         );
         assert_eq!(found.messages, 1);
+    }
+
+    /// The trap the `Exchange` doc names, asserted rather than described: the same
+    /// single question counts one message in one family and two in the other, and
+    /// both are one question.
+    #[test]
+    fn the_same_single_question_counts_differently_and_is_one_question_either_way() {
+        let anthropic = json!({
+            "system": "you audit accounts",
+            "messages": [{"role": "user", "content": "what did we spend?"}],
+        });
+        let openai = json!({"messages": [
+            {"role": "system", "content": "you audit accounts"},
+            {"role": "user", "content": "what did we spend?"},
+        ]});
+        let (one, two) = (of(&anthropic).unwrap(), of(&openai).unwrap());
+        assert_eq!((one.messages, two.messages), (1, 2), "the counts differ");
+        assert_eq!(one.exchange, Exchange::OneQuestion);
+        assert_eq!(
+            two.exchange,
+            Exchange::OneQuestion,
+            "counting messages would have read this one as a conversation under way"
+        );
+    }
+
+    #[test]
+    fn an_answer_already_in_the_body_makes_it_an_exchange() {
+        for body in [
+            json!({"messages": [
+                {"role": "user", "content": "what did we spend?"},
+                {"role": "assistant", "content": "four pounds"},
+            ]}),
+            json!({"contents": [
+                {"role": "user", "parts": [{"text": "what did we spend?"}]},
+                {"role": "model", "parts": [{"text": "four pounds"}]},
+            ]}),
+        ] {
+            assert_eq!(of(&body).unwrap().exchange, Exchange::Continuing, "{body}");
+        }
+    }
+
+    /// A tool result can only exist because the model already asked for it, so it is
+    /// an answer in the body however it is spelled — and it arrives with the user's
+    /// turn count still at one, which is what makes it worth its own case.
+    #[test]
+    fn a_tool_result_is_an_answer_too() {
+        for role in ["tool", "function"] {
+            let body = json!({"messages": [
+                {"role": "user", "content": "what is the weather?"},
+                {"role": role, "content": "{\"c\": 14}"},
+            ]});
+            assert_eq!(
+                of(&body).unwrap().exchange,
+                Exchange::Continuing,
+                "a {role} message is an answer"
+            );
+        }
+    }
+
+    #[test]
+    fn more_than_one_thing_asked_is_an_exchange_even_with_nothing_answered() {
+        let body = json!({"messages": [
+            {"role": "user", "content": "what did we spend?"},
+            {"role": "user", "content": "and on what?"},
+        ]});
+        assert_eq!(of(&body).unwrap().exchange, Exchange::Continuing);
+    }
+
+    #[test]
+    fn an_instruction_is_neither_asked_nor_answered() {
+        // Every role a family uses for standing instruction must leave a single
+        // question a single question, or the level switches itself off for whoever
+        // writes one.
+        for role in ["system", "developer"] {
+            let body = json!({"messages": [
+                {"role": role, "content": "you audit accounts"},
+                {"role": "user", "content": "what did we spend?"},
+            ]});
+            assert_eq!(
+                of(&body).unwrap().exchange,
+                Exchange::OneQuestion,
+                "a {role} entry should not make this an exchange"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lone_question_naming_no_role_is_still_one_question() {
+        let gemini = json!({"contents": [{"parts": [{"text": "hello"}]}]});
+        assert_eq!(of(&gemini).unwrap().exchange, Exchange::OneQuestion);
     }
 
     #[test]

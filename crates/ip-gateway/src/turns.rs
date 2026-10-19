@@ -21,6 +21,7 @@ use std::time::Duration;
 use ip_auth::Identity;
 use ip_cache::{Cache, CacheKey, CacheLevel, Ttl};
 use ip_core::{Difficulty, Host, Port, Replica, TurnId};
+use ip_protocol::anchor::Exchange;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -121,6 +122,12 @@ pub struct Opening {
     pub anchor: TurnId,
     /// How many messages the request carries, the whole exchange and not just the opening.
     pub messages: usize,
+    /// Whether this is one question standing alone or a conversation already under way.
+    ///
+    /// Read from `ip-protocol` rather than worked out from `messages`, which cannot
+    /// answer it: the count includes the standing instruction in one family and not in
+    /// the other. [`ip_protocol::anchor::Exchange`] has the table.
+    pub exchange: Exchange,
     /// The text the anchor was digested from — the system prompt and the first user
     /// message, joined for a reader that reads rather than hashes: the classifier.
     ///
@@ -170,6 +177,7 @@ impl Opening {
         Some(Self {
             anchor,
             messages: found.messages,
+            exchange: found.exchange,
             text: opening_text(found.system, found.opening),
         })
     }
@@ -586,6 +594,36 @@ mod tests {
             &[("user", "hi"), ("assistant", "hello"), ("user", "again")],
         );
         assert_eq!(Opening::read(next.as_bytes()).unwrap().messages, 3);
+    }
+
+    /// An opening carries whether the body is one question, and carries it from
+    /// `ip-protocol` rather than deriving it from the count beside it. Both halves are
+    /// asserted: a single question that counts two messages still reads as one
+    /// question, and a conversation under way does not.
+    #[test]
+    fn an_opening_says_whether_it_is_one_question_or_an_exchange() {
+        // Written the way the family that puts the instruction among the messages
+        // writes it, which is where counting them would get the answer wrong.
+        let alone = r#"{"messages": [
+            {"role": "system", "content": "talk"},
+            {"role": "user", "content": "hi"}
+        ]}"#;
+        let read = Opening::read(alone.as_bytes()).unwrap();
+        assert_eq!(read.messages, 2, "the instruction is among them");
+        assert_eq!(
+            read.exchange,
+            Exchange::OneQuestion,
+            "two messages, and still one question"
+        );
+
+        let under_way = conversation(
+            "talk",
+            &[("user", "hi"), ("assistant", "hello"), ("user", "again")],
+        );
+        assert_eq!(
+            Opening::read(under_way.as_bytes()).unwrap().exchange,
+            Exchange::Continuing
+        );
     }
 
     #[test]

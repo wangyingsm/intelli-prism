@@ -23,6 +23,7 @@ pub mod gemini;
 pub mod openai;
 pub mod stream;
 
+pub use anchor::Exchange;
 pub use answer::{Event, Gathered, Stop};
 pub use conversation::{
     Block, Conversation, Dropped, Message, Role, Sampling, Tool, ToolCallId, ToolName,
