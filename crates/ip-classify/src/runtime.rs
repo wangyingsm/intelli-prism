@@ -12,36 +12,23 @@
 //! classify is a value, never a panic and never a block — what the gateway does with
 //! the error is its business, not this crate's.
 //!
-//! # The runtime library, and which one
+//! # The runtime library, and the artefact directory
 //!
-//! The ONNX Runtime is dynamically loaded (`load-dynamic`): this crate builds with no
-//! native dependency present and finds it at open time by name, searched as `dlopen`
-//! searches — `$ORIGIN`, `LD_LIBRARY_PATH`, the system cache. Every path in
-//! [`Classifier::open`] resolves the library *through a call that returns*: an absent
-//! or unloadable library is `ClassifyError::RuntimeMissing`, always a value. (The
-//! default loading route of `ort` resolves lazily inside the session builder and
-//! aborts the process when it finds nothing — this module never takes that route.)
-//!
-//! The version is not a free variable: `ort 2.0.0-rc.13` is built against **ONNX
-//! Runtime 1.28.0**, which is what this crate was verified against. A newer library
-//! on the search path is untested territory — the symbols load, the graph may run,
-//! and the numbers are then no longer the ones measured here.
-//!
-//! Where the library may *not* live: a package manager's cache directory. The
-//! artifacts under such a tree are content-addressed and a routine cache prune
-//! deletes them out from under a running configuration; it belongs in a system
-//! library directory or next to the binary, where it is the operator's to keep.
+//! Neither is this crate's business: `ip-onnx` finds the ONNX Runtime, checks the
+//! directory holds what it must, proves the weights are the ones the manifest speaks
+//! for, and opens the graph and the tokenizer. What is left here is the part that is
+//! about *this* model — the gate's fitted figures, the five logits, the class order.
+//! See that crate's module doc for which runtime library is loaded and why only one
+//! of them can be.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ip_core::Difficulty;
 
-use crate::{ClassifyError, Distribution, Temperature};
+use ip_onnx::OnnxError;
 
-/// The library name the search resolves when nothing better is offered: the SONAME
-/// of a release build, as `dlopen` looks it up.
-const DEFAULT_LIBRARY: &str = "libonnxruntime.so";
+use crate::{ClassifyError, Distribution, Temperature};
 
 /// The classifier itself: one loaded model, ready for one call at a time.
 ///
@@ -50,8 +37,8 @@ const DEFAULT_LIBRARY: &str = "libonnxruntime.so";
 /// offered: the session holds the weights.
 #[derive(Debug)]
 pub struct Classifier {
-    session: ort::session::Session,
-    tokenizer: tokenizers::Tokenizer,
+    session: ip_onnx::ort::session::Session,
+    tokenizer: ip_onnx::tokenizers::Tokenizer,
     gate: Gate,
 }
 
@@ -72,10 +59,9 @@ impl Classifier {
     /// Loads an artefact directory — `model.onnx`, `tokenizer.json`, `gate.json` —
     /// resolving the runtime library by the environment or the default search.
     ///
-    /// Every failure leaves the process standing: an absent library is
-    /// [`ClassifyError::RuntimeMissing`], a missing file
-    /// [`ClassifyError::ArtifactMissing`], a graph that will not open a
-    /// [`ClassifyError::GraphRefused`]. Startup may fail; it may not abort.
+    /// Every failure leaves the process standing — an absent library, a missing
+    /// file, a graph that will not open are each a value from `ip-onnx`. Startup may
+    /// fail; it may not abort.
     pub fn open(artifact_dir: impl AsRef<Path>) -> Result<Self, ClassifyError> {
         Self::open_inner(artifact_dir.as_ref(), None)
     }
@@ -92,45 +78,15 @@ impl Classifier {
     fn open_inner(artifact_dir: &Path, library: Option<&Path>) -> Result<Self, ClassifyError> {
         // Files first: their absence is news no installed library changes, and it is
         // reported identically on a machine with a runtime and one without.
-        let model = artifact_dir.join("model.onnx");
-        let tokenizer_path = artifact_dir.join("tokenizer.json");
-        let gate = artifact_dir.join("gate.json");
-        for required in [&model, &tokenizer_path, &gate] {
-            if !required.exists() {
-                return Err(ClassifyError::ArtifactMissing(format!(
-                    "{} — an artefact directory holds model.onnx, tokenizer.json \
-                     and gate.json",
-                    required.display()
-                )));
-            }
-        }
-        // Every remaining arm names a candidate and calls the one loading API that
-        // returns — `init_from`. ort's own default route defers the load into the
-        // first session and aborts on failure, so this code never asks it to. Once a
-        // library is loaded for the process a later call resolves against that one:
-        // the first successful open in a process owns the choice, as the runtime
-        // itself specifies.
-        let candidate = library
-            .map(PathBuf::from)
-            .or_else(Self::library_from_env)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_LIBRARY));
-        let builder = ort::init_from(&candidate)
-            .map_err(|error| ClassifyError::RuntimeMissing(format!("{candidate:?}: {error}")))?;
-        let _environment = builder.commit();
-        let artifact = Gate::read(&gate, &model)?;
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|error| {
-            ClassifyError::ArtifactUnreadable(format!("{}: {error}", tokenizer_path.display()))
-        })?;
-        let session = ort::session::Session::builder()
-            .map_err(|error| ClassifyError::Inference(error.to_string()))?
-            .commit_from_file(&model)
-            .map_err(|error| {
-                ClassifyError::GraphRefused(format!("{}: {error}", model.display()))
-            })?;
+        let artifact = ip_onnx::Artifact::at(artifact_dir, MANIFEST)?;
+        ip_onnx::load(library)?;
+        let gate = Gate::read(artifact.manifest(), artifact.model())?;
+        let tokenizer = artifact.tokenizer()?;
+        let session = artifact.session()?;
         Ok(Self {
             session,
             tokenizer,
-            gate: artifact,
+            gate,
         })
     }
 
@@ -142,8 +98,8 @@ impl Classifier {
 
     /// The path the runtime library was searched for under `ORT_DYLIB_PATH`, if set.
     #[must_use]
-    pub fn library_from_env() -> Option<PathBuf> {
-        std::env::var_os(DYLIB_ENV).map(PathBuf::from)
+    pub fn library_from_env() -> Option<std::path::PathBuf> {
+        ip_onnx::library_from_env()
     }
 
     /// The distribution over the five classes for one text, in the order of
@@ -152,7 +108,7 @@ impl Classifier {
         let encoded = self
             .tokenizer
             .encode(text, true)
-            .map_err(|error| ClassifyError::Tokenize(error.to_string()))?;
+            .map_err(|error| ClassifyError::from(OnnxError::Tokenize(error.to_string())))?;
         self.classify_ids(
             encoded
                 .get_ids()
@@ -176,20 +132,20 @@ impl Classifier {
         let width = ids.len();
         let attention = vec![1i64; width];
         let shape = [1usize, width];
-        let input_ids = ort::value::Tensor::from_array((shape, ids))
-            .map_err(|error| ClassifyError::Inference(error.to_string()))?;
-        let attention_mask = ort::value::Tensor::from_array((shape, attention))
-            .map_err(|error| ClassifyError::Inference(error.to_string()))?;
+        let input_ids = ip_onnx::ort::value::Tensor::from_array((shape, ids))
+            .map_err(|error| ClassifyError::from(OnnxError::Inference(error.to_string())))?;
+        let attention_mask = ip_onnx::ort::value::Tensor::from_array((shape, attention))
+            .map_err(|error| ClassifyError::from(OnnxError::Inference(error.to_string())))?;
         let outputs = self
             .session
-            .run(ort::inputs![
+            .run(ip_onnx::ort::inputs![
                 "input_ids" => input_ids,
                 "attention_mask" => attention_mask,
             ])
-            .map_err(|error| ClassifyError::Inference(error.to_string()))?;
+            .map_err(|error| ClassifyError::from(OnnxError::Inference(error.to_string())))?;
         let (shape, logits) = outputs[0]
             .try_extract_tensor::<f32>()
-            .map_err(|error| ClassifyError::Inference(error.to_string()))?;
+            .map_err(|error| ClassifyError::from(OnnxError::Inference(error.to_string())))?;
         let shape: &[i64] = shape.as_ref();
         // The shape is the proof, not a curiosity: 768 hidden states laid over five
         // logits read exactly as confident nonsense, and only the dimensions tell.
@@ -206,7 +162,10 @@ impl Classifier {
 }
 
 /// The environment variable naming the runtime library, if the operator set one.
-pub const DYLIB_ENV: &str = "ORT_DYLIB_PATH";
+pub const DYLIB_ENV: &str = ip_onnx::DYLIB_ENV;
+
+/// What this kind of artefact calls its manifest.
+const MANIFEST: &str = "gate.json";
 
 /// Manifest schemas this build reads. A version outside this list is refused rather
 /// than read for the keys it recognises, because a later shape may mean something
@@ -269,76 +228,65 @@ impl Gate {
     /// A manifest that will not read, a schema this build does not carry, or weights
     /// whose digest is not the one named.
     pub fn read(manifest: &Path, model: &Path) -> Result<Self, ClassifyError> {
-        let gate = read_gate(manifest)?;
-        let text = std::fs::read_to_string(manifest)
-            .map_err(|_| ClassifyError::ArtifactUnreadable(manifest.display().to_string()))?;
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|_| ClassifyError::ArtifactUnreadable(manifest.display().to_string()))?;
-        check_weights(text_at(&value, "checksum").as_deref(), model)?;
+        let value = ip_onnx::read_json(manifest)?;
+        let gate = read_gate(manifest, &value)?;
+        ip_onnx::check_weights(
+            ip_onnx::text_at(&value, "checksum").as_deref(),
+            &ip_onnx::digest(model)?,
+        )?;
         Ok(gate)
     }
 }
 
-/// Reads the two figures: refuse an unreadable file as itself, and a missing figure
-/// as what it is too.
-fn read_gate(path: &Path) -> Result<Gate, ClassifyError> {
-    let unreadable = || ClassifyError::ArtifactUnreadable(path.display().to_string());
-    let text = std::fs::read_to_string(path).map_err(|_| unreadable())?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
+/// Reads the figures out of an already-parsed manifest: refuse a missing one as what
+/// it is, naming the file it was missing from.
+fn read_gate(path: &Path, value: &ip_onnx::serde_json::Value) -> Result<Gate, ClassifyError> {
+    let unreadable = || ip_onnx::OnnxError::ArtifactUnreadable(path.display().to_string());
     let temperature = Temperature::new(
         value
             .get("temperature")
-            .and_then(serde_json::Value::as_f64)
+            .and_then(ip_onnx::serde_json::Value::as_f64)
             .ok_or_else(unreadable)?,
     )
     .map_err(|_| unreadable())?;
     let max_length = value
         .get("max_length")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(ip_onnx::serde_json::Value::as_u64)
         .and_then(|length| usize::try_from(length).ok())
         .filter(|length| *length > 2)
         .ok_or_else(unreadable)?;
     let classes = value
         .get("classes")
-        .and_then(serde_json::Value::as_array)
+        .and_then(ip_onnx::serde_json::Value::as_array)
         .map(|names| {
             names
                 .iter()
-                .filter_map(serde_json::Value::as_str)
+                .filter_map(ip_onnx::serde_json::Value::as_str)
                 .map(str::to_owned)
                 .collect::<Vec<String>>()
         })
         .filter(|names| !names.is_empty())
         .ok_or_else(unreadable)?;
     // A schema this build does not read is refused whole; see `SCHEMAS`.
-    let schema = value
-        .get("version")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1);
-    if !SCHEMAS.contains(&schema) {
-        return Err(ClassifyError::ArtifactSchema {
-            found: schema,
-            carried: format!("{SCHEMAS:?}"),
-        });
-    }
+    ip_onnx::schema(value, &SCHEMAS)?;
     let margin = value
         .get("margin")
-        .and_then(serde_json::Value::as_array)
+        .and_then(ip_onnx::serde_json::Value::as_array)
         .map(|rows| rows.iter().filter_map(measured).collect())
         .unwrap_or_default();
     Ok(Gate {
         temperature,
         max_length,
         classes,
-        quantization: text_at(&value, "quantization"),
+        quantization: ip_onnx::text_at(value, "quantization"),
         margin,
-        base: text_at(&value, "base"),
-        model_version: text_at(&value, "model_version"),
+        base: ip_onnx::text_at(value, "base"),
+        model_version: ip_onnx::text_at(value, "model_version"),
     })
 }
 
 /// One row of the margin table, or nothing where a row is not one.
-fn measured(row: &serde_json::Value) -> Option<Measured> {
+fn measured(row: &ip_onnx::serde_json::Value) -> Option<Measured> {
     Some(Measured {
         threshold: row.get("threshold")?.as_f64()?,
         accuracy: row.get("accuracy")?.as_f64()?,
@@ -346,53 +294,10 @@ fn measured(row: &serde_json::Value) -> Option<Measured> {
     })
 }
 
-/// A string field of the manifest, when it carries one.
-fn text_at(value: &serde_json::Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-}
-
-/// The digest of the weights, read in pieces so a file of any size costs one buffer.
-fn digest(path: &Path) -> Result<String, ClassifyError> {
-    use sha2::Digest;
-    use std::io::Read;
-    let unreadable = || ClassifyError::ArtifactUnreadable(path.display().to_string());
-    let mut file = std::fs::File::open(path).map_err(|_| unreadable())?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        let read = file.read(&mut buffer).map_err(|_| unreadable())?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// Refuses weights that are not the weights the manifest was written for.
-///
-/// Only when the manifest names a digest: one written before checksums existed has
-/// nothing to disagree with, and refusing it would refuse every artefact built before
-/// this gateway could check.
-fn check_weights(named: Option<&str>, model: &Path) -> Result<(), ClassifyError> {
-    let Some(named) = named else {
-        return Ok(());
-    };
-    let named = named.strip_prefix("sha256:").unwrap_or(named);
-    let found = digest(model)?;
-    if found != named {
-        return Err(ClassifyError::ArtifactChecksum {
-            named: named.to_owned(),
-            found,
-        });
-    }
-    Ok(())
-}
 #[cfg(all(test, feature = "runtime"))]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     /// The artefact, spelled: this names the one trained checkpoint the tests speak
@@ -453,7 +358,7 @@ mod tests {
             "full-gate",
             [("gate.json", FULL.as_bytes()), ("a", b""), ("b", b"")],
         );
-        let gate = read_gate(&dir.join("gate.json")).expect("a manifest");
+        let gate = gate_in(&dir).expect("a manifest");
         assert_eq!(gate.temperature.value(), 1.2);
         assert_eq!(gate.max_length, 256);
         assert_eq!(gate.quantization.as_deref(), Some("int8"));
@@ -472,7 +377,7 @@ mod tests {
         let old = br#"{"temperature": 1.3, "max_length": 256, "version": 1,
             "classes": ["easy", "routine", "median", "hard", "research"]}"#;
         let dir = artifact_with("old-gate", [("gate.json", old), ("a", b""), ("b", b"")]);
-        let gate = read_gate(&dir.join("gate.json")).expect("a manifest");
+        let gate = gate_in(&dir).expect("a manifest");
         assert_eq!(gate.quantization, None);
         assert!(gate.margin.is_empty(), "no table is not a broken table");
         assert_eq!(gate.model_version, None);
@@ -486,44 +391,25 @@ mod tests {
             "classes": ["easy", "routine", "median", "hard", "research"]}"#;
         let dir = artifact_with("ahead-gate", [("gate.json", ahead), ("a", b""), ("b", b"")]);
         assert!(matches!(
-            read_gate(&dir.join("gate.json")),
-            Err(ClassifyError::ArtifactSchema { found: 99, .. })
+            gate_in(&dir),
+            Err(ClassifyError::Onnx(OnnxError::ArtifactSchema {
+                found: 99,
+                ..
+            }))
         ));
     }
 
-    /// Weights that are not the weights the manifest was written for: a truncated
-    /// download, a half-replaced file, an artefact swapped under a deployment. Every
-    /// one of them routes by a gate fitted to something else, silently, unless this
-    /// says so.
-    #[test]
-    fn weights_the_manifest_was_not_written_for_are_refused() {
-        let dir = artifact_with(
-            "checksum",
-            [("model.onnx", b"not the weights"), ("a", b""), ("b", b"")],
-        );
-        let model = dir.join("model.onnx");
-        let named = digest(&model).expect("a digest of what is there");
-
-        check_weights(Some(&named), &model).expect("the digest it actually has");
-        check_weights(Some(&format!("sha256:{named}")), &model).expect("the prefix is optional");
-        let refused = check_weights(Some("sha256:0000"), &model).expect_err("a wrong digest");
-        let ClassifyError::ArtifactChecksum { named: said, found } = refused else {
-            panic!("refused for the wrong reason: {refused}")
-        };
-        assert_eq!(said, "0000");
-        assert_eq!(found, named, "the error says what the file actually is");
+    /// The manifest of an artefact directory, read the way `Gate::read` reads it but
+    /// without the weights beside it, which these cases do not have.
+    fn gate_in(dir: &Path) -> Result<Gate, ClassifyError> {
+        let manifest = dir.join("gate.json");
+        let value = ip_onnx::read_json(&manifest)?;
+        read_gate(&manifest, &value)
     }
 
-    /// A manifest naming no digest has nothing to disagree with. Refusing it would
-    /// refuse every artefact built before this gateway could check one.
-    #[test]
-    fn weights_no_manifest_speaks_for_are_not_refused() {
-        let dir = artifact_with(
-            "unchecked",
-            [("model.onnx", b"whatever"), ("a", b""), ("b", b"")],
-        );
-        check_weights(None, &dir.join("model.onnx")).expect("nothing claimed, nothing refused");
-    }
+    // The digest and the checksum themselves are `ip-onnx`'s now, and are tested
+    // there against files written for the purpose. What stays here is what this
+    // crate still decides: its own manifest's fields, and the whole opening path.
 
     /// A throwaway artefact directory of the named shape, for the loading-failure
     /// tests: real layout, files of their claims only.
@@ -571,7 +457,7 @@ mod tests {
         // for this one — and the message names the file and spells the layout.
         let error = Classifier::open(&dir).err();
         match error {
-            Some(ClassifyError::ArtifactMissing(message)) => {
+            Some(ClassifyError::Onnx(OnnxError::ArtifactMissing(message))) => {
                 assert!(
                     message.contains("model.onnx"),
                     "the file by name: {message}"
@@ -642,7 +528,7 @@ mod tests {
         );
         let error = Classifier::open(&dir).expect_err("an absent library cannot load a classifier");
         assert!(
-            matches!(error, ClassifyError::RuntimeMissing(_)),
+            matches!(error, ClassifyError::Onnx(OnnxError::RuntimeMissing(_))),
             "an absent library is RuntimeMissing, got {error}"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -664,7 +550,10 @@ mod tests {
         );
         let error = Classifier::open(&dir).err();
         assert!(
-            matches!(error, Some(ClassifyError::ArtifactUnreadable(_))),
+            matches!(
+                error,
+                Some(ClassifyError::Onnx(OnnxError::ArtifactUnreadable(_)))
+            ),
             "an unreadable tokenizer is the news itself, got {error:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -687,7 +576,7 @@ mod tests {
         );
         let error = Classifier::open(&dir).expect_err("a manifest without its figures cannot load");
         assert!(
-            matches!(error, ClassifyError::ArtifactUnreadable(_)),
+            matches!(error, ClassifyError::Onnx(OnnxError::ArtifactUnreadable(_))),
             "the missing figures are the unreadable part, got {error}"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -715,7 +604,7 @@ mod tests {
         );
         let error = Classifier::open(&dir).err();
         assert!(
-            matches!(error, Some(ClassifyError::GraphRefused(_))),
+            matches!(error, Some(ClassifyError::Onnx(OnnxError::GraphRefused(_)))),
             "a corrupt graph is refused at open, got {error:?}"
         );
         std::fs::remove_dir_all(&dir).ok();

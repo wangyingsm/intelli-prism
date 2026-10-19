@@ -13,6 +13,7 @@ categories = ["network-programming", "web-programming::http-server"]
 [dependencies]
 ip-classify = { path = "crates/ip-classify", optional = true }
 ip-embed = { version = "0.1.0", path = "crates/ip-embed", optional = true }
+ip-onnx = { version = "0.1.0", path = "crates/ip-onnx", optional = true }
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 getrandom.workspace = true
@@ -84,5 +85,5 @@ standalone-storage = ["ip-storage/standalone-storage"]
 fast-storage = ["ip-storage/fast-storage"]
 standalone-cache = ["ip-cache/standalone-cache"]
 cluster-cache = ["ip-cache/cluster-cache"]
-classifier = ["dep:ip-classify", "ip-classify/runtime"]
+classifier = ["dep:ip-classify", "ip-classify/runtime", "dep:ip-onnx"]
 semantic = ["dep:ip-embed", "ip-embed/runtime"]

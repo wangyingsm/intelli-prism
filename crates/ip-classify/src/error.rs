@@ -43,61 +43,20 @@ pub enum ClassifyError {
         value: f64,
     },
 
-    /// The ONNX Runtime library could not be found or loaded. An ordinary startup
-    /// failure of a build with the `runtime` feature on a machine that has no runtime
-    /// installed — reported, never aborted: a classifier that cannot load leaves the
-    /// process standing. The message names what was tried.
-    #[error("the ONNX Runtime library could not be loaded: {0}")]
-    RuntimeMissing(String),
-
-    /// A required file of the artefact directory is not there — a misspelled path or
-    /// a half-copied export. The message names the file and spells the layout.
-    #[error("the classifier artefact is missing {0}")]
-    ArtifactMissing(String),
-
-    /// A file of the artefact exists and is not readable as what it claims: tokenizer
-    /// json that isn't, a gate manifest without its temperature, a temperature the
-    /// arithmetic refuses. The artifact on disk is wrong; the operator needs to know
-    /// which file to go look at.
-    #[error("the classifier artefact file {0} is not readable as what it claims")]
-    ArtifactUnreadable(String),
-
-    /// The manifest declares a schema this build does not read. Refused rather than
-    /// read for the fields it happens to recognise: a manifest written to a later
-    /// shape may mean something different by the same key, and guessing at it is how
-    /// a gate ends up calibrated for an artefact nobody shipped.
-    #[error(
-        "the classifier artefact declares manifest schema {found}, and this build reads {carried}"
-    )]
-    ArtifactSchema {
-        /// What the manifest said.
-        found: u64,
-        /// What this build knows, listed.
-        carried: String,
-    },
-
-    /// The weights are not the weights the manifest was written for. A truncated
-    /// download, a half-replaced file, an artefact swapped under a running deployment:
-    /// each would route by a gate fitted to something else, which is silent, so this
-    /// is loud instead.
-    #[error(
-        "the classifier weights do not match the manifest: it names {named}, the file is {found}"
-    )]
-    ArtifactChecksum {
-        /// The digest the manifest claims.
-        named: String,
-        /// The digest the file actually has.
-        found: String,
-    },
-
-    /// The graph would not open: corrupted, foreign, or built for another runtime.
-    #[error("the classifier graph would not open: {0}")]
-    GraphRefused(String),
+    /// Opening the model: the runtime library, the artefact directory, the graph,
+    /// the tokenizer, and the forward pass itself. Every one of them belongs to
+    /// `ip-onnx`, which both this crate and the embedder open their models through.
+    #[cfg(feature = "runtime")]
+    #[error(transparent)]
+    Onnx(#[from] ip_onnx::OnnxError),
 
     /// The graph opened and answered, but not with the five numbers the gate is built
     /// on: a logits vector shorter than the classes, which only a mis-shaped export
     /// produces — the failure a numeric export verification promises against, and
     /// double-checks with what it reads back.
+    ///
+    /// This one stays here rather than moving to `ip-onnx`: what shape an answer must
+    /// be is the one thing about a model that only the crate asking it can know.
     #[error(
         "the classifier answered with {got} logits, not {}",
         ip_core::Difficulty::COUNT
@@ -106,18 +65,6 @@ pub enum ClassifyError {
         /// How many logits came back.
         got: usize,
     },
-
-    /// The forward pass failed at run time, or its output would not extract. Ordinary
-    /// operation includes this possibility, which is why it is a value: serving never
-    /// fails because classifying did.
-    #[error("classification failed: {0}")]
-    Inference(String),
-
-    /// The text would not tokenize — input the model's tokenizer rejects, which real
-    /// user text sometimes is and which classifies as nothing rather than as an error
-    /// above the request.
-    #[error("the text could not be tokenized: {0}")]
-    Tokenize(String),
 
     /// The threshold compares probabilities. A value outside 0.0..=1.0 would pass or refuse
     /// every distribution, which a configuration mistype reaches faster than a thought.

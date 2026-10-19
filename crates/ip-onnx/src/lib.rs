@@ -43,6 +43,15 @@ use std::sync::Mutex;
 
 pub use error::OnnxError;
 
+// Re-exported rather than depended on twice. A crate that runs a model needs the
+// session, the tensors and the tokenizer, and the one thing that must not happen is
+// two versions of `ort` in one process — its loaded library and its environment are
+// process-global, so a second copy would be a second global disagreeing with the
+// first. Reaching them through here makes that unrepresentable.
+pub use ort;
+pub use serde_json;
+pub use tokenizers;
+
 /// The environment variable naming the runtime library, if the operator set one.
 pub const DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 

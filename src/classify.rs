@@ -206,8 +206,11 @@ mod judge {
                 Ok(judged) => judged,
                 Err(error) => {
                     let kind = match &error {
-                        ip_classify::ClassifyError::Inference(_) => "inference",
-                        ip_classify::ClassifyError::Tokenize(_) => "tokenize",
+                        ip_classify::ClassifyError::Onnx(onnx) => match onnx {
+                            ip_onnx::OnnxError::Inference(_) => "inference",
+                            ip_onnx::OnnxError::Tokenize(_) => "tokenize",
+                            _ => "artefact error",
+                        },
                         _ => "classifier error",
                     };
                     tracing::warn!(kind, "classification failed; dispatching unclassified");
