@@ -51,7 +51,7 @@ impl FailingCache {
     fn answering(&self) -> Result<(), CacheError> {
         let taken = self
             .answers_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 (left > 0).then(|| left.saturating_sub(1))
             });
         match taken {
