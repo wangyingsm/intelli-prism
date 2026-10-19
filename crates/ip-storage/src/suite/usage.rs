@@ -122,18 +122,24 @@ pub(crate) async fn reading_a_request_nobody_recorded_is_nothing(store: &impl Us
 }
 
 /// Records one request per name given, each for its own tenant, user and api.
-async fn spent_by(store: &impl UsageStore, who: &[(&str, &str, &str)]) {
+/// The rows are handed back because the store stamps each one's moment itself, and a
+/// test about moments can only be exact about one it was told.
+async fn spent_by(store: &impl UsageStore, who: &[(&str, &str, &str)]) -> Vec<crate::usage::Usage> {
+    let mut recorded = Vec::with_capacity(who.len());
     for (tenant, user, api) in who {
-        store
-            .record_usage(NewUsage {
-                tenant: TenantId::new(tenant).unwrap(),
-                user: UserId::new(user).unwrap(),
-                api: ApiId::new(api).unwrap(),
-                ..spent()
-            })
-            .await
-            .unwrap();
+        recorded.push(
+            store
+                .record_usage(NewUsage {
+                    tenant: TenantId::new(tenant).unwrap(),
+                    user: UserId::new(user).unwrap(),
+                    api: ApiId::new(api).unwrap(),
+                    ..spent()
+                })
+                .await
+                .unwrap(),
+        );
     }
+    recorded
 }
 
 /// Every tenant of a listed page, newest first.
@@ -353,8 +359,13 @@ pub(crate) async fn what_was_spent_is_summed_for_a_scope_since_a_moment(store: &
 }
 
 pub(crate) async fn what_was_spent_before_the_moment_is_not_counted(store: &impl Backend) {
-    spent_by(store, &[("acme", "alice", "anthropic")]).await;
-    let now = ip_core::Timestamp::now();
+    let recorded = spent_by(store, &[("acme", "alice", "anthropic")]).await;
+    // The row's own moment, not a clock read beside it. The store stamps `created_at`
+    // inside `record_usage` and times are whole seconds, so an insert that finishes
+    // either side of a second boundary from a `now()` taken here puts the row one
+    // second outside the window it is meant to be inside — which is a failure of the
+    // test's arithmetic and not of the store's, and only shows up on a loaded machine.
+    let now = recorded[0].created_at;
     let filter = UsageFilter::default();
 
     // The moment a period begins counts what was spent in it, so the row now is inside.
