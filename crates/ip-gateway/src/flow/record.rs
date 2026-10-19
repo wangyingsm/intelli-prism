@@ -268,6 +268,8 @@ impl Recording {
                 api: self.api.as_str(),
                 model: model.as_ref(),
                 served: serving.source,
+                tokens,
+                latency: Latency::from_millis(self.started.elapsed().as_millis()),
             });
         }
         let Some(store) = self.keeping.store.clone() else {

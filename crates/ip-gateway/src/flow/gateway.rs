@@ -648,6 +648,110 @@ mod tests {
         );
     }
 
+    /// What the answer was measured at, counted in each direction, and how long the
+    /// whole thing took — the two numbers a bill and a dashboard are both built from.
+    #[tokio::test]
+    async fn what_an_answer_spent_and_how_long_it_took_are_counted() {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (gateway, exporter, provider) = metered(upstream);
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(body_of(answered).await, ANSWERED);
+
+        // The answer names 120 in and 30 out, which is what the usage row records too.
+        let mut spent: Vec<(String, u64)> = counted(&exporter, &provider, "ip.tokens")
+            .into_iter()
+            .map(|(labels, value)| {
+                let direction = labels
+                    .iter()
+                    .find(|(key, _)| key == "direction")
+                    .expect("each direction is its own series")
+                    .1
+                    .clone();
+                (direction, value)
+            })
+            .collect();
+        spent.sort();
+        assert_eq!(
+            spent,
+            vec![("input".to_owned(), 120), ("output".to_owned(), 30)]
+        );
+
+        // And the latency landed somewhere, under labels a configuration bounds.
+        provider.force_flush().unwrap();
+        let exported = exporter.get_finished_metrics().unwrap();
+        let latency = exported
+            .iter()
+            .flat_map(|held| held.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "ip.latency")
+            .expect("the histogram reached the exporter");
+        let AggregatedMetrics::U64(MetricData::Histogram(held)) = latency.data() else {
+            panic!("a latency is a histogram");
+        };
+        let point = held.data_points().next().expect("one request, one point");
+        assert_eq!(point.count(), 1);
+        let labels: Vec<String> = point.attributes().map(|at| at.key.to_string()).collect();
+        assert!(
+            !labels.contains(&"tenant".to_owned()),
+            "a tenant on the histogram multiplies it by its buckets: {labels:?}"
+        );
+        assert!(labels.contains(&"api".to_owned()), "{labels:?}");
+    }
+
+    /// A cache hit spends nothing, and the zero is the point: a series that appeared
+    /// only when tokens were spent could not show what the cache saved.
+    #[tokio::test]
+    async fn an_answer_the_cache_gave_is_counted_as_spending_nothing() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
+            .measuring(Arc::new(Meters::new(&provider.meter("test"))));
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap();
+            body_of(answered).await;
+        }
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            1,
+            "the second was a hit"
+        );
+
+        let by_outcome: Vec<(String, String, u64)> = counted(&exporter, &provider, "ip.tokens")
+            .into_iter()
+            .map(|(labels, value)| {
+                let at = |key: &str| {
+                    labels
+                        .iter()
+                        .find(|(name, _)| name == key)
+                        .map(|(_, held)| held.clone())
+                        .unwrap_or_default()
+                };
+                (at("outcome"), at("direction"), value)
+            })
+            .collect();
+        assert!(
+            by_outcome.contains(&("cache".to_owned(), "input".to_owned(), 0)),
+            "the hit should have spent nothing, and said so: {by_outcome:?}"
+        );
+        assert!(
+            by_outcome.contains(&("upstream".to_owned(), "input".to_owned(), 120)),
+            "{by_outcome:?}"
+        );
+    }
+
     /// A gateway nobody asked to count does not, and still serves. Without this the
     /// test above would pass just as well if counting were unconditional.
     #[tokio::test]

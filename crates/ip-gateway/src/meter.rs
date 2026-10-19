@@ -29,9 +29,32 @@
 //! and where both could answer a question the row is authoritative. That is what stops
 //! this label set having to grow to cover every question anyone will ever ask.
 
-use ip_core::{ModelName, Served, TenantId};
-use opentelemetry::metrics::{Counter, Meter};
+use ip_core::{Latency, ModelName, Served, TenantId, Tokens};
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{KeyValue, Value};
+
+/// Where the latency histogram's buckets fall, in milliseconds.
+///
+/// The defaults are no use here. They stop at ten seconds, and an llm call routinely
+/// runs longer — everything past the last boundary lands in one overflow bucket, so a
+/// gateway whose slow requests are the interesting ones would have a histogram that
+/// says only "slow". These run from a cache hit to a long stream:
+///
+/// - **1 to 25 ms** is an answer the gateway gave itself. A cache hit is well under a
+///   millisecond of work plus whatever the backend costs, and seeing that separately
+///   from an upstream call is most of why the cache levels are worth having.
+/// - **50 to 1000 ms** is a fast model, or a refusal, or a request that never left.
+/// - **2.5 to 60 s** is the ordinary range of a real completion. A minute is the last
+///   boundary because past it the interesting fact is that it happened at all, which
+///   the overflow bucket says perfectly well.
+///
+/// Milliseconds rather than the seconds OpenTelemetry prefers, so that this and the
+/// `latency_ms` column of a usage row are the same number: an operator correlating a
+/// spike on a dashboard with the rows behind it should not have to convert.
+const LATENCY_MS: &[f64] = &[
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+    60_000.0,
+];
 
 /// Every instrument the gateway writes to, built once.
 ///
@@ -42,6 +65,8 @@ use opentelemetry::{KeyValue, Value};
 #[derive(Debug, Clone)]
 pub struct Meters {
     requests: Counter<u64>,
+    tokens: Counter<u64>,
+    latency: Histogram<u64>,
 }
 
 impl Meters {
@@ -54,16 +79,42 @@ impl Meters {
                 .with_description("Requests answered, by who asked and what answered.")
                 .with_unit("{request}")
                 .build(),
+            tokens: meter
+                .u64_counter("ip.tokens")
+                .with_description("Tokens an answer was measured at, in each direction.")
+                .with_unit("{token}")
+                .build(),
+            latency: meter
+                .u64_histogram("ip.latency")
+                .with_description("How long a request took, end to end.")
+                .with_unit("ms")
+                .with_boundaries(LATENCY_MS.to_vec())
+                .build(),
         }
     }
 
-    /// Counts one answered request.
+    /// Counts one answered request: that it happened, what it spent, how long it took.
     ///
     /// Called for every answer the gateway gives, including the ones no endpoint was
     /// reached for — a cache hit is a request served, and a dashboard that counted
     /// only upstream calls would report a falling request rate as a cache warmed.
     pub(crate) fn answered(&self, asked: &Answered<'_>) {
-        self.requests.add(1, &asked.labels());
+        let whose = asked.labels();
+        self.requests.add(1, &whose);
+        // Recorded even when it is nothing, because nothing is the interesting number:
+        // a cache hit spending zero tokens against an upstream call spending a
+        // thousand is the whole of what the cache levels are worth, and a series that
+        // appeared only when tokens were spent could not show it.
+        for (direction, spent) in [
+            ("input", u64::from(asked.tokens.input.get())),
+            ("output", u64::from(asked.tokens.output.get())),
+        ] {
+            let mut labels = whose.clone();
+            labels.push(KeyValue::new("direction", direction));
+            self.tokens.add(spent, &labels);
+        }
+        self.latency
+            .record(u64::from(asked.latency.millis()), &asked.bounded());
     }
 }
 
@@ -82,13 +133,31 @@ pub(crate) struct Answered<'a> {
     pub model: Option<&'a ModelName>,
     /// Which of the three places the answer came from.
     pub served: Served,
+    /// What the answer was measured at, which is nothing for a cache hit.
+    pub tokens: Tokens,
+    /// How long the whole thing took.
+    pub latency: Latency,
 }
 
 impl Answered<'_> {
-    /// The labels, built in one place so every instrument agrees about them.
+    /// The labels a counter carries, the tenant among them.
+    ///
+    /// One series per tenant, which is what the ruling costs and buys.
     fn labels(&self) -> Vec<KeyValue> {
+        let mut labels = self.bounded();
+        labels.push(KeyValue::new("tenant", self.tenant.as_str().to_owned()));
+        labels
+    }
+
+    /// The labels a histogram carries: only those a configuration file bounds.
+    ///
+    /// No tenant here, deliberately. A counter with a tenant costs one series per
+    /// tenant; a histogram costs one per bucket per tenant, which with these
+    /// boundaries is fourteen times more — for a question that is about the
+    /// deployment rather than about any one tenant. What a particular tenant waited
+    /// is in their usage rows, to the millisecond, per request.
+    fn bounded(&self) -> Vec<KeyValue> {
         vec![
-            KeyValue::new("tenant", self.tenant.as_str().to_owned()),
             KeyValue::new("api", self.api.to_owned()),
             // A request whose answer named no model is still a request, so the label
             // is present and empty rather than absent: a missing label would put it in
@@ -143,21 +212,75 @@ mod tests {
             api: "anthropic",
             model: Some(&model),
             served: Served::Semantic,
+            tokens: Tokens::new(ip_core::TokenCount::new(120), ip_core::TokenCount::new(30)),
+            latency: Latency::from_millis(42),
         };
-        let labels: Vec<(String, String)> = asked
+        // Sorted, because labels are a set: the order they are built in is not part
+        // of what a series is, and asserting it would break on a harmless rewrite.
+        let mut labels: Vec<(String, String)> = asked
             .labels()
             .iter()
             .map(|at| (at.key.to_string(), at.value.to_string()))
             .collect();
+        labels.sort();
         assert_eq!(
             labels,
             vec![
-                ("tenant".to_owned(), "acme".to_owned()),
                 ("api".to_owned(), "anthropic".to_owned()),
                 ("model".to_owned(), "claude-opus-5".to_owned()),
                 ("outcome".to_owned(), "semantic".to_owned()),
+                ("tenant".to_owned(), "acme".to_owned()),
             ]
         );
+    }
+
+    /// The ruling's cost, pinned where it is paid: the tenant is on a counter and not
+    /// on the histogram, because a histogram multiplies by its buckets.
+    #[test]
+    fn a_histogram_carries_no_tenant_and_a_counter_does() {
+        let tenant = TenantId::new("acme").unwrap();
+        let asked = Answered {
+            tenant: &tenant,
+            api: "anthropic",
+            model: None,
+            served: Served::Upstream,
+            tokens: Tokens::ZERO,
+            latency: Latency::from_millis(1),
+        };
+        let named = |labels: Vec<KeyValue>| -> Vec<String> {
+            labels.iter().map(|at| at.key.to_string()).collect()
+        };
+        assert!(named(asked.labels()).contains(&"tenant".to_owned()));
+        assert!(
+            !named(asked.bounded()).contains(&"tenant".to_owned()),
+            "a tenant on the histogram would cost {} series each instead of one",
+            LATENCY_MS.len() + 1
+        );
+        // And everything else is on both, or the two would not be comparable.
+        for label in named(asked.bounded()) {
+            assert!(named(asked.labels()).contains(&label), "{label}");
+        }
+    }
+
+    /// The boundaries have to span what this gateway actually serves — a cache hit
+    /// under a millisecond and a long completion of a minute — or the interesting
+    /// requests all land in one bucket and the histogram says nothing.
+    #[test]
+    fn the_latency_buckets_span_a_cache_hit_and_a_long_completion() {
+        assert_eq!(
+            LATENCY_MS.first(),
+            Some(&1.0),
+            "a cache hit is milliseconds"
+        );
+        assert_eq!(
+            LATENCY_MS.last(),
+            Some(&60_000.0),
+            "past a minute the fact that it happened is the whole news"
+        );
+        let mut rising = LATENCY_MS.to_vec();
+        rising.sort_by(f64::total_cmp);
+        rising.dedup();
+        assert_eq!(rising, LATENCY_MS, "boundaries rise, and none is repeated");
     }
 
     /// An answer that named no model is still an answer, and belongs in the same
@@ -170,6 +293,8 @@ mod tests {
             api: "anthropic",
             model: None,
             served: Served::Upstream,
+            tokens: Tokens::ZERO,
+            latency: Latency::from_millis(1),
         };
         let model = asked
             .labels()
