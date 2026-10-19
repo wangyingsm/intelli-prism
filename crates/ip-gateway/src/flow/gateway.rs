@@ -193,6 +193,17 @@ impl Gateway {
         self
     }
 
+    /// Whether this gateway answers by meaning at all.
+    ///
+    /// What a startup test asks to know that the level was not merely built but
+    /// attached: everything else about it is observable only through a request, and
+    /// a level built and left unattached fails exactly the way a level nobody
+    /// configured does.
+    #[must_use]
+    pub fn recognises(&self) -> bool {
+        self.semantic.is_some() && self.embedder.is_some()
+    }
+
     /// Answers a question whose meaning the gateway has answered before, even where
     /// nobody asked it in those words.
     ///

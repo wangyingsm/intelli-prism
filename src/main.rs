@@ -3,6 +3,7 @@ mod auth;
 mod classify;
 mod cli;
 mod cookie;
+mod embed;
 mod error;
 mod manage;
 #[cfg(feature = "classifier")]

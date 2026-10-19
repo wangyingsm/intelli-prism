@@ -100,6 +100,25 @@ impl AppState {
             }
             None
         };
+        // The encoder on the same terms and for the same reason, and before any
+        // backend is touched: a level configured and silently off is indistinguishable
+        // from one nobody's traffic suits, which is the worst way for this to fail.
+        #[cfg(feature = "semantic")]
+        let encoder: Option<std::sync::Arc<crate::embed::RuntimeEmbedder>> =
+            match config.semantic.as_ref() {
+                Some(semantic) => Some(std::sync::Arc::new(
+                    crate::embed::RuntimeEmbedder::open(semantic)
+                        .map_err(|reason| StartupError::Embedder { reason })?,
+                )),
+                None => None,
+            };
+        #[cfg(not(feature = "semantic"))]
+        if config.semantic.is_some() {
+            return Err(StartupError::UnsupportedBackend {
+                backend: "semantic cache",
+                feature: "semantic",
+            });
+        }
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
         let backend: Arc<dyn Backend> = Arc::clone(&store);
@@ -206,6 +225,38 @@ impl AppState {
                 seconds = ttl.get(),
                 "answering repeated requests from the cache"
             );
+        }
+        #[cfg(feature = "semantic")]
+        if let Some(encoder) = encoder {
+            // Unwrapped against the stanza that opened the encoder: the two are
+            // present together or neither is, which the arm above establishes.
+            let semantic = config
+                .semantic
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("an encoder is opened only from a stanza"));
+            let settings = ip_gateway::SemanticSettings {
+                nearness: ip_embed::Nearness::new(semantic.nearness).map_err(|reason| {
+                    StartupError::Embedder {
+                        reason: reason.to_string(),
+                    }
+                })?,
+                ttl: Ttl::new(semantic.ttl.as_duration())?,
+                width: encoder.width(),
+                capacity: ip_embed::Capacity::new(semantic.capacity).map_err(|reason| {
+                    StartupError::Embedder {
+                        reason: reason.to_string(),
+                    }
+                })?,
+                model: encoder.model().to_owned(),
+            };
+            let by_meaning = ip_gateway::SemanticCache::new(Arc::clone(&cache), settings);
+            tracing::info!(
+                nearness = semantic.nearness,
+                seconds = semantic.ttl.get(),
+                capacity = semantic.capacity,
+                "answering a question asked before in other words"
+            );
+            gateway = gateway.recognising(Arc::new(by_meaning), encoder);
         }
         let nonce_ttl = Ttl::new(config.auth.nonce_ttl.as_duration())?;
         let store = Arc::clone(&backend) as Arc<dyn Storage>;
@@ -615,6 +666,135 @@ confidence = 0.4
             panic!("a directory with no model in it must refuse startup");
         };
         assert!(reason.contains("model.onnx"), "{reason}");
+    }
+
+    /// A semantic section in a build with no encoder in it is refused, never ignored.
+    ///
+    /// Silently ignoring it is the worst of the three possible behaviours: a level
+    /// that never hits is indistinguishable from one nobody's traffic suits, so an
+    /// operator would read a working gateway and a flat hit rate and conclude the
+    /// feature does not pay — having never once run it.
+    #[cfg(not(feature = "semantic"))]
+    #[tokio::test]
+    async fn a_semantic_cache_this_build_does_not_carry_stops_startup() {
+        let config = Config::parse(&format!(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "/nonexistent/ip.db"
+
+{}
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[semantic]
+artifact = {artifact:?}
+nearness = 0.97
+"#,
+            sled_cache(&scratch("unopened-semantic-cache")),
+            artifact = scratch("unbuilt-semantic").display().to_string(),
+        ))
+        .expect("the file itself is well-formed");
+        assert!(matches!(
+            AppState::open(&config).await,
+            Err(StartupError::UnsupportedBackend {
+                backend: "semantic cache",
+                feature: "semantic",
+            })
+        ));
+    }
+
+    /// And a build that does carry one still refuses a directory with no model in it,
+    /// rather than coming up with the level quietly off.
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn an_embedding_artefact_that_is_not_one_stops_startup() {
+        let config = Config::parse(&format!(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "/nonexistent/ip.db"
+
+{}
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[semantic]
+artifact = {artifact:?}
+nearness = 0.97
+"#,
+            sled_cache(&scratch("unopened-semantic-cache")),
+            artifact = scratch("no-such-embedding-artefact").display().to_string(),
+        ))
+        .expect("the file itself is well-formed");
+        let Err(StartupError::Embedder { reason }) = AppState::open(&config).await else {
+            panic!("a directory with no model in it must refuse startup");
+        };
+        assert!(reason.contains("model.onnx"), "{reason}");
+    }
+
+    /// The whole level wired into a standing gateway, against a real export, for
+    /// whoever runs with `IP_EMBED_ARTIFACT`. Without one it says so and passes.
+    ///
+    /// What it is really checking is the assembly between the manifest and the cache:
+    /// the nearness, the span and the bound all come out of the stanza as types the
+    /// cache takes, and the width and the model's digest come out of the artefact.
+    /// Every one of those is a conversion that can refuse, and a refusal here is a
+    /// gateway that will not start.
+    #[cfg(all(feature = "semantic", feature = "standalone-storage"))]
+    #[tokio::test]
+    async fn a_real_embedding_artefact_wires_the_level_into_the_gateway() {
+        let Ok(artifact) = std::env::var("IP_EMBED_ARTIFACT") else {
+            eprintln!("IP_EMBED_ARTIFACT unset: no artefact to wire up");
+            return;
+        };
+        let library = std::env::var("ORT_DYLIB_PATH")
+            .map(|path| format!("library = {path:?}\n"))
+            .unwrap_or_default();
+        let config = Config::parse(&format!(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = {store:?}
+
+{cache}
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[semantic]
+artifact = {artifact:?}
+nearness = 0.97
+ttl = 900
+capacity = 128
+{library}"#,
+            store = scratch("semantic-wired.db").display().to_string(),
+            cache = sled_cache(&scratch("semantic-wired-cache")),
+        ))
+        .expect("the file itself is well-formed");
+        let state = AppState::open(&config)
+            .await
+            .expect("the gateway stands up");
+        assert_eq!(state.listen(), config.server.listen);
+        assert!(
+            state.gateway().recognises(),
+            "the level was built and then not attached, which fails exactly the way \
+             never configuring it does"
+        );
     }
 
     #[cfg(not(feature = "fast-storage"))]

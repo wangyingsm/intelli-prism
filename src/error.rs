@@ -80,6 +80,18 @@ pub enum StartupError {
         reason: String,
     },
 
+    /// The embedding model could not be opened — an artefact that is not there, a
+    /// runtime that will not load, a graph whose answer is not the shape its manifest
+    /// promised. Startup is the only honest place to say so: a gateway configured to
+    /// answer by meaning that cannot must not stand up with the level silently off,
+    /// because a level that never hits looks exactly like one nobody's traffic suits.
+    #[cfg(feature = "semantic")]
+    #[error("the embedding model cannot open: {reason}")]
+    Embedder {
+        /// What the loader refused with.
+        reason: String,
+    },
+
     /// The listener could not take the configured address.
     #[error("cannot listen on {address}")]
     Bind {
