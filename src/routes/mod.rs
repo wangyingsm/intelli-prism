@@ -1,6 +1,8 @@
 mod grant;
 #[cfg(test)]
 pub(crate) mod harness;
+#[cfg(test)]
+mod isolation;
 mod key;
 mod limit;
 mod member;
