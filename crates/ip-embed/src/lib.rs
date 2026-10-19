@@ -21,8 +21,10 @@
 //!   on every comparison the one time somebody forgets.
 
 pub mod error;
+pub mod neighbourhood;
 
 pub use error::EmbedError;
+pub use neighbourhood::{Capacity, MOST_HELD, Neighbourhood};
 
 /// The widest vector this build will hold.
 ///

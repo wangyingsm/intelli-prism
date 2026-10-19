@@ -50,4 +50,19 @@ pub enum EmbedError {
         /// The threshold that was refused.
         value: f32,
     },
+
+    /// A cache bounded at nothing is one that never hits, written as though it were a
+    /// setting. Switching the level off is said by leaving it unconfigured.
+    #[error("a neighbourhood that holds nothing can never answer")]
+    HoldsNothing,
+
+    /// A lookup is linear in what is held, so a bound past what can be scanned is a
+    /// cache that costs more than the call it saves.
+    #[error("holding {got} vectors is more than one neighbourhood scans, which is {most}")]
+    HoldsTooMuch {
+        /// What was asked for.
+        got: usize,
+        /// The most that will be held.
+        most: usize,
+    },
 }

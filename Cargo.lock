@@ -1672,6 +1672,7 @@ dependencies = [
 name = "ip-embed"
 version = "0.1.0"
 dependencies = [
+ "ip-core",
  "proptest",
  "thiserror",
 ]
