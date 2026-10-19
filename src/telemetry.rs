@@ -1,12 +1,19 @@
-//! Logs and traces: the subscriber the process installs, and the collector it exports to.
+//! Logs, traces and metrics: the subscriber the process installs, and the collector it
+//! exports to.
+//!
+//! Traces say what happened to one request. Metrics say what has been happening to all of
+//! them, which is a different question and the only one a dashboard can ask: no amount of
+//! sampled spans tells an operator their cache hit rate. Both go to the same collector,
+//! because an operator configuring one endpoint has configured observability.
 
 use std::future::Future;
 
 use ip_config::{SampleRatio, TelemetryConfig};
 use ip_core::TraceId;
 use opentelemetry::trace::{SpanId, TracerProvider as _};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{ExporterBuildError, WithExportConfig};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::metrics::{SdkMeterProvider, exporter::PushMetricExporter};
 use opentelemetry_sdk::trace::{
     IdGenerator, RandomIdGenerator, Sampler, SdkTracerProvider, SpanExporter,
 };
@@ -29,26 +36,42 @@ pub async fn under<F: Future>(trace: TraceId, work: F) -> F::Output {
     DRAWN.scope(trace, work).await
 }
 
-/// What the process exports traces through, held until it ends.
+/// What the process exports through, held until it ends.
+///
+/// Both providers are held rather than only registered, because both have to be told to
+/// flush: a gateway that stops without one has thrown away whatever it had gathered since
+/// the last export, and for metrics that is up to a whole interval of them.
 pub struct Telemetry {
     provider: Option<SdkTracerProvider>,
+    meter: Option<SdkMeterProvider>,
 }
 
 impl Telemetry {
     /// Sends what is recorded but not yet exported, and stops exporting.
+    ///
+    /// Each is flushed even if the other will not: one collector refusing a batch is no
+    /// reason to drop the batch beside it.
     pub fn shutdown(&self) {
         if let Some(provider) = &self.provider
             && let Err(error) = provider.shutdown()
         {
             tracing::warn!(%error, "could not flush the traces");
         }
+        if let Some(meter) = &self.meter
+            && let Err(error) = meter.shutdown()
+        {
+            tracing::warn!(%error, "could not flush the metrics");
+        }
     }
 }
 
-/// Installs the log subscriber for the process, exporting traces when a collector is configured.
+/// Installs the log subscriber for the process, exporting traces and metrics when a
+/// collector is configured.
 ///
-/// A collector that cannot be reached leaves the logs alone: the server serves without traces
-/// rather than refusing to start.
+/// A collector that cannot be reached leaves the logs alone: the server serves without
+/// either rather than refusing to start. The two are built separately on purpose — a
+/// collector that takes spans and refuses metrics, or the reverse, leaves the gateway
+/// with whichever of them works instead of neither.
 pub fn install(config: &TelemetryConfig) -> Telemetry {
     let level = LevelFilter::from(config.log_level);
     let logs = tracing_subscriber::registry()
@@ -56,23 +79,69 @@ pub fn install(config: &TelemetryConfig) -> Telemetry {
         .with(tracing_subscriber::fmt::layer());
     let Some(endpoint) = &config.otlp_endpoint else {
         logs.init();
-        return Telemetry { provider: None };
+        return Telemetry {
+            provider: None,
+            meter: None,
+        };
     };
-    match exporting(endpoint, config.sample_ratio) {
+    let provider = match exporting(endpoint, config.sample_ratio) {
         Ok(provider) => {
             let traces = tracing_opentelemetry::layer().with_tracer(provider.tracer(SERVICE));
             logs.with(traces).init();
             tracing::info!(%endpoint, ratio = config.sample_ratio.get(), "exporting traces");
-            Telemetry {
-                provider: Some(provider),
-            }
+            Some(provider)
         }
         Err(error) => {
             logs.init();
             tracing::error!(%error, %endpoint, "could not export traces to the collector");
-            Telemetry { provider: None }
+            None
+        }
+    };
+    Telemetry {
+        provider,
+        meter: metering(endpoint),
+    }
+}
+
+/// The meter provider, registered for the process so an instrument can be made wherever
+/// one is needed, and handed back so it can be flushed when the process stops.
+///
+/// Registered globally, unlike the tracer, because that is how an instrument is reached:
+/// the tracing layer carries spans to their provider for us, and there is no equivalent
+/// carrying a counter to its meter. Nothing is registered when the exporter will not
+/// build, so the global stays the no-op the sdk starts with and every instrument made
+/// against it costs nothing.
+fn metering(endpoint: &Url) -> Option<SdkMeterProvider> {
+    match exporter(endpoint) {
+        Ok(exporter) => {
+            let meter = meters(exporter);
+            opentelemetry::global::set_meter_provider(meter.clone());
+            tracing::info!(%endpoint, "exporting metrics");
+            Some(meter)
+        }
+        Err(error) => {
+            tracing::error!(%error, %endpoint, "could not export metrics to the collector");
+            None
         }
     }
+}
+
+/// The meter provider itself: a periodic reader over the exporter, under our service
+/// name, which is what a collector files the numbers against.
+pub(crate) fn meters<E: PushMetricExporter + 'static>(exporter: E) -> SdkMeterProvider {
+    SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter)
+        .with_resource(Resource::builder().with_service_name(SERVICE).build())
+        .build()
+}
+
+/// The metric exporter the configured collector is reached over, over the same transport
+/// the spans take.
+fn exporter(endpoint: &Url) -> Result<opentelemetry_otlp::MetricExporter, ExporterBuildError> {
+    opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint.as_str())
+        .build()
 }
 
 /// Builds the exporter the configured collector is reached over.
@@ -181,6 +250,97 @@ mod tests {
         let exported = exporter.get_finished_spans().unwrap();
         assert_eq!(exported.len(), 1);
         assert!(exported[0].span_context.trace_id() != opentelemetry::trace::TraceId::INVALID);
+    }
+
+    /// What a counter made against a provider of our shape actually reaches, which is
+    /// the whole of what this commit does: an instrument, a flush, and a number at the
+    /// far end carrying the labels it was given.
+    #[test]
+    fn a_counter_reaches_the_exporter_when_the_process_stops() {
+        use opentelemetry::KeyValue;
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = meters(exporter.clone());
+        let counter = provider
+            .meter(SERVICE)
+            .u64_counter("ip_asked_total")
+            .build();
+        counter.add(2, &[KeyValue::new("tenant", "acme")]);
+        counter.add(1, &[KeyValue::new("tenant", "globex")]);
+        // Stopped the way the process stops it, rather than by reaching for the
+        // provider: what is being asserted is that a gateway shutting down does not
+        // throw away the interval it had gathered, and that is `Telemetry`'s job.
+        //
+        // Bound rather than dropped on this line, and every assertion below made while
+        // it is still alive. A provider flushes when it drops, so a temporary here
+        // would export the same numbers whether or not `shutdown` touched the meter at
+        // all — the test would pass with the flush deleted, which it must not.
+        let telemetry = Telemetry {
+            provider: None,
+            meter: Some(provider),
+        };
+        telemetry.shutdown();
+
+        let exported = exporter.get_finished_metrics().unwrap();
+        assert!(
+            !exported.is_empty(),
+            "stopping the process should have flushed what was gathered"
+        );
+        assert!(
+            exported.iter().any(|held| {
+                held.resource()
+                    .iter()
+                    .any(|(key, value)| key.as_str() == "service.name" && value.as_str() == SERVICE)
+            }),
+            "the collector files these under the service that sent them"
+        );
+        let scopes: Vec<_> = exported
+            .iter()
+            .flat_map(|held| held.scope_metrics())
+            .collect();
+        let metric = scopes
+            .iter()
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "ip_asked_total")
+            .expect("the counter reached the exporter");
+        let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+            panic!("a counter exports as a sum");
+        };
+        let mut by_tenant: Vec<(String, u64)> = sum
+            .data_points()
+            .map(|point| {
+                let tenant = point
+                    .attributes()
+                    .find(|at| at.key.as_str() == "tenant")
+                    .expect("the label it was given")
+                    .value
+                    .to_string();
+                (tenant, point.value())
+            })
+            .collect();
+        by_tenant.sort();
+        assert_eq!(
+            by_tenant,
+            vec![("acme".to_owned(), 2), ("globex".to_owned(), 1)],
+            "each label is its own series, which is what the tenant ruling costs and buys"
+        );
+        // Everything above was read while this was alive, so none of it can have been
+        // the provider's own flush-on-drop. Dropped here, deliberately and last.
+        drop(telemetry);
+    }
+
+    /// A process nobody configured a collector for exports neither, and stopping is
+    /// still well-behaved rather than a panic on an absent provider.
+    #[test]
+    fn an_unconfigured_process_exports_nothing_and_stops_cleanly() {
+        let quiet = Telemetry {
+            provider: None,
+            meter: None,
+        };
+        quiet.shutdown();
     }
 
     /// Drives a future on this thread, so the spans it opens reach the subscriber installed here.
