@@ -27,6 +27,7 @@ ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-embed = { version = "0.1.0", path = "../ip-embed" }
 ip-filter = { version = "0.1.0", path = "../ip-filter" }
 ip-protocol = { version = "0.1.0", path = "../ip-protocol" }
+opentelemetry = "0.33.0"
 ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }
 serde_json.workspace = true
 sha2.workspace = true
@@ -40,3 +41,4 @@ httpdate = "1.0.3"
 hyper = { version = "1.11.1", features = ["server"] }
 tracing-subscriber = "0.3.23"
 ip-cache = { version = "0.1.0", path = "../ip-cache", features = ["standalone-cache", "testing"] }
+opentelemetry_sdk = { version = "0.33.0", features = ["testing"] }

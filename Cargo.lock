@@ -1714,6 +1714,8 @@ dependencies = [
  "ip-filter",
  "ip-protocol",
  "ip-storage",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "rustls",
  "serde_json",
  "sha2 0.11.0",

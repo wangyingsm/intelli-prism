@@ -20,6 +20,7 @@ use crate::body::{BoxError, GatewayBody};
 use crate::filter::{Filtered, Reported};
 use crate::limit::{Asking, Limiter, Limits};
 use crate::measure::{Measuring, measure};
+use crate::meter::Meters;
 use crate::stage::Dispatched;
 use ip_core::Redacted;
 
@@ -81,13 +82,46 @@ impl Limiting {
     }
 }
 
+/// Where what a request cost is kept: the rows, the dashboard, or both.
+///
+/// A composite because `Recording::of` already took five arguments, and because the
+/// two destinations are one decision — a request is worth describing if *either* of
+/// them is listening, and the description is identical for both.
+#[derive(Clone, Default)]
+pub(super) struct Keeping {
+    store: Option<Arc<dyn UsageStore>>,
+    meters: Option<Arc<Meters>>,
+}
+
+impl Keeping {
+    /// What a gateway keeps, which may be neither.
+    pub(super) fn new(store: Option<Arc<dyn UsageStore>>, meters: Option<Arc<Meters>>) -> Self {
+        Self { store, meters }
+    }
+
+    /// Whether anything is listening at all. Nothing is described when nothing is.
+    fn any(&self) -> bool {
+        self.store.is_some() || self.meters.is_some()
+    }
+
+    /// The instruments, so one half can be replaced without disturbing the other.
+    pub(super) fn meters(&self) -> Option<Arc<Meters>> {
+        self.meters.clone()
+    }
+
+    /// The store, likewise.
+    pub(super) fn store(&self) -> Option<Arc<dyn UsageStore>> {
+        self.store.clone()
+    }
+}
+
 /// What is known about a request before its answer is, and what writes the row when it ends.
 ///
 /// Cloneable so that one identity can be recorded twice: the request, and the arbitrating
 /// call this request caused (see [`Recording::arbitrated`]).
 #[derive(Clone)]
 pub(super) struct Recording {
-    store: Arc<dyn UsageStore>,
+    keeping: Keeping,
     pending: Pending,
     limiting: Option<Limiting>,
     started: Instant,
@@ -100,15 +134,21 @@ pub(super) struct Recording {
 
 impl Recording {
     /// What will record this request, now that the route says which api serves it.
+    ///
+    /// Nothing at all when nothing is listening, and nothing when no route was
+    /// resolved: a request that never reached an api has no api to be counted under.
     pub(super) fn of(
-        store: &Arc<dyn UsageStore>,
+        keeping: &Keeping,
         pending: &Pending,
         followed: &Followed,
         started: Instant,
         limiting: Option<Limiting>,
     ) -> Option<Self> {
+        if !keeping.any() {
+            return None;
+        }
         Some(Self {
-            store: Arc::clone(store),
+            keeping: keeping.clone(),
             pending: pending.clone(),
             limiting,
             started,
@@ -219,6 +259,23 @@ impl Recording {
 
     /// Writes the row, off the path of the request it belongs to.
     fn write(self, model: Option<ip_core::ModelName>, tokens: Tokens, serving: Serving) {
+        // Counted here rather than beside the store, so that a gateway recording no
+        // rows still has a dashboard, and so that the two can never describe the same
+        // request differently: there is one place that knows what it was.
+        if let Some(meters) = &self.keeping.meters {
+            meters.answered(&crate::meter::Answered {
+                tenant: &self.tenant,
+                api: self.api.as_str(),
+                model: model.as_ref(),
+                served: serving.source,
+            });
+        }
+        let Some(store) = self.keeping.store.clone() else {
+            // Nothing to write, but what was spent still has to be counted against
+            // the limits, which is the other half of what this does.
+            self.spend(tokens);
+            return;
+        };
         let usage = NewUsage {
             trace: self.trace,
             turn: self.turn,
@@ -235,7 +292,6 @@ impl Recording {
             redacted: serving.redacted,
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
-        let store = self.store;
         let limiting = self.limiting;
         let spent = tokens.total();
         // A caller never waits on the record of what it already has, and never fails for it.
@@ -249,6 +305,24 @@ impl Recording {
                     .spend(&limiting.limits, &limiting.asking, spent)
                     .await;
             }
+        });
+    }
+
+    /// Counts what was spent against the limits, with no row to write beside it.
+    ///
+    /// The limits are not an observability concern: a gateway keeping no rows still
+    /// enforces a quota, and forgetting this when the store became optional would
+    /// have let an operator switch quotas off by switching recording off.
+    fn spend(self, tokens: Tokens) {
+        let Some(limiting) = self.limiting else {
+            return;
+        };
+        let spent = tokens.total();
+        self.pending.writing(async move {
+            limiting
+                .limiter
+                .spend(&limiting.limits, &limiting.asking, spent)
+                .await;
         });
     }
 }

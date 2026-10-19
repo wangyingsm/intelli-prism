@@ -17,7 +17,7 @@ use super::followed::{
     EGRESS_REQUEST, EGRESS_RESPONSE, Followed, INGRESS_REQUEST, INGRESS_RESPONSE, stage_span,
 };
 use super::headers::set_length;
-use super::record::{Limiting, Pending, Recording};
+use super::record::{Keeping, Limiting, Pending, Recording};
 use crate::arbiter::Arbiter;
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
@@ -28,6 +28,7 @@ use crate::error::{GatewayError, GatewayErrorKind};
 use crate::filter::{Filtered, Filtering, Reported};
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
+use crate::meter::Meters;
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
 use crate::semantic::{self, Question, SemanticCache};
 use crate::stage::{Authorized, BodyProcessed, Dispatched, ResponseBodyProcessed, Stage};
@@ -59,7 +60,8 @@ pub struct Gateway {
     routing: ArcSwap<Routing>,
     upstream: Arc<dyn Upstream>,
     responses: Option<ResponseCache>,
-    usage: Option<Arc<dyn UsageStore>>,
+    /// Where what a request cost is kept: the rows, the dashboard, or neither.
+    keeping: Keeping,
     limiter: Option<Arc<Limiter>>,
     dispatcher: Arc<Dispatcher>,
     /// Where the turns that pass through are kept to the endpoints they landed on.
@@ -117,7 +119,7 @@ impl Gateway {
             }),
             upstream,
             responses: None,
-            usage: None,
+            keeping: Keeping::default(),
             limiter: None,
             // Nothing folds what this one learns until a caller supplies one that is folded for.
             dispatcher: Arc::new(Dispatcher::new().0),
@@ -151,7 +153,17 @@ impl Gateway {
 
     /// Records what every request costs, an answer out of the cache included.
     pub fn recording(mut self, usage: Arc<dyn UsageStore>) -> Self {
-        self.usage = Some(usage);
+        self.keeping = Keeping::new(Some(usage), self.keeping.meters());
+        self
+    }
+
+    /// Counts what every request was, for a dashboard to read.
+    ///
+    /// Independent of `recording`: a gateway may keep rows without a dashboard, a
+    /// dashboard without rows, or both. What each is told about a request is decided
+    /// in one place, so the two can never disagree about what happened.
+    pub fn measuring(mut self, meters: Arc<Meters>) -> Self {
+        self.keeping = Keeping::new(self.keeping.store(), Some(meters));
         self
     }
 
@@ -302,15 +314,13 @@ impl Gateway {
         let followed = followed.serving(api);
         // Before the cache is asked, so an answer it holds still counts as a request made.
         self.admit(&routing.limits, &asking).await?;
-        let recording = self.usage.as_ref().and_then(|store| {
-            Recording::of(
-                store,
-                &self.pending,
-                &followed,
-                started,
-                self.limiting_with(&routing.limits, &asking),
-            )
-        });
+        let recording = Recording::of(
+            &self.keeping,
+            &self.pending,
+            &followed,
+            started,
+            self.limiting_with(&routing.limits, &asking),
+        );
 
         // Both cache levels are asked here, in order, and either may be absent. A hit
         // from either answers without spending a token or running a response
@@ -558,6 +568,153 @@ mod tests {
     use std::sync::Mutex;
 
     use ip_cache::Ttl;
+
+    /// What a counter saw, as `(labels, value)` pairs, flushed out of a provider the
+    /// test holds.
+    fn counted(
+        exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter,
+        provider: &opentelemetry_sdk::metrics::SdkMeterProvider,
+        name: &str,
+    ) -> Vec<(Vec<(String, String)>, u64)> {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        provider.force_flush().expect("the instruments flush");
+        exporter
+            .get_finished_metrics()
+            .expect("something was exported")
+            .iter()
+            .flat_map(|held| held.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .filter(|metric| metric.name() == name)
+            .flat_map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                    .data_points()
+                    .map(|point| {
+                        let mut labels: Vec<(String, String)> = point
+                            .attributes()
+                            .map(|at| (at.key.to_string(), at.value.to_string()))
+                            .collect();
+                        labels.sort();
+                        (labels, point.value())
+                    })
+                    .collect::<Vec<_>>(),
+                _ => panic!("{name} is not a counter"),
+            })
+            .collect()
+    }
+
+    /// A gateway that counts into a provider this test can read back.
+    fn metered(
+        upstream: Arc<FakeUpstream>,
+    ) -> (
+        Gateway,
+        opentelemetry_sdk::metrics::InMemoryMetricExporter,
+        opentelemetry_sdk::metrics::SdkMeterProvider,
+    ) {
+        use opentelemetry::metrics::MeterProvider as _;
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let meters = Arc::new(Meters::new(&provider.meter("test")));
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream).measuring(meters);
+        (gateway, exporter, provider)
+    }
+
+    /// The seam the rest of the milestone hangs on: a request through the gateway
+    /// reaches an instrument, labelled by who asked and what answered.
+    #[tokio::test]
+    async fn a_request_is_counted_by_who_asked_and_what_answered() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (gateway, exporter, provider) = metered(upstream);
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        // The count is written when the answer is finished with, so the body has to
+        // be read before there is anything to flush.
+        assert_eq!(body_of(answered).await, ANSWERED);
+
+        assert_eq!(
+            counted(&exporter, &provider, "ip.requests"),
+            vec![(
+                vec![
+                    ("api".to_owned(), "anthropic".to_owned()),
+                    ("model".to_owned(), "claude-opus-5".to_owned()),
+                    ("outcome".to_owned(), "upstream".to_owned()),
+                    ("tenant".to_owned(), "acme".to_owned()),
+                ],
+                1
+            )]
+        );
+    }
+
+    /// A gateway nobody asked to count does not, and still serves. Without this the
+    /// test above would pass just as well if counting were unconditional.
+    #[tokio::test]
+    async fn a_gateway_that_was_not_asked_to_count_does_not() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (_, exporter, provider) = metered(upstream.clone());
+        // The same provider, and a gateway that was never handed its instruments.
+        let quiet = Gateway::new(table(), ProcessorChain::new(), upstream);
+        let answered = quiet
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(body_of(answered).await, ANSWERED);
+        assert!(counted(&exporter, &provider, "ip.requests").is_empty());
+    }
+
+    /// Rows and a dashboard are separate: a gateway keeping no usage still counts.
+    #[tokio::test]
+    async fn counting_does_not_need_a_store_to_write_rows_to() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (gateway, exporter, provider) = metered(upstream);
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        assert_eq!(body_of(answered).await, ANSWERED);
+        let seen = counted(&exporter, &provider, "ip.requests");
+        assert_eq!(seen.len(), 1, "no store, and still counted");
+        assert_eq!(seen[0].1, 1);
+    }
+
+    /// The store became optional this commit, and the quota rides the same path.
+    ///
+    /// Spending used to happen only where a row was written, because a `Recording`
+    /// needed a store to exist at all. Now one exists for a dashboard alone, and what
+    /// an answer costs has to be counted against the limits on that path too — or
+    /// switching the rows off would quietly switch the quotas off with them.
+    #[tokio::test]
+    async fn a_gateway_that_writes_no_rows_still_spends_the_quota() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder().build();
+        let gateway = limited(
+            upstream,
+            vec![allowing(
+                ip_core::Counted::Tokens,
+                ip_core::Period::Month,
+                100,
+            )],
+        )
+        .measuring(Arc::new(Meters::new(&provider.meter("test"))));
+
+        // The answer holds 150 tokens, past the 100 the month allows — and no store
+        // is recording any of it.
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        gateway.settled().await;
+
+        let refused = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 
     /// A gateway that answers by meaning alone — no exact cache behind it, so a hit
     /// here can only have come from the semantic level.
