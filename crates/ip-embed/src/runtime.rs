@@ -445,6 +445,199 @@ mod tests {
         })
     }
 
+    /// A directory of this test's own, distinct per test and per process.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        /// An artefact directory holding exactly the files named, with the contents
+        /// given. What is left out is what the test is about.
+        fn holding(tag: &str, files: &[(&str, &[u8])]) -> Self {
+            let at = std::env::temp_dir().join(format!("ip-embed-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&at);
+            std::fs::create_dir_all(&at).expect("a scratch directory");
+            for (name, bytes) in files {
+                std::fs::write(at.join(name), bytes).expect("a scratch file");
+            }
+            Self(at)
+        }
+
+        fn at(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Whether a runtime library is in reach. The refusals below that lie past the
+    /// loader need one, because the loader is the gate before them: without it every
+    /// one of them is `RuntimeMissing` instead of the thing it is testing.
+    fn runtime_in_reach() -> bool {
+        Embedder::library_from_env().is_some()
+    }
+
+    /// Bytes that are a file and are not an onnx graph.
+    const NOT_A_GRAPH: &[u8] = b"this is not a model";
+
+    /// A half-copied export is the likeliest way this goes wrong, so each file's
+    /// absence is reported as itself and names what is missing.
+    #[test]
+    fn a_directory_missing_a_file_is_refused_and_says_which() {
+        let whole: [(&str, &[u8]); 3] = [
+            ("model.onnx", NOT_A_GRAPH),
+            ("tokenizer.json", b"{}"),
+            ("embed.json", b"{}"),
+        ];
+        for missing in ["model.onnx", "tokenizer.json", "embed.json"] {
+            let kept: Vec<(&str, &[u8])> = whole
+                .iter()
+                .filter(|(name, _)| *name != missing)
+                .copied()
+                .collect();
+            let dir = Scratch::holding(&format!("without-{missing}"), &kept);
+            let Err(EmbedError::ArtifactMissing(said)) = Embedder::open(dir.at()) else {
+                panic!("an artefact with no {missing} must be refused");
+            };
+            assert!(said.contains(missing), "{said} should name {missing}");
+        }
+    }
+
+    /// A truncated download, a half-replaced file, an artefact swapped under a running
+    /// deployment: each would embed with weights nobody measured, which is silent.
+    #[test]
+    fn weights_that_are_not_the_ones_the_manifest_names_are_refused_at_open() {
+        if !runtime_in_reach() {
+            eprintln!("ORT_DYLIB_PATH unset: the loader would refuse before the manifest does");
+            return;
+        }
+        let manifest = br#"{"version":1,"width":384,"max_length":512,"pooling":"mean",
+            "checksum":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let dir = Scratch::holding(
+            "wrong-digest",
+            &[
+                ("model.onnx", NOT_A_GRAPH),
+                ("tokenizer.json", b"{}"),
+                ("embed.json", manifest),
+            ],
+        );
+        let Err(EmbedError::ArtifactChecksum { named, found }) = Embedder::open(dir.at()) else {
+            panic!("weights the manifest does not speak for must be refused");
+        };
+        assert!(named.starts_with("0000"), "{named}");
+        assert_ne!(named, found);
+    }
+
+    /// A manifest that is not readable as one, which is a hand-edited file far more
+    /// often than a corrupted download.
+    #[test]
+    fn a_manifest_that_is_not_one_is_refused_as_the_file_it_is() {
+        if !runtime_in_reach() {
+            eprintln!("ORT_DYLIB_PATH unset: the loader would refuse before the manifest does");
+            return;
+        }
+        for (tag, manifest) in [
+            ("not-json", &b"width = 384"[..]),
+            (
+                "no-width",
+                &b"{\"max_length\":512,\"pooling\":\"mean\"}"[..],
+            ),
+        ] {
+            let dir = Scratch::holding(
+                tag,
+                &[
+                    ("model.onnx", NOT_A_GRAPH),
+                    ("tokenizer.json", b"{}"),
+                    ("embed.json", manifest),
+                ],
+            );
+            let Err(EmbedError::ArtifactUnreadable(said)) = Embedder::open(dir.at()) else {
+                panic!("a manifest that is not one ({tag}) must be refused");
+            };
+            assert!(said.contains("embed.json"), "{said} should name the file");
+        }
+    }
+
+    /// A manifest this build will not read, refused through the whole opening path
+    /// rather than only in the parse the unit tests above reach.
+    #[test]
+    fn a_later_schema_is_refused_at_open_too() {
+        if !runtime_in_reach() {
+            eprintln!("ORT_DYLIB_PATH unset: the loader would refuse before the manifest does");
+            return;
+        }
+        let manifest = br#"{"version":99,"width":384,"max_length":512,"pooling":"mean"}"#;
+        let dir = Scratch::holding(
+            "later-schema",
+            &[
+                ("model.onnx", NOT_A_GRAPH),
+                ("tokenizer.json", b"{}"),
+                ("embed.json", manifest),
+            ],
+        );
+        assert!(matches!(
+            Embedder::open(dir.at()),
+            Err(EmbedError::ArtifactSchema { found: 99, .. })
+        ));
+    }
+
+    /// A tokenizer that is not one, which is the file after the manifest in the
+    /// opening order and so the next thing an operator meets.
+    #[test]
+    fn a_tokenizer_that_is_not_one_is_refused() {
+        if !runtime_in_reach() {
+            eprintln!("ORT_DYLIB_PATH unset: the loader would refuse before the tokenizer does");
+            return;
+        }
+        let manifest = br#"{"version":1,"width":384,"max_length":512,"pooling":"mean"}"#;
+        let dir = Scratch::holding(
+            "bad-tokenizer",
+            &[
+                ("model.onnx", NOT_A_GRAPH),
+                ("tokenizer.json", b"not a tokenizer"),
+                ("embed.json", manifest),
+            ],
+        );
+        let Err(EmbedError::ArtifactUnreadable(said)) = Embedder::open(dir.at()) else {
+            panic!("a tokenizer that is not one must be refused");
+        };
+        assert!(said.contains("tokenizer.json"), "{said}");
+    }
+
+    /// And a graph that is not one, which is the last door: everything else about the
+    /// artefact was right. Needs a real tokenizer to get this far, so it runs beside
+    /// the artefact the other live tests use.
+    #[test]
+    fn a_graph_that_is_not_one_is_refused() {
+        let (Ok(artifact), true) = (std::env::var("IP_EMBED_ARTIFACT"), runtime_in_reach()) else {
+            eprintln!("no artefact and runtime: nothing to borrow a tokenizer from");
+            return;
+        };
+        let tokenizer = std::fs::read(std::path::Path::new(&artifact).join("tokenizer.json"))
+            .expect("the artefact's tokenizer");
+        let digest = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(NOT_A_GRAPH))
+        };
+        let manifest = format!(
+            r#"{{"version":1,"width":384,"max_length":512,"pooling":"mean","checksum":"{digest}"}}"#
+        );
+        let dir = Scratch::holding(
+            "bad-graph",
+            &[
+                ("model.onnx", NOT_A_GRAPH),
+                ("tokenizer.json", &tokenizer),
+                ("embed.json", manifest.as_bytes()),
+            ],
+        );
+        let Err(EmbedError::GraphRefused(said)) = Embedder::open(dir.at()) else {
+            panic!("bytes that are not a graph must be refused");
+        };
+        assert!(said.contains("model.onnx"), "{said}");
+    }
+
     #[test]
     fn a_whole_manifest_reads_as_what_it_says() {
         let read = manifest_of(&whole()).unwrap();
