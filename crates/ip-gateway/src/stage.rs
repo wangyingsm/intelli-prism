@@ -5,7 +5,7 @@ use http::{Request, Response};
 use ip_core::{Decider, Dialect, Difficulty, Hedge, Replica};
 
 use crate::body::GatewayBody;
-use crate::filter::Filtered;
+use crate::filter::{Filtered, Reported};
 use crate::table::Resolution;
 
 /// Where in the dataflow a request had got to.
@@ -149,6 +149,9 @@ pub struct Answered {
     /// the caller's own where a rule bridged two, and the upstream's where it did not.
     /// A streamed answer has to be read back to be filtered, and this says how.
     pub speaks: Dialect,
+    /// Where a streamed answer leaves what it gave up, when one is being filtered.
+    /// A whole answer needs none: its tally is known before the ledger asks.
+    pub reported: Option<Reported>,
 }
 
 /// What a request was dispatched at, and which level of the margin named it.

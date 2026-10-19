@@ -25,7 +25,7 @@ pub use cache::{CachedResponse, Freshness, ResponseCache, freshness, response_ke
 pub use classifier::{CLASSIFY_DEADLINE, Classifier};
 pub use dispatch::{Chosen, Dispatcher};
 pub use error::{GatewayError, GatewayErrorKind, ProcessorError, RouteError, UpstreamError};
-pub use filter::{Filtered, Filtering, Unscanned};
+pub use filter::{Filtered, Filtering, Reported, Unscanned};
 pub use flow::{Flow, Gateway, RequestContext};
 pub use hyper_upstream::{HyperUpstream, UpstreamSettings};
 pub use limit::{Asking, Decision, Limiter, Limits};

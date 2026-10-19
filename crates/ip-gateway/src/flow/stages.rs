@@ -23,7 +23,7 @@ use crate::cache::{CachedResponse, Freshness, freshness, response_key};
 use crate::classifier::{CLASSIFY_DEADLINE, Classifier};
 use crate::dispatch::{Dispatcher, Dispatching, may_hold, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
-use crate::filter::{self, Filtered, Filtering, Unscanned};
+use crate::filter::{self, Filtered, Filtering, Reported, Unscanned};
 use crate::processor::{HeaderProcessor, ProcessorChain};
 use crate::sse::{crossed_events, filtered_events, stream_chunks};
 use crate::stage::{
@@ -305,6 +305,12 @@ impl Flow<HeadersProcessed> {
 }
 
 impl Flow<BodyProcessed> {
+    /// What the filter took out of the request. A cache hit is answered from here,
+    /// before any answer exists to filter, so this is the whole of its tally.
+    pub fn filtered(&self) -> &Filtered {
+        &self.held.filtered
+    }
+
     /// What the request is dispatched at, read once where the header chain left it: anything
     /// that needs the class later takes it from here rather than reading the header again,
     /// which could let two readings disagree.
@@ -491,6 +497,7 @@ impl Flow<BodyProcessed> {
                     dispatched,
                     filtered,
                     speaks,
+                    reported: None,
                 },
             });
         }
@@ -1022,12 +1029,15 @@ impl Flow<ResponseHeadersProcessed> {
             if let Some(filtering) = filtering {
                 self.held.response.headers_mut().remove(CONTENT_LENGTH);
                 let body = std::mem::replace(self.held.response.body_mut(), crate::body::empty());
+                let reported = Reported::new();
                 *self.held.response.body_mut() = filtered_events(
                     body,
                     self.held.speaks,
                     Arc::clone(filtering),
                     self.context.authority.identity().tenant.clone(),
+                    reported.clone(),
                 );
+                self.held.reported = Some(reported);
                 // What a stream gave up is not known when its headers go out, so the
                 // header says it was looked at and the count goes to the log.
                 self.held.filtered.absorb(&if filtering.window() == 0 {
@@ -1081,6 +1091,17 @@ impl Flow<ResponseHeadersProcessed> {
 }
 
 impl Flow<ResponseBodyProcessed> {
+    /// What the filter took out of this exchange, as far as it is known now: a whole
+    /// answer's tally is complete, and a streamed one's arrives later.
+    pub fn filtered(&self) -> &Filtered {
+        &self.held.filtered
+    }
+
+    /// Where a streamed answer will leave what it gave up, when one is streaming.
+    pub fn reported(&self) -> Option<&Reported> {
+        self.held.reported.as_ref()
+    }
+
     /// Which endpoint answered.
     pub fn served(&self) -> &Replica {
         &self.held.served
@@ -1290,8 +1311,9 @@ async fn race(
             served,
             raced,
             dispatched,
-            filtered: Filtered::clean(),
+            filtered: Filtered::default(),
             speaks: Dialect::OpenAi,
+            reported: None,
         },
     })
 }

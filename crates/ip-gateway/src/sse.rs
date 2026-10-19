@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::body::{BoxError, ChannelBody, GatewayBody};
 use crate::error::ProcessorError;
-use crate::filter::Filtering;
+use crate::filter::{Filtering, Reported};
 use crate::processor::BodyProcessor;
 use ip_core::{Dialect, TenantId};
 use ip_filter::Trickle;
@@ -170,9 +170,10 @@ pub(crate) fn filtered_events(
     speaks: Dialect,
     filtering: Arc<Filtering>,
     tenant: TenantId,
+    reported: Reported,
 ) -> GatewayBody {
     let (sender, receiver) = mpsc::channel(BUFFERED_EVENTS);
-    tokio::spawn(sift(body, speaks, filtering, tenant, sender));
+    tokio::spawn(sift(body, speaks, filtering, tenant, reported, sender));
     ChannelBody::new(receiver).boxed_unsync()
 }
 
@@ -181,6 +182,7 @@ async fn sift(
     speaks: Dialect,
     filtering: Arc<Filtering>,
     tenant: TenantId,
+    reported: Reported,
     sender: Sender,
 ) {
     let mut reading = Reading::new(speaks);
@@ -239,6 +241,9 @@ async fn sift(
         send_event(&writing.end(), &sender).await;
     }
     let found = trickle.found();
+    // Left where the ledger reads it: the row cannot be written before the body ends,
+    // and the body cannot end before this returns.
+    reported.said(found);
     if !found.is_empty() || trickle.overran() {
         // The count cannot ride the answer's headers, which went out before its first
         // event, so this line is where an operator reads what a stream gave up.

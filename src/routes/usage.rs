@@ -63,6 +63,14 @@ pub struct UsageView {
     /// local classifier or the arbiter — absent where there is no class.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decided_by: Option<Decider>,
+    /// How many secrets the filter took out of the request and its answer, absent
+    /// where no filter looked at them. Nought means it looked and found none, which
+    /// is a different fact from not having looked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted: Option<u32>,
+    /// What those were, as the filter named them, and never what they said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted_kinds: Option<String>,
     /// How long the caller waited, in milliseconds.
     pub latency_ms: u32,
     /// When it was recorded, in seconds since the unix epoch.
@@ -85,6 +93,8 @@ impl From<Usage> for UsageView {
             raced_across: usage.raced_across,
             dispatched_class: usage.dispatched_class,
             decided_by: usage.decided_by,
+            redacted: usage.redacted.count(),
+            redacted_kinds: usage.redacted.kinds().map(str::to_owned),
             latency_ms: Latency::millis(usage.latency),
             created_at: usage.created_at,
         }

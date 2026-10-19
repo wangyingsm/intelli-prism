@@ -17,9 +17,11 @@ use tokio::sync::Notify;
 
 use super::followed::Followed;
 use crate::body::{BoxError, GatewayBody};
+use crate::filter::{Filtered, Reported};
 use crate::limit::{Asking, Limiter, Limits};
 use crate::measure::{Measuring, measure};
 use crate::stage::Dispatched;
+use ip_core::Redacted;
 
 /// The records still being written, so a shutdown can wait for them.
 ///
@@ -124,7 +126,12 @@ impl Recording {
     /// says of it what it says of every answer nothing asked of an endpoint: one endpoint.
     /// The class is kept all the same, and so is the level that named it: who answered
     /// says nothing about how hard the request was treated as, or about who said so.
-    pub(super) fn out_of_the_cache(self, body: &Bytes, dispatched: Dispatched) {
+    pub(super) fn out_of_the_cache(
+        self,
+        body: &Bytes,
+        dispatched: Dispatched,
+        filtered: &Filtered,
+    ) {
         let model = measure(body).and_then(|measured| measured.model);
         self.write(
             model,
@@ -134,6 +141,9 @@ impl Recording {
                 endpoint: None,
                 arms: Hedge::default(),
                 dispatched,
+                // The request was filtered before its key was taken, so a hit is a hit
+                // on redacted bytes and the row says what that cost.
+                redacted: filtered.recorded(),
             },
         );
     }
@@ -145,6 +155,8 @@ impl Recording {
         served_by: Replica,
         raced: Hedge,
         dispatched: Dispatched,
+        filtered: Filtered,
+        reported: Option<Reported>,
     ) -> GatewayBody {
         Measured {
             inner: body,
@@ -152,6 +164,8 @@ impl Recording {
             served_by: Some(served_by),
             raced,
             dispatched,
+            filtered,
+            reported,
             recording: Some(self),
         }
         .boxed_unsync()
@@ -192,6 +206,8 @@ impl Recording {
                 endpoint: Some(Replica::of(endpoint)),
                 arms: Hedge::default(),
                 dispatched: Dispatched::NONE,
+                // The arbiter's question is the gateway's own, and nothing filters it.
+                redacted: Redacted::NONE,
             },
         );
     }
@@ -211,8 +227,7 @@ impl Recording {
             raced_across: serving.arms,
             dispatched_class: serving.dispatched.class(),
             decided_by: serving.dispatched.decided_by(),
-            // Filled where the filter runs, which is not here yet.
-            redacted: ip_core::Redacted::NONE,
+            redacted: serving.redacted,
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;
@@ -246,6 +261,8 @@ struct Serving {
     /// by a cache answer too, since who answered says nothing about how hard it was
     /// treated as, or about who decided that.
     dispatched: Dispatched,
+    /// What the filter took out of the request and the answer together.
+    redacted: Redacted,
 }
 
 /// A body that measures what passes, and records it when the last of it has.
@@ -253,6 +270,8 @@ struct Measured {
     inner: GatewayBody,
     measuring: Measuring,
     served_by: Option<Replica>,
+    filtered: Filtered,
+    reported: Option<Reported>,
     raced: Hedge,
     dispatched: Dispatched,
     recording: Option<Recording>,
@@ -269,6 +288,12 @@ impl Measured {
             Some(measured) => (measured.model, measured.tokens),
             None => (None, Tokens::ZERO),
         };
+        // A streamed answer's tally is left behind by the pump that fed this body, so
+        // it is read now rather than when the headers went out.
+        let mut filtered = std::mem::take(&mut self.filtered);
+        if let Some(reported) = self.reported.take() {
+            filtered.absorb(&Filtered::redacted(reported.taken()));
+        }
         recording.write(
             model,
             tokens,
@@ -277,6 +302,7 @@ impl Measured {
                 endpoint: self.served_by.take(),
                 arms: self.raced,
                 dispatched: self.dispatched,
+                redacted: filtered.recorded(),
             },
         );
     }

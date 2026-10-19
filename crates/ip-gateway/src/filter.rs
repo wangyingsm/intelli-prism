@@ -11,10 +11,11 @@
 //! what was redacted rather than what arrived.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName};
-use ip_core::TenantId;
+use ip_core::{Redacted, TenantId};
 use ip_filter::{Detectors, Redaction, WINDOW, redact};
 
 /// The header an answer carries to say what was taken out of its request.
@@ -58,13 +59,21 @@ pub struct Filtered {
     found: Redaction,
     unscanned: BTreeSet<Unscanned>,
     streamed: bool,
+    looked: bool,
 }
 
 impl Filtered {
     /// Nothing was taken out, and everything was looked at.
+    ///
+    /// Not the same as the default, which is a request no filter looked at. A row that
+    /// cannot tell those apart says nothing useful: the first means the body was clean
+    /// and the second means nobody checked.
     #[must_use]
     pub fn clean() -> Self {
-        Self::default()
+        Self {
+            looked: true,
+            ..Self::default()
+        }
     }
 
     /// This much was replaced.
@@ -72,6 +81,7 @@ impl Filtered {
     pub fn redacted(found: Redaction) -> Self {
         Self {
             found,
+            looked: true,
             ..Self::default()
         }
     }
@@ -83,6 +93,7 @@ impl Filtered {
     pub fn streamed() -> Self {
         Self {
             streamed: true,
+            looked: true,
             ..Self::default()
         }
     }
@@ -94,6 +105,7 @@ impl Filtered {
     pub fn unscanned(why: Unscanned) -> Self {
         Self {
             unscanned: [why].into_iter().collect(),
+            looked: true,
             ..Self::default()
         }
     }
@@ -103,6 +115,7 @@ impl Filtered {
         self.found.absorb(&other.found);
         self.unscanned.extend(other.unscanned.iter().copied());
         self.streamed |= other.streamed;
+        self.looked |= other.looked;
     }
 
     /// What the answer's header should say, or nothing when there is nothing to report.
@@ -132,6 +145,28 @@ impl Filtered {
     #[must_use]
     pub const fn left_unscanned(&self) -> &BTreeSet<Unscanned> {
         &self.unscanned
+    }
+
+    /// This, as a row records it.
+    ///
+    /// A request no filter looked at, and one whose body could not be held to be
+    /// looked at, both record nothing: the column says what was examined, and neither
+    /// of those was. A body that was examined and held nothing records a clean nought,
+    /// which is a different fact and the reason the column is a pair.
+    #[must_use]
+    pub fn recorded(&self) -> Redacted {
+        if !self.looked {
+            return Redacted::NONE;
+        }
+        let count = u32::try_from(self.found.total()).unwrap_or(u32::MAX);
+        if count == 0 {
+            return if self.unscanned.is_empty() {
+                Redacted::clean()
+            } else {
+                Redacted::NONE
+            };
+        }
+        Redacted::of(count, &self.found.said()).unwrap_or(Redacted::NONE)
     }
 }
 
@@ -211,6 +246,35 @@ impl Filtering {
                 Filtered::redacted(found),
             ),
         }
+    }
+}
+
+/// Where a streamed answer leaves what it gave up.
+///
+/// A stream's headers go out before its first event, so its tally cannot ride them.
+/// The pump writes here when the stream ends and the ledger reads it when the body
+/// does, which is after — the body cannot end before the pump that feeds it has.
+#[derive(Clone, Default)]
+pub struct Reported(Arc<Mutex<Redaction>>);
+
+impl Reported {
+    /// A place for a stream to leave its tally.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What the stream gave up, said once it has ended.
+    pub fn said(&self, found: &Redaction) {
+        if let Ok(mut held) = self.0.lock() {
+            held.absorb(found);
+        }
+    }
+
+    /// What was left here, which is nothing until the stream ends.
+    #[must_use]
+    pub fn taken(&self) -> Redaction {
+        self.0.lock().map(|held| held.clone()).unwrap_or_default()
     }
 }
 

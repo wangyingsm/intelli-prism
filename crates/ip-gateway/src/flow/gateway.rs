@@ -24,7 +24,7 @@ use crate::cache::{CachedResponse, ResponseCache};
 use crate::classifier::Classifier;
 use crate::dispatch::Dispatcher;
 use crate::error::{GatewayError, GatewayErrorKind};
-use crate::filter::Filtering;
+use crate::filter::{Filtered, Filtering, Reported};
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
@@ -286,10 +286,14 @@ impl Gateway {
                 .await?;
             let served_by = done.served().clone();
             let raced = done.raced();
+            let filtered = done.filtered().clone();
+            let reported = done.reported().cloned();
             let answered = stage_span!(EGRESS_RESPONSE, followed);
             answered.record("hit", false);
             let sent = async { done.into_response() }.instrument(answered).await?;
-            return Ok(measuring(sent, recording, served_by, raced, dispatched));
+            return Ok(measuring(
+                sent, recording, served_by, raced, dispatched, filtered, reported,
+            ));
         };
         // A hit answers here, spending no tokens and running no response processor, as designed.
         let key = processed.response_key().await?;
@@ -298,7 +302,7 @@ impl Gateway {
                 let answered = stage_span!(EGRESS_RESPONSE, followed);
                 answered.record("hit", true);
                 if let Some(recording) = recording {
-                    recording.out_of_the_cache(hit.body(), named);
+                    recording.out_of_the_cache(hit.body(), named, processed.filtered());
                 }
                 return Ok(answered.in_scope(|| answer_with(hit)));
             }
@@ -317,6 +321,8 @@ impl Gateway {
             .await?;
         let served_by = done.served().clone();
         let raced = done.raced();
+        let filtered = done.filtered().clone();
+        let reported = done.reported().cloned();
         if let Some((answer, ttl)) = done.cacheable(responses.ttl()).await?
             && let Err(error) = responses.put(&key, &answer, ttl).await
         {
@@ -327,7 +333,9 @@ impl Gateway {
         let sent = async { done.into_response() }.instrument(answered).await?;
         // The row is measured against what went upstream: a turn's remembered class is
         // the class it was dispatched at, whatever named it.
-        Ok(measuring(sent, recording, served_by, raced, dispatched))
+        Ok(measuring(
+            sent, recording, served_by, raced, dispatched, filtered, reported,
+        ))
     }
 
     /// Refuses a request that has run out of what it may spend, or that cannot be counted.
@@ -405,6 +413,8 @@ fn measuring(
     served_by: Replica,
     raced: Hedge,
     dispatched: Dispatched,
+    filtered: Filtered,
+    reported: Option<Reported>,
 ) -> Response<GatewayBody> {
     let Some(recording) = recording else {
         return response;
@@ -412,7 +422,7 @@ fn measuring(
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        recording.measuring(body, served_by, raced, dispatched),
+        recording.measuring(body, served_by, raced, dispatched, filtered, reported),
     )
 }
 
@@ -4747,5 +4757,104 @@ mod tests {
             !sent.contains("ada@example.com"),
             "the floor was skipped: {sent}"
         );
+    }
+
+    /// What a whole answer gave up reaches the row.
+    #[tokio::test]
+    async fn the_row_says_what_the_filter_took_out() {
+        let (recorder, mut recorded) = Ledger::new();
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(r#"{"said":"ask bob@example.org"}"#),
+        )
+        .recording(recorder)
+        .filtering(Arc::new(crate::filter::Filtering::new(detectors)));
+        let (row, _) = asked(
+            &gateway,
+            &mut recorded,
+            context(granted()),
+            request(
+                "/anthropic",
+                r#"{"q":"mail ada@example.com about sk-abcdefghij1234"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(row.redacted.count(), Some(3));
+        assert_eq!(row.redacted.kinds(), Some("email=2, openai-key=1"));
+    }
+
+    /// Looked at and clean is a different row from one no filter looked at, and the
+    /// ledger has to be able to say which.
+    #[tokio::test]
+    async fn a_clean_request_records_a_nought_and_an_unfiltered_one_records_nothing() {
+        for (filtering, want) in [(true, Some(0)), (false, None)] {
+            let (recorder, mut recorded) = Ledger::new();
+            let mut gateway = Gateway::new(
+                table(),
+                ProcessorChain::new(),
+                FakeUpstream::answering(r#"{"said":"pong"}"#),
+            )
+            .recording(recorder);
+            if filtering {
+                let detectors = ip_filter::Detectors::defaults().unwrap();
+                gateway = gateway.filtering(Arc::new(crate::filter::Filtering::new(detectors)));
+            }
+            let (row, _) = asked(
+                &gateway,
+                &mut recorded,
+                context(granted()),
+                request("/anthropic", r#"{"q":"nothing to see"}"#),
+            )
+            .await;
+            assert_eq!(
+                row.redacted.count(),
+                want,
+                "filtering={filtering} recorded the wrong thing"
+            );
+        }
+    }
+
+    /// The asymmetry this commit closes: a stream's headers go out before its first
+    /// event, so its tally cannot ride them — it reaches the row instead, written when
+    /// the last event has gone.
+    #[tokio::test]
+    async fn a_streamed_answers_tally_reaches_the_row_even_though_it_missed_the_header() {
+        const STREAMED: [&[u8]; 4] = [
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"your key is sk-\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"abcdefghij1234\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            b"data: [DONE]\n\n",
+        ];
+        let (recorder, mut recorded) = Ledger::new();
+        let detectors = ip_filter::Detectors::defaults().unwrap();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            Arc::new(Streaming(&STREAMED)),
+        )
+        .recording(recorder)
+        .filtering(Arc::new(crate::filter::Filtering::new(detectors)));
+        let answer = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", r#"{"q":"hello"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.headers().get(crate::filter::REDACTED).unwrap(),
+            "streamed",
+            "the header cannot carry the count"
+        );
+        let said = body_of(answer).await;
+        assert!(!said.contains("sk-abcdefghij1234"), "{said}");
+        let row = recorded
+            .recv()
+            .await
+            .expect("the row is written once the last event has gone");
+        assert_eq!(row.redacted.count(), Some(1), "but the row can");
+        assert_eq!(row.redacted.kinds(), Some("openai-key=1"));
     }
 }
