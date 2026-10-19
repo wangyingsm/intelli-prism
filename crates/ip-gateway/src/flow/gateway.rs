@@ -28,7 +28,7 @@ use crate::error::{GatewayError, GatewayErrorKind};
 use crate::filter::{Filtered, Filtering, Reported};
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
-use crate::meter::Meters;
+use crate::meter::{Looked, Meters};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
 use crate::semantic::{self, Question, SemanticCache};
 use crate::stage::{Authorized, BodyProcessed, Dispatched, ResponseBodyProcessed, Stage};
@@ -354,36 +354,57 @@ impl Gateway {
         // What the semantic level was asked, kept for the way back: embedding is the
         // expensive part and a miss must not pay for it twice.
         let mut meant: Option<(Question, Embedding)> = None;
-        if let Some(semantic) = &self.semantic
-            && let Some(question) = processed.question().await?
-            && let Some(vector) = self.vector_for(&question).await
-        {
-            match semantic
-                .look(&followed.tenant, &question.route, &vector)
-                .await
-            {
-                Ok(Some((hit, nearness))) => {
-                    let answered = stage_span!(EGRESS_RESPONSE, followed);
-                    answered.record("hit", true);
-                    tracing::debug!(%nearness, "answering a question asked in other words");
-                    if let Some(recording) = recording {
-                        recording.out_of_the_cache(
-                            hit.body(),
-                            named,
-                            processed.filtered(),
-                            Served::Semantic,
-                        );
+        if let Some(semantic) = &self.semantic {
+            // Every way this can end is counted, including the two where no question
+            // was ever asked. Why it was not asked is as much of the answer as whether
+            // it hit: ineligible traffic says this level will never suit this
+            // workload, where a near-miss says the threshold is too tight — and in
+            // `ip.requests` the two are the same upstream call.
+            match processed.question().await? {
+                None => self.looked(Looked::Ineligible, &followed),
+                Some(question) => match self.vector_for(&question).await {
+                    None => self.looked(Looked::Unembedded, &followed),
+                    Some(vector) => {
+                        match semantic
+                            .look(&followed.tenant, &question.route, &vector)
+                            .await
+                        {
+                            Ok(Some((hit, nearness))) => {
+                                self.looked(Looked::Hit, &followed);
+                                let answered = stage_span!(EGRESS_RESPONSE, followed);
+                                answered.record("hit", true);
+                                tracing::debug!(
+                                    %nearness,
+                                    "answering a question asked in other words"
+                                );
+                                if let Some(recording) = recording {
+                                    recording.out_of_the_cache(
+                                        hit.body(),
+                                        named,
+                                        processed.filtered(),
+                                        Served::Semantic,
+                                    );
+                                }
+                                return Ok(answered.in_scope(|| {
+                                    let mut answer = answer_with(hit);
+                                    semantic::say(answer.headers_mut(), nearness);
+                                    answer
+                                }));
+                            }
+                            // A cache that could not be read is counted with the
+                            // misses rather than apart from them: from the request's
+                            // side nothing was found either way, and the failure
+                            // itself is in the log where a rare fault belongs.
+                            Err(error) => {
+                                tracing::warn!(%error, "could not read the semantic cache");
+                                self.looked(Looked::Miss, &followed);
+                            }
+                            Ok(None) => self.looked(Looked::Miss, &followed),
+                        }
+                        meant = Some((question, vector));
                     }
-                    return Ok(answered.in_scope(|| {
-                        let mut answer = answer_with(hit);
-                        semantic::say(answer.headers_mut(), nearness);
-                        answer
-                    }));
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(%error, "could not read the semantic cache"),
+                },
             }
-            meant = Some((question, vector));
         }
         let (mut done, dispatched) = self
             .upstream_answer(
@@ -430,6 +451,16 @@ impl Gateway {
         Ok(measuring(
             sent, recording, served_by, raced, dispatched, filtered, reported,
         ))
+    }
+
+    /// Counts one request's turn at the semantic cache, when anything is counting.
+    fn looked(&self, outcome: Looked, followed: &Followed) {
+        if let Some(meters) = self.keeping.meters() {
+            // A route was resolved by the time the semantic level is reached, so the
+            // api is there; an empty label rather than a panic if it ever is not.
+            let api = followed.api.as_ref().map_or("", ip_core::ApiId::as_str);
+            meters.looked(outcome, &followed.tenant, api);
+        }
     }
 
     /// What one question means, under the embedder's own clock.
@@ -818,6 +849,91 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A gateway that counts, and answers by meaning alone.
+    fn metered_by_meaning(
+        upstream: Arc<FakeUpstream>,
+        embedder: FakeEmbedder,
+    ) -> (
+        Gateway,
+        opentelemetry_sdk::metrics::InMemoryMetricExporter,
+        opentelemetry_sdk::metrics::SdkMeterProvider,
+    ) {
+        use opentelemetry::metrics::MeterProvider as _;
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream)
+            .measuring(Arc::new(Meters::new(&provider.meter("test"))))
+            .recognising(recognising(0.95), Arc::new(embedder));
+        (gateway, exporter, provider)
+    }
+
+    /// What came of each turn at the semantic cache, counted — including the turns
+    /// where no question was asked at all.
+    ///
+    /// All four in one test on purpose: what matters is that they are told *apart*,
+    /// and four separate tests could each pass while two of the labels were the same
+    /// string.
+    #[tokio::test]
+    async fn every_way_a_semantic_lookup_can_end_is_counted_apart() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (gateway, exporter, provider) = metered_by_meaning(
+            upstream,
+            FakeEmbedder::default()
+                .saying("what did we spend", &[1.0, 0.0, 0.0])
+                .saying("how much did we spend", &[1.0, 0.0, 0.05]),
+        );
+        let ask = |body: String| request("/anthropic/messages", &body);
+
+        // Asked and nothing there yet: a miss. Then the same meaning again: a hit.
+        for question in ["what did we spend", "how much did we spend"] {
+            let answered = gateway
+                .handle(context(granted()), ask(asking(question)))
+                .await
+                .unwrap();
+            body_of(answered).await;
+        }
+        // An exchange, which is never eligible to be asked.
+        let answered = gateway
+            .handle(context(granted()), ask(asking_again("what did we spend")))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        // A phrase the encoder will not commit to a vector for.
+        let answered = gateway
+            .handle(
+                context(granted()),
+                ask(asking("something it never learned")),
+            )
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        let mut seen: Vec<(String, u64)> = counted(&exporter, &provider, "ip.semantic.lookups")
+            .into_iter()
+            .map(|(labels, value)| {
+                let outcome = labels
+                    .iter()
+                    .find(|(key, _)| key == "outcome")
+                    .expect("every lookup says what came of it")
+                    .1
+                    .clone();
+                (outcome, value)
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("hit".to_owned(), 1),
+                ("ineligible".to_owned(), 1),
+                ("miss".to_owned(), 1),
+                ("unembedded".to_owned(), 1),
+            ]
+        );
     }
 
     /// A gateway that answers by meaning alone — no exact cache behind it, so a hit

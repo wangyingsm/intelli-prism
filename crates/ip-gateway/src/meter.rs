@@ -67,6 +67,7 @@ pub struct Meters {
     requests: Counter<u64>,
     tokens: Counter<u64>,
     latency: Histogram<u64>,
+    lookups: Counter<u64>,
 }
 
 impl Meters {
@@ -89,6 +90,14 @@ impl Meters {
                 .with_description("How long a request took, end to end.")
                 .with_unit("ms")
                 .with_boundaries(LATENCY_MS.to_vec())
+                .build(),
+            lookups: meter
+                .u64_counter("ip.semantic.lookups")
+                .with_description(
+                    "Turns at the semantic cache, by what came of them, including the \
+                     ones never eligible to be asked.",
+                )
+                .with_unit("{lookup}")
                 .build(),
         }
     }
@@ -115,6 +124,59 @@ impl Meters {
         }
         self.latency
             .record(u64::from(asked.latency.millis()), &asked.bounded());
+    }
+
+    /// Counts what came of one request's turn at the semantic cache.
+    ///
+    /// Counted here and not from `Recording`, unlike everything above, and the
+    /// difference is real: `Recording` knows what a request *was*, while this is what
+    /// happened at one gate inside it. A request that was never eligible has no
+    /// semantic outcome to carry to the end, and folding this into the record would
+    /// mean teaching it about a level it has no other business knowing.
+    pub(crate) fn looked(&self, outcome: Looked, tenant: &TenantId, api: &str) {
+        self.lookups.add(
+            1,
+            &[
+                KeyValue::new("tenant", tenant.as_str().to_owned()),
+                KeyValue::new("api", api.to_owned()),
+                KeyValue::new("outcome", outcome.as_str()),
+            ],
+        );
+    }
+}
+
+/// What came of asking the semantic cache, or of not asking it.
+///
+/// The hit rate alone cannot say whether the level is worth running, because it
+/// cannot tell a question that was asked and missed from one that was never eligible
+/// to be asked. Those want opposite responses: near-misses say *lower the threshold*,
+/// and ineligible traffic says *this workload will never suit this level* — and in
+/// `ip.requests` the two are indistinguishable, since both were answered upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Looked {
+    /// A question was asked and answered from the cache.
+    Hit,
+    /// A question was asked and nothing was near enough.
+    Miss,
+    /// Never asked: the body was not a single unanswered question. An agent loop and
+    /// an embeddings call both land here, and for both the answer is the same — this
+    /// level is not for this traffic.
+    Ineligible,
+    /// Never asked: the encoder was busy, too slow, or would not commit to a vector.
+    /// Unlike the others this is a capacity problem rather than a property of the
+    /// traffic, which is why it is not folded in with them.
+    Unembedded,
+}
+
+impl Looked {
+    /// What this is called on a dashboard.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Ineligible => "ineligible",
+            Self::Unembedded => "unembedded",
+        }
     }
 }
 
