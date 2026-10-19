@@ -1669,6 +1669,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-embed"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "ip-filter"
 version = "0.1.0"
 dependencies = [
