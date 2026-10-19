@@ -1715,6 +1715,7 @@ dependencies = [
  "ip-cache",
  "ip-config",
  "ip-core",
+ "ip-embed",
  "ip-filter",
  "ip-protocol",
  "ip-storage",

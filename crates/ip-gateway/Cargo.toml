@@ -24,6 +24,7 @@ ip-auth = { version = "0.1.0", path = "../ip-auth" }
 ip-cache = { version = "0.1.0", path = "../ip-cache", default-features = false }
 ip-config = { version = "0.1.0", path = "../ip-config" }
 ip-core = { version = "0.1.0", path = "../ip-core" }
+ip-embed = { version = "0.1.0", path = "../ip-embed" }
 ip-filter = { version = "0.1.0", path = "../ip-filter" }
 ip-protocol = { version = "0.1.0", path = "../ip-protocol" }
 ip-storage = { version = "0.1.0", path = "../ip-storage", default-features = false }

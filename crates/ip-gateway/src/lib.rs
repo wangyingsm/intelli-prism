@@ -12,6 +12,7 @@ pub mod hyper_upstream;
 pub mod limit;
 pub mod measure;
 pub mod processor;
+pub mod semantic;
 mod sse;
 pub mod stage;
 pub mod table;
@@ -31,6 +32,7 @@ pub use hyper_upstream::{HyperUpstream, UpstreamSettings};
 pub use limit::{Asking, Decision, Limiter, Limits};
 pub use measure::{Measured, Measuring, measure};
 pub use processor::{BodyProcessor, ChainSource, FixedChains, HeaderProcessor, ProcessorChain};
+pub use semantic::{SemanticCache, SemanticSettings, semantic_key};
 pub use stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
     ResponseHeadersProcessed, Routed, Stage, StageName,

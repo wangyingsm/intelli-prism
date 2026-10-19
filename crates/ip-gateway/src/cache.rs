@@ -154,7 +154,7 @@ impl CachedResponse {
     }
 
     /// The entry as the cache stores it: the content type's length, the content type, the body.
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let content_type = self.content_type.as_ref().map_or(&[][..], |value| {
             let bytes = value.as_bytes();
             // A content type longer than the length field can hold is stored as none at all.
@@ -173,7 +173,7 @@ impl CachedResponse {
     }
 
     /// Reads an entry back, or nothing when the bytes are not one.
-    fn decode(entry: &[u8]) -> Option<Self> {
+    pub(crate) fn decode(entry: &[u8]) -> Option<Self> {
         let (len, rest) = entry.split_at_checked(TYPE_LEN)?;
         let len = usize::from(u16::from_be_bytes(len.try_into().ok()?));
         let (content_type, body) = rest.split_at_checked(len)?;
