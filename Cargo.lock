@@ -1643,6 +1643,7 @@ name = "ip-config"
 version = "0.1.0"
 dependencies = [
  "ip-core",
+ "ip-embed",
  "ip-filter",
  "serde",
  "subtle",

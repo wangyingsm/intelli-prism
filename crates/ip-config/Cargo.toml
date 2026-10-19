@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 ip-core = { version = "0.1.0", path = "../ip-core" }
+ip-embed = { version = "0.1.0", path = "../ip-embed" }
 ip-filter = { version = "0.1.0", path = "../ip-filter" }
 serde.workspace = true
 subtle = "2.6.1"

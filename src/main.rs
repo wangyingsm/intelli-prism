@@ -154,36 +154,7 @@ mod tests {
     /// file — so a misplaced one fails here.
     #[test]
     fn the_whole_filter_section_parses_when_taken_up() {
-        let lines: Vec<&str> = EXAMPLE.lines().collect();
-        let from = lines
-            .iter()
-            .position(|line| line.trim_start() == "# [filter]")
-            .expect("the example shows a filter section");
-        let taken: String = lines
-            .iter()
-            .enumerate()
-            .map(|(at, line)| {
-                if at < from {
-                    return (*line).to_owned();
-                }
-                // Only the lines that are toml, never the prose around them: a table
-                // header, or a key and its value.
-                match line.trim_start().strip_prefix("# ") {
-                    Some(rest)
-                        if rest.starts_with('[')
-                            || rest.split_once(" = ").is_some_and(|(name, _)| {
-                                !name.is_empty()
-                                    && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
-                            }) =>
-                    {
-                        rest.to_owned()
-                    }
-                    _ => (*line).to_owned(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
+        let taken = taken_from("# [filter]");
         let config = ip_config::Config::parse(&taken).expect("the filter section parses");
         let filter = config.filter.expect("the section is there");
         assert_eq!(filter.window, 256);
@@ -236,5 +207,59 @@ mod tests {
             secrets.len(),
             "a tenant the example does not name gets the floor, no more and no less"
         );
+    }
+
+    /// The semantic section, uncommented as an operator would take it up, and read
+    /// back as what it resolves to rather than merely proved to parse.
+    #[test]
+    fn the_whole_semantic_section_parses_when_taken_up() {
+        let config = ip_config::Config::parse(&taken_from("# [semantic]"))
+            .expect("the semantic section parses");
+        let semantic = config.semantic.expect("the section is there");
+        assert_eq!(
+            semantic.artifact,
+            std::path::PathBuf::from("/var/lib/intelli-prism/embed")
+        );
+        assert!((semantic.nearness - 0.97).abs() < f32::EPSILON);
+        assert_eq!(semantic.ttl.get(), 3_600);
+        assert_eq!(semantic.capacity, 4_096);
+        // The example shows no library key, because the loader's own search answers
+        // first; an operator who needs one reads the difficulty section for it.
+        assert_eq!(semantic.library, None);
+    }
+
+    /// The example with one commented section taken up, from its table header to the
+    /// end of the file.
+    ///
+    /// Only the lines that are toml, never the prose around them: a table header, or
+    /// a key and its value.
+    fn taken_from(header: &str) -> String {
+        let lines: Vec<&str> = EXAMPLE.lines().collect();
+        let from = lines
+            .iter()
+            .position(|line| line.trim_start() == header)
+            .unwrap_or_else(|| panic!("the example shows a {header} section"));
+        lines
+            .iter()
+            .enumerate()
+            .map(|(at, line)| {
+                if at < from {
+                    return (*line).to_owned();
+                }
+                match line.trim_start().strip_prefix("# ") {
+                    Some(rest)
+                        if rest.starts_with('[')
+                            || rest.split_once(" = ").is_some_and(|(name, _)| {
+                                !name.is_empty()
+                                    && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                            }) =>
+                    {
+                        rest.to_owned()
+                    }
+                    _ => (*line).to_owned(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use ip_embed::MOST_HELD;
 use serde::Deserialize;
 use url::Url;
 
@@ -45,6 +46,59 @@ pub struct Config {
     /// every body travels exactly as it did before the filter existed.
     #[serde(default)]
     pub filter: Option<FilterConfig>,
+    /// The cache that answers a question asked before in other words. Absent, the
+    /// level holds nothing and no request is ever embedded.
+    #[serde(default)]
+    pub semantic: Option<SemanticConfig>,
+}
+
+/// The third cache level: the model that recognises a question, and how near two of
+/// them must be before one may answer for the other.
+///
+/// Present at all, the level is on for every llm route. There is no per-route switch:
+/// what a near miss is worth is one judgement about one deployment's traffic, and an
+/// operator who needs it off for a route can leave the stanza out until they do not.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticConfig {
+    /// The directory the embedding model was exported to: `model.onnx`,
+    /// `tokenizer.json` and `embed.json` together are the whole artefact.
+    pub artifact: std::path::PathBuf,
+    /// How near two questions must mean the same thing before one is answered with
+    /// the other's answer, inclusive at the boundary.
+    ///
+    /// No default, deliberately, exactly as the classifier's confidence has none.
+    /// This number decides when the gateway hands one caller another's answer, and
+    /// the only honest way to pick it is to watch `x-ip-nearness` against real
+    /// traffic. A figure invented here would be a stranger's guess wearing the
+    /// authority of a default.
+    pub nearness: f32,
+    /// How long an answer stands for a question other than the one that produced it.
+    ///
+    /// Its own span, not the response cache's: how long an answer is good for its own
+    /// question is a different judgement from how long it may stand in for a
+    /// different one, and the second is the shorter of the two more often than not.
+    #[serde(default = "default_semantic_ttl")]
+    pub ttl: Seconds,
+    /// How many questions one tenant's index holds on one route before its least
+    /// recently used go.
+    ///
+    /// A lookup is a scan, so this is a latency budget as much as a memory one; the
+    /// default is comfortably inside what a scan answers in about a millisecond.
+    #[serde(default = "default_semantic_capacity")]
+    pub capacity: usize,
+    /// Where `libonnxruntime` lives, when the build did not find one. The
+    /// environment's `ORT_DYLIB_PATH` answers first.
+    #[serde(default)]
+    pub library: Option<std::path::PathBuf>,
+}
+
+fn default_semantic_ttl() -> Seconds {
+    Seconds::new(3_600)
+}
+
+fn default_semantic_capacity() -> usize {
+    4_096
 }
 
 /// The operator's floor: what must not leave, whoever is asking.
@@ -262,6 +316,23 @@ impl Config {
             return Err(ConfigError::DifficultyConfidence {
                 value: difficulty.confidence,
             });
+        }
+        // The same judgement as the confidence above, and for a sharper reason: this
+        // number decides when one caller is handed another's answer. Outside the unit
+        // it admits everything or nothing, and a capacity of nothing is a level that
+        // can never hit, written as though it were a setting.
+        if let Some(semantic) = &self.semantic {
+            if !(0.0..=1.0).contains(&semantic.nearness) {
+                return Err(ConfigError::SemanticNearness {
+                    value: semantic.nearness,
+                });
+            }
+            if !(1..=MOST_HELD).contains(&semantic.capacity) {
+                return Err(ConfigError::SemanticCapacity {
+                    value: semantic.capacity,
+                    limit: MOST_HELD,
+                });
+            }
         }
         // A timeout outside a second to half a minute is a shape mistake, refused where
         // the rest of the config's shape is refused: zero asks the arbiter nothing, and
@@ -816,6 +887,99 @@ path = "/chat"
             Err(ConfigError::DifficultyConfidence { .. })
         ));
         assert!(bad("0.4").is_ok());
+    }
+
+    /// What a whole stanza resolves to, not merely that it parses: every field read
+    /// back as the value it was written as, which is the half a parse test misses.
+    #[test]
+    fn a_whole_semantic_section_reads_as_what_it_says() {
+        let text = format!(
+            r#"{FULL}
+[semantic]
+artifact = "/var/lib/ip/embed"
+nearness = 0.97
+ttl = 900
+capacity = 2048
+library = "/usr/lib/libonnxruntime.so"
+"#
+        );
+        let semantic = Config::parse(&text).unwrap().semantic.unwrap();
+        assert_eq!(semantic.artifact, PathBuf::from("/var/lib/ip/embed"));
+        assert!((semantic.nearness - 0.97).abs() < f32::EPSILON);
+        assert_eq!(semantic.ttl.get(), 900);
+        assert_eq!(semantic.capacity, 2048);
+        assert_eq!(
+            semantic.library,
+            Some(PathBuf::from("/usr/lib/libonnxruntime.so"))
+        );
+    }
+
+    /// The two fields that may be left out, and what standing in for them means.
+    #[test]
+    fn a_semantic_section_may_leave_the_span_and_the_bound_unsaid() {
+        let text =
+            format!("{FULL}\n[semantic]\nartifact = \"/var/lib/ip/embed\"\nnearness = 0.97\n");
+        let semantic = Config::parse(&text).unwrap().semantic.unwrap();
+        assert_eq!(semantic.ttl.get(), 3_600, "an hour");
+        assert_eq!(semantic.capacity, 4_096);
+        assert_eq!(semantic.library, None);
+    }
+
+    /// No stanza, no level: nothing is embedded and nothing is answered by meaning.
+    #[test]
+    fn a_file_naming_no_semantic_section_switches_the_level_off() {
+        assert!(Config::parse(MINIMAL).unwrap().semantic.is_none());
+    }
+
+    /// The number that decides when one caller is handed another's answer. Outside
+    /// the unit it answers everything from the cache or nothing, and learning that
+    /// after the weights have loaded is the wrong place to learn it.
+    #[test]
+    fn rejects_a_semantic_nearness_outside_its_range() {
+        let bad = |nearness: &str| {
+            let text = format!(
+                "{FULL}\n[semantic]\nartifact = \"/var/lib/ip/embed\"\nnearness = {nearness}\n"
+            );
+            Config::parse(&text)
+        };
+        assert!(matches!(
+            bad("1.5"),
+            Err(ConfigError::SemanticNearness { value }) if (value - 1.5).abs() < f32::EPSILON
+        ));
+        assert!(matches!(
+            bad("-0.1"),
+            Err(ConfigError::SemanticNearness { .. })
+        ));
+        // Both ends are meaningful: one admits only an exact meaning, zero admits
+        // whatever the index finds.
+        assert!(bad("0.0").is_ok());
+        assert!(bad("1.0").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_semantic_index_that_holds_nothing_or_too_much() {
+        let bad = |capacity: usize| {
+            let text = format!(
+                "{FULL}\n[semantic]\nartifact = \"/var/lib/ip/embed\"\nnearness = 0.97\ncapacity = {capacity}\n"
+            );
+            Config::parse(&text)
+        };
+        assert!(matches!(
+            bad(0),
+            Err(ConfigError::SemanticCapacity { value: 0, .. })
+        ));
+        assert!(matches!(
+            bad(MOST_HELD + 1),
+            Err(ConfigError::SemanticCapacity { limit, .. }) if limit == MOST_HELD
+        ));
+        assert!(bad(1).is_ok(), "one is a bound, if a pointless one");
+        assert!(bad(MOST_HELD).is_ok(), "the bound itself is allowed");
+    }
+
+    #[test]
+    fn rejects_a_semantic_section_naming_no_artifact() {
+        let text = format!("{FULL}\n[semantic]\nnearness = 0.97\n");
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Parse(_))));
     }
 
     #[test]

@@ -210,3 +210,51 @@ temperature = 0.7
 # [[filter.tenant.secret]]
 # kind = "acme-id"
 # prefix = "ACME-"
+
+# Answer a question asked before in other words — optional, and the third cache level.
+# The binary must be built with `--features semantic`; a [semantic] stanza in a build
+# without it is refused at startup rather than ignored.
+#
+# Absent, the level holds nothing and no request is ever embedded. Present, it is on
+# for every llm route: there is no per-route switch, because what a near miss is worth
+# is one judgement about one deployment's traffic.
+#
+# Three gates bound what it can get wrong, and only one of them is yours to set:
+#
+#   One question. Only a body holding a single unanswered turn is looked up or kept.
+#   In a conversation the context is most of the meaning, so matching on the question
+#   alone would answer it out of somebody else's exchange. Agent traffic never touches
+#   this level at all.
+#
+#   One tenant, one route. Every tenant's questions live in an index of that tenant's
+#   own, per route, and the stored answer is keyed under both besides.
+#
+#   Near enough. Yours. There is deliberately no default: this number decides when the
+#   gateway hands one caller another caller's answer. Every answer it gives carries
+#   x-ip-cache: semantic and x-ip-nearness, so set it high, watch what your own traffic
+#   actually scores, and move it against that rather than against a stranger's guess.
+#
+# artifact is a directory holding model.onnx, tokenizer.json and embed.json, exported
+# from a sentence-embedding model — not the difficulty artifact, which answers with
+# five logits and no geometry to compare. The manifest carries the width, the pooling
+# and the weights' digest, and that digest goes into every key, so replacing the model
+# cannot serve an answer found by the old one's geometry.
+#
+# ttl is how long an answer may stand in for a *different* question, which is usually
+# shorter than how long it is good for its own; it is its own span and not the response
+# cache's. A response saying no-store is still kept in neither.
+#
+# capacity is how many questions one tenant holds on one route. A lookup scans them, so
+# it is a latency budget as much as a memory one: the default answers in about a
+# millisecond, and the ceiling is 65536.
+#
+# Two things this does not do yet. The index is in memory, in one process, so each node
+# learns only from the traffic it has seen and a restart starts over. And a request that
+# misses pays one forward pass of the encoder before going upstream, which is the cost
+# the hit rate has to earn back.
+#
+# [semantic]
+# artifact = "/var/lib/intelli-prism/embed"
+# nearness = 0.97
+# ttl = 3600
+# capacity = 4096

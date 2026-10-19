@@ -82,6 +82,25 @@ pub enum ConfigError {
         value: f64,
     },
 
+    /// A nearness threshold that is not one. Outside the unit it answers every
+    /// question from the cache or none, and this is the number that decides when one
+    /// caller is handed another's answer.
+    #[error("semantic nearness {value} is not between 0 and 1")]
+    SemanticNearness {
+        /// What the file asked for.
+        value: f32,
+    },
+
+    /// An index holding nothing, which can never hit, or more than a scan answers in
+    /// any useful time.
+    #[error("a semantic index holds between 1 and {limit} questions, not {value}")]
+    SemanticCapacity {
+        /// What the file asked for.
+        value: usize,
+        /// The most that will be held.
+        limit: usize,
+    },
+
     /// A trace sampling ratio that is not a share.
     #[error("sample ratio {value} is not between 0 and 1")]
     SampleRatio {
