@@ -2,7 +2,7 @@
 
 use ip_core::{
     ApiId, Capability, CapabilityScope, Decider, Dialect, Latency, PluginOrder, PluginScope,
-    Served, TenantId, TnKey, TokenCount, UserId,
+    Redacted, Served, TenantId, TnKey, TokenCount, UserId,
 };
 
 use crate::error::{Entity, StorageError};
@@ -184,6 +184,32 @@ pub(crate) fn decided_by(named: Option<String>) -> Result<Option<Decider>, Stora
         .map(|name| Decider::named(&name))
         .transpose()
         .map_err(StorageError::from)
+}
+
+/// Reads back what a filter took out of a request, refusing a count with no kinds
+/// named and kinds with nothing counted: the two describe each other, and a row
+/// holding one without the other describes nothing.
+pub(crate) fn redacted(
+    count: Option<i64>,
+    kinds: Option<String>,
+) -> Result<Redacted, StorageError> {
+    match (count, kinds) {
+        (None, None) => Ok(Redacted::NONE),
+        (Some(count), Some(kinds)) => {
+            let count = u32::try_from(count).map_err(|_| StorageError::Malformed {
+                entity: Entity::Usage,
+                detail: format!("a redaction of {count} is not a count"),
+            })?;
+            Redacted::of(count, &kinds).map_err(|error| StorageError::Malformed {
+                entity: Entity::Usage,
+                detail: error.to_string(),
+            })
+        }
+        (count, kinds) => Err(StorageError::Malformed {
+            entity: Entity::Usage,
+            detail: format!("a redaction of {count:?} naming {kinds:?} describes nothing"),
+        }),
+    }
 }
 
 /// The stored name of a provider family.

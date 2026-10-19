@@ -1,6 +1,6 @@
 use ip_core::{
-    ApiId, Counted, Decider, Difficulty, Hedge, Host, Latency, ModelName, Port, Replica, Served,
-    TenantId, Timestamp, TokenCount, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Decider, Difficulty, Hedge, Host, Latency, ModelName, Port, Redacted, Replica,
+    Served, TenantId, Timestamp, TokenCount, Tokens, TraceId, TurnId, UserId,
 };
 
 use crate::list::Page;
@@ -29,6 +29,7 @@ pub(crate) fn spent() -> NewUsage {
         raced_across: Hedge::default(),
         dispatched_class: None,
         decided_by: None,
+        redacted: Redacted::NONE,
         latency: Latency::from_millis(1_250),
     }
 }
@@ -630,4 +631,45 @@ pub(crate) async fn what_was_sent_upstream_after_a_moment_excludes_the_moment(
         .await
         .unwrap();
     assert_eq!((all.answered, all.sent), (1, 1));
+}
+
+/// A row carrying what the filter took out, and one carrying that a filter looked and
+/// found nothing. Telling the two apart from a row no filter looked at is the whole
+/// reason the column is a pair rather than a number.
+pub(crate) async fn a_row_says_what_was_taken_out_of_it(store: &impl UsageStore) {
+    let taken = NewUsage {
+        redacted: Redacted::of(3, "email=2, openai-key=1").unwrap(),
+        ..spent()
+    };
+    let recorded = store.record_usage(taken).await.unwrap();
+    assert_eq!(recorded.redacted.count(), Some(3));
+    assert_eq!(recorded.redacted.kinds(), Some("email=2, openai-key=1"));
+    let read = store.usage(recorded.row_id).await.unwrap().unwrap();
+    assert_eq!(read.redacted.count(), Some(3));
+    assert_eq!(read.redacted.kinds(), Some("email=2, openai-key=1"));
+}
+
+pub(crate) async fn a_row_a_filter_looked_at_and_found_nothing_in_says_so(store: &impl UsageStore) {
+    let clean = NewUsage {
+        redacted: Redacted::clean(),
+        ..spent()
+    };
+    let read = store
+        .usage(store.record_usage(clean).await.unwrap().row_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(read.redacted.looked(), "a filter did look at this one");
+    assert_eq!(read.redacted.count(), Some(0));
+}
+
+pub(crate) async fn a_row_no_filter_looked_at_says_nothing_at_all(store: &impl UsageStore) {
+    let read = store
+        .usage(store.record_usage(spent()).await.unwrap().row_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!read.redacted.looked());
+    assert_eq!(read.redacted.count(), None);
+    assert_eq!(read.redacted.kinds(), None);
 }

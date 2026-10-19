@@ -329,6 +329,7 @@ mod tests {
             raced_across: Hedge::default(),
             dispatched_class: None,
             decided_by: None,
+            redacted: ip_core::Redacted::NONE,
             latency: Latency::from_millis(1_250),
         }
     }

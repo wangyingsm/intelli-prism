@@ -211,6 +211,8 @@ impl Recording {
             raced_across: serving.arms,
             dispatched_class: serving.dispatched.class(),
             decided_by: serving.dispatched.decided_by(),
+            // Filled where the filter runs, which is not here yet.
+            redacted: ip_core::Redacted::NONE,
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let store = self.store;

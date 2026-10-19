@@ -30,4 +30,4 @@ pub use route::{
 };
 pub use timestamp::Timestamp;
 pub use trace::TraceId;
-pub use usage::{Latency, Served, TokenCount, Tokens};
+pub use usage::{Latency, Redacted, Served, TokenCount, Tokens};

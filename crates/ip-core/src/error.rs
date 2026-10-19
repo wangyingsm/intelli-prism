@@ -144,4 +144,15 @@ pub enum CoreError {
         /// The most it may ask for.
         most: u8,
     },
+
+    /// A redaction tally describing nothing: a count with no kinds named, or kinds
+    /// with nothing counted. The two describe each other and one without the other is
+    /// a row nobody can read.
+    #[error("a redaction of {count} names {kinds:?}, and the two do not describe each other")]
+    RedactedKinds {
+        /// How many the row said were taken out.
+        count: u32,
+        /// What it said they were.
+        kinds: String,
+    },
 }

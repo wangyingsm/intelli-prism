@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, Decider, Difficulty, Hedge, Latency, ModelName, Replica, Served, TenantId,
-    Timestamp, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Decider, Difficulty, Hedge, Latency, ModelName, Redacted, Replica, Served,
+    TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
 };
 
 use crate::error::StorageError;
@@ -52,6 +52,9 @@ pub struct Usage {
     pub dispatched_class: Option<Difficulty>,
     /// Which level of the margin named that class, and none where there is no class.
     pub decided_by: Option<Decider>,
+    /// What the filter took out of the request and its answer, and nothing at all
+    /// where no filter looked.
+    pub redacted: Redacted,
     /// How long the caller waited.
     pub latency: Latency,
     /// When the request was recorded.
@@ -86,6 +89,9 @@ pub struct NewUsage {
     pub dispatched_class: Option<Difficulty>,
     /// Which level of the margin named that class, and none where there is no class.
     pub decided_by: Option<Decider>,
+    /// What the filter took out of the request and its answer, and nothing at all
+    /// where no filter looked.
+    pub redacted: Redacted,
     /// How long the caller waited.
     pub latency: Latency,
 }
