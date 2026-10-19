@@ -743,6 +743,65 @@ nearness = 0.97
         assert!(reason.contains("model.onnx"), "{reason}");
     }
 
+    /// Two stanzas, two different runtime libraries, and only one of them can be
+    /// had: the library is loaded once for the process and the first load wins.
+    ///
+    /// This used to be silent. `ort` ignores a second load naming another path, so
+    /// the gateway accepted a configuration it could not honour, loaded whichever
+    /// model opened first against *its* library, and said nothing — leaving the other
+    /// running against a library its operator did not choose. It is refused now,
+    /// which is the whole reason the loading moved into one crate.
+    #[cfg(all(feature = "classifier", feature = "semantic"))]
+    #[tokio::test]
+    async fn two_models_may_not_name_two_runtime_libraries() {
+        let ((Ok(difficulty), Ok(embed)), Some(library)) = (
+            (
+                std::env::var("IP_CLASSIFY_ARTIFACT"),
+                std::env::var("IP_EMBED_ARTIFACT"),
+            ),
+            ip_onnx::library_from_env(),
+        ) else {
+            eprintln!("both artefacts and a runtime library are needed to have two of one");
+            return;
+        };
+        let config = Config::parse(&format!(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = {store:?}
+
+{cache}
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[difficulty]
+artifact = {difficulty:?}
+confidence = 0.4
+library = {library:?}
+
+[semantic]
+artifact = {embed:?}
+nearness = 0.97
+library = "/nonexistent/other/libonnxruntime.so"
+"#,
+            store = scratch("two-libraries.db").display().to_string(),
+            cache = sled_cache(&scratch("two-libraries-cache")),
+            library = library.display().to_string(),
+        ))
+        .expect("the file itself is well-formed");
+        // The classifier opens first and settles the choice, so it is the encoder
+        // that finds the disagreement.
+        let Err(StartupError::Embedder { reason }) = AppState::open(&config).await else {
+            panic!("a second runtime library must stop startup, not be ignored");
+        };
+        assert!(reason.contains("already loaded"), "{reason}");
+    }
+
     /// The whole level wired into a standing gateway, against a real export, for
     /// whoever runs with `IP_EMBED_ARTIFACT`. Without one it says so and passes.
     ///

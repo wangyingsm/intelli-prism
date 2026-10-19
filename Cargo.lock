@@ -1671,14 +1671,10 @@ dependencies = [
 name = "ip-embed"
 version = "0.1.0"
 dependencies = [
- "hex",
  "ip-core",
- "ort",
+ "ip-onnx",
  "proptest",
- "serde_json",
- "sha2 0.11.0",
  "thiserror",
- "tokenizers",
 ]
 
 [[package]]

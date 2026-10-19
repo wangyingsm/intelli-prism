@@ -29,10 +29,6 @@ use std::time::{Duration, Instant};
 
 use crate::{EmbedError, Embedding, Width};
 
-/// The library name the search resolves when nothing better is offered: the SONAME of
-/// a release build, as `dlopen` looks it up.
-const DEFAULT_LIBRARY: &str = "libonnxruntime.so";
-
 /// The environment variable naming the runtime library, if the operator set one. The
 /// same one the classifier reads: one process loads one runtime.
 pub const DYLIB_ENV: &str = "ORT_DYLIB_PATH";
@@ -41,6 +37,9 @@ pub const DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 /// than read for the keys it recognises, because a later shape may mean something
 /// different by the same name.
 pub const SCHEMAS: [u64; 1] = [1];
+
+/// What this kind of artefact calls its manifest.
+const MANIFEST: &str = "embed.json";
 
 /// How a sequence of token vectors becomes the one vector that stands for the text.
 ///
@@ -114,43 +113,38 @@ impl Manifest {
     ///
     /// A manifest that will not read, a schema this build does not carry, a pooling it
     /// does not know, or weights whose digest is not the one named.
-    pub fn read(manifest: &Path, model: &Path) -> Result<Self, EmbedError> {
-        let unreadable = || EmbedError::ArtifactUnreadable(manifest.display().to_string());
-        let text = std::fs::read_to_string(manifest).map_err(|_| unreadable())?;
-        let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
-        let digest = digest(model)?;
-        check_weights(text_at(&value, "checksum").as_deref(), &digest)?;
-        Self::from_value(&value, digest).map_err(|error| match error {
-            // A field that is missing or mis-shaped names the file it is missing from.
-            EmbedError::ArtifactUnreadable(_) => unreadable(),
+    pub fn read(artifact: &ip_onnx::Artifact) -> Result<Self, EmbedError> {
+        let read = artifact.read()?;
+        Self::from_value(&read.manifest, read.digest).map_err(|error| match error {
+            // A field that is missing or mis-shaped names the file it is missing from,
+            // which `from_value` cannot do because it was handed no file.
+            EmbedError::Onnx(ip_onnx::OnnxError::ArtifactUnreadable(_)) => {
+                ip_onnx::OnnxError::ArtifactUnreadable(artifact.manifest().display().to_string())
+                    .into()
+            }
             other => other,
         })
     }
 
     /// The manifest's fields out of already-parsed json, so what a manifest means can
     /// be tested without a directory to put one in.
-    pub fn from_value(value: &serde_json::Value, digest: String) -> Result<Self, EmbedError> {
-        let unreadable = || EmbedError::ArtifactUnreadable("embed.json".to_owned());
-        let schema = value
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1);
-        if !SCHEMAS.contains(&schema) {
-            return Err(EmbedError::ArtifactSchema {
-                found: schema,
-                carried: format!("{SCHEMAS:?}"),
-            });
-        }
+    pub fn from_value(
+        value: &ip_onnx::serde_json::Value,
+        digest: String,
+    ) -> Result<Self, EmbedError> {
+        let unreadable =
+            || EmbedError::from(ip_onnx::OnnxError::ArtifactUnreadable(MANIFEST.to_owned()));
+        ip_onnx::schema(value, &SCHEMAS)?;
         let width = Width::new(
             value
                 .get("width")
-                .and_then(serde_json::Value::as_u64)
+                .and_then(ip_onnx::serde_json::Value::as_u64)
                 .and_then(|width| usize::try_from(width).ok())
                 .ok_or_else(unreadable)?,
         )?;
         let max_length = value
             .get("max_length")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(ip_onnx::serde_json::Value::as_u64)
             .and_then(|length| usize::try_from(length).ok())
             // Two tokens is an opening and a closing one with no text between them.
             .filter(|length| *length > 2)
@@ -158,63 +152,20 @@ impl Manifest {
         let pooling = Pooling::named(
             value
                 .get("pooling")
-                .and_then(serde_json::Value::as_str)
+                .and_then(ip_onnx::serde_json::Value::as_str)
                 .ok_or_else(unreadable)?,
         )?;
         Ok(Self {
             width,
             max_length,
             pooling,
-            query_prefix: text_at(value, "query_prefix"),
-            quantization: text_at(value, "quantization"),
-            base: text_at(value, "base"),
-            model_version: text_at(value, "model_version"),
+            query_prefix: ip_onnx::text_at(value, "query_prefix"),
+            quantization: ip_onnx::text_at(value, "quantization"),
+            base: ip_onnx::text_at(value, "base"),
+            model_version: ip_onnx::text_at(value, "model_version"),
             digest,
         })
     }
-}
-
-/// A string field of the manifest, when it carries one that is not empty.
-fn text_at(value: &serde_json::Value, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
-}
-
-/// The digest of the weights, read in pieces so a file of any size costs one buffer.
-fn digest(path: &Path) -> Result<String, EmbedError> {
-    use sha2::Digest;
-    use std::io::Read;
-    let unreadable = || EmbedError::ArtifactUnreadable(path.display().to_string());
-    let mut file = std::fs::File::open(path).map_err(|_| unreadable())?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        let read = file.read(&mut buffer).map_err(|_| unreadable())?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// Refuses weights that are not the weights the manifest was written for, when the
-/// manifest says which those were.
-fn check_weights(named: Option<&str>, found: &str) -> Result<(), EmbedError> {
-    let Some(named) = named else {
-        return Ok(());
-    };
-    let named = named.strip_prefix("sha256:").unwrap_or(named);
-    if found != named {
-        return Err(EmbedError::ArtifactChecksum {
-            named: named.to_owned(),
-            found: found.to_owned(),
-        });
-    }
-    Ok(())
 }
 
 /// One answer: the vector, and what producing it cost.
@@ -236,8 +187,8 @@ pub struct Embedded {
 /// they are a machine, not read-mostly state. Cloning is not cheap and is not offered.
 #[derive(Debug)]
 pub struct Embedder {
-    session: ort::session::Session,
-    tokenizer: tokenizers::Tokenizer,
+    session: ip_onnx::ort::session::Session,
+    tokenizer: ip_onnx::tokenizers::Tokenizer,
     manifest: Manifest,
     /// Whether the graph asks for `token_type_ids`. BERT-shaped exports do and
     /// XLM-R-shaped ones do not, and a graph handed an input it never declared
@@ -265,47 +216,26 @@ impl Embedder {
 
     fn open_inner(artifact_dir: &Path, library: Option<&Path>) -> Result<Self, EmbedError> {
         // Files first: their absence is news no installed library changes.
-        let model = artifact_dir.join("model.onnx");
-        let tokenizer_path = artifact_dir.join("tokenizer.json");
-        let manifest_path = artifact_dir.join("embed.json");
-        for required in [&model, &tokenizer_path, &manifest_path] {
-            if !required.exists() {
-                return Err(EmbedError::ArtifactMissing(format!(
-                    "{} — an artefact directory holds model.onnx, tokenizer.json \
-                     and embed.json",
-                    required.display()
-                )));
-            }
-        }
-        // `init_from` is the one loading route that returns rather than aborting the
-        // process when it finds nothing, which is why this never takes ort's default.
-        let candidate = library
-            .map(PathBuf::from)
-            .or_else(Self::library_from_env)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_LIBRARY));
-        let builder = ort::init_from(&candidate)
-            .map_err(|error| EmbedError::RuntimeMissing(format!("{candidate:?}: {error}")))?;
-        let _environment = builder.commit();
-        let manifest = Manifest::read(&manifest_path, &model)?;
-        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|error| {
-            EmbedError::ArtifactUnreadable(format!("{}: {error}", tokenizer_path.display()))
-        })?;
+        let artifact = ip_onnx::Artifact::at(artifact_dir, MANIFEST)?;
+        ip_onnx::load(library)?;
+        let manifest = Manifest::read(&artifact)?;
+        let mut tokenizer = artifact.tokenizer()?;
         // Cut in the tokenizer rather than in the ids, so the closing token the model
         // was trained to see is still there after a long text is shortened.
         tokenizer
-            .with_truncation(Some(tokenizers::TruncationParams {
-                direction: tokenizers::TruncationDirection::Right,
+            .with_truncation(Some(ip_onnx::tokenizers::TruncationParams {
+                direction: ip_onnx::tokenizers::TruncationDirection::Right,
                 max_length: manifest.max_length,
-                strategy: tokenizers::TruncationStrategy::LongestFirst,
+                strategy: ip_onnx::tokenizers::TruncationStrategy::LongestFirst,
                 stride: 0,
             }))
             .map_err(|error| {
-                EmbedError::ArtifactUnreadable(format!("{}: {error}", tokenizer_path.display()))
+                EmbedError::from(ip_onnx::OnnxError::ArtifactUnreadable(format!(
+                    "{}: {error}",
+                    artifact.tokenizer_path().display()
+                )))
             })?;
-        let session = ort::session::Session::builder()
-            .map_err(|error| EmbedError::Inference(error.to_string()))?
-            .commit_from_file(&model)
-            .map_err(|error| EmbedError::GraphRefused(format!("{}: {error}", model.display())))?;
+        let session = artifact.session()?;
         let wants_token_types = session
             .inputs()
             .iter()
@@ -340,21 +270,21 @@ impl Embedder {
         let encoded = self
             .tokenizer
             .encode(asked.as_str(), true)
-            .map_err(|error| EmbedError::Tokenize(error.to_string()))?;
+            .map_err(|error| EmbedError::from(ip_onnx::OnnxError::Tokenize(error.to_string())))?;
         let ids: Vec<i64> = encoded.get_ids().iter().map(|&id| i64::from(id)).collect();
         let width = ids.len();
         if width == 0 {
-            return Err(EmbedError::Tokenize(
-                "the text is no tokens at all".to_owned(),
-            ));
+            return Err(
+                ip_onnx::OnnxError::Tokenize("the text is no tokens at all".to_owned()).into(),
+            );
         }
         let shape = [1usize, width];
         let tensor = |numbers: Vec<i64>| {
-            ort::value::Tensor::from_array((shape, numbers))
-                .map_err(|error| EmbedError::Inference(error.to_string()))
+            ip_onnx::ort::value::Tensor::from_array((shape, numbers))
+                .map_err(|error| EmbedError::from(ip_onnx::OnnxError::Inference(error.to_string())))
         };
         // One text at a time, so nothing is padded and every position is attended to.
-        let mut inputs = ort::inputs![
+        let mut inputs = ip_onnx::ort::inputs![
             "input_ids" => tensor(ids)?,
             "attention_mask" => tensor(vec![1i64; width])?,
         ];
@@ -364,10 +294,10 @@ impl Embedder {
         let outputs = self
             .session
             .run(inputs)
-            .map_err(|error| EmbedError::Inference(error.to_string()))?;
+            .map_err(|error| EmbedError::from(ip_onnx::OnnxError::Inference(error.to_string())))?;
         let (shape, numbers) = outputs[0]
             .try_extract_tensor::<f32>()
-            .map_err(|error| EmbedError::Inference(error.to_string()))?;
+            .map_err(|error| EmbedError::from(ip_onnx::OnnxError::Inference(error.to_string())))?;
         let pooled = pool(
             shape.as_ref(),
             numbers,
@@ -425,14 +355,16 @@ fn pool(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
+    use ip_onnx::OnnxError;
 
-    fn manifest_of(value: &serde_json::Value) -> Result<Manifest, EmbedError> {
+    use super::*;
+    use ip_onnx::serde_json::json;
+
+    fn manifest_of(value: &ip_onnx::serde_json::Value) -> Result<Manifest, EmbedError> {
         Manifest::from_value(value, "deadbeef".to_owned())
     }
 
-    fn whole() -> serde_json::Value {
+    fn whole() -> ip_onnx::serde_json::Value {
         json!({
             "version": 1,
             "width": 384,
@@ -498,7 +430,8 @@ mod tests {
                 .copied()
                 .collect();
             let dir = Scratch::holding(&format!("without-{missing}"), &kept);
-            let Err(EmbedError::ArtifactMissing(said)) = Embedder::open(dir.at()) else {
+            let Err(EmbedError::Onnx(OnnxError::ArtifactMissing(said))) = Embedder::open(dir.at())
+            else {
                 panic!("an artefact with no {missing} must be refused");
             };
             assert!(said.contains(missing), "{said} should name {missing}");
@@ -523,7 +456,9 @@ mod tests {
                 ("embed.json", manifest),
             ],
         );
-        let Err(EmbedError::ArtifactChecksum { named, found }) = Embedder::open(dir.at()) else {
+        let Err(EmbedError::Onnx(OnnxError::ArtifactChecksum { named, found })) =
+            Embedder::open(dir.at())
+        else {
             panic!("weights the manifest does not speak for must be refused");
         };
         assert!(named.starts_with("0000"), "{named}");
@@ -553,7 +488,9 @@ mod tests {
                     ("embed.json", manifest),
                 ],
             );
-            let Err(EmbedError::ArtifactUnreadable(said)) = Embedder::open(dir.at()) else {
+            let Err(EmbedError::Onnx(OnnxError::ArtifactUnreadable(said))) =
+                Embedder::open(dir.at())
+            else {
                 panic!("a manifest that is not one ({tag}) must be refused");
             };
             assert!(said.contains("embed.json"), "{said} should name the file");
@@ -579,7 +516,10 @@ mod tests {
         );
         assert!(matches!(
             Embedder::open(dir.at()),
-            Err(EmbedError::ArtifactSchema { found: 99, .. })
+            Err(EmbedError::Onnx(OnnxError::ArtifactSchema {
+                found: 99,
+                ..
+            }))
         ));
     }
 
@@ -600,7 +540,8 @@ mod tests {
                 ("embed.json", manifest),
             ],
         );
-        let Err(EmbedError::ArtifactUnreadable(said)) = Embedder::open(dir.at()) else {
+        let Err(EmbedError::Onnx(OnnxError::ArtifactUnreadable(said))) = Embedder::open(dir.at())
+        else {
             panic!("a tokenizer that is not one must be refused");
         };
         assert!(said.contains("tokenizer.json"), "{said}");
@@ -617,10 +558,11 @@ mod tests {
         };
         let tokenizer = std::fs::read(std::path::Path::new(&artifact).join("tokenizer.json"))
             .expect("the artefact's tokenizer");
-        let digest = {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(NOT_A_GRAPH))
-        };
+        // Digested from the file the fixture is about to write, so the manifest
+        // speaks for exactly the bytes beside it and the graph is the only thing
+        // left for the open to object to.
+        let planted = Scratch::holding("bad-graph-weights", &[("model.onnx", NOT_A_GRAPH)]);
+        let digest = ip_onnx::digest(&planted.at().join("model.onnx")).expect("a digest");
         let manifest = format!(
             r#"{{"version":1,"width":384,"max_length":512,"pooling":"mean","checksum":"{digest}"}}"#
         );
@@ -632,7 +574,7 @@ mod tests {
                 ("embed.json", manifest.as_bytes()),
             ],
         );
-        let Err(EmbedError::GraphRefused(said)) = Embedder::open(dir.at()) else {
+        let Err(EmbedError::Onnx(OnnxError::GraphRefused(said))) = Embedder::open(dir.at()) else {
             panic!("bytes that are not a graph must be refused");
         };
         assert!(said.contains("model.onnx"), "{said}");
@@ -682,10 +624,10 @@ mod tests {
         later["version"] = json!(2);
         assert_eq!(
             manifest_of(&later),
-            Err(EmbedError::ArtifactSchema {
+            Err(EmbedError::Onnx(OnnxError::ArtifactSchema {
                 found: 2,
                 carried: format!("{SCHEMAS:?}")
-            })
+            }))
         );
         // Absent, the schema is the first one, so an export written before the key
         // existed still reads.
@@ -717,7 +659,10 @@ mod tests {
             let mut short = whole();
             short.as_object_mut().unwrap().remove(missing);
             assert!(
-                matches!(manifest_of(&short), Err(EmbedError::ArtifactUnreadable(_))),
+                matches!(
+                    manifest_of(&short),
+                    Err(EmbedError::Onnx(OnnxError::ArtifactUnreadable(_)))
+                ),
                 "a manifest with no {missing} should be refused"
             );
         }
@@ -742,7 +687,10 @@ mod tests {
         for length in [0, 1, 2] {
             tiny["max_length"] = json!(length);
             assert!(
-                matches!(manifest_of(&tiny), Err(EmbedError::ArtifactUnreadable(_))),
+                matches!(
+                    manifest_of(&tiny),
+                    Err(EmbedError::Onnx(OnnxError::ArtifactUnreadable(_)))
+                ),
                 "a max_length of {length} should be refused"
             );
         }
@@ -750,27 +698,8 @@ mod tests {
         assert!(manifest_of(&tiny).is_ok());
     }
 
-    #[test]
-    fn weights_that_are_not_the_weights_the_manifest_names_are_refused() {
-        assert_eq!(
-            check_weights(None, "abc"),
-            Ok(()),
-            "nothing to disagree with"
-        );
-        assert_eq!(check_weights(Some("abc"), "abc"), Ok(()));
-        assert_eq!(
-            check_weights(Some("sha256:abc"), "abc"),
-            Ok(()),
-            "the prefix an export writes is not part of the digest"
-        );
-        assert_eq!(
-            check_weights(Some("abc"), "def"),
-            Err(EmbedError::ArtifactChecksum {
-                named: "abc".to_owned(),
-                found: "def".to_owned()
-            })
-        );
-    }
+    // The digest and the checksum are `ip-onnx`'s now, and are tested there against
+    // files written for the purpose. What stays here is this crate's own manifest.
 
     fn pooling_manifest(width: usize) -> Manifest {
         Manifest {

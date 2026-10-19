@@ -151,6 +151,13 @@ impl Artifact {
         &self.manifest
     }
 
+    /// Where the tokenizer is. [`Self::tokenizer`] opens it; this is for a caller
+    /// that has to say which file it was unhappy with.
+    #[must_use]
+    pub fn tokenizer_path(&self) -> &Path {
+        &self.tokenizer
+    }
+
     /// The manifest as json, and the digest of the weights beside it, with the
     /// manifest's own checksum already checked against them.
     pub fn read(&self) -> Result<Read, OnnxError> {

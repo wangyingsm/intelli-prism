@@ -123,8 +123,11 @@ mod encoder {
                 // hits, which is exactly how this would be misread.
                 Err(error) => {
                     let kind = match &error {
-                        ip_embed::EmbedError::Inference(_) => "inference",
-                        ip_embed::EmbedError::Tokenize(_) => "tokenize",
+                        ip_embed::EmbedError::Onnx(onnx) => match onnx {
+                            ip_onnx::OnnxError::Inference(_) => "inference",
+                            ip_onnx::OnnxError::Tokenize(_) => "tokenize",
+                            _ => "artefact error",
+                        },
                         _ => "embedder error",
                     };
                     tracing::warn!(kind, "embedding failed; the question is not recognised");
