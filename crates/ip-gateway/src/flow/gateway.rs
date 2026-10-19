@@ -638,6 +638,44 @@ mod tests {
         assert_eq!(found.headers()[semantic::NEARNESS], "0.995");
     }
 
+    /// A semantic hit answers where an exact one does — before the response chain —
+    /// so it runs no response processor either. Asserted rather than inferred from
+    /// where the `return` sits, because that is a claim the roadmap makes.
+    #[tokio::test]
+    async fn a_hit_by_meaning_runs_no_response_processor() {
+        let upstream = FakeUpstream::answering("four pounds");
+        let processors =
+            ProcessorChain::new().with_response_header(SetHeader::new("x-processed", "yes"));
+        let gateway = Gateway::new(table(), processors, upstream.clone()).recognising(
+            recognising(0.95),
+            Arc::new(
+                FakeEmbedder::default()
+                    .saying("what did we spend", &[1.0, 0.0, 0.0])
+                    .saying("how much did we spend", &[1.0, 0.0, 0.05]),
+            ),
+        );
+        let fresh = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking("what did we spend")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh.headers()["x-processed"], "yes");
+        let found = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking("how much did we spend")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.headers()[semantic::CACHE], "semantic");
+        assert!(
+            found.headers().get("x-processed").is_none(),
+            "a hit by meaning ran the response header chain"
+        );
+    }
+
     /// The row tells the two cache levels apart, because they are different promises.
     /// Both halves asserted together: after an incident the question is *which
     /// answers were approximate*, and a column reading `cache` for both could not say.
@@ -777,6 +815,31 @@ mod tests {
             assert_eq!(answered.status(), StatusCode::OK);
         }
         assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
+
+    /// An encoder too slow to answer costs a miss, never a request. The deadline is a
+    /// ceiling on what this level may add to a request that was going upstream
+    /// anyway, and the roadmap says so.
+    #[tokio::test]
+    async fn an_embedder_too_slow_to_answer_leaves_the_request_alone() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .recognising(recognising(0.95), Arc::new(SlowEmbedder));
+        let started = std::time::Instant::now();
+        let answered = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking("what did we spend")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1, "it went upstream");
+        assert!(
+            started.elapsed() < EMBED_DEADLINE * 3,
+            "the request waited on the encoder past its deadline, taking {:?}",
+            started.elapsed()
+        );
     }
 
     /// A body that is no conversation at all — an embeddings call, a moderation

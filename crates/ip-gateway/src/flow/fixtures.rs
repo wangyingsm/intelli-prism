@@ -544,6 +544,23 @@ impl crate::embedder::Embedder for FakeEmbedder {
     }
 }
 
+/// An encoder that never answers in time, for the arm where the deadline decides.
+///
+/// It sleeps well past the deadline rather than a hair over it, so what the test
+/// measures is the deadline firing and never a race against the clock on a loaded
+/// box. Only a few times over, though: a blocking task cannot be cancelled, so the
+/// test's runtime waits out this whole sleep on its way down however early the
+/// timeout returned, and the multiple is what that costs the suite.
+#[derive(Debug)]
+pub(super) struct SlowEmbedder;
+
+impl crate::embedder::Embedder for SlowEmbedder {
+    fn embed(&self, _text: &str) -> Option<ip_embed::Embedding> {
+        std::thread::sleep(crate::embedder::EMBED_DEADLINE * 4);
+        ip_embed::Embedding::new(&[1.0, 0.0, 0.0]).ok()
+    }
+}
+
 /// The semantic level at a stated threshold, over a cache of its own.
 pub(super) fn recognising(nearness: f32) -> Arc<crate::semantic::SemanticCache> {
     Arc::new(crate::semantic::SemanticCache::new(

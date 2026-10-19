@@ -234,6 +234,19 @@ temperature = 0.7
 #   x-ip-cache: semantic and x-ip-nearness, so set it high, watch what your own traffic
 #   actually scores, and move it against that rather than against a stranger's guess.
 #
+# Set it high because the floor is high, which is the thing that surprises people.
+# Measured on multilingual-e5-small, 384 dimensions, int8:
+#
+#   two ways of asking one question                0.978
+#   the same question in Chinese, not English      0.822
+#   two questions with nothing in common           0.762
+#
+# Unrelated text scores 0.76, not 0.0, so 0.5 would answer very nearly everything out
+# of the cache. These are this model's figures and not a law; yours will differ, which
+# is what the reported nearness is for. Note the middle row too: at a sane threshold
+# the same question in another language is a miss, which is usually right, since the
+# answer held for it is in the other language.
+#
 # artifact is a directory holding model.onnx, tokenizer.json and embed.json, exported
 # from a sentence-embedding model — not the difficulty artifact, which answers with
 # five logits and no geometry to compare. The manifest carries the width, the pooling

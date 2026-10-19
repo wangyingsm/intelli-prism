@@ -320,6 +320,42 @@ carries is asked whether naming one tenant can return another's rows; every rout
 api nests is asked whether one tenant's member can reach another's. Both have a tripwire that
 reads the source, so a listing or a router added without a case fails the suite.
 
+### Answering what was asked before, in other words
+
+- The third cache level. A question is embedded by a local model, matched against the questions
+this tenant has already had answered on this route, and answered from the nearest of them when it
+is near enough. A hit spends no tokens, runs no response processor and reaches no endpoint, as an
+exact hit does.
+- **Only a single unanswered turn is ever looked up or kept.** A body holding one user message and
+no answer is a question; anything else is a conversation, where the context is most of the meaning
+and matching on the question alone would answer it out of somebody else's exchange. Agent traffic
+therefore never touches this level. The test is per family and not a count of messages: one family
+puts the standing instruction among them and the other beside them, so the same single question
+counts one message written one way and two written the other.
+- **How near is the operator's, with no default.** This is the number that decides when the gateway
+hands one caller another caller's answer, and the only honest way to pick it is against real
+traffic — so every answer carries `x-ip-cache: semantic` and `x-ip-nearness`, and the threshold is
+moved against what your own questions actually score. An exact hit stays silent, because the same
+bytes to the same question is not something a caller needs told.
+- The usage row says which cache answered. An exact hit and a semantic one are different promises,
+and after an incident the only question anyone asks of this level is which answers were
+approximate.
+- Isolation is structural in two places rather than filtered in one. Each tenant and route has an
+index of its own, so a scan cannot reach anyone else's vector; and the stored answer is named by
+the tenant, the route, the model and the vector together, so two indexes that somehow did exchange
+keys would read nothing under them. Audited from both sides, with a tripwire that reads the key's
+own parts out of the source.
+- The model's identity in every key is the digest of its weights, not a version string somebody
+remembered to bump. Two models' vectors are not near or far from each other but incomparable, so
+replacing the model cannot serve an answer found by the old one's geometry.
+- A vector is normalised the moment it is built, an answer that says `no-store` is kept in neither
+cache level, and an embedder that is slow, busy or broken costs a miss and never a request.
+- The model is the operator's, declared by a manifest beside the weights: the width, the length it
+was trained at, how its token vectors become one, and any prefix it wants of a query. Verified
+against `multilingual-e5-small` quantized to int8 — 384 numbers in about 6 ms, which scores a
+paraphrase at 0.978 against 0.762 for two questions with nothing in common. That floor is why the
+threshold belongs near the top of the range and why the figure is nobody's to default.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -441,6 +477,27 @@ user and api is not, which is the reason.
 endpoint actually takes, and a delay set too short spends the arms the staggering was meant to
 save. The adaptive version would need a latency distribution the gateway does not keep, which is
 why it was not built.
+- **The semantic index is in memory, in one process.** The answers are shared through the cache
+like everything else; the vectors that find them are not, because a shared cache has no way to be
+asked *what is near this*. So each node's hit rate is built from the traffic that node has seen,
+and a restart starts over — the answers outlive it, unreachable, until their ttl. The cluster
+already has a publication channel for propagating rules, and that is the route to sharing vectors
+when it is worth building.
+- **A lookup is an exact scan, not the HNSW graph `DESIGN.md` names.** Measured before it was
+built: at the size a per-tenant, single-turn index actually reaches, a scan is *faster* than an
+approximate search as well as being exact, and the crate that builds the graph cannot grow one, so
+every eviction would mean a rebuild longer than the entries it rebuilds. The cost is that a lookup
+is linear in what a tenant holds, which `capacity` bounds. The day a tenant's index is genuinely
+large, what changes is the body of one method.
+- **Every request that misses pays one forward pass of the encoder** before it goes upstream. The
+level only earns its keep where enough questions hit, which is what the reported nearness is for.
+- **The semantic level is per tenant, not per user.** Two people inside one tenant share answers,
+exactly as they already do through the response cache, whose key has never been per user either.
+With an approximate match that is a looser promise than with an exact one, and it is recorded as a
+decision rather than left to be inferred.
+- **No image ships an embedding model.** The classifier has a `--target classifier` image with its
+artefact inside; the embedder has no equivalent yet, so a deployment that wants this level builds
+with `--features semantic` and mounts an artefact of its own.
 
 ## To be implemented
 
@@ -466,11 +523,13 @@ artefact — and it is the weight of that pipeline, not a gap in the gateway, th
 - The best-effort endpoint that asks every upstream and aggregates or picks one. Unrelated to the
 classifier, and unchanged.
 
-### Semantic cache
+### Semantic cache, what is left of it
 
-- The third cache level: embedding the request body, an HNSW index over it, and a hit when meaning
-matches rather than bytes. Waits on an embedding model and a live LLM endpoint, which is why the
-level exists in the key space but holds nothing.
+- An index the nodes of a cluster share, over the publication channel the rules already use.
+Today each node learns only from what it has seen.
+- A per-route or per-tenant threshold. One number governs every llm route, which is the right
+default and the wrong answer for a deployment whose routes differ in what a near miss costs.
+- An image with an embedding model in it, as `--target classifier` carries the difficulty one.
 
 ### System agents and run graph
 

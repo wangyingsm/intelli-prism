@@ -681,5 +681,49 @@ mod tests {
         eprintln!("embedded {} numbers in {:?}", width, once.took);
     }
 
+    /// The property the whole cache rests on, against a real model: two ways of
+    /// asking one thing are nearer to each other than either is to a different
+    /// question. Nothing else in this crate can check it — a fake encoder is told
+    /// what things mean, so it can only confirm the arithmetic around the answer.
+    ///
+    /// Deliberately not asserted against a fixed threshold. What number separates
+    /// these is a property of the artefact and of the language, and pinning one here
+    /// would make a better model fail it; what must hold for *any* usable model is
+    /// the ordering. The figures are printed so an operator choosing a threshold has
+    /// somewhere to start.
+    #[test]
+    fn a_real_model_puts_two_ways_of_asking_one_thing_together() {
+        let Ok(dir) = std::env::var("IP_EMBED_ARTIFACT") else {
+            eprintln!("IP_EMBED_ARTIFACT unset: no model to ask");
+            return;
+        };
+        let mut embedder = match std::env::var("ORT_DYLIB_PATH") {
+            Ok(library) => Embedder::open_with_library(&dir, library),
+            Err(_) => Embedder::open(&dir),
+        }
+        .expect("the artefact opens");
+        let mut vector = |text: &str| embedder.embed(text).expect("it embeds").embedding;
+        let asked = vector("what did we spend last quarter?");
+        let again = vector("how much did we spend in the last quarter?");
+        let other = vector("write me a poem about the sea");
+        // The same question in the other language this gateway serves, which is why
+        // the model has to be multilingual at all.
+        let chinese = vector("我们上个季度花了多少钱？");
+
+        let same = asked.similarity(&again).unwrap();
+        let different = asked.similarity(&other).unwrap();
+        let across = asked.similarity(&chinese).unwrap();
+        eprintln!("paraphrase {same}, across languages {across}, unrelated {different}");
+        assert!(
+            same > different,
+            "a paraphrase ({same}) should be nearer than an unrelated question ({different})"
+        );
+        assert!(
+            across > different,
+            "the same question in another language ({across}) should be nearer than an \
+             unrelated one ({different})"
+        );
+    }
+
     use crate::Nearness;
 }
