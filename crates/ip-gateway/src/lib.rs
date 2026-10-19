@@ -5,6 +5,7 @@ pub mod body;
 pub mod cache;
 pub mod classifier;
 pub mod dispatch;
+pub mod embedder;
 pub mod error;
 pub mod filter;
 pub mod flow;
@@ -25,6 +26,7 @@ pub use body::{BoxError, GatewayBody};
 pub use cache::{CachedResponse, Freshness, ResponseCache, freshness, response_key};
 pub use classifier::{CLASSIFY_DEADLINE, Classifier};
 pub use dispatch::{Chosen, Dispatcher};
+pub use embedder::{EMBED_DEADLINE, Embedder};
 pub use error::{GatewayError, GatewayErrorKind, ProcessorError, RouteError, UpstreamError};
 pub use filter::{Filtered, Filtering, Reported, Unscanned};
 pub use flow::{Flow, Gateway, RequestContext};
@@ -32,7 +34,7 @@ pub use hyper_upstream::{HyperUpstream, UpstreamSettings};
 pub use limit::{Asking, Decision, Limiter, Limits};
 pub use measure::{Measured, Measuring, measure};
 pub use processor::{BodyProcessor, ChainSource, FixedChains, HeaderProcessor, ProcessorChain};
-pub use semantic::{SemanticCache, SemanticSettings, semantic_key};
+pub use semantic::{Question, SemanticCache, SemanticSettings, semantic_key};
 pub use stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
     ResponseHeadersProcessed, Routed, Stage, StageName,

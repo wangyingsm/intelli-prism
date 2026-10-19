@@ -67,6 +67,29 @@ pub struct SemanticSettings {
     pub model: String,
 }
 
+/// What the semantic cache may be asked by: where the question arrived and what was
+/// asked, once the body has been found to hold one question and no answer.
+///
+/// `Debug` is hand-written and leaves `text` out, as [`crate::turns::Opening`]'s does
+/// and for the same reason: this travels with the request and its text is what the
+/// user typed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Question {
+    /// The route the question arrived on, which is half of the partition it is
+    /// matched within.
+    pub route: RouteKey,
+    /// The standing instruction and the one thing asked, joined for a reader.
+    pub text: String,
+}
+
+impl std::fmt::Debug for Question {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Question")
+            .field("route", &self.route)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Whose questions, asked where: one neighbourhood's worth.
 ///
 /// The route is half of it and not decoration. One index per tenant would let a
@@ -114,6 +137,14 @@ impl SemanticCache {
     #[must_use]
     pub fn width(&self) -> Width {
         self.settings.width
+    }
+
+    /// How long an answer stands here, which is its own span and not the response
+    /// cache's: how long an answer is good for the question that produced it is a
+    /// different judgement from how long it may stand in for a different one.
+    #[must_use]
+    pub fn ttl(&self) -> Ttl {
+        self.settings.ttl
     }
 
     /// The nearest question this tenant has already had answered, if one is near

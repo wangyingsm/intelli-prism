@@ -23,15 +23,18 @@ use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
 use crate::classifier::Classifier;
 use crate::dispatch::Dispatcher;
+use crate::embedder::{EMBED_DEADLINE, Embedder};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::filter::{Filtered, Filtering, Reported};
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
+use crate::semantic::{Question, SemanticCache};
 use crate::stage::{Authorized, BodyProcessed, Dispatched, ResponseBodyProcessed, Stage};
 use crate::table::RoutingTable;
 use crate::turns::TurnAffinity;
 use crate::upstream::Upstream;
+use ip_embed::Embedding;
 
 /// What the dataflow needs about a request beyond the request itself.
 pub struct RequestContext {
@@ -70,6 +73,11 @@ pub struct Gateway {
     /// What must not leave a request, when an operator has said: applied to every body
     /// the gateway may hold, after the plugin chain and before the response key.
     filtering: Option<Arc<Filtering>>,
+    /// The cache that answers a question asked before in other words, when one is
+    /// configured, and the encoder that recognises it. Neither is any use alone, so
+    /// they arrive together and are absent together.
+    semantic: Option<Arc<SemanticCache>>,
+    embedder: Option<Arc<dyn Embedder>>,
     pending: Pending,
 }
 
@@ -117,6 +125,8 @@ impl Gateway {
             classifier: None,
             arbiter: None,
             filtering: None,
+            semantic: None,
+            embedder: None,
             pending: Pending::default(),
         }
     }
@@ -180,6 +190,23 @@ impl Gateway {
     /// the answer says that too.
     pub fn filtering(mut self, filtering: Arc<Filtering>) -> Self {
         self.filtering = Some(filtering);
+        self
+    }
+
+    /// Answers a question whose meaning the gateway has answered before, even where
+    /// nobody asked it in those words.
+    ///
+    /// Only a body holding one question and no answer is ever looked up or kept, and
+    /// only within the asking tenant's own index on the asking route. A hit spends
+    /// nothing and reaches no endpoint, exactly as the exact cache's does; a miss
+    /// costs one forward pass of the encoder, under its own deadline.
+    pub fn recognising(
+        mut self,
+        semantic: Arc<SemanticCache>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Self {
+        self.semantic = Some(semantic);
+        self.embedder = Some(embedder);
         self
     }
 
@@ -274,41 +301,54 @@ impl Gateway {
             )
         });
 
-        let Some(responses) = &self.responses else {
-            let (done, dispatched) = self
-                .upstream_answer(
-                    processed,
-                    &routing.table,
-                    &chains,
-                    &followed,
-                    recording.clone(),
-                )
-                .await?;
-            let served_by = done.served().clone();
-            let raced = done.raced();
-            let filtered = done.filtered().clone();
-            let reported = done.reported().cloned();
-            let answered = stage_span!(EGRESS_RESPONSE, followed);
-            answered.record("hit", false);
-            let sent = async { done.into_response() }.instrument(answered).await?;
-            return Ok(measuring(
-                sent, recording, served_by, raced, dispatched, filtered, reported,
-            ));
+        // Both cache levels are asked here, in order, and either may be absent. A hit
+        // from either answers without spending a token or running a response
+        // processor, as designed. The exact level is asked first because it is the
+        // cheaper question and the surer answer: bytes, not meaning.
+        let exact = match &self.responses {
+            Some(responses) => Some((responses, processed.response_key().await?)),
+            None => None,
         };
-        // A hit answers here, spending no tokens and running no response processor, as designed.
-        let key = processed.response_key().await?;
-        match responses.get(&key).await {
-            Ok(Some(hit)) => {
-                let answered = stage_span!(EGRESS_RESPONSE, followed);
-                answered.record("hit", true);
-                if let Some(recording) = recording {
-                    recording.out_of_the_cache(hit.body(), named, processed.filtered());
+        if let Some((responses, key)) = &exact {
+            match responses.get(key).await {
+                Ok(Some(hit)) => {
+                    let answered = stage_span!(EGRESS_RESPONSE, followed);
+                    answered.record("hit", true);
+                    if let Some(recording) = recording {
+                        recording.out_of_the_cache(hit.body(), named, processed.filtered());
+                    }
+                    return Ok(answered.in_scope(|| answer_with(hit)));
                 }
-                return Ok(answered.in_scope(|| answer_with(hit)));
+                Ok(None) => {}
+                // A cache that cannot answer costs a round trip upstream, never the
+                // request itself.
+                Err(error) => tracing::warn!(%error, "could not read the response cache"),
             }
-            Ok(None) => {}
-            // A cache that cannot answer costs a round trip upstream, never the request itself.
-            Err(error) => tracing::warn!(%error, "could not read the response cache"),
+        }
+        // What the semantic level was asked, kept for the way back: embedding is the
+        // expensive part and a miss must not pay for it twice.
+        let mut meant: Option<(Question, Embedding)> = None;
+        if let Some(semantic) = &self.semantic
+            && let Some(question) = processed.question().await?
+            && let Some(vector) = self.vector_for(&question).await
+        {
+            match semantic
+                .look(&followed.tenant, &question.route, &vector)
+                .await
+            {
+                Ok(Some((hit, nearness))) => {
+                    let answered = stage_span!(EGRESS_RESPONSE, followed);
+                    answered.record("hit", true);
+                    tracing::debug!(%nearness, "answering a question asked in other words");
+                    if let Some(recording) = recording {
+                        recording.out_of_the_cache(hit.body(), named, processed.filtered());
+                    }
+                    return Ok(answered.in_scope(|| answer_with(hit)));
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(%error, "could not read the semantic cache"),
+            }
+            meant = Some((question, vector));
         }
         let (mut done, dispatched) = self
             .upstream_answer(
@@ -323,10 +363,29 @@ impl Gateway {
         let raced = done.raced();
         let filtered = done.filtered().clone();
         let reported = done.reported().cloned();
-        if let Some((answer, ttl)) = done.cacheable(responses.ttl()).await?
-            && let Err(error) = responses.put(&key, &answer, ttl).await
+        // One reading of whether this answer may be kept at all, for both levels: a
+        // response saying `no-store` is kept in neither. The span it carries governs
+        // the exact level, whose business it is; the semantic level keeps its own.
+        let default = exact
+            .as_ref()
+            .map(|(responses, _)| responses.ttl())
+            .or_else(|| self.semantic.as_ref().map(|semantic| semantic.ttl()));
+        if let Some(default) = default
+            && let Some((answer, ttl)) = done.cacheable(default).await?
         {
-            tracing::warn!(%error, "could not keep a response in the cache");
+            if let Some((responses, key)) = &exact
+                && let Err(error) = responses.put(key, &answer, ttl).await
+            {
+                tracing::warn!(%error, "could not keep a response in the cache");
+            }
+            if let Some(semantic) = &self.semantic
+                && let Some((question, vector)) = meant
+                && let Err(error) = semantic
+                    .keep(&followed.tenant, &question.route, vector, &answer)
+                    .await
+            {
+                tracing::warn!(%error, "could not keep an answer against its meaning");
+            }
         }
         let answered = stage_span!(EGRESS_RESPONSE, followed);
         answered.record("hit", false);
@@ -336,6 +395,26 @@ impl Gateway {
         Ok(measuring(
             sent, recording, served_by, raced, dispatched, filtered, reported,
         ))
+    }
+
+    /// What one question means, under the embedder's own clock.
+    ///
+    /// Weights, not a future: off the task, as the classifier is run, because a
+    /// forward pass that blocked the runtime would cost every other request in flight.
+    /// A slow embedder, a busy one and one whose task died are the same answer — none
+    /// — and the request goes upstream as it would have anyway.
+    async fn vector_for(&self, question: &Question) -> Option<Embedding> {
+        let embedder = Arc::clone(self.embedder.as_ref()?);
+        let text = question.text.clone();
+        match tokio::time::timeout(
+            EMBED_DEADLINE,
+            tokio::task::spawn_blocking(move || embedder.embed(&text)),
+        )
+        .await
+        {
+            Ok(Ok(vector)) => vector,
+            _ => None,
+        }
     }
 
     /// Refuses a request that has run out of what it may spend, or that cannot be counted.
@@ -454,6 +533,205 @@ mod tests {
     use std::sync::Mutex;
 
     use ip_cache::Ttl;
+
+    /// A gateway that answers by meaning alone — no exact cache behind it, so a hit
+    /// here can only have come from the semantic level.
+    fn by_meaning(upstream: Arc<FakeUpstream>, embedder: FakeEmbedder, nearness: f32) -> Gateway {
+        Gateway::new(table(), ProcessorChain::new(), upstream)
+            .recognising(recognising(nearness), Arc::new(embedder))
+    }
+
+    /// The point of the whole milestone: a question nobody asked in those words is
+    /// answered all the same, and the upstream is never reached.
+    #[tokio::test]
+    async fn a_question_asked_in_other_words_is_answered_without_the_upstream() {
+        let upstream = FakeUpstream::answering("four pounds");
+        let gateway = by_meaning(
+            upstream.clone(),
+            FakeEmbedder::default()
+                .saying("what did we spend", &[1.0, 0.0, 0.0])
+                .saying("how much did we spend", &[1.0, 0.0, 0.05]),
+            0.95,
+        );
+        let first = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking("what did we spend")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_of(first).await, "four pounds");
+        let second = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking("how much did we spend")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_of(second).await, "four pounds");
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            1,
+            "the second question reached the upstream"
+        );
+    }
+
+    /// And a question that means something else does not get the other's answer.
+    #[tokio::test]
+    async fn a_question_meaning_something_else_still_reaches_the_upstream() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = by_meaning(
+            upstream.clone(),
+            FakeEmbedder::default()
+                .saying("what did we spend", &[1.0, 0.0, 0.0])
+                .saying("write me a poem", &[0.0, 1.0, 0.0]),
+            0.95,
+        );
+        for question in ["what did we spend", "write me a poem"] {
+            gateway
+                .handle(context(granted()), request("/anthropic", &asking(question)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
+
+    /// The first gate, at the level it is actually enforced. An exchange is never
+    /// looked up and never kept, however near its words are to a question that was.
+    #[tokio::test]
+    async fn a_conversation_under_way_is_neither_answered_from_here_nor_kept() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = by_meaning(
+            upstream.clone(),
+            FakeEmbedder::default().saying("what did we spend", &[1.0, 0.0, 0.0]),
+            0.95,
+        );
+        // Asked twice as an exchange: neither is kept, so neither can answer the other.
+        for _ in 0..2 {
+            gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic", &asking_again("what did we spend")),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+        // And an exchange cannot be answered by a single question that *was* kept,
+        // which is the half a test of the keeping alone would miss.
+        gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking("what did we spend")),
+            )
+            .await
+            .unwrap();
+        gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking_again("what did we spend")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            4,
+            "an exchange was answered out of the semantic cache"
+        );
+    }
+
+    /// An embedder that will not commit to a vector costs a miss, never a request.
+    #[tokio::test]
+    async fn an_embedder_that_says_nothing_leaves_the_request_alone() {
+        let upstream = FakeUpstream::answering("pong");
+        // It knows no phrase, so it answers nothing for every text.
+        let gateway = by_meaning(upstream.clone(), FakeEmbedder::default(), 0.95);
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic", &asking("what did we spend")),
+                )
+                .await
+                .unwrap();
+            assert_eq!(answered.status(), StatusCode::OK);
+        }
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
+
+    /// A body that is no conversation at all — an embeddings call, a moderation
+    /// request — has no question in it and is left entirely alone.
+    #[tokio::test]
+    async fn a_body_that_is_no_conversation_is_left_alone() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = by_meaning(
+            upstream.clone(),
+            FakeEmbedder::default().saying("some text", &[1.0, 0.0, 0.0]),
+            0.95,
+        );
+        for _ in 0..2 {
+            gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic", r#"{"input": "some text"}"#),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
+
+    /// One tenant's answer is never another's, through the whole flow rather than
+    /// only at the cache's own door.
+    #[tokio::test]
+    async fn a_question_one_tenant_asked_is_not_answered_for_another() {
+        let upstream = FakeUpstream::answering("acme's books");
+        let gateway = by_meaning(
+            upstream.clone(),
+            FakeEmbedder::default().saying("what did we spend", &[1.0, 0.0, 0.0]),
+            0.95,
+        );
+        let ask = || request("/anthropic", &asking("what did we spend"));
+        gateway.handle(context(granted()), ask()).await.unwrap();
+        gateway
+            .handle(context(other_tenant()), ask())
+            .await
+            .unwrap();
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            2,
+            "the other tenant was served this one's answer"
+        );
+        // The positive control: without it this passes if nothing ever hits at all.
+        gateway.handle(context(granted()), ask()).await.unwrap();
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            2,
+            "the tenant's own repeated question should have hit"
+        );
+    }
+
+    /// A threshold of one admits only an exact meaning, which is an operator saying
+    /// they want the level but not its judgement.
+    #[tokio::test]
+    async fn a_question_short_of_the_threshold_is_not_near_enough() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = by_meaning(
+            upstream.clone(),
+            FakeEmbedder::default()
+                .saying("what did we spend", &[1.0, 0.0, 0.0])
+                // 1/sqrt(1 + 0.05^2) is 0.9988, which clears 0.95 and not 0.999.
+                .saying("how much did we spend", &[1.0, 0.0, 0.05]),
+            0.999,
+        );
+        for question in ["what did we spend", "how much did we spend"] {
+            gateway
+                .handle(context(granted()), request("/anthropic", &asking(question)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(upstream.seen.lock().unwrap().len(), 2);
+    }
 
     #[tokio::test]
     async fn a_repeated_request_is_answered_without_the_upstream() {

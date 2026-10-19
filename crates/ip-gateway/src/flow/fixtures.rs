@@ -516,6 +516,64 @@ pub(super) fn caching_gateway(upstream: Arc<FakeUpstream>) -> Gateway {
         .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
 }
 
+/// An encoder a test can state the meaning of.
+///
+/// A text means whichever vector's phrase it contains, and nothing when it contains
+/// none — so a test says in one line which two questions mean the same thing, instead
+/// of depending on what some real model happens to think of them.
+#[derive(Debug, Default)]
+pub(super) struct FakeEmbedder {
+    meanings: Vec<(String, Vec<f32>)>,
+}
+
+impl FakeEmbedder {
+    /// Any text holding `phrase` means `vector`. Earliest match wins.
+    pub(super) fn saying(mut self, phrase: &str, vector: &[f32]) -> Self {
+        self.meanings.push((phrase.to_owned(), vector.to_vec()));
+        self
+    }
+}
+
+impl crate::embedder::Embedder for FakeEmbedder {
+    fn embed(&self, text: &str) -> Option<ip_embed::Embedding> {
+        let (_, vector) = self
+            .meanings
+            .iter()
+            .find(|(phrase, _)| text.contains(phrase.as_str()))?;
+        ip_embed::Embedding::new(vector).ok()
+    }
+}
+
+/// The semantic level at a stated threshold, over a cache of its own.
+pub(super) fn recognising(nearness: f32) -> Arc<crate::semantic::SemanticCache> {
+    Arc::new(crate::semantic::SemanticCache::new(
+        Arc::new(ip_cache::SledCache::temporary().unwrap()),
+        crate::semantic::SemanticSettings {
+            nearness: ip_embed::Nearness::new(nearness).unwrap(),
+            ttl: Ttl::seconds(60).unwrap(),
+            width: ip_embed::Width::new(3).unwrap(),
+            capacity: ip_embed::Capacity::new(64).unwrap(),
+            model: "fake-model".to_owned(),
+        },
+    ))
+}
+
+/// One question, written the way a client writes one.
+pub(super) fn asking(question: &str) -> String {
+    serde_json::json!({"messages": [{"role": "user", "content": question}]}).to_string()
+}
+
+/// The same question with an answer already in the body, which is no longer one
+/// question however near its words are to another's.
+pub(super) fn asking_again(question: &str) -> String {
+    serde_json::json!({"messages": [
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": "an earlier answer"},
+        {"role": "user", "content": question},
+    ]})
+    .to_string()
+}
+
 /// Another tenant asking the same route the same thing.
 pub(super) fn other_tenant() -> Authority {
     let tenant = TenantId::new("other").unwrap();

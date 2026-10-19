@@ -25,6 +25,7 @@ use crate::dispatch::{Dispatcher, Dispatching, may_hold, may_race};
 use crate::error::{GatewayError, GatewayErrorKind};
 use crate::filter::{self, Filtered, Filtering, Reported, Unscanned};
 use crate::processor::{HeaderProcessor, ProcessorChain};
+use crate::semantic::Question;
 use crate::sse::{crossed_events, filtered_events, stream_chunks};
 use crate::stage::{
     Answered, Authorized, BodyProcessed, Dispatched, Forwarded, HeadersProcessed, Received,
@@ -34,7 +35,7 @@ use crate::table::{Resolution, RoutingTable, request_key};
 use crate::translate::{self, Crossing};
 use crate::turns::{Opening, TurnAffinity, Verdict};
 use crate::upstream::Upstream;
-use ip_protocol::Dropped;
+use ip_protocol::{Dropped, Exchange};
 
 /// The request header naming the difficulty class the caller asks to be served at.
 const DIFFICULTY: HeaderName = HeaderName::from_static("x-ip-difficulty");
@@ -317,6 +318,33 @@ impl Flow<BodyProcessed> {
     #[must_use]
     pub fn class(&self) -> Option<Difficulty> {
         self.held.class
+    }
+
+    /// What the semantic cache may be asked by, or nothing when this body is not one
+    /// question.
+    ///
+    /// The single-turn gate lives here, in one place, so no caller has to remember it:
+    /// a body that is no conversation at all, or one already under way, answers
+    /// `None` and is never looked up and never kept. [`ip_protocol::Exchange`] says
+    /// why that is not a count of messages.
+    ///
+    /// The body is buffered as [`Self::response_key`] buffers it, and for the same
+    /// reason: it must still be forwardable afterwards.
+    pub async fn question(&mut self) -> Result<Option<Question>, GatewayError> {
+        let route = key_of(&self.context, &self.held.request)?;
+        let body = std::mem::replace(self.held.request.body_mut(), crate::body::empty());
+        let bytes = collect(StageName::BodyRead, body).await?;
+        *self.held.request.body_mut() = from_bytes(bytes.clone());
+        let Some(opening) = Opening::read(&bytes) else {
+            return Ok(None);
+        };
+        if opening.exchange != Exchange::OneQuestion {
+            return Ok(None);
+        }
+        Ok(Some(Question {
+            route,
+            text: opening.text,
+        }))
     }
 
     /// Names this request in the response cache, buffering the body it is keyed by so the
