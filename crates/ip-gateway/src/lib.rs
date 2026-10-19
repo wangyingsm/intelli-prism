@@ -34,7 +34,7 @@ pub use hyper_upstream::{HyperUpstream, UpstreamSettings};
 pub use limit::{Asking, Decision, Limiter, Limits};
 pub use measure::{Measured, Measuring, measure};
 pub use processor::{BodyProcessor, ChainSource, FixedChains, HeaderProcessor, ProcessorChain};
-pub use semantic::{Question, SemanticCache, SemanticSettings, semantic_key};
+pub use semantic::{CACHE, NEARNESS, Question, SemanticCache, SemanticSettings, semantic_key};
 pub use stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
     ResponseHeadersProcessed, Routed, Stage, StageName,

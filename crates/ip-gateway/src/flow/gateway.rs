@@ -29,7 +29,7 @@ use crate::filter::{Filtered, Filtering, Reported};
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
-use crate::semantic::{Question, SemanticCache};
+use crate::semantic::{self, Question, SemanticCache};
 use crate::stage::{Authorized, BodyProcessed, Dispatched, ResponseBodyProcessed, Stage};
 use crate::table::RoutingTable;
 use crate::turns::TurnAffinity;
@@ -343,7 +343,11 @@ impl Gateway {
                     if let Some(recording) = recording {
                         recording.out_of_the_cache(hit.body(), named, processed.filtered());
                     }
-                    return Ok(answered.in_scope(|| answer_with(hit)));
+                    return Ok(answered.in_scope(|| {
+                        let mut answer = answer_with(hit);
+                        semantic::say(answer.headers_mut(), nearness);
+                        answer
+                    }));
                 }
                 Ok(None) => {}
                 Err(error) => tracing::warn!(%error, "could not read the semantic cache"),
@@ -574,6 +578,60 @@ mod tests {
             1,
             "the second question reached the upstream"
         );
+    }
+
+    /// A semantic answer is somebody else's answer, so the caller is told — and told
+    /// how near, which is what an operator tunes the threshold against.
+    #[tokio::test]
+    async fn an_answer_found_by_meaning_says_so_and_says_how_near() {
+        let upstream = FakeUpstream::answering("four pounds");
+        let gateway = by_meaning(
+            upstream.clone(),
+            FakeEmbedder::default()
+                .saying("what did we spend", &[1.0, 0.0, 0.0])
+                // 1/sqrt(1 + 0.1^2) is 0.995, printed to three places.
+                .saying("how much did we spend", &[1.0, 0.0, 0.1]),
+            0.95,
+        );
+        let fresh = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking("what did we spend")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            fresh.headers().get(semantic::CACHE).is_none(),
+            "an answer from the upstream must not claim to be a cached one"
+        );
+        assert!(fresh.headers().get(semantic::NEARNESS).is_none());
+
+        let found = gateway
+            .handle(
+                context(granted()),
+                request("/anthropic", &asking("how much did we spend")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.headers()[semantic::CACHE], "semantic");
+        assert_eq!(found.headers()[semantic::NEARNESS], "0.995");
+    }
+
+    /// An exact hit is the same bytes to the same question, which is nothing a caller
+    /// needs told — so it stays indistinguishable from a fresh answer, as it was
+    /// before this level existed.
+    #[tokio::test]
+    async fn an_exact_hit_still_says_nothing() {
+        let upstream = FakeUpstream::answering("pong");
+        let gateway = caching_gateway(upstream.clone());
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(context(granted()), request("/anthropic", "ask"))
+                .await
+                .unwrap();
+            assert!(answered.headers().get(semantic::CACHE).is_none());
+        }
+        assert_eq!(upstream.seen.lock().unwrap().len(), 1, "the second hit");
     }
 
     /// And a question that means something else does not get the other's answer.

@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use http::{HeaderMap, HeaderName, HeaderValue};
 use ip_cache::{Cache, CacheError, CacheKey, CacheLevel, Ttl};
 use ip_core::{RouteKey, TenantId, Timestamp};
 use ip_embed::{Capacity, Embedding, Nearness, Neighbourhood, Width};
@@ -65,6 +66,33 @@ pub struct SemanticSettings {
     /// models' vectors are not near or far from each other; they are incomparable,
     /// and the only safe thing is for them to share no keys at all.
     pub model: String,
+}
+
+/// Names the level that answered, where a caller can see it.
+///
+/// Only a semantic answer sets it. An exact hit is indistinguishable from a fresh
+/// answer, as it has always been, and rightly: the same bytes to the same question is
+/// not something a caller needs told. This is, because it is somebody else's answer.
+pub const CACHE: HeaderName = HeaderName::from_static("x-ip-cache");
+
+/// How near the question that was answered was to the one that was asked.
+///
+/// The value this level turns on, reported on every answer it gives. Without it an
+/// operator choosing a threshold is guessing at their own traffic: with it they can
+/// watch what their real questions actually score and move the number against
+/// evidence. It is also the only way a caller who cannot accept an approximate answer
+/// can tell they were given one.
+pub const NEARNESS: HeaderName = HeaderName::from_static("x-ip-nearness");
+
+/// What the level answers under, which is the level's own name.
+const BY_MEANING: HeaderValue = HeaderValue::from_static("semantic");
+
+/// Says on the answer that it was found by meaning, and how near that meaning was.
+pub fn say(headers: &mut HeaderMap, nearness: Nearness) {
+    headers.insert(CACHE, BY_MEANING);
+    if let Ok(value) = HeaderValue::from_str(&nearness.to_string()) {
+        headers.insert(NEARNESS, value);
+    }
 }
 
 /// What the semantic cache may be asked by: where the question arrived and what was
