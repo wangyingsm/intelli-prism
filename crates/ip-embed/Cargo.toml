@@ -10,6 +10,18 @@ authors.workspace = true
 [dependencies]
 ip-core.workspace = true
 thiserror.workspace = true
+# The inference runtime, behind `runtime` and never default: a build that does not want a
+# native ONNX Runtime must not get one. `load-dynamic` keeps it a runtime find rather than
+# a build-time link, so the library ships beside the binary and the crate builds anywhere.
+serde_json = { workspace = true, optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"], optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
+[features]
+default = []
+runtime = ["dep:ort", "dep:tokenizers", "dep:serde_json", "dep:sha2", "dep:hex"]
 
 [dev-dependencies]
 proptest = "1.12.0"

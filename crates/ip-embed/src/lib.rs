@@ -23,6 +23,9 @@
 pub mod error;
 pub mod neighbourhood;
 
+#[cfg(feature = "runtime")]
+pub mod runtime;
+
 pub use error::EmbedError;
 pub use neighbourhood::{Capacity, MOST_HELD, Neighbourhood};
 

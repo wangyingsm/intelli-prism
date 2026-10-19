@@ -65,4 +65,80 @@ pub enum EmbedError {
         /// The most that will be held.
         most: usize,
     },
+
+    /// The ONNX Runtime library could not be found or loaded. An ordinary startup
+    /// failure of a build with the `runtime` feature on a machine that has no runtime
+    /// installed — reported, never aborted. The message names what was tried.
+    #[error("the ONNX Runtime library could not be loaded: {0}")]
+    RuntimeMissing(String),
+
+    /// A required file of the artefact directory is not there — a misspelled path or
+    /// a half-copied export. The message names the file and spells the layout.
+    #[error("the embedding artefact is missing {0}")]
+    ArtifactMissing(String),
+
+    /// A file of the artefact exists and is not readable as what it claims: tokenizer
+    /// json that isn't, a manifest without its width. The operator needs to know
+    /// which file to go and look at.
+    #[error("the embedding artefact file {0} is not readable as what it claims")]
+    ArtifactUnreadable(String),
+
+    /// The manifest declares a schema this build does not read. Refused rather than
+    /// read for the fields it happens to recognise: a later shape may mean something
+    /// different by the same key.
+    #[error(
+        "the embedding artefact declares manifest schema {found}, and this build reads {carried}"
+    )]
+    ArtifactSchema {
+        /// What the manifest said.
+        found: u64,
+        /// What this build knows, listed.
+        carried: String,
+    },
+
+    /// A way of turning token vectors into one that this build does not carry. Which
+    /// one is right is a property of how the model was trained, so guessing would give
+    /// a confident vector that means nothing much, and silently.
+    #[error("the embedding artefact pools its tokens by {named}, which this build does not carry")]
+    UnknownPooling {
+        /// What the manifest named.
+        named: String,
+    },
+
+    /// The weights are not the weights the manifest was written for: a truncated
+    /// download, a half-replaced file, an artefact swapped under a running deployment.
+    #[error(
+        "the embedding weights do not match the manifest: it names {named}, the file is {found}"
+    )]
+    ArtifactChecksum {
+        /// The digest the manifest claims.
+        named: String,
+        /// The digest the file actually has.
+        found: String,
+    },
+
+    /// The graph would not open: corrupted, foreign, or built for another runtime.
+    #[error("the embedding graph would not open: {0}")]
+    GraphRefused(String),
+
+    /// The graph answered in a shape this cannot read as one vector of the manifest's
+    /// width. Refused rather than reinterpreted: token vectors laid over a pooled one
+    /// read as a perfectly plausible vector of the wrong thing.
+    #[error("the embedding graph answered {got}, which is not one vector of {expected}")]
+    WrongOutput {
+        /// The width the manifest promised.
+        expected: usize,
+        /// The shape that came back.
+        got: String,
+    },
+
+    /// The forward pass failed at run time, or its output would not extract. Ordinary
+    /// operation includes this possibility, which is why it is a value: serving never
+    /// fails because embedding did.
+    #[error("embedding failed: {0}")]
+    Inference(String),
+
+    /// The text would not tokenize, which real user text sometimes does not.
+    #[error("the text could not be tokenized: {0}")]
+    Tokenize(String),
 }
