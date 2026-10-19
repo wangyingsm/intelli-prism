@@ -71,6 +71,25 @@ pub(crate) async fn an_answer_out_of_the_cache_is_recorded_spending_nothing(
     assert_eq!(read.tokens.total(), 0);
 }
 
+/// Which cache answered survives the column, because the two are different promises
+/// and an audit that could not tell them apart could not say which answers were
+/// approximate.
+///
+/// Written over every value rather than the new one alone: the names are a mapping
+/// kept by hand in two directions, and a round trip that only ever tries one of them
+/// is how the other comes to disagree.
+pub(crate) async fn where_an_answer_came_from_round_trips(store: &impl UsageStore) {
+    for source in [Served::Upstream, Served::Cache, Served::Semantic] {
+        let row = NewUsage {
+            served: source,
+            ..spent()
+        };
+        let recorded = store.record_usage(row).await.unwrap();
+        let read = store.usage(recorded.row_id).await.unwrap().unwrap();
+        assert_eq!(read.served, source, "{source:?} did not survive the column");
+    }
+}
+
 pub(crate) async fn a_request_carrying_no_turn_or_model_round_trips(store: &impl UsageStore) {
     let bare = NewUsage {
         turn: None,

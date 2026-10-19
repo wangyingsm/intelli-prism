@@ -225,6 +225,7 @@ macro_rules! backend_suite {
             a_recorded_request_round_trips,
             the_primary_key_is_an_integer_the_backend_assigns,
             an_answer_out_of_the_cache_is_recorded_spending_nothing,
+            where_an_answer_came_from_round_trips,
             a_request_carrying_no_turn_or_model_round_trips,
             what_a_tenant_spent_outlives_the_tenant,
             reading_a_request_nobody_recorded_is_nothing,

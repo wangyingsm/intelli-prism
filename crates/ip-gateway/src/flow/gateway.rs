@@ -5,7 +5,7 @@ use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use ip_auth::Authority;
 use ip_cache::Cache;
-use ip_core::{Decider, Hedge, Protocol, Replica, TraceId, TurnId};
+use ip_core::{Decider, Hedge, Protocol, Replica, Served, TraceId, TurnId};
 use ip_storage::UsageStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -315,7 +315,12 @@ impl Gateway {
                     let answered = stage_span!(EGRESS_RESPONSE, followed);
                     answered.record("hit", true);
                     if let Some(recording) = recording {
-                        recording.out_of_the_cache(hit.body(), named, processed.filtered());
+                        recording.out_of_the_cache(
+                            hit.body(),
+                            named,
+                            processed.filtered(),
+                            Served::Cache,
+                        );
                     }
                     return Ok(answered.in_scope(|| answer_with(hit)));
                 }
@@ -341,7 +346,12 @@ impl Gateway {
                     answered.record("hit", true);
                     tracing::debug!(%nearness, "answering a question asked in other words");
                     if let Some(recording) = recording {
-                        recording.out_of_the_cache(hit.body(), named, processed.filtered());
+                        recording.out_of_the_cache(
+                            hit.body(),
+                            named,
+                            processed.filtered(),
+                            Served::Semantic,
+                        );
                     }
                     return Ok(answered.in_scope(|| {
                         let mut answer = answer_with(hit);
@@ -615,6 +625,47 @@ mod tests {
             .unwrap();
         assert_eq!(found.headers()[semantic::CACHE], "semantic");
         assert_eq!(found.headers()[semantic::NEARNESS], "0.995");
+    }
+
+    /// The row tells the two cache levels apart, because they are different promises.
+    /// Both halves asserted together: after an incident the question is *which
+    /// answers were approximate*, and a column reading `cache` for both could not say.
+    #[tokio::test]
+    async fn the_row_says_which_cache_answered() {
+        let (recorder, mut recorded) = Ledger::new();
+        let upstream = FakeUpstream::answering("four pounds");
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream)
+            .recording(recorder)
+            .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
+            .recognising(
+                recognising(0.95),
+                Arc::new(
+                    FakeEmbedder::default()
+                        .saying("what did we spend", &[1.0, 0.0, 0.0])
+                        .saying("how much did we spend", &[1.0, 0.0, 0.05]),
+                ),
+            );
+        let ask = |question: &str| request("/anthropic", &asking(question));
+        gateway
+            .handle(context(granted()), ask("what did we spend"))
+            .await
+            .unwrap();
+        assert_eq!(recorded.recv().await.unwrap().served, Served::Upstream);
+
+        // The identical question: the exact level has it, and says so.
+        gateway
+            .handle(context(granted()), ask("what did we spend"))
+            .await
+            .unwrap();
+        assert_eq!(recorded.recv().await.unwrap().served, Served::Cache);
+
+        // A question meaning the same thing: only the semantic level can have it.
+        gateway
+            .handle(context(granted()), ask("how much did we spend"))
+            .await
+            .unwrap();
+        assert_eq!(recorded.recv().await.unwrap().served, Served::Semantic);
     }
 
     /// An exact hit is the same bytes to the same question, which is nothing a caller

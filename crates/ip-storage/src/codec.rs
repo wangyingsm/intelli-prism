@@ -158,6 +158,7 @@ pub(crate) fn served_name(served: Served) -> &'static str {
     match served {
         Served::Upstream => "upstream",
         Served::Cache => "cache",
+        Served::Semantic => "semantic",
     }
 }
 
@@ -166,6 +167,7 @@ pub(crate) fn served(name: &str) -> Result<Served, StorageError> {
     match name {
         "upstream" => Ok(Served::Upstream),
         "cache" => Ok(Served::Cache),
+        "semantic" => Ok(Served::Semantic),
         other => Err(StorageError::Malformed {
             entity: Entity::Usage,
             detail: format!("unknown answer source {other:?}"),

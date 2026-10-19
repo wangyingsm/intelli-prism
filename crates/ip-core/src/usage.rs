@@ -72,14 +72,22 @@ impl Tokens {
 }
 
 /// Where the answer a request was given came from.
+///
+/// The two cache levels are told apart rather than counted together, because they are
+/// different promises. An exact hit is the same bytes to the same question and cannot
+/// be wrong; a semantic one is another question's answer, judged near enough. After an
+/// incident the only question anyone will ask of this feature is *which answers were
+/// approximate*, and a column that said only `cache` could not answer it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Served {
     /// The upstream model answered, and was paid in tokens for it.
     #[default]
     Upstream,
-    /// The cache answered, spending nothing.
+    /// The cache answered the same question with the same bytes, spending nothing.
     Cache,
+    /// The cache answered a question that meant the same thing, spending nothing.
+    Semantic,
 }
 
 /// How long a request took, to the millisecond.

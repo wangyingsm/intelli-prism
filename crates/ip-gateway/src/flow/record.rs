@@ -126,18 +126,23 @@ impl Recording {
     /// says of it what it says of every answer nothing asked of an endpoint: one endpoint.
     /// The class is kept all the same, and so is the level that named it: who answered
     /// says nothing about how hard the request was treated as, or about who said so.
+    ///
+    /// `source` names *which* cache, which is a different promise in each case and is
+    /// the one thing an audit will want of this row. Only a cache answers here, so
+    /// only [`Served::Cache`] and [`Served::Semantic`] belong in it.
     pub(super) fn out_of_the_cache(
         self,
         body: &Bytes,
         dispatched: Dispatched,
         filtered: &Filtered,
+        source: Served,
     ) {
         let model = measure(body).and_then(|measured| measured.model);
         self.write(
             model,
             Tokens::ZERO,
             Serving {
-                source: Served::Cache,
+                source,
                 endpoint: None,
                 arms: Hedge::default(),
                 dispatched,
