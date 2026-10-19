@@ -1,0 +1,18 @@
+[package]
+name = "ip-onnx"
+description = "The ONNX Runtime, and what an exported model's directory has to hold"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+hex.workspace = true
+# Pinned, and pinned in one place now: two crates loading two different `ort` versions
+# into one process is not a thing the runtime's global state survives.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

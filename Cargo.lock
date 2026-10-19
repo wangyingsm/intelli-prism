@@ -1731,6 +1731,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-onnx"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "ort",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokenizers",
+]
+
+[[package]]
 name = "ip-plugin"
 version = "0.1.0"
 dependencies = [
