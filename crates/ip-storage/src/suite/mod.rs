@@ -1,6 +1,7 @@
 //! Tests every storage backend must pass, written once and run against each backend.
 
 pub(crate) mod identity;
+pub(crate) mod isolation;
 pub(crate) mod limit;
 pub(crate) mod list;
 pub(crate) mod member_add;
@@ -206,6 +207,19 @@ macro_rules! backend_suite {
             a_list_holds_only_the_tenant_it_names,
         ]);
     };
+    (isolation, $open:path) => {
+        $crate::suite::backend_suite!(@module isolation, $open, [
+            members_of_one_tenant_are_not_listed_for_another,
+            grants_inside_one_tenant_are_not_listed_for_another,
+            grants_on_one_account_are_not_listed_for_another,
+            plugins_one_tenant_owns_are_not_listed_for_another,
+            limits_on_one_tenant_are_not_listed_for_another,
+            what_one_tenant_spent_is_not_listed_for_another,
+            what_one_tenant_spent_is_not_summed_for_another,
+            rules_in_one_tenants_chain_are_not_listed_for_another,
+            routes_belong_to_no_tenant_and_the_audit_says_so,
+        ]);
+    };
     (usage, $open:path) => {
         $crate::suite::backend_suite!(@module usage, $open, [
             a_recorded_request_round_trips,
@@ -250,6 +264,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(revision, $open);
         $crate::suite::backend_suite!(usage, $open);
         $crate::suite::backend_suite!(limit, $open);
+        $crate::suite::backend_suite!(isolation, $open);
     };
 }
 
