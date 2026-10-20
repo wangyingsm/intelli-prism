@@ -36,6 +36,7 @@ use crate::table::RoutingTable;
 use crate::turns::TurnAffinity;
 use crate::upstream::Upstream;
 use ip_embed::Embedding;
+use ip_embed::Found;
 
 /// What the dataflow needs about a request beyond the request itself.
 pub struct RequestContext {
@@ -369,7 +370,7 @@ impl Gateway {
                             .look(&followed.tenant, &question.route, &vector)
                             .await
                         {
-                            Ok(Some((hit, nearness))) => {
+                            Ok(Found::Near(hit, nearness)) => {
                                 self.looked(Looked::Hit, &followed);
                                 let answered = stage_span!(EGRESS_RESPONSE, followed);
                                 answered.record("hit", true);
@@ -399,7 +400,9 @@ impl Gateway {
                                 tracing::warn!(%error, "could not read the semantic cache");
                                 self.looked(Looked::Miss, &followed);
                             }
-                            Ok(None) => self.looked(Looked::Miss, &followed),
+                            Ok(Found::Short(_) | Found::Nothing) => {
+                                self.looked(Looked::Miss, &followed);
+                            }
                         }
                         meant = Some((question, vector));
                     }

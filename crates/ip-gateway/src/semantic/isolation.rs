@@ -79,7 +79,7 @@ mod tests {
         who: &TenantId,
         where_: &RouteKey,
     ) -> Option<&'static str> {
-        let (held, _) = cache.look(who, where_, &question()).await.unwrap()?;
+        let (held, _) = cache.look(who, where_, &question()).await.unwrap().near()?;
         match std::str::from_utf8(held.body()).unwrap() {
             "acme's" => Some("acme's"),
             "globex's" => Some("globex's"),
@@ -190,7 +190,7 @@ mod tests {
         // vector names is not the one the old model wrote under.
         let after = SemanticCache::new(Arc::clone(&answers), settings_of("model-two"));
         assert_eq!(
-            after.look(&acme, &path, &question()).await.unwrap(),
+            after.look(&acme, &path, &question()).await.unwrap().near(),
             None,
             "the new model was served what the old one found"
         );

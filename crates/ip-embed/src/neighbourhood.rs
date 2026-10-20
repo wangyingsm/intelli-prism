@@ -210,7 +210,7 @@ impl<T: Clone + PartialEq> Neighbourhood<T> {
         query: &Embedding,
         threshold: Nearness,
         now: Timestamp,
-    ) -> Result<Option<(T, Nearness)>, EmbedError> {
+    ) -> Result<Found<T>, EmbedError> {
         if query.width() != self.width {
             return Err(EmbedError::WidthMismatch {
                 expected: self.width.get(),
@@ -225,12 +225,60 @@ impl<T: Clone + PartialEq> Neighbourhood<T> {
                 best = Some((at, nearness));
             }
         }
-        let Some((at, nearness)) = best.filter(|(_, nearness)| nearness.reaches(threshold)) else {
-            return Ok(None);
+        let Some((at, nearness)) = best else {
+            return Ok(Found::Nothing);
         };
+        if !nearness.reaches(threshold) {
+            return Ok(Found::Short(nearness));
+        }
         let used = self.touch();
         self.held[at].used = used;
-        Ok(Some((self.held[at].value.clone(), nearness)))
+        Ok(Found::Near(self.held[at].value.clone(), nearness))
+    }
+}
+
+/// What a scan found, and how near it was.
+///
+/// Three outcomes rather than an `Option`, because *nothing was near enough* and
+/// *nothing is filed here* are different facts and only the first has a distance to
+/// report. That distance is the whole reason this type exists: a threshold can only
+/// be chosen by somebody who can see what their own traffic nearly matched, and an
+/// `Option` throws exactly that away.
+///
+/// The threshold is applied here rather than by the caller so that the index still
+/// knows whether a hit happened — a read keeps an entry alive, and an index that did
+/// not know it had been read could not say which entries to forget.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Found<T> {
+    /// The nearest was near enough: here it is, and how near.
+    Near(T, Nearness),
+    /// Something was nearest and is not being returned, with how near it came.
+    Short(Nearness),
+    /// Nothing is filed here at all, so there is no distance to speak of.
+    Nothing,
+}
+
+impl<T> Found<T> {
+    /// How near the nearest came, whether or not it was near enough.
+    ///
+    /// Nothing when nothing was filed: an empty index has no near miss, and counting
+    /// one as a zero would put a bar at the bottom of every histogram for traffic
+    /// that was never compared with anything.
+    #[must_use]
+    pub fn nearness(&self) -> Option<Nearness> {
+        match self {
+            Self::Near(_, nearness) | Self::Short(nearness) => Some(*nearness),
+            Self::Nothing => None,
+        }
+    }
+
+    /// What was found, if it was near enough to return.
+    #[must_use]
+    pub fn near(self) -> Option<(T, Nearness)> {
+        match self {
+            Self::Near(value, nearness) => Some((value, nearness)),
+            Self::Short(_) | Self::Nothing => None,
+        }
     }
 }
 
@@ -271,7 +319,7 @@ mod tests {
         let found = held
             .nearest(&vector(&[1.0, 0.0, 0.0]), near(0.99), at(0))
             .unwrap();
-        assert_eq!(found, Some(("answer", Nearness::SAME)));
+        assert_eq!(found, Found::Near("answer", Nearness::SAME));
     }
 
     #[test]
@@ -282,12 +330,21 @@ mod tests {
         // The cosine of this against the axis is 1/sqrt(1 + w^2); at w = 0.1 that is
         // 0.995, and at w = 0.5 it is 0.894.
         let close = held.nearest(&off_by(0.1), near(0.99), at(0)).unwrap();
-        assert_eq!(close.map(|(value, _)| value), Some("answer"));
+        assert_eq!(close.near().map(|(value, _)| value), Some("answer"));
+        // Short, not nothing — and it says how short, which is the whole point of
+        // the distinction: 0.894 against a threshold of 0.99 is a near miss worth
+        // seeing, and an `Option` would have thrown the number away.
         let far = held.nearest(&off_by(0.5), near(0.99), at(0)).unwrap();
-        assert_eq!(far, None, "0.894 does not reach 0.99");
+        let Found::Short(missed) = far else {
+            panic!("0.894 does not reach 0.99, and something was there: {far:?}");
+        };
+        assert!(
+            missed.reaches(near(0.89)) && !missed.reaches(near(0.9)),
+            "{missed}"
+        );
         // And the same far question does hit a threshold set low enough for it.
         let lowered = held.nearest(&off_by(0.5), near(0.89), at(0)).unwrap();
-        assert_eq!(lowered.map(|(value, _)| value), Some("answer"));
+        assert_eq!(lowered.near().map(|(value, _)| value), Some("answer"));
     }
 
     #[test]
@@ -301,6 +358,7 @@ mod tests {
         let (value, _) = held
             .nearest(&vector(&[1.0, 0.0, 0.0]), near(0.5), at(0))
             .unwrap()
+            .near()
             .expect("one of them is near enough");
         assert_eq!(value, "nearest");
     }
@@ -312,17 +370,20 @@ mod tests {
         let (_, measured) = held
             .nearest(&vector(&[1.0, 0.0, 0.0]), near(0.0), at(0))
             .unwrap()
+            .near()
             .expect("something is there");
         // Exactly the nearness it measured is near enough; a hair more is not.
         assert!(
             held.nearest(&vector(&[1.0, 0.0, 0.0]), measured, at(0))
                 .unwrap()
+                .near()
                 .is_some()
         );
         let over = near((measured.value() + 1e-5).min(1.0));
         assert!(
             held.nearest(&vector(&[1.0, 0.0, 0.0]), over, at(0))
                 .unwrap()
+                .near()
                 .is_none()
         );
     }
@@ -335,11 +396,16 @@ mod tests {
         let still = held
             .nearest(&vector(&[1.0, 0.0, 0.0]), near(0.9), at(99))
             .unwrap();
-        assert!(still.is_some(), "it has not expired yet");
+        assert!(still.near().is_some(), "it has not expired yet");
         let gone = held
             .nearest(&vector(&[1.0, 0.0, 0.0]), near(0.9), at(100))
             .unwrap();
-        assert_eq!(gone, None, "the expiry is the moment it stops, inclusive");
+        assert_eq!(
+            gone,
+            Found::Nothing,
+            "the expiry is the moment it stops, inclusive, and a swept index has \
+             nothing to report a distance to"
+        );
         assert!(
             held.is_empty(),
             "and it is swept rather than merely skipped"
@@ -355,7 +421,7 @@ mod tests {
         assert_eq!(held.len(), 2, "the bound holds");
         // "first" was the oldest, so it is the one that went.
         let found = held.nearest(&off_by(0.1), near(0.0), at(0)).unwrap();
-        assert_eq!(found.map(|(value, _)| value), Some("second"));
+        assert_eq!(found.near().map(|(value, _)| value), Some("second"));
     }
 
     /// The property a bound without an ordering would not have, and the one a cache
@@ -367,12 +433,12 @@ mod tests {
         held.insert(off_by(0.9), "second", at(100), at(0)).unwrap();
         // Reading the older one makes the newer one the least recently used.
         let read = held.nearest(&off_by(0.1), near(0.9), at(0)).unwrap();
-        assert_eq!(read.map(|(value, _)| value), Some("first"));
+        assert_eq!(read.near().map(|(value, _)| value), Some("first"));
         held.insert(off_by(0.95), "third", at(100), at(0)).unwrap();
         assert_eq!(held.len(), 2);
         let survivor = held.nearest(&off_by(0.1), near(0.99), at(0)).unwrap();
         assert_eq!(
-            survivor.map(|(value, _)| value),
+            survivor.near().map(|(value, _)| value),
             Some("first"),
             "the entry that was read should have outlived the one that was not"
         );
@@ -386,7 +452,7 @@ mod tests {
         assert_eq!(held.len(), 1, "one value, one entry");
         let later = held.nearest(&off_by(0.1), near(0.9), at(200)).unwrap();
         assert!(
-            later.is_some(),
+            later.near().is_some(),
             "the second filing should have carried the later expiry"
         );
     }
@@ -411,6 +477,66 @@ mod tests {
         );
     }
 
+    /// The distinction this type exists for: *nothing was near enough* carries a
+    /// number and *nothing is filed here* does not.
+    ///
+    /// A threshold can only be chosen by somebody who can see what their own traffic
+    /// nearly matched. Reporting an empty index as a nearness of zero would put a bar
+    /// at the bottom of every histogram for traffic that was never compared with
+    /// anything, and reporting a near miss as nothing at all would hide the bulge
+    /// just under the line that says the threshold is too tight.
+    #[test]
+    fn a_near_miss_reports_its_distance_and_an_empty_index_has_none() {
+        let mut held = holding(8);
+        assert_eq!(
+            held.nearest(&off_by(0.1), near(0.99), at(0)).unwrap(),
+            Found::Nothing
+        );
+        assert_eq!(
+            held.nearest(&off_by(0.1), near(0.99), at(0))
+                .unwrap()
+                .nearness(),
+            None,
+            "nothing was compared, so there is no distance"
+        );
+
+        held.insert(vector(&[1.0, 0.0, 0.0]), "answer", at(100), at(0))
+            .unwrap();
+        let missed = held
+            .nearest(&off_by(0.5), near(0.99), at(0))
+            .unwrap()
+            .nearness()
+            .expect("something was compared, even though it fell short");
+        // 1/sqrt(1 + 0.5^2) is 0.894.
+        assert!(missed.reaches(near(0.89)), "{missed}");
+        assert!(!missed.reaches(near(0.9)), "{missed}");
+    }
+
+    /// A miss leaves the ordering alone. Only a hit counts as a use, or a question
+    /// nobody could answer would keep alive the entry it failed to match.
+    #[test]
+    fn falling_short_does_not_count_as_having_read_the_entry() {
+        let mut held = holding(2);
+        held.insert(off_by(0.1), "first", at(100), at(0)).unwrap();
+        held.insert(off_by(0.9), "second", at(100), at(0)).unwrap();
+        // Nearest to "first" and still short of the threshold, so nothing is touched.
+        // The query is not identical to anything filed, or it would score 1.0 and no
+        // threshold could make it fall short.
+        assert!(matches!(
+            held.nearest(&off_by(0.15), near(0.999), at(0)).unwrap(),
+            Found::Short(_)
+        ));
+        held.insert(off_by(0.95), "third", at(100), at(0)).unwrap();
+        assert_eq!(
+            held.nearest(&off_by(0.1), near(0.0), at(0))
+                .unwrap()
+                .near()
+                .map(|(value, _)| value),
+            Some("second"),
+            "the oldest should still have gone, since the near miss read nothing"
+        );
+    }
+
     #[test]
     fn nothing_filed_means_nothing_found() {
         let mut held = holding(8);
@@ -418,8 +544,9 @@ mod tests {
         assert_eq!(
             held.nearest(&vector(&[1.0, 0.0, 0.0]), near(0.0), at(0))
                 .unwrap(),
-            None,
-            "not even at a threshold of nothing: there is nothing to return"
+            Found::Nothing,
+            "not even at a threshold of nothing: there is nothing to return, and no \
+             distance to report either"
         );
     }
 

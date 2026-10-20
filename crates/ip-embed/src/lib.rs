@@ -27,7 +27,7 @@ pub mod neighbourhood;
 pub mod runtime;
 
 pub use error::EmbedError;
-pub use neighbourhood::{Capacity, MOST_HELD, Neighbourhood};
+pub use neighbourhood::{Capacity, Found, MOST_HELD, Neighbourhood};
 
 /// The widest vector this build will hold.
 ///

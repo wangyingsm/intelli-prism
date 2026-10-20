@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use ip_cache::{Cache, CacheError, CacheKey, CacheLevel, Ttl};
 use ip_core::{RouteKey, TenantId, Timestamp};
-use ip_embed::{Capacity, Embedding, Nearness, Neighbourhood, Width};
+use ip_embed::{Capacity, Embedding, Found, Nearness, Neighbourhood, Width};
 use sha2::{Digest, Sha256};
 
 use crate::cache::CachedResponse;
@@ -189,9 +189,13 @@ impl SemanticCache {
         tenant: &TenantId,
         route: &RouteKey,
         query: &Embedding,
-    ) -> Result<Option<(CachedResponse, Nearness)>, CacheError> {
-        let Some((key, nearness)) = self.nearest(tenant, route, query) else {
-            return Ok(None);
+    ) -> Result<Found<CachedResponse>, CacheError> {
+        let (key, nearness) = match self.nearest(tenant, route, query) {
+            Found::Near(key, nearness) => (key, nearness),
+            // Nothing near enough, and how near it came — which is the number an
+            // operator needs to know whether their threshold is too tight.
+            Found::Short(nearness) => return Ok(Found::Short(nearness)),
+            Found::Nothing => return Ok(Found::Nothing),
         };
         let Some(held) = self
             .answers
@@ -199,9 +203,12 @@ impl SemanticCache {
             .await?
             .and_then(|entry| CachedResponse::decode(&entry))
         else {
-            return Ok(None);
+            // The vector outlived the answer it pointed at. Reported as short rather
+            // than as nothing, because something *was* near — the nearness is real
+            // and belongs in the histogram, even though nothing can be served.
+            return Ok(Found::Short(nearness));
         };
-        Ok(Some((held, nearness)))
+        Ok(Found::Near(held, nearness))
     }
 
     /// Keeps `answer` as what this question means, so a later one meaning the same
@@ -224,22 +231,19 @@ impl SemanticCache {
     }
 
     /// The nearest vector this partition holds, under the lock and nowhere near i/o.
-    fn nearest(
-        &self,
-        tenant: &TenantId,
-        route: &RouteKey,
-        query: &Embedding,
-    ) -> Option<(CacheKey, Nearness)> {
+    fn nearest(&self, tenant: &TenantId, route: &RouteKey, query: &Embedding) -> Found<CacheKey> {
         let now = Timestamp::now();
         let mut known = self.locked();
-        let found = known.get_mut(&(tenant.clone(), route.clone()))?;
+        let Some(found) = known.get_mut(&(tenant.clone(), route.clone())) else {
+            return Found::Nothing;
+        };
         match found.nearest(query, self.settings.nearness, now) {
             Ok(found) => found,
             // A query of another width is a model changed under a running index, which
             // is a fault to report rather than a question to answer badly.
             Err(error) => {
                 tracing::warn!(%error, "a question could not be compared with what is known");
-                None
+                Found::Nothing
             }
         }
     }
@@ -378,6 +382,7 @@ mod tests {
             .look(&acme, &path, &off_by(0.1))
             .await
             .unwrap()
+            .near()
             .expect("near enough");
         assert_eq!(found.body(), &bytes::Bytes::from_static(b"four pounds"));
         assert!(nearness.reaches(Nearness::new(0.99).unwrap()), "{nearness}");
@@ -392,7 +397,60 @@ mod tests {
             .await
             .unwrap();
         // 1/sqrt(1 + 0.5^2) is 0.894, which does not.
-        assert_eq!(cache.look(&acme, &path, &off_by(0.5)).await.unwrap(), None);
+        assert_eq!(
+            cache.look(&acme, &path, &off_by(0.5)).await.unwrap().near(),
+            None
+        );
+    }
+
+    /// A question that fell short says how short, and one with nothing to compare
+    /// against says nothing — which is the difference a threshold is chosen on.
+    #[tokio::test]
+    async fn a_question_that_fell_short_reports_how_short() {
+        let cache = caching(settings());
+        let (acme, path) = (tenant("acme"), route("/v1/messages"));
+        assert_eq!(
+            cache.look(&acme, &path, &off_by(0.0)).await.unwrap(),
+            Found::Nothing,
+            "nothing is filed, so there is nothing to have been near"
+        );
+        cache
+            .keep(&acme, &path, off_by(0.0), &answer("four pounds"))
+            .await
+            .unwrap();
+        // 1/sqrt(1 + 0.5^2) is 0.894, short of the 0.95 this cache is set to.
+        let missed = cache
+            .look(&acme, &path, &off_by(0.5))
+            .await
+            .unwrap()
+            .nearness()
+            .expect("it fell short of something rather than of nothing");
+        assert!(missed.reaches(Nearness::new(0.89).unwrap()), "{missed}");
+        assert!(!missed.reaches(Nearness::new(0.9).unwrap()), "{missed}");
+    }
+
+    /// A vector that outlived its answer fell short in the only sense that matters
+    /// to a caller — nothing was served — but it was genuinely near, and the number
+    /// belongs in the histogram all the same.
+    #[tokio::test]
+    async fn a_vector_whose_answer_is_gone_still_reports_how_near_it_was() {
+        let answers: Arc<dyn Cache> = Arc::new(SledCache::temporary().unwrap());
+        let cache = SemanticCache::new(Arc::clone(&answers), settings());
+        let (acme, path) = (tenant("acme"), route("/v1/messages"));
+        cache
+            .keep(&acme, &path, off_by(0.0), &answer("four pounds"))
+            .await
+            .unwrap();
+        let key = semantic_key(&acme, &path, "model-one", &off_by(0.0)).unwrap();
+        assert!(answers.remove(&key).await.unwrap(), "it was there");
+
+        let found = cache.look(&acme, &path, &off_by(0.0)).await.unwrap();
+        assert_eq!(found.clone().near(), None, "nothing can be served");
+        assert_eq!(
+            found.nearness(),
+            Some(Nearness::SAME),
+            "and yet the question matched exactly, which the histogram should see"
+        );
     }
 
     /// The gate the whole level is judged on. Two tenants asking the identical
@@ -407,7 +465,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cache.look(&globex, &path, &off_by(0.0)).await.unwrap(),
+            cache
+                .look(&globex, &path, &off_by(0.0))
+                .await
+                .unwrap()
+                .near(),
             None,
             "globex was served acme's answer to the identical question"
         );
@@ -416,6 +478,7 @@ mod tests {
             .look(&acme, &path, &off_by(0.0))
             .await
             .unwrap()
+            .near()
             .expect("acme's own answer is still there");
         assert_eq!(mine.body(), &bytes::Bytes::from_static(b"acme's books"));
     }
@@ -446,6 +509,7 @@ mod tests {
                 .look(who, &path, &off_by(0.0))
                 .await
                 .unwrap()
+                .near()
                 .expect("each tenant's own answer");
             assert_eq!(
                 found.body(),
@@ -475,6 +539,7 @@ mod tests {
                 .look(&acme, path, &off_by(0.0))
                 .await
                 .unwrap()
+                .near()
                 .expect("each route's own answer");
             assert_eq!(found.body(), &bytes::Bytes::from(expected));
         }
@@ -499,7 +564,8 @@ mod tests {
             cache
                 .look(&acme, &route("/v1/complete"), &off_by(0.0))
                 .await
-                .unwrap(),
+                .unwrap()
+                .near(),
             None
         );
     }
@@ -511,7 +577,8 @@ mod tests {
             cache
                 .look(&tenant("acme"), &route("/v1/messages"), &off_by(0.0))
                 .await
-                .unwrap(),
+                .unwrap()
+                .near(),
             None,
             "a tenant with no neighbourhood of its own answers nothing"
         );
@@ -530,7 +597,10 @@ mod tests {
             .unwrap();
         let key = semantic_key(&acme, &path, "model-one", &off_by(0.0)).unwrap();
         assert!(answers.remove(&key).await.unwrap(), "it was there");
-        assert_eq!(cache.look(&acme, &path, &off_by(0.0)).await.unwrap(), None);
+        assert_eq!(
+            cache.look(&acme, &path, &off_by(0.0)).await.unwrap().near(),
+            None
+        );
     }
 
     /// Replacing the model must not let an answer found by the old geometry be served
@@ -594,7 +664,8 @@ mod tests {
             cache
                 .look(&acme, &path, &vector(&[1.0, 0.0]))
                 .await
-                .unwrap(),
+                .unwrap()
+                .near(),
             None
         );
         // And the tenant's own question still works afterwards.
@@ -603,6 +674,7 @@ mod tests {
                 .look(&acme, &path, &off_by(0.0))
                 .await
                 .unwrap()
+                .near()
                 .is_some()
         );
     }
