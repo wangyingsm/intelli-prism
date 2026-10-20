@@ -29,7 +29,9 @@
 //! and where both could answer a question the row is authoritative. That is what stops
 //! this label set having to grow to cover every question anyone will ever ask.
 
-use ip_core::{Decider, Difficulty, Latency, ModelName, Served, TenantId, Tokens};
+use ip_core::{
+    Counted, Decider, Difficulty, Hedge, Latency, ModelName, Redacted, Served, TenantId, Tokens,
+};
 use ip_embed::Nearness;
 
 use crate::stage::Dispatched;
@@ -91,6 +93,9 @@ pub struct Meters {
     lookups: Counter<u64>,
     nearness: Histogram<f64>,
     classified: Counter<u64>,
+    refused: Counter<u64>,
+    arms: Counter<u64>,
+    redacted: Counter<u64>,
 }
 
 impl Meters {
@@ -139,6 +144,23 @@ impl Meters {
                 )
                 .with_unit("{request}")
                 .build(),
+            refused: meter
+                .u64_counter("ip.refused")
+                .with_description("Requests a limit turned away, and what ran out.")
+                .with_unit("{request}")
+                .build(),
+            arms: meter
+                .u64_counter("ip.arms")
+                .with_description(
+                    "Requests actually sent upstream, hedged ones counted once per arm.",
+                )
+                .with_unit("{request}")
+                .build(),
+            redacted: meter
+                .u64_counter("ip.redacted")
+                .with_description("Secrets taken out of a request or its answer.")
+                .with_unit("{secret}")
+                .build(),
         }
     }
 
@@ -168,10 +190,39 @@ impl Meters {
         // multiply that one by twenty-one for a question nobody asks of it. The rate
         // of requests and the shape of the classification are different questions
         // and are asked at different times.
-        let mut judged = whose;
+        let mut judged = whose.clone();
         judged.push(KeyValue::new("class", class_of(asked.dispatched)));
         judged.push(KeyValue::new("decided_by", decider_of(asked.dispatched)));
         self.classified.add(1, &judged);
+        // What was *sent*, which is not what was answered. A hedged request sends
+        // several and keeps one, so the gap between this and `ip.requests` is what
+        // racing costs — and a cache hit sends nothing at all, however many arms the
+        // rule would have raced, which is why this is not simply the hedge count.
+        if asked.served == Served::Upstream {
+            self.arms.add(u64::from(asked.raced.get()), &whose);
+        }
+        if let Some(taken) = asked.redacted.count() {
+            self.redacted.add(u64::from(taken), &whose);
+        }
+    }
+
+    /// Counts a request a limit turned away.
+    ///
+    /// Its own call because a refusal never reaches the end of the flow: it is an
+    /// error before a `Recording` exists, so nothing else in this module would ever
+    /// see it. A limit that is working is invisible in every other metric here —
+    /// the requests it stopped are simply absent — which is exactly why it needs one
+    /// of its own.
+    pub(crate) fn refused(&self, why: Refused, tenant: &TenantId, api: &str) {
+        self.refused.add(
+            1,
+            &[
+                KeyValue::new("tenant", tenant.as_str().to_owned()),
+                KeyValue::new("api", api.to_owned()),
+                KeyValue::new("reason", why.reason()),
+                KeyValue::new("counted", why.counted()),
+            ],
+        );
     }
 
     /// Counts what came of one request's turn at the semantic cache.
@@ -209,6 +260,40 @@ impl Meters {
                 KeyValue::new("outcome", outcome.as_str()),
             ],
         );
+    }
+}
+
+/// Why a limit turned a request away.
+///
+/// The two are different operationally and must not be summed into one number: a
+/// quota genuinely spent is the system working, where a quota that could not be read
+/// is the system failing open or closed on a backend problem. One is a conversation
+/// with a customer, the other is a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// A quota ran out, over this kind of thing.
+    Spent(Counted),
+    /// A quota could not be read at all.
+    Unmeasured,
+}
+
+impl Refused {
+    /// Which of the two this is.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Spent(_) => "spent",
+            Self::Unmeasured => "unmeasured",
+        }
+    }
+
+    /// What ran out, where anything did.
+    fn counted(self) -> &'static str {
+        match self {
+            Self::Spent(counted) => counted.name(),
+            // A quota nobody could read ran out of nothing in particular, and the
+            // label is present so the two reasons share a series shape.
+            Self::Unmeasured => UNNAMED,
+        }
     }
 }
 
@@ -268,6 +353,10 @@ pub(crate) struct Answered<'a> {
     pub latency: Latency,
     /// What class it went at and who said so, or that nobody did.
     pub dispatched: Dispatched,
+    /// How many endpoints the request was raced across; one when it was not raced.
+    pub raced: Hedge,
+    /// What the filter took out, if a filter looked at all.
+    pub redacted: Redacted,
 }
 
 impl Answered<'_> {
@@ -370,6 +459,8 @@ mod tests {
             tokens: Tokens::new(ip_core::TokenCount::new(120), ip_core::TokenCount::new(30)),
             latency: Latency::from_millis(42),
             dispatched: Dispatched::at(Difficulty::Hard, Decider::Classifier),
+            raced: Hedge::NONE,
+            redacted: Redacted::NONE,
         };
         // Sorted, because labels are a set: the order they are built in is not part
         // of what a series is, and asserting it would break on a harmless rewrite.
@@ -434,6 +525,8 @@ mod tests {
             tokens: Tokens::ZERO,
             latency: Latency::from_millis(1),
             dispatched: Dispatched::NONE,
+            raced: Hedge::NONE,
+            redacted: Redacted::NONE,
         };
         let named = |labels: Vec<KeyValue>| -> Vec<String> {
             labels.iter().map(|at| at.key.to_string()).collect()
@@ -484,6 +577,8 @@ mod tests {
             tokens: Tokens::ZERO,
             latency: Latency::from_millis(1),
             dispatched: Dispatched::NONE,
+            raced: Hedge::NONE,
+            redacted: Redacted::NONE,
         };
         let model = asked
             .labels()

@@ -28,7 +28,7 @@ use crate::error::{GatewayError, GatewayErrorKind};
 use crate::filter::{Filtered, Filtering, Reported};
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
-use crate::meter::{Looked, Meters};
+use crate::meter::{Looked, Meters, Refused};
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
 use crate::semantic::{self, Question, SemanticCache};
 use crate::stage::{Authorized, BodyProcessed, Dispatched, ResponseBodyProcessed, Stage};
@@ -509,21 +509,32 @@ impl Gateway {
         let Some(limiter) = &self.limiter else {
             return Ok(());
         };
-        let kind = match limiter.admit(limits, asking).await {
+        let (kind, why) = match limiter.admit(limits, asking).await {
             Decision::Allowed => return Ok(()),
             Decision::Spent {
                 counted,
                 period,
                 allowance,
                 ends,
-            } => GatewayErrorKind::Spent {
-                counted,
-                period,
-                allowance,
-                ends,
-            },
-            Decision::Unknown { detail } => GatewayErrorKind::Unmeasured { detail },
+            } => (
+                GatewayErrorKind::Spent {
+                    counted,
+                    period,
+                    allowance,
+                    ends,
+                },
+                Refused::Spent(counted),
+            ),
+            Decision::Unknown { detail } => {
+                (GatewayErrorKind::Unmeasured { detail }, Refused::Unmeasured)
+            }
         };
+        // Counted here because a refusal never reaches the end of the flow. Every
+        // other metric in this gateway describes a request that was served, so a
+        // limit doing its job is invisible in all of them.
+        if let Some(meters) = self.keeping.meters() {
+            meters.refused(why, &asking.tenant, asking.api.as_str());
+        }
         Err(GatewayError::new(Authorized::NAME, kind))
     }
 
@@ -630,10 +641,16 @@ mod tests {
     ) -> Vec<(Vec<(String, String)>, u64)> {
         use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
         provider.force_flush().expect("the instruments flush");
-        exporter
+        let exported = exporter
             .get_finished_metrics()
-            .expect("something was exported")
-            .iter()
+            .expect("something was exported");
+        // The exporter keeps a batch per flush and a counter exports its running
+        // total, so the newest batch is the answer and the older ones are the same
+        // numbers from earlier. Reading them all would count one request twice for
+        // every time a test looked.
+        exported
+            .last()
+            .into_iter()
             .flat_map(|held| held.scope_metrics())
             .flat_map(|scope| scope.metrics())
             .filter(|metric| metric.name() == name)
@@ -736,7 +753,8 @@ mod tests {
         provider.force_flush().unwrap();
         let exported = exporter.get_finished_metrics().unwrap();
         let latency = exported
-            .iter()
+            .last()
+            .into_iter()
             .flat_map(|held| held.scope_metrics())
             .flat_map(|scope| scope.metrics())
             .find(|metric| metric.name() == "ip.latency")
@@ -850,6 +868,139 @@ mod tests {
             .into_iter()
             .collect::<Vec<_>>()
         );
+    }
+
+    /// A limit doing its job is invisible in every other metric here — the requests
+    /// it stopped are simply absent — so it needs one of its own.
+    #[tokio::test]
+    async fn a_request_a_limit_turned_away_is_counted_as_refused() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let gateway = limited(
+            upstream,
+            vec![allowing(
+                ip_core::Counted::Tokens,
+                ip_core::Period::Month,
+                100,
+            )],
+        )
+        .measuring(Arc::new(Meters::new(&provider.meter("test"))));
+
+        // The first answer spends 150 of the 100 the month allows, so the second is
+        // turned away before it reaches anything.
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        gateway.settled().await;
+        let refused = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let seen: Vec<(String, String, u64)> = counted(&exporter, &provider, "ip.refused")
+            .into_iter()
+            .map(|(labels, value)| {
+                let at = |key: &str| {
+                    labels
+                        .iter()
+                        .find(|(name, _)| name == key)
+                        .map(|(_, held)| held.clone())
+                        .unwrap_or_default()
+                };
+                (at("reason"), at("counted"), value)
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("spent".to_owned(), "tokens".to_owned(), 1)],
+            "the refusal says which quota ran out, not merely that one did"
+        );
+        // And exactly one request was served, so the refusal is not hiding in the
+        // request count either.
+        assert_eq!(counted(&exporter, &provider, "ip.requests").len(), 1);
+    }
+
+    /// What went upstream, which is not what was answered: a hedge sends several and
+    /// keeps one, and a cache hit sends none at all.
+    #[tokio::test]
+    async fn arms_count_what_was_sent_and_a_cache_hit_sends_none() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone())
+            .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
+            .measuring(Arc::new(Meters::new(&provider.meter("test"))));
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap();
+            body_of(answered).await;
+        }
+        assert_eq!(
+            upstream.seen.lock().unwrap().len(),
+            1,
+            "the second was a hit"
+        );
+
+        let sent: u64 = counted(&exporter, &provider, "ip.arms")
+            .into_iter()
+            .map(|(_, value)| value)
+            .sum();
+        assert_eq!(
+            sent, 1,
+            "two requests answered, one sent: the hit must add no arm"
+        );
+    }
+
+    /// What the filter took out, counted — and nothing counted where it looked and
+    /// found nothing, which is a different fact from never having looked.
+    #[tokio::test]
+    async fn what_the_filter_took_out_is_counted() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let filtering = Arc::new(crate::filter::Filtering::new(
+            ip_filter::Detectors::of(&[ip_filter::Secret::new(
+                ip_filter::Kind::new("email").unwrap(),
+                ip_filter::Match::Regexp(r"[a-z]+@[a-z.]+".to_owned()),
+            )])
+            .unwrap(),
+        ));
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream)
+            .filtering(filtering)
+            .measuring(Arc::new(Meters::new(&provider.meter("test"))));
+        let answered = gateway
+            .handle(
+                context(granted()),
+                request(
+                    "/anthropic/messages",
+                    r#"{"messages":[{"role":"user","content":"write to ada@example.com"}]}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        let taken: u64 = counted(&exporter, &provider, "ip.redacted")
+            .into_iter()
+            .map(|(_, value)| value)
+            .sum();
+        assert_eq!(taken, 1, "one address went out of the request");
     }
 
     /// A gateway nobody asked to count does not, and still serves. Without this the
@@ -1046,7 +1197,8 @@ mod tests {
         provider.force_flush().unwrap();
         let exported = exporter.get_finished_metrics().unwrap();
         let held = exported
-            .iter()
+            .last()
+            .into_iter()
             .flat_map(|scope| scope.scope_metrics())
             .flat_map(|scope| scope.metrics())
             .find(|metric| metric.name() == "ip.semantic.nearness")

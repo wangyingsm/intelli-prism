@@ -271,6 +271,8 @@ impl Recording {
                 tokens,
                 latency: Latency::from_millis(self.started.elapsed().as_millis()),
                 dispatched: serving.dispatched,
+                raced: serving.arms,
+                redacted: serving.redacted.clone(),
             });
         }
         let Some(store) = self.keeping.store.clone() else {
