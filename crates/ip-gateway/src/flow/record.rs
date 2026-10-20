@@ -270,6 +270,7 @@ impl Recording {
                 served: serving.source,
                 tokens,
                 latency: Latency::from_millis(self.started.elapsed().as_millis()),
+                dispatched: serving.dispatched,
             });
         }
         let Some(store) = self.keeping.store.clone() else {

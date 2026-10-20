@@ -804,6 +804,54 @@ mod tests {
         );
     }
 
+    /// What a request was dispatched at, and who said so — including the requests
+    /// nothing would commit to, which is the share that says whether the classifier
+    /// is earning its forward pass.
+    #[tokio::test]
+    async fn what_class_a_request_went_at_and_who_named_it_are_counted() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (gateway, exporter, provider) = metered(upstream);
+        // One that names its own class in a header, and one that names none.
+        let named = Request::builder()
+            .uri("/anthropic/messages")
+            .header(http::header::HOST, "gateway.local:8080")
+            .header("x-ip-difficulty", "hard")
+            .body(from_bytes(Bytes::from_static(b"ask")))
+            .unwrap();
+        for request in [named, request("/anthropic/messages", "ask")] {
+            let answered = gateway.handle(context(granted()), request).await.unwrap();
+            body_of(answered).await;
+        }
+
+        let mut seen: Vec<(String, String, u64)> = counted(&exporter, &provider, "ip.classified")
+            .into_iter()
+            .map(|(labels, value)| {
+                let at = |key: &str| {
+                    labels
+                        .iter()
+                        .find(|(name, _)| name == key)
+                        .map(|(_, held)| held.clone())
+                        .unwrap_or_default()
+                };
+                (at("class"), at("decided_by"), value)
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                // The unclassified one is present and says so, rather than being
+                // absent and uncountable.
+                ("none".to_owned(), "none".to_owned(), 1),
+                ("hard".to_owned(), "request".to_owned(), 1),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+        );
+    }
+
     /// A gateway nobody asked to count does not, and still serves. Without this the
     /// test above would pass just as well if counting were unconditional.
     #[tokio::test]

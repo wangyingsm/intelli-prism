@@ -29,8 +29,10 @@
 //! and where both could answer a question the row is authoritative. That is what stops
 //! this label set having to grow to cover every question anyone will ever ask.
 
-use ip_core::{Latency, ModelName, Served, TenantId, Tokens};
+use ip_core::{Decider, Difficulty, Latency, ModelName, Served, TenantId, Tokens};
 use ip_embed::Nearness;
+
+use crate::stage::Dispatched;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{KeyValue, Value};
 
@@ -88,6 +90,7 @@ pub struct Meters {
     latency: Histogram<u64>,
     lookups: Counter<u64>,
     nearness: Histogram<f64>,
+    classified: Counter<u64>,
 }
 
 impl Meters {
@@ -128,6 +131,14 @@ impl Meters {
                 .with_unit("1")
                 .with_boundaries(NEARNESS.to_vec())
                 .build(),
+            classified: meter
+                .u64_counter("ip.classified")
+                .with_description(
+                    "Requests by the class they were dispatched at and the level \
+                     that named it.",
+                )
+                .with_unit("{request}")
+                .build(),
         }
     }
 
@@ -153,6 +164,14 @@ impl Meters {
         }
         self.latency
             .record(u64::from(asked.latency.millis()), &asked.bounded());
+        // Its own counter rather than two more labels on `ip.requests`, which would
+        // multiply that one by twenty-one for a question nobody asks of it. The rate
+        // of requests and the shape of the classification are different questions
+        // and are asked at different times.
+        let mut judged = whose;
+        judged.push(KeyValue::new("class", class_of(asked.dispatched)));
+        judged.push(KeyValue::new("decided_by", decider_of(asked.dispatched)));
+        self.classified.add(1, &judged);
     }
 
     /// Counts what came of one request's turn at the semantic cache.
@@ -247,6 +266,8 @@ pub(crate) struct Answered<'a> {
     pub tokens: Tokens,
     /// How long the whole thing took.
     pub latency: Latency,
+    /// What class it went at and who said so, or that nobody did.
+    pub dispatched: Dispatched,
 }
 
 impl Answered<'_> {
@@ -282,6 +303,30 @@ impl Answered<'_> {
         ]
     }
 }
+
+/// What class a request went at, or that none was named.
+///
+/// The names come from `Difficulty` and `Decider` themselves rather than being
+/// spelled again here. Unlike the outcome below, those are the domain's own words —
+/// the same ones the config is written in and the management api answers with — so a
+/// third spelling would be the thing that could drift, not a guard against drift.
+fn class_of(dispatched: Dispatched) -> &'static str {
+    dispatched.class().map_or(UNNAMED, Difficulty::name)
+}
+
+/// Which level named it, or that none did.
+fn decider_of(dispatched: Dispatched) -> &'static str {
+    dispatched.decided_by().map_or(UNNAMED, Decider::name)
+}
+
+/// What stands for a request nobody classified.
+///
+/// A label rather than an absent one, and a word rather than an empty string: every
+/// request that went unclassified is a fact about the gate — the share of traffic
+/// nothing would commit to is exactly what says whether the classifier is earning
+/// its forward pass — and a series that vanished when nothing was named could not
+/// be divided by the total.
+const UNNAMED: &str = "none";
 
 /// What a `Served` is called on a dashboard.
 ///
@@ -324,6 +369,7 @@ mod tests {
             served: Served::Semantic,
             tokens: Tokens::new(ip_core::TokenCount::new(120), ip_core::TokenCount::new(30)),
             latency: Latency::from_millis(42),
+            dispatched: Dispatched::at(Difficulty::Hard, Decider::Classifier),
         };
         // Sorted, because labels are a set: the order they are built in is not part
         // of what a series is, and asserting it would break on a harmless rewrite.
@@ -344,6 +390,37 @@ mod tests {
         );
     }
 
+    /// A request nobody classified is a counted fact, not an absent one.
+    ///
+    /// The share of traffic no level would commit to is exactly what says whether
+    /// the classifier is earning its forward pass, and a series that vanished when
+    /// nothing was named could not be divided by the total to find it.
+    #[test]
+    fn a_request_nobody_classified_still_says_so() {
+        assert_eq!(class_of(Dispatched::NONE), "none");
+        assert_eq!(decider_of(Dispatched::NONE), "none");
+        let judged = Dispatched::at(Difficulty::Research, Decider::Arbiter);
+        assert_eq!(class_of(judged), "research");
+        assert_eq!(decider_of(judged), "arbiter");
+    }
+
+    /// Every class and every level has a name of its own, taken from the domain.
+    ///
+    /// Two sharing one would merge two kinds of request into a single series, and
+    /// a class whose name collided with `none` would be counted as unclassified.
+    #[test]
+    fn every_class_and_every_level_is_named_apart() {
+        let classes: Vec<&str> = Difficulty::ALL.iter().map(|at| at.name()).collect();
+        let levels: Vec<&str> = Decider::ALL.iter().map(|at| at.name()).collect();
+        for named in classes.iter().chain(&levels) {
+            assert_ne!(*named, UNNAMED, "{named} collides with an unclassified one");
+        }
+        let unique: std::collections::BTreeSet<&str> = classes.iter().copied().collect();
+        assert_eq!(unique.len(), classes.len(), "two classes share a name");
+        let unique: std::collections::BTreeSet<&str> = levels.iter().copied().collect();
+        assert_eq!(unique.len(), levels.len(), "two levels share a name");
+    }
+
     /// The ruling's cost, pinned where it is paid: the tenant is on a counter and not
     /// on the histogram, because a histogram multiplies by its buckets.
     #[test]
@@ -356,6 +433,7 @@ mod tests {
             served: Served::Upstream,
             tokens: Tokens::ZERO,
             latency: Latency::from_millis(1),
+            dispatched: Dispatched::NONE,
         };
         let named = |labels: Vec<KeyValue>| -> Vec<String> {
             labels.iter().map(|at| at.key.to_string()).collect()
@@ -405,6 +483,7 @@ mod tests {
             served: Served::Upstream,
             tokens: Tokens::ZERO,
             latency: Latency::from_millis(1),
+            dispatched: Dispatched::NONE,
         };
         let model = asked
             .labels()
