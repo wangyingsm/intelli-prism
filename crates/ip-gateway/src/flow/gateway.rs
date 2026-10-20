@@ -366,10 +366,20 @@ impl Gateway {
                 Some(question) => match self.vector_for(&question).await {
                     None => self.looked(Looked::Unembedded, &followed),
                     Some(vector) => {
-                        match semantic
+                        let found = semantic
                             .look(&followed.tenant, &question.route, &vector)
-                            .await
+                            .await;
+                        // How near the nearest came, recorded before anything is
+                        // decided about it. A miss that nearly hit is the one
+                        // observation that can say a threshold is too tight, and it
+                        // exists only here — by the time this request is a row or a
+                        // counter, the distance is gone.
+                        if let Ok(found) = &found
+                            && let Some(nearness) = found.nearness()
                         {
+                            self.measured(nearness, &followed);
+                        }
+                        match found {
                             Ok(Found::Near(hit, nearness)) => {
                                 self.looked(Looked::Hit, &followed);
                                 let answered = stage_span!(EGRESS_RESPONSE, followed);
@@ -454,6 +464,14 @@ impl Gateway {
         Ok(measuring(
             sent, recording, served_by, raced, dispatched, filtered, reported,
         ))
+    }
+
+    /// Records how near the nearest question came, when anything is counting.
+    fn measured(&self, nearness: ip_embed::Nearness, followed: &Followed) {
+        if let Some(meters) = self.keeping.meters() {
+            let api = followed.api.as_ref().map_or("", ip_core::ApiId::as_str);
+            meters.measured(nearness, api);
+        }
     }
 
     /// Counts one request's turn at the semantic cache, when anything is counting.
@@ -936,6 +954,98 @@ mod tests {
                 ("miss".to_owned(), 1),
                 ("unembedded".to_owned(), 1),
             ]
+        );
+    }
+
+    /// The observation M17 asked for and could not make: how near the questions that
+    /// were *turned away* came.
+    ///
+    /// Three questions against a threshold of 0.95 — one that hits, one that misses
+    /// by a little, one that misses by a lot — and all three land in the histogram.
+    /// A hit-only histogram would hold one of the three and could never say that
+    /// lowering the threshold to 0.9 would have paid.
+    #[tokio::test]
+    async fn how_near_a_question_came_is_recorded_whether_or_not_it_hit() {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (gateway, exporter, provider) = metered_by_meaning(
+            upstream,
+            FakeEmbedder::default()
+                .saying("what did we spend", &[1.0, 0.0, 0.0])
+                // 1/sqrt(1 + 0.1^2) is 0.995: near enough.
+                .saying("how much did we spend", &[1.0, 0.0, 0.1])
+                // 1/sqrt(1 + 0.4^2) is 0.928: short of 0.95, and the whole point.
+                .saying("what is our budget", &[1.0, 0.0, 0.4])
+                // 1/sqrt(1 + 1.5^2) is 0.555: nowhere near.
+                .saying("write me a poem", &[1.0, 0.0, 1.5]),
+        );
+        for question in [
+            "what did we spend",
+            "how much did we spend",
+            "what is our budget",
+            "write me a poem",
+        ] {
+            let answered = gateway
+                .handle(
+                    context(granted()),
+                    request("/anthropic/messages", &asking(question)),
+                )
+                .await
+                .unwrap();
+            body_of(answered).await;
+        }
+
+        provider.force_flush().unwrap();
+        let exported = exporter.get_finished_metrics().unwrap();
+        let held = exported
+            .iter()
+            .flat_map(|scope| scope.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "ip.semantic.nearness")
+            .expect("the histogram reached the exporter");
+        let AggregatedMetrics::F64(MetricData::Histogram(held)) = held.data() else {
+            panic!("a nearness is a histogram");
+        };
+        let point = held.data_points().next().expect("one api, one series");
+        // The first question had nothing to compare against, so it is not in here:
+        // three observations, not four.
+        assert_eq!(
+            point.count(),
+            3,
+            "an empty index has no near miss to report, and must not report a zero"
+        );
+        // Both sides of the threshold are in here, which is the whole claim. The
+        // lowest is the question that was nowhere near — measured against the
+        // *nearest thing filed by then*, which is the 0.4 question and not the
+        // origin, so it scores 0.824 rather than the 0.555 it would against an index
+        // holding only the first.
+        assert!(
+            point.min().is_some_and(|least| least < 0.85),
+            "the question that was turned away is in here: {:?}",
+            point.min()
+        );
+        assert!(
+            point.max().is_some_and(|most| most > 0.99),
+            "and so is the one that hit: {:?}",
+            point.max()
+        );
+        // And the near miss landed just under the line, which is the shape an
+        // operator reads to decide the threshold is too tight. Boundaries are
+        // [.., 0.92, 0.94, 0.95, ..], so the 0.928 observation is in the bucket
+        // spanning 0.92 to 0.94 — two below the 0.95 the cache is set to.
+        let buckets: Vec<u64> = point.bucket_counts().collect();
+        let under = crate::meter::NEARNESS
+            .iter()
+            .position(|edge| *edge == 0.94)
+            .expect("the boundary the near miss falls under");
+        assert_eq!(
+            buckets[under], 1,
+            "the near miss should sit just under the threshold: {buckets:?}"
+        );
+        let labels: Vec<String> = point.attributes().map(|at| at.key.to_string()).collect();
+        assert!(
+            !labels.contains(&"tenant".to_owned()),
+            "a tenant here would cost a series per bucket per tenant: {labels:?}"
         );
     }
 

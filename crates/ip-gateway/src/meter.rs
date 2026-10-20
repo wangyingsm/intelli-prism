@@ -30,6 +30,7 @@
 //! this label set having to grow to cover every question anyone will ever ask.
 
 use ip_core::{Latency, ModelName, Served, TenantId, Tokens};
+use ip_embed::Nearness;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::{KeyValue, Value};
 
@@ -56,6 +57,24 @@ const LATENCY_MS: &[f64] = &[
     60_000.0,
 ];
 
+/// Where the nearness histogram's buckets fall.
+///
+/// Uniform buckets across the unit would put almost every observation in the top two
+/// and waste the rest, because an embedding model's similarities do not use the range.
+/// Measured on `multilingual-e5-small`, which is the artefact M17 was verified
+/// against: two questions with **nothing in common** score 0.762, the same question
+/// in another language 0.822, and a paraphrase 0.978.
+///
+/// So the floor is around 0.75 and everything that matters happens above 0.9. These
+/// are coarse below that — enough to see the shape of the unrelated mass — and fine
+/// from 0.9 up, where a threshold is actually chosen. A bulge in the 0.95 to 0.97
+/// buckets against a threshold of 0.97 is the picture this exists to draw: it says
+/// lowering the threshold would start paying, and nothing else the gateway records
+/// can say it.
+pub(crate) const NEARNESS: &[f64] = &[
+    0.5, 0.7, 0.8, 0.85, 0.9, 0.92, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99, 1.0,
+];
+
 /// Every instrument the gateway writes to, built once.
 ///
 /// Built once because building one is not free — it goes through the provider to be
@@ -68,6 +87,7 @@ pub struct Meters {
     tokens: Counter<u64>,
     latency: Histogram<u64>,
     lookups: Counter<u64>,
+    nearness: Histogram<f64>,
 }
 
 impl Meters {
@@ -98,6 +118,15 @@ impl Meters {
                      ones never eligible to be asked.",
                 )
                 .with_unit("{lookup}")
+                .build(),
+            nearness: meter
+                .f64_histogram("ip.semantic.nearness")
+                .with_description(
+                    "How near the nearest question came, on every lookup that had \
+                     something to compare against.",
+                )
+                .with_unit("1")
+                .with_boundaries(NEARNESS.to_vec())
                 .build(),
         }
     }
@@ -133,6 +162,25 @@ impl Meters {
     /// happened at one gate inside it. A request that was never eligible has no
     /// semantic outcome to carry to the end, and folding this into the record would
     /// mean teaching it about a level it has no other business knowing.
+    /// Records how near the nearest question came, hit or miss.
+    ///
+    /// The misses are the half that matters. A hit-only histogram says how confident
+    /// the answers it gave were, which is reassurance; this says what was *turned
+    /// away*, which is the only thing that can tell an operator their threshold is
+    /// too tight. Both are recorded, and the threshold is the line between them.
+    ///
+    /// No tenant, like the other histogram and for the same reason: fourteen buckets
+    /// multiplied by a tenant count, for a question about the deployment's traffic.
+    /// No outcome either — the threshold already divides this distribution in two, so
+    /// a label saying which side an observation fell on would double the series to
+    /// repeat what the buckets say.
+    pub(crate) fn measured(&self, nearness: Nearness, api: &str) {
+        self.nearness.record(
+            f64::from(nearness.value()),
+            &[KeyValue::new("api", api.to_owned())],
+        );
+    }
+
     pub(crate) fn looked(&self, outcome: Looked, tenant: &TenantId, api: &str) {
         self.lookups.add(
             1,
