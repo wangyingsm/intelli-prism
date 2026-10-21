@@ -111,7 +111,7 @@ impl fmt::Display for Money {
     serde::Serialize,
     serde::Deserialize,
 )]
-#[serde(transparent)]
+#[serde(try_from = "u64")]
 pub struct Rate(u64);
 
 impl Rate {
@@ -159,6 +159,17 @@ impl Rate {
         let spent = u128::from(self.0) * u128::from(tokens.get());
         let rounded = (spent + PER / 2) / PER;
         Money(u64::try_from(rounded).unwrap_or(u64::MAX))
+    }
+}
+
+impl TryFrom<u64> for Rate {
+    type Error = CoreError;
+
+    /// Every way a rate arrives from outside goes through the ceiling, deserialization
+    /// included: a transparent newtype that derived its way past [`Rate::new`] would
+    /// take a price the api refuses from a payload nobody checked.
+    fn try_from(micros_per_million: u64) -> Result<Self, Self::Error> {
+        Self::new(micros_per_million)
     }
 }
 
@@ -265,6 +276,21 @@ mod tests {
         assert_eq!(
             Money::from_micros(u64::MAX).times(2),
             Money::from_micros(u64::MAX)
+        );
+    }
+
+    /// The ceiling holds against a payload as well as against a caller: a rate is read
+    /// from json wherever the api and the store meet, and a transparent newtype whose
+    /// `Deserialize` derived its way past the check would let a refused price in.
+    #[test]
+    fn a_rate_read_from_json_goes_through_the_ceiling_too() {
+        let read: Rate = serde_json::from_str("3000000").unwrap();
+        assert_eq!(read.get(), 3_000_000);
+
+        let refused = serde_json::from_str::<Rate>("9000000000000").unwrap_err();
+        assert!(
+            refused.to_string().contains("past the"),
+            "the refusal is the type's own: {refused}"
         );
     }
 

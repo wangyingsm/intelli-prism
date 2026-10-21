@@ -291,7 +291,7 @@ mod tests {
             .collect();
         // Every prefix, and what this file does about it. A prefix that holds nothing
         // of any tenant's says so here rather than being quietly left out.
-        let audited: [(&str, &str); 11] = [
+        let audited: [(&str, &str); 12] = [
             ("/_ip/tenants", "asked for by path"),
             ("/_ip/tenants/{tenant}/members", "asked for by path"),
             (
@@ -305,6 +305,10 @@ mod tests {
             ("/_ip/plugins", "owned by a tenant, listed by owner"),
             ("/_ip/plugin-rules", "listed without naming a tenant"),
             ("/_ip/limits", "asked for by query and by body"),
+            (
+                "/_ip/prices",
+                "what a vendor charges the deployment, belonging to no tenant",
+            ),
             ("/_ip/usage", "asked for by query"),
         ];
         for prefix in &nested {

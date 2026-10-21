@@ -7,6 +7,7 @@ mod key;
 mod limit;
 mod member;
 mod plugin;
+mod price;
 mod route;
 mod tenant;
 mod usage;
@@ -60,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/_ip/plugins", plugin::store_router())
         .nest("/_ip/plugin-rules", plugin::rules_router())
         .nest("/_ip/limits", limit::router())
+        .nest("/_ip/prices", price::router())
         .nest("/_ip/usage", usage::router())
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
