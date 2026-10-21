@@ -10,7 +10,9 @@ use std::time::Instant;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
-use ip_core::{ApiId, Hedge, Latency, Replica, Served, TenantId, Tokens, TraceId, TurnId, UserId};
+use ip_core::{
+    ApiId, Hedge, Latency, Money, Price, Replica, Served, TenantId, Tokens, TraceId, TurnId, UserId,
+};
 use ip_storage::{NewUsage, UsageStore};
 
 use tokio::sync::Notify;
@@ -21,6 +23,7 @@ use crate::filter::{Filtered, Reported};
 use crate::limit::{Asking, Limiter, Limits};
 use crate::measure::{Measuring, measure};
 use crate::meter::Meters;
+use crate::price::Prices;
 use crate::stage::Dispatched;
 
 /// The records still being written, so a shutdown can wait for them.
@@ -81,6 +84,23 @@ impl Limiting {
     }
 }
 
+/// What the rules in force say about a request's spending: what it counts against, and
+/// what it costs.
+///
+/// A composite because both come off the same loaded routing, and because `Recording::of`
+/// already took five arguments.
+pub(super) struct Ruled {
+    limiting: Option<Limiting>,
+    prices: Prices,
+}
+
+impl Ruled {
+    /// The limits this request spends against, and the prices it is costed at.
+    pub(super) fn new(limiting: Option<Limiting>, prices: Prices) -> Self {
+        Self { limiting, prices }
+    }
+}
+
 /// Where what a request cost is kept: the rows, the dashboard, or both.
 ///
 /// A composite because `Recording::of` already took five arguments, and because the
@@ -123,6 +143,7 @@ pub(super) struct Recording {
     keeping: Keeping,
     pending: Pending,
     limiting: Option<Limiting>,
+    prices: Prices,
     started: Instant,
     trace: TraceId,
     turn: Option<TurnId>,
@@ -141,7 +162,7 @@ impl Recording {
         pending: &Pending,
         followed: &Followed,
         started: Instant,
-        limiting: Option<Limiting>,
+        ruled: Ruled,
     ) -> Option<Self> {
         if !keeping.any() {
             return None;
@@ -149,7 +170,8 @@ impl Recording {
         Some(Self {
             keeping: keeping.clone(),
             pending: pending.clone(),
-            limiting,
+            limiting: ruled.limiting,
+            prices: ruled.prices,
             started,
             trace: followed.trace,
             turn: followed.turn.clone(),
@@ -280,6 +302,10 @@ impl Recording {
             self.spend(tokens);
             return;
         };
+        let cost = model
+            .as_ref()
+            .and_then(|model| self.prices.of(model))
+            .map(|price| priced(price, tokens, serving.arms));
         let usage = NewUsage {
             trace: self.trace,
             turn: self.turn,
@@ -295,7 +321,7 @@ impl Recording {
             decided_by: serving.dispatched.decided_by(),
             redacted: serving.filtered.recorded(),
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
-            cost: None,
+            cost,
         };
         let limiting = self.limiting;
         let spent = tokens.total();
@@ -330,6 +356,13 @@ impl Recording {
                 .await;
         });
     }
+}
+
+/// What an answer cost: the winner in both directions, and the prompt once more for every
+/// arm that lost, which the upstream read and billed for whether or not it won.
+fn priced(price: Price, tokens: Tokens, arms: Hedge) -> Money {
+    let lost = u32::from(arms.get().saturating_sub(1));
+    price.of(tokens) + price.input.of(tokens.input).times(lost)
 }
 
 /// How the request was served, which together is what a row keeps of it past its request.

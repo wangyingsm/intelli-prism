@@ -17,7 +17,7 @@ use super::followed::{
     EGRESS_REQUEST, EGRESS_RESPONSE, Followed, INGRESS_REQUEST, INGRESS_RESPONSE, stage_span,
 };
 use super::headers::set_length;
-use super::record::{Keeping, Limiting, Pending, Recording};
+use super::record::{Keeping, Limiting, Pending, Recording, Ruled};
 use crate::arbiter::Arbiter;
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
@@ -351,7 +351,10 @@ impl Gateway {
             &self.pending,
             &followed,
             started,
-            self.limiting_with(&routing.limits, &asking),
+            Ruled::new(
+                self.limiting_with(&routing.limits, &asking),
+                routing.prices.clone(),
+            ),
         );
 
         // Both cache levels are asked here, in order, and either may be absent. A hit
@@ -2732,6 +2735,139 @@ mod tests {
         assert_eq!(hit.served_by, None);
         // An answer out of the cache was raced across one endpoint: nothing was reached.
         assert_eq!(hit.raced_across, Hedge::default());
+    }
+
+    /// What the fixture answer's model costs: three units a million in, fifteen out.
+    fn prices() -> Prices {
+        Prices::new(vec![ip_storage::Priced {
+            model: ip_core::ModelName::new("claude-opus-5").unwrap(),
+            price: ip_core::Price::new(
+                ip_core::Rate::new(3_000_000).unwrap(),
+                ip_core::Rate::new(15_000_000).unwrap(),
+            ),
+            created_at: ip_core::Timestamp::now(),
+        }])
+    }
+
+    #[tokio::test]
+    async fn a_priced_answer_records_what_it_cost() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        )
+        .recording(recorder)
+        .with_prices(prices());
+
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(
+            row.tokens,
+            Tokens::new(TokenCount::new(120), TokenCount::new(30))
+        );
+        // 120 in at three a million is 360 micros, 30 out at fifteen is 450.
+        assert_eq!(row.cost, Some(ip_core::Money::from_micros(810)));
+    }
+
+    /// The distinction the column exists for: a model nobody priced has no cost, which
+    /// is not a cost of nothing.
+    #[tokio::test]
+    async fn an_answer_nothing_prices_records_no_cost() {
+        let (recorder, mut recorded) = Ledger::new();
+        let elsewhere = Prices::new(vec![ip_storage::Priced {
+            model: ip_core::ModelName::new("gpt-5").unwrap(),
+            price: ip_core::Price::new(
+                ip_core::Rate::new(3_000_000).unwrap(),
+                ip_core::Rate::new(15_000_000).unwrap(),
+            ),
+            created_at: ip_core::Timestamp::now(),
+        }]);
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        )
+        .recording(recorder)
+        .with_prices(elsewhere);
+
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(
+            row.model,
+            Some(ip_core::ModelName::new("claude-opus-5").unwrap())
+        );
+        assert_eq!(row.cost, None);
+    }
+
+    #[tokio::test]
+    async fn a_raced_answer_costs_the_winner_plus_the_prompt_every_loser_was_billed_for() {
+        let (recorder, mut recorded) = Ledger::new();
+        let gateway = Gateway::new(
+            hedged_table(
+                ip_core::Strategy::RoundRobin,
+                Hedge::new(3).unwrap(),
+                &["one.example.com", "two.example.com", "three.example.com"],
+            ),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        )
+        .recording(recorder)
+        .with_prices(prices());
+
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        let row = recorded.recv().await.unwrap();
+        assert_eq!(row.raced_across, Hedge::new(3).unwrap());
+        // The winner's 810, and the 120-token prompt twice more at three a million: the
+        // two arms that lost were read and billed for all the same.
+        assert_eq!(row.cost, Some(ip_core::Money::from_micros(810 + 720)));
+    }
+
+    #[tokio::test]
+    async fn an_answer_out_of_the_cache_costs_nothing_rather_than_nothing_known() {
+        let (recorder, mut recorded) = Ledger::new();
+        let cache = Arc::new(ip_cache::SledCache::temporary().unwrap());
+        let gateway = Gateway::new(
+            table(),
+            ProcessorChain::new(),
+            FakeUpstream::answering(ANSWERED),
+        )
+        .caching(ResponseCache::new(cache, Ttl::seconds(60).unwrap()))
+        .recording(recorder)
+        .with_prices(prices());
+
+        for _ in 0..2 {
+            let answered = gateway
+                .handle(context(granted()), request("/anthropic/messages", "ask"))
+                .await
+                .unwrap();
+            body_of(answered).await;
+        }
+
+        assert_eq!(
+            recorded.recv().await.unwrap().cost,
+            Some(ip_core::Money::from_micros(810))
+        );
+        let hit = recorded.recv().await.unwrap();
+        assert_eq!(hit.served, Served::Cache);
+        // The model is priced and the hit spent nothing of it, which is the figure an
+        // operator reads against what the cache saved.
+        assert_eq!(hit.cost, Some(ip_core::Money::ZERO));
     }
 
     #[tokio::test]
