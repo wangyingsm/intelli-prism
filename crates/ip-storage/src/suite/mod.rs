@@ -269,6 +269,9 @@ macro_rules! backend_suite {
             a_row_nothing_priced_costs_nothing_known,
             a_cost_past_what_a_column_holds_is_refused,
             a_listed_row_carries_what_it_cost,
+            a_window_sums_what_its_rows_cost,
+            a_window_says_how_many_of_its_rows_nothing_priced,
+            a_window_of_nothing_costs_nothing,
         ]);
     };
     ($open:path) => {

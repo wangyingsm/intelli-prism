@@ -7,8 +7,8 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ip_core::{
-    ApiId, Capability, CapabilityScope, Decider, Difficulty, Hedge, Latency, Served, TenantId,
-    Timestamp, UserId,
+    ApiId, Capability, CapabilityScope, Decider, Difficulty, Hedge, Latency, Money, Served,
+    TenantId, Timestamp, UserId,
 };
 use ip_storage::{Decided, SpentArms, Usage, UsageFilter};
 
@@ -73,6 +73,10 @@ pub struct UsageView {
     pub redacted_kinds: Option<String>,
     /// How long the caller waited, in milliseconds.
     pub latency_ms: u32,
+    /// What it cost, in micros of the deployment's currency, absent where nothing priced
+    /// the model. Absent is not nought: a model priced at nothing reports nought.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
     /// When it was recorded, in seconds since the unix epoch.
     pub created_at: Timestamp,
 }
@@ -96,6 +100,7 @@ impl From<Usage> for UsageView {
             redacted: usage.redacted.count(),
             redacted_kinds: usage.redacted.kinds().map(str::to_owned),
             latency_ms: Latency::millis(usage.latency),
+            cost_micros: usage.cost.map(Money::micros),
             created_at: usage.created_at,
         }
     }
@@ -114,6 +119,12 @@ pub struct SpendView {
     /// How many of the window's requests each level of the margin decided, and how many
     /// nothing could. The five add up to `answered`.
     pub decided: DecidedView,
+    /// What the window cost, in micros of the deployment's currency, over the rows that
+    /// carry a cost.
+    pub cost_micros: u64,
+    /// How many of the window's requests nothing priced, and which `cost_micros` is
+    /// therefore missing. Nought means the total is of everything answered.
+    pub unpriced: u64,
     /// What the window was asked open from, in seconds since the unix epoch; null when
     /// it opened with everything.
     pub since: Option<i64>,
@@ -156,6 +167,8 @@ impl SpendView {
             answered: sums.answered,
             sent: sums.sent,
             decided: sums.decided.into(),
+            cost_micros: sums.cost.micros(),
+            unpriced: sums.unpriced,
             since: None,
         }
     }
@@ -166,6 +179,8 @@ impl SpendView {
             answered: sums.answered,
             sent: sums.sent,
             decided: sums.decided.into(),
+            cost_micros: sums.cost.micros(),
+            unpriced: sums.unpriced,
             since: Some(since.unix_seconds()),
         }
     }
@@ -620,6 +635,69 @@ mod tests {
         let router = crate::routes::router(state.clone());
         let refused = read(&router, &state, "alice", "?tenant=other").await;
         assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// One request, priced at `micros`, under whoever is named.
+    fn costing(tenant_id: &str, user_id: &str, api: &str, micros: u64) -> NewUsage {
+        NewUsage {
+            cost: Some(Money::from_micros(micros)),
+            ..spent(tenant_id, user_id, api)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_row_says_what_it_cost_and_an_unpriced_one_says_nothing() {
+        let store = store().await;
+        store
+            .record_usage(costing("acme", "alice", "gemini", 810))
+            .await
+            .unwrap();
+        let state = state_over_shared(store);
+        let router = crate::routes::router(state.clone());
+
+        let priced = listed(read(&router, &state, "root", "?api=gemini").await).await;
+        assert_eq!(priced[0]["cost_micros"], 810);
+
+        // A row nothing priced carries no key at all, rather than a null or a nought.
+        let unpriced = listed(read(&router, &state, "root", "?api=openai").await).await;
+        assert!(unpriced[0].get("cost_micros").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_summary_totals_what_the_window_cost() {
+        let store = store().await;
+        for micros in [810, 1_530, 0] {
+            store
+                .record_usage(costing("acme", "alice", "gemini", micros))
+                .await
+                .unwrap();
+        }
+        let state = state_over_shared(store);
+        let router = crate::routes::router(state.clone());
+
+        let sums = summary_of(&router, &state, "root", "?api=gemini").await;
+        assert_eq!(sums["answered"], 3);
+        assert_eq!(sums["cost_micros"], 2_340);
+        assert_eq!(sums["unpriced"], 0, "every row of the window was priced");
+    }
+
+    /// A total over rows of which some are unpriced says how many it could not price,
+    /// rather than reading as a smaller bill.
+    #[tokio::test]
+    async fn a_summary_says_how_many_rows_it_could_not_price() {
+        let store = store().await;
+        store
+            .record_usage(costing("acme", "alice", "anthropic", 810))
+            .await
+            .unwrap();
+        let state = state_over_shared(store);
+        let router = crate::routes::router(state.clone());
+
+        // acme's two seeded rows carry no cost, and the one just written does.
+        let sums = summary_of(&router, &state, "alice", "?tenant=acme").await;
+        assert_eq!(sums["answered"], 3);
+        assert_eq!(sums["cost_micros"], 810);
+        assert_eq!(sums["unpriced"], 2);
     }
 
     /// What the summary exists for: how much of a window the local model carried, how

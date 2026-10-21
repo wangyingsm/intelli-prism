@@ -765,3 +765,58 @@ pub(crate) async fn a_listed_row_carries_what_it_cost(store: &impl Backend) {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].cost, Some(Money::from_micros(42)));
 }
+
+pub(crate) async fn a_window_sums_what_its_rows_cost(store: &impl UsageStore) {
+    for micros in [810, 1_530, 0] {
+        let priced = NewUsage {
+            cost: Some(Money::from_micros(micros)),
+            ..spent()
+        };
+        store.record_usage(priced).await.unwrap();
+    }
+    let sums = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sums.answered, 3);
+    assert_eq!(sums.cost, Money::from_micros(2_340));
+    assert_eq!(sums.unpriced, 0);
+}
+
+/// A window holding a row nothing priced reports the total it can and how many rows are
+/// missing from it, rather than reading as a smaller bill.
+pub(crate) async fn a_window_says_how_many_of_its_rows_nothing_priced(store: &impl UsageStore) {
+    let priced = NewUsage {
+        cost: Some(Money::from_micros(810)),
+        ..spent()
+    };
+    store.record_usage(priced).await.unwrap();
+    store.record_usage(spent()).await.unwrap();
+
+    let sums = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            Some(Timestamp::from_unix_seconds(0).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sums.answered, 2);
+    assert_eq!(sums.cost, Money::from_micros(810));
+    assert_eq!(sums.unpriced, 1);
+}
+
+pub(crate) async fn a_window_of_nothing_costs_nothing(store: &impl UsageStore) {
+    let sums = store
+        .sent_upstream(
+            &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sums.answered, 0);
+    assert_eq!(sums.cost, Money::ZERO);
+    assert_eq!(sums.unpriced, 0);
+}

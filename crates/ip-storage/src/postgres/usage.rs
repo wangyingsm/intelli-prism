@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, Decider, Difficulty, Hedge, ModelName, Replica, Served, TenantId, Timestamp,
-    Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Decider, Difficulty, Hedge, ModelName, Money, Replica, Served, TenantId,
+    Timestamp, Tokens, TraceId, TurnId, UserId,
 };
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -143,7 +143,9 @@ impl UsageStore for PostgresStore {
                COUNT(decided_by) FILTER (WHERE decided_by = $7), \
                COUNT(decided_by) FILTER (WHERE decided_by = $8), \
                COUNT(decided_by) FILTER (WHERE decided_by = $9), \
-               COUNT(*) FILTER (WHERE decided_by IS NULL) \
+               COUNT(*) FILTER (WHERE decided_by IS NULL), \
+               COALESCE(SUM(cost_micros), 0)::bigint, \
+               COUNT(*) FILTER (WHERE cost_micros IS NULL) \
                FROM usage \
              WHERE created_at >= $1 \
                AND ($2 IS NULL OR tenant_id = $2) \
@@ -176,6 +178,8 @@ impl UsageStore for PostgresStore {
                 arbiter: counted(5),
                 undecided: counted(6),
             },
+            cost: Money::from_micros(counted(7)),
+            unpriced: counted(8),
         })
     }
 

@@ -107,6 +107,9 @@ pub struct NewUsage {
 /// `sent` is the one number that cannot be got by adding the columns up: a row served
 /// out of the cache still carries the arms count its type says when nothing was raced,
 /// which is one, and one cached answer is not one request the upstream was billed for.
+///
+/// `cost` and `unpriced` travel together for the same reason: the sum is over the rows
+/// that have one, and the count says how many it is missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpentArms {
     /// Requests answered — cache included, which is every row.
@@ -116,6 +119,12 @@ pub struct SpentArms {
     pub sent: u64,
     /// How many of them each level of the margin decided.
     pub decided: Decided,
+    /// What the rows carrying a cost cost, added up.
+    pub cost: Money,
+    /// How many rows nothing priced, which the sum above is therefore missing. Reported
+    /// rather than folded in, because a total that quietly leaves rows out reads as a
+    /// smaller bill instead of an incomplete one.
+    pub unpriced: u64,
 }
 
 /// How many of a window's requests each level of the margin decided, and how many it

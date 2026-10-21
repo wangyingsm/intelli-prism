@@ -376,6 +376,8 @@ pub(crate) mod tests {
                 decided: ip_storage::Decided::default(),
                 answered: 0,
                 sent: 0,
+                cost: ip_core::Money::ZERO,
+                unpriced: 0,
             })
         }
     }

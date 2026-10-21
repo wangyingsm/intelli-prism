@@ -66,6 +66,10 @@ jsonpath "$.decided.turn" == 0
 jsonpath "$.decided.classifier" == 0
 jsonpath "$.decided.arbiter" == 0
 jsonpath "$.decided.undecided" == 0
+# An empty ledger cost nothing and left nothing unpriced; the two keys travel together,
+# so a client reading the bill knows how much of it is missing.
+jsonpath "$.cost_micros" == 0
+jsonpath "$.unpriced" == 0
 
 GET {{host}}/_ip/usage/summary?tenant=acme
 HTTP 200
