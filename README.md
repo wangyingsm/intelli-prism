@@ -36,9 +36,11 @@ per rule and per configured upstream; a rule can also race a request across two 
 and take the first successful answer, when the body is one the gateway can send more than once. A
 share of nothing drains an endpoint without touching the rule, and every usage row names the
 endpoint that answered and how many it was raced across.
-- **Quota and rate limits.** What a tenant, one of its accounts or one of its apis may spend, in
-tokens or in requests, over a minute, an hour, a day or a month. The counts live in the cache and
-are seeded from the usage rows; a caller past its limit is told with 429 and when to come back.
+- **Quota, rate and spend limits.** What a tenant, one of its accounts or one of its apis may
+spend, in tokens, in requests or in money, over a minute, an hour, a day or a month. The counts
+live in the cache and are seeded from the usage rows; a caller past its limit is told with 429,
+which of the three ran out, and when to come back. A money cap counts only what is priced, so it
+is as complete as the prices are.
 - **Two storage backends.** sqlite for a single node, postgres for a cluster, behind one trait and
 one conformance suite so neither drifts from the other.
 - **Two cache backends.** sled for a single node, redis for a cluster, same arrangement. The

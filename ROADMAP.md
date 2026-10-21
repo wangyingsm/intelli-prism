@@ -434,6 +434,23 @@ beside `unpriced` — how many of its rows it could not price. A total missing r
 incomplete rather than as a smaller bill.
 - `ip.cost` beside `ip.tokens`, in micros, under the same labels.
 
+### Capping what is spent
+
+- **A money cap is a limit like the other two**, not a budget system beside them. `counted:
+"money"` on `PUT /_ip/limits`, over the scope, the period and the api a limit already has, with
+the allowance in micros — five currency units a month is `5000000`. No migration and no new
+endpoint: the column stores the name of what is counted, and `money` is a new one.
+- What is spent comes from the same rows the dashboard reads, summed over `cost_micros`, seeded
+into the cache counter the way a token quota is seeded. A node that loses its cache re-reads the
+rows rather than handing a tenant a fresh allowance.
+- The refusal is the 429 every other limit gives, with the moment the next stretch begins, and
+it says `money` where another says `tokens` — in the message, in the log and on `ip.refused`. A
+caller that already backs off on 429 needs no change, which is why it is not a 402.
+- **A money cap is a quota, not a rate**: a count it cannot read refuses. A rate fails open
+because it protects an upstream; a quota and a cap fail closed because they protect a bill.
+- An answer out of the cache costs nothing and moves no cap, which is the same arithmetic that
+makes a hit free in the ledger.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -609,9 +626,17 @@ wherever the invoices are made.
 price changes what the next request costs, not what last month cost — which is what a ledger
 should do, and does mean rows answered before anyone set a price stay unpriced forever. Pricing
 a model is worth doing before the traffic, not after it.
-- **Nothing caps what is spent.** The money is measured, never limited: no budget, no alert, and
-no refusal when a tenant has spent what it was meant to. The entry below says what that would
-take.
+- **A money cap is only as complete as the prices.** A row nothing priced spends nothing
+against it, so a model nobody has priced is a model with no cap on it. This is the deliberate
+side of the trade: the alternative, refusing while anything in the window is unpriced, turns one
+forgotten price into an outage for every capped tenant, including their traffic to models that
+*are* priced. `GET /_ip/usage/summary` reports `unpriced` beside the total, which is where an
+operator sees the hole before it matters.
+- **A money cap overshoots by the request that crossed it**, exactly as a token quota does and
+for the same reason: a cost is known only once the answer is. A single request can therefore
+carry a tenant past its cap, and the next one is refused.
+- **A cap refuses; it does not warn.** There is no soft threshold, no alert and no webhook. An
+operator who wants to know before the wall reads the summary.
 
 ## To be implemented
 
@@ -670,13 +695,8 @@ management api.
 
 ### Money, what is left of it
 
-- **A cap on spend**, which is the whole of what M20 left out. The limits machinery already
-counts a thing per scope per window and refuses when it runs out, so money is a third thing
-counted over the same counters, seeded from the rows the way tokens and requests are. Two
-decisions make it more than a fourth column: a cost is known only after the answer, so a money
-cap overshoots by the request that crossed it, the way a token quota already does; and a window
-holding rows nothing priced has to decide whether to refuse on what it cannot see or admit it,
-which is a ruling and not an implementation detail.
+- Alerting before a cap is reached: a soft threshold that notifies rather than refuses. Needs a
+delivery mechanism the gateway has none of, which is the whole of why it is not built.
 - A per-tenant price or markup. A price today is what the vendor charges this deployment, and
 what a tenant is billed is left outside. Carrying it here means a second table and a decision
 about which of the two a usage row should hold.
