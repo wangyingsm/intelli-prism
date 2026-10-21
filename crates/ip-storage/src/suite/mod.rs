@@ -7,6 +7,7 @@ pub(crate) mod list;
 pub(crate) mod member_add;
 pub(crate) mod member_remove;
 pub(crate) mod plugin;
+pub(crate) mod price;
 pub(crate) mod revision;
 pub(crate) mod route;
 pub(crate) mod usage;
@@ -207,6 +208,18 @@ macro_rules! backend_suite {
             a_list_holds_only_the_tenant_it_names,
         ]);
     };
+    (price, $open:path) => {
+        $crate::suite::backend_suite!(@module price, $open, [
+            a_price_round_trips,
+            pricing_the_same_model_again_replaces_what_it_costs,
+            a_model_costing_nothing_is_priced_at_nothing,
+            every_model_holds_its_own_price,
+            removing_a_price_leaves_the_others,
+            removing_a_price_that_is_absent_reports_it_missing,
+            every_change_to_a_price_moves_the_revision_on,
+            a_price_belongs_to_no_tenant,
+        ]);
+    };
     (isolation, $open:path) => {
         $crate::suite::backend_suite!(@module isolation, $open, [
             members_of_one_tenant_are_not_listed_for_another,
@@ -265,6 +278,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(revision, $open);
         $crate::suite::backend_suite!(usage, $open);
         $crate::suite::backend_suite!(limit, $open);
+        $crate::suite::backend_suite!(price, $open);
         $crate::suite::backend_suite!(isolation, $open);
     };
 }

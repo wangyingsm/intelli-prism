@@ -99,6 +99,8 @@ pub enum Entity {
     Usage,
     /// What a scope may spend.
     Limit,
+    /// What a model costs.
+    Price,
 }
 
 impl fmt::Display for Entity {
@@ -114,6 +116,7 @@ impl fmt::Display for Entity {
             Self::RuleRevision => "rule revision",
             Self::Usage => "usage",
             Self::Limit => "limit",
+            Self::Price => "price",
         })
     }
 }

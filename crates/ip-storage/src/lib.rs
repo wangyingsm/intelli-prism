@@ -11,6 +11,7 @@ pub mod model;
 pub mod plugin;
 #[cfg(feature = "fast-storage")]
 pub mod postgres;
+pub mod price;
 pub mod revision;
 pub mod route;
 #[cfg(feature = "standalone-storage")]
@@ -37,6 +38,7 @@ pub use plugin::{
 };
 #[cfg(feature = "fast-storage")]
 pub use postgres::PostgresStore;
+pub use price::{NewPrice, PriceStore, Priced};
 pub use revision::{RevisionStore, RuleRevision, RuleSet};
 pub use route::RouteStore;
 #[cfg(feature = "standalone-storage")]

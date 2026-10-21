@@ -2,6 +2,7 @@ mod identity;
 mod limit;
 mod list;
 mod plugin;
+mod price;
 mod revision;
 mod route;
 mod usage;

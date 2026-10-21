@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use ip_core::{
-    Checksum, Counted, Grant, Grants, LimitScope, NewPluginRule, PassphraseHash, Period,
+    Checksum, Counted, Grant, Grants, LimitScope, ModelName, NewPluginRule, PassphraseHash, Period,
     PluginKind, PluginOrder, PluginRule, RouteKey, RouteRule, TenantId, Timestamp, UserId,
 };
 
@@ -14,6 +14,7 @@ use crate::limit::{Limit, LimitStore, NewLimit};
 use crate::list::{ListStore, Listed, Page};
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{NewPlugin, Plugin, PluginOwner, PluginRecord, PluginRuleStore, PluginStore};
+use crate::price::{NewPrice, PriceStore, Priced};
 use crate::revision::{RevisionStore, RuleRevision, RuleSet};
 use crate::route::RouteStore;
 use crate::store::{Backend, GrantStore, MembershipStore, TenantStore, UserStore};
@@ -387,6 +388,24 @@ impl LimitStore for FailingStore {
     async fn limits(&self) -> Result<Vec<Limit>, StorageError> {
         self.answering()?;
         self.inner.limits().await
+    }
+}
+
+#[async_trait]
+impl PriceStore for FailingStore {
+    async fn put_price(&self, price: NewPrice) -> Result<Priced, StorageError> {
+        self.answering()?;
+        self.inner.put_price(price).await
+    }
+
+    async fn remove_price(&self, model: &ModelName) -> Result<(), StorageError> {
+        self.answering()?;
+        self.inner.remove_price(model).await
+    }
+
+    async fn prices(&self) -> Result<Vec<Priced>, StorageError> {
+        self.answering()?;
+        self.inner.prices().await
     }
 }
 

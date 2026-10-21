@@ -6,6 +6,7 @@ use crate::limit::LimitStore;
 use crate::list::ListStore;
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{PluginRuleStore, PluginStore};
+use crate::price::PriceStore;
 use crate::revision::RevisionStore;
 use crate::route::RouteStore;
 use crate::usage::UsageStore;
@@ -101,6 +102,7 @@ pub trait Backend:
     + RevisionStore
     + UsageStore
     + LimitStore
+    + PriceStore
 {
 }
 
@@ -113,6 +115,7 @@ impl<T> Backend for T where
         + RevisionStore
         + UsageStore
         + LimitStore
+        + PriceStore
 {
 }
 
