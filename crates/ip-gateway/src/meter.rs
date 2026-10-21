@@ -23,16 +23,17 @@
 //!   — how slow is the gateway — that is about the deployment and not about a tenant.
 //! - `api`, `model` — bounded by the upstreams somebody declared.
 //! - `outcome` — which of the three places an answer came from.
+//! - `kind` — on `ip.redacted` alone, bounded by the filter stanza an operator wrote.
+//!   Nothing a caller sends can mint one.
 //!
 //! The usage rows remain the detailed record: they hold every one of these per
 //! request, queryable and audited. Metrics are the dashboard, the rows are the ledger,
 //! and where both could answer a question the row is authoritative. That is what stops
 //! this label set having to grow to cover every question anyone will ever ask.
 
-use ip_core::{
-    Counted, Decider, Difficulty, Hedge, Latency, ModelName, Redacted, Served, TenantId, Tokens,
-};
+use ip_core::{Counted, Decider, Difficulty, Hedge, Latency, ModelName, Served, TenantId, Tokens};
 use ip_embed::Nearness;
+use ip_filter::Redaction;
 
 use crate::stage::Dispatched;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
@@ -201,8 +202,15 @@ impl Meters {
         if asked.served == Served::Upstream {
             self.arms.add(u64::from(asked.raced.get()), &whose);
         }
-        if let Some(taken) = asked.redacted.count() {
-            self.redacted.add(u64::from(taken), &whose);
+        // One series per kind, so a dashboard can say *what* is being taken out rather
+        // than only how much. Kinds come from the filter stanza and nowhere else, so
+        // the count of them is the operator's own and is small. Nothing is added where
+        // nothing was taken: there is no kind to name it by.
+        for (kind, count) in asked.redacted.counted() {
+            let mut named = whose.clone();
+            named.push(KeyValue::new("kind", kind.as_str().to_owned()));
+            self.redacted
+                .add(u64::try_from(*count).unwrap_or(u64::MAX), &named);
         }
     }
 
@@ -355,8 +363,8 @@ pub(crate) struct Answered<'a> {
     pub dispatched: Dispatched,
     /// How many endpoints the request was raced across; one when it was not raced.
     pub raced: Hedge,
-    /// What the filter took out, if a filter looked at all.
-    pub redacted: Redacted,
+    /// What the filter took out, kind by kind, and empty where it took nothing.
+    pub redacted: &'a Redaction,
 }
 
 impl Answered<'_> {
@@ -460,7 +468,7 @@ mod tests {
             latency: Latency::from_millis(42),
             dispatched: Dispatched::at(Difficulty::Hard, Decider::Classifier),
             raced: Hedge::NONE,
-            redacted: Redacted::NONE,
+            redacted: &Redaction::default(),
         };
         // Sorted, because labels are a set: the order they are built in is not part
         // of what a series is, and asserting it would break on a harmless rewrite.
@@ -526,7 +534,7 @@ mod tests {
             latency: Latency::from_millis(1),
             dispatched: Dispatched::NONE,
             raced: Hedge::NONE,
-            redacted: Redacted::NONE,
+            redacted: &Redaction::default(),
         };
         let named = |labels: Vec<KeyValue>| -> Vec<String> {
             labels.iter().map(|at| at.key.to_string()).collect()
@@ -578,7 +586,7 @@ mod tests {
             latency: Latency::from_millis(1),
             dispatched: Dispatched::NONE,
             raced: Hedge::NONE,
-            redacted: Redacted::NONE,
+            redacted: &Redaction::default(),
         };
         let model = asked
             .labels()

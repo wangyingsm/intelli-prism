@@ -22,7 +22,6 @@ use crate::limit::{Asking, Limiter, Limits};
 use crate::measure::{Measuring, measure};
 use crate::meter::Meters;
 use crate::stage::Dispatched;
-use ip_core::Redacted;
 
 /// The records still being written, so a shutdown can wait for them.
 ///
@@ -188,7 +187,7 @@ impl Recording {
                 dispatched,
                 // The request was filtered before its key was taken, so a hit is a hit
                 // on redacted bytes and the row says what that cost.
-                redacted: filtered.recorded(),
+                filtered: filtered.clone(),
             },
         );
     }
@@ -252,7 +251,7 @@ impl Recording {
                 arms: Hedge::default(),
                 dispatched: Dispatched::NONE,
                 // The arbiter's question is the gateway's own, and nothing filters it.
-                redacted: Redacted::NONE,
+                filtered: Filtered::default(),
             },
         );
     }
@@ -272,7 +271,7 @@ impl Recording {
                 latency: Latency::from_millis(self.started.elapsed().as_millis()),
                 dispatched: serving.dispatched,
                 raced: serving.arms,
-                redacted: serving.redacted.clone(),
+                redacted: serving.filtered.redaction(),
             });
         }
         let Some(store) = self.keeping.store.clone() else {
@@ -294,7 +293,7 @@ impl Recording {
             raced_across: serving.arms,
             dispatched_class: serving.dispatched.class(),
             decided_by: serving.dispatched.decided_by(),
-            redacted: serving.redacted,
+            redacted: serving.filtered.recorded(),
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
         };
         let limiting = self.limiting;
@@ -346,7 +345,11 @@ struct Serving {
     /// treated as, or about who decided that.
     dispatched: Dispatched,
     /// What the filter took out of the request and the answer together.
-    redacted: Redacted,
+    ///
+    /// The pass itself rather than what it recorded, because the row wants a count
+    /// with the kinds written out and the meter wants them apart, and two fields
+    /// saying the same thing differently is exactly what this column exists to stop.
+    filtered: Filtered,
 }
 
 /// A body that measures what passes, and records it when the last of it has.
@@ -386,7 +389,7 @@ impl Measured {
                 endpoint: self.served_by.take(),
                 arms: self.raced,
                 dispatched: self.dispatched,
-                redacted: filtered.recorded(),
+                filtered,
             },
         );
     }

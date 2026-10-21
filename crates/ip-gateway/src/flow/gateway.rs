@@ -1003,6 +1003,106 @@ mod tests {
         assert_eq!(taken, 1, "one address went out of the request");
     }
 
+    /// Two kinds in one request are two series, each counted under its own name, and
+    /// their sum is the one number the counter said before it knew the difference.
+    #[tokio::test]
+    async fn what_was_taken_out_is_counted_by_kind() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let filtering = Arc::new(crate::filter::Filtering::new(
+            ip_filter::Detectors::of(&[
+                ip_filter::Secret::new(
+                    ip_filter::Kind::new("email").unwrap(),
+                    ip_filter::Match::Regexp(r"[a-z]+@[a-z.]+".to_owned()),
+                ),
+                ip_filter::Secret::new(
+                    ip_filter::Kind::new("api-key").unwrap(),
+                    ip_filter::Match::Regexp(r"sk-[a-z0-9]+".to_owned()),
+                ),
+            ])
+            .unwrap(),
+        ));
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream)
+            .filtering(filtering)
+            .measuring(Arc::new(Meters::new(&provider.meter("test"))));
+        let answered = gateway
+            .handle(
+                context(granted()),
+                request(
+                    "/anthropic/messages",
+                    r#"{"messages":[{"role":"user","content":"ada@example.com asked with sk-abc123 and sk-def456"}]}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        let mut by_kind: Vec<(String, u64)> = counted(&exporter, &provider, "ip.redacted")
+            .into_iter()
+            .map(|(labels, value)| {
+                let kind = labels
+                    .iter()
+                    .find(|(key, _)| key == "kind")
+                    .map(|(_, kind)| kind.clone())
+                    .expect("every redaction is counted under the kind it was");
+                (kind, value)
+            })
+            .collect();
+        by_kind.sort();
+        assert_eq!(
+            by_kind,
+            vec![("api-key".to_owned(), 2), ("email".to_owned(), 1)],
+            "two keys and one address, each under its own name"
+        );
+    }
+
+    /// A request a filter looked at and found nothing in adds no series at all: there
+    /// is no kind to count it under, and a dashboard reads the absence as the nought
+    /// it is.
+    #[tokio::test]
+    async fn a_clean_request_is_counted_under_no_kind() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let filtering = Arc::new(crate::filter::Filtering::new(
+            ip_filter::Detectors::of(&[ip_filter::Secret::new(
+                ip_filter::Kind::new("email").unwrap(),
+                ip_filter::Match::Regexp(r"[a-z]+@[a-z.]+".to_owned()),
+            )])
+            .unwrap(),
+        ));
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream)
+            .filtering(filtering)
+            .measuring(Arc::new(Meters::new(&provider.meter("test"))));
+        let answered = gateway
+            .handle(
+                context(granted()),
+                request(
+                    "/anthropic/messages",
+                    r#"{"messages":[{"role":"user","content":"nothing to hide here"}]}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        assert!(
+            counted(&exporter, &provider, "ip.redacted").is_empty(),
+            "nothing was taken out, so nothing names it"
+        );
+        assert!(
+            !counted(&exporter, &provider, "ip.requests").is_empty(),
+            "the request itself was still counted"
+        );
+    }
+
     /// A gateway nobody asked to count does not, and still serves. Without this the
     /// test above would pass just as well if counting were unconditional.
     #[tokio::test]
