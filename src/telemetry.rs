@@ -3,21 +3,25 @@
 //!
 //! Traces say what happened to one request. Metrics say what has been happening to all of
 //! them, which is a different question and the only one a dashboard can ask: no amount of
-//! sampled spans tells an operator their cache hit rate. Both go to the same collector,
-//! because an operator configuring one endpoint has configured observability.
+//! sampled spans tells an operator their cache hit rate. Logs say what the process itself
+//! had to report, which neither of the other two carries. All three go to the same
+//! collector, because an operator configuring one endpoint has configured observability.
 
 use std::future::Future;
 
 use ip_config::{SampleRatio, TelemetryConfig};
 use ip_core::TraceId;
 use opentelemetry::trace::{SpanId, TracerProvider as _};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{ExporterBuildError, WithExportConfig};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::{LogExporter, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::{SdkMeterProvider, exporter::PushMetricExporter};
 use opentelemetry_sdk::trace::{
     IdGenerator, RandomIdGenerator, Sampler, SdkTracerProvider, SpanExporter,
 };
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use url::Url;
@@ -38,18 +42,19 @@ pub async fn under<F: Future>(trace: TraceId, work: F) -> F::Output {
 
 /// What the process exports through, held until it ends.
 ///
-/// Both providers are held rather than only registered, because both have to be told to
+/// Every provider is held rather than only registered, because each has to be told to
 /// flush: a gateway that stops without one has thrown away whatever it had gathered since
 /// the last export, and for metrics that is up to a whole interval of them.
 pub struct Telemetry {
     provider: Option<SdkTracerProvider>,
     meter: Option<SdkMeterProvider>,
+    logger: Option<SdkLoggerProvider>,
 }
 
 impl Telemetry {
     /// Sends what is recorded but not yet exported, and stops exporting.
     ///
-    /// Each is flushed even if the other will not: one collector refusing a batch is no
+    /// Each is flushed even if the others will not: one collector refusing a batch is no
     /// reason to drop the batch beside it.
     pub fn shutdown(&self) {
         if let Some(provider) = &self.provider
@@ -62,45 +67,102 @@ impl Telemetry {
         {
             tracing::warn!(%error, "could not flush the metrics");
         }
+        if let Some(logger) = &self.logger
+            && let Err(error) = logger.shutdown()
+        {
+            tracing::warn!(%error, "could not flush the logs");
+        }
     }
 }
 
-/// Installs the log subscriber for the process, exporting traces and metrics when a
-/// collector is configured.
+/// Installs the log subscriber for the process, exporting logs, traces and metrics when
+/// a collector is configured.
 ///
-/// A collector that cannot be reached leaves the logs alone: the server serves without
-/// either rather than refusing to start. The two are built separately on purpose — a
-/// collector that takes spans and refuses metrics, or the reverse, leaves the gateway
-/// with whichever of them works instead of neither.
+/// A collector that cannot be reached leaves the printed logs alone: the server serves
+/// without the export rather than refusing to start, and whatever `docker logs` showed
+/// before shows the same now. The three are built separately on purpose — a collector
+/// that takes spans and refuses metrics, or any other pairing, leaves the gateway with
+/// whichever of them works instead of none.
 pub fn install(config: &TelemetryConfig) -> Telemetry {
     let level = LevelFilter::from(config.log_level);
-    let logs = tracing_subscriber::registry()
-        .with(level)
-        .with(tracing_subscriber::fmt::layer());
+    let printed = tracing_subscriber::fmt::layer();
     let Some(endpoint) = &config.otlp_endpoint else {
-        logs.init();
+        tracing_subscriber::registry()
+            .with(level)
+            .with(printed)
+            .init();
         return Telemetry {
             provider: None,
             meter: None,
+            logger: None,
         };
     };
-    let provider = match exporting(endpoint, config.sample_ratio) {
-        Ok(provider) => {
-            let traces = tracing_opentelemetry::layer().with_tracer(provider.tracer(SERVICE));
-            logs.with(traces).init();
-            tracing::info!(%endpoint, ratio = config.sample_ratio.get(), "exporting traces");
-            Some(provider)
-        }
+    let traced = exporting(endpoint, config.sample_ratio);
+    let shipped = shipping(endpoint);
+    let traces = traced
+        .as_ref()
+        .ok()
+        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer(SERVICE)));
+    let lines = shipped
+        .as_ref()
+        .ok()
+        .map(|provider| OpenTelemetryTracingBridge::new(provider).with_filter(ours()));
+    tracing_subscriber::registry()
+        .with(level)
+        .with(printed)
+        .with(traces)
+        .with(lines)
+        .init();
+    match &traced {
+        Ok(_) => tracing::info!(%endpoint, ratio = config.sample_ratio.get(), "exporting traces"),
         Err(error) => {
-            logs.init();
-            tracing::error!(%error, %endpoint, "could not export traces to the collector");
-            None
+            tracing::error!(%error, %endpoint, "could not export traces to the collector")
         }
-    };
-    Telemetry {
-        provider,
-        meter: metering(endpoint),
     }
+    match &shipped {
+        Ok(_) => tracing::info!(%endpoint, "exporting logs"),
+        Err(error) => tracing::error!(%error, %endpoint, "could not export logs to the collector"),
+    }
+    Telemetry {
+        provider: traced.ok(),
+        meter: metering(endpoint),
+        logger: shipped.ok(),
+    }
+}
+
+/// The machinery an export runs on, whose own logs the bridge must not carry.
+const PLUMBING: [&str; 5] = ["opentelemetry", "tonic", "hyper", "h2", "tower"];
+
+/// What the bridge ships: everything the process logs except what the export itself logs.
+///
+/// A collector that starts refusing batches makes the exporter say so, and a bridge that
+/// shipped that line would hand it straight back to the exporter it came from. A failure
+/// that feeds itself is the one failure a log pipeline must not have, so these targets are
+/// printed and never exported.
+fn ours() -> Targets {
+    PLUMBING.iter().fold(
+        Targets::new().with_default(LevelFilter::TRACE),
+        |targets, target| targets.with_target(*target, LevelFilter::OFF),
+    )
+}
+
+/// Builds the log exporter the configured collector is reached over, over the same
+/// transport the spans take.
+fn shipping(endpoint: &Url) -> Result<SdkLoggerProvider, ExporterBuildError> {
+    let exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint.as_str())
+        .build()?;
+    Ok(logging(exporter))
+}
+
+/// The logger provider itself: a batched exporter under our service name, which is what a
+/// collector files the lines against.
+pub(crate) fn logging<E: LogExporter + 'static>(exporter: E) -> SdkLoggerProvider {
+    SdkLoggerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(Resource::builder().with_service_name(SERVICE).build())
+        .build()
 }
 
 /// The meter provider, registered for the process so an instrument can be made wherever
@@ -187,7 +249,11 @@ impl IdGenerator for Drawn {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
+    use opentelemetry::logs::{AnyValue, Severity};
+    use opentelemetry_sdk::logs::InMemoryLogExporter;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use tracing_subscriber::Registry;
 
@@ -281,6 +347,7 @@ mod tests {
         let telemetry = Telemetry {
             provider: None,
             meter: Some(provider),
+            logger: None,
         };
         telemetry.shutdown();
 
@@ -339,8 +406,97 @@ mod tests {
         let quiet = Telemetry {
             provider: None,
             meter: None,
+            logger: None,
         };
         quiet.shutdown();
+    }
+
+    /// Records what the bridge ships, under the subscriber a test installs for itself.
+    fn listening() -> (
+        InMemoryLogExporter,
+        SdkLoggerProvider,
+        impl tracing::Subscriber,
+    ) {
+        let exporter = InMemoryLogExporter::default();
+        let provider = logging(exporter.clone());
+        let subscriber = Registry::default()
+            .with(OpenTelemetryTracingBridge::new(&provider).with_filter(ours()));
+        (exporter, provider, subscriber)
+    }
+
+    /// What one log line becomes at the far end, which is the whole of what this commit
+    /// does: a line the process wrote, carrying its level and its words, filed under the
+    /// service that wrote it.
+    #[test]
+    fn a_log_line_reaches_the_collector() {
+        let (exporter, provider, subscriber) = listening();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "ip_gateway::flow", "the upstream refused");
+        });
+        provider.force_flush().unwrap();
+
+        let shipped = exporter.get_emitted_logs().unwrap();
+        assert_eq!(shipped.len(), 1);
+        let line = &shipped[0];
+        assert_eq!(line.record.severity_number(), Some(Severity::Error));
+        assert_eq!(
+            line.record.target().map(Cow::as_ref),
+            Some("ip_gateway::flow")
+        );
+        let Some(AnyValue::String(body)) = line.record.body() else {
+            panic!("a line carries what was written");
+        };
+        assert_eq!(body.as_str(), "the upstream refused");
+        assert!(
+            line.resource
+                .iter()
+                .any(|(key, value)| key.as_str() == "service.name" && value.as_str() == SERVICE),
+            "the collector files these under the service that sent them"
+        );
+    }
+
+    /// The guard that keeps a failing export from feeding itself: the exporter's own
+    /// complaint is printed and never shipped, while the line beside it is shipped.
+    #[test]
+    fn the_export_does_not_ship_its_own_complaints() {
+        let (exporter, provider, subscriber) = listening();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "opentelemetry", "the collector refused the batch");
+            tracing::error!(target: "tonic::transport", "the channel is gone");
+            tracing::error!(target: "ip_gateway", "the upstream refused");
+        });
+        provider.force_flush().unwrap();
+
+        let shipped = exporter.get_emitted_logs().unwrap();
+        let targets: Vec<_> = shipped
+            .iter()
+            .filter_map(|line| line.record.target().map(Cow::to_string))
+            .collect();
+        assert_eq!(
+            targets,
+            vec!["ip_gateway".to_owned()],
+            "a line the exporter wrote about its own failure must not go back to it"
+        );
+    }
+
+    /// Stopping flushes the logs too, and the provider is reached through `Telemetry`
+    /// rather than directly, so the assertion is about what the process does on its way
+    /// out. Read while it is still alive, because a provider also flushes when dropped.
+    #[test]
+    fn stopping_flushes_the_logs() {
+        let exporter = InMemoryLogExporter::default();
+        let telemetry = Telemetry {
+            provider: None,
+            meter: None,
+            logger: Some(logging(exporter.clone())),
+        };
+        telemetry.shutdown();
+
+        assert!(
+            exporter.is_shutdown_called(),
+            "stopping the process should have flushed what was written"
+        );
+        drop(telemetry);
     }
 
     /// Drives a future on this thread, so the spans it opens reach the subscriber installed here.
