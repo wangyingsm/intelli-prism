@@ -283,6 +283,11 @@ impl Recording {
         // Counted here rather than beside the store, so that a gateway recording no
         // rows still has a dashboard, and so that the two can never describe the same
         // request differently: there is one place that knows what it was.
+        // Above the return below, or a gateway with a dashboard and no rows prices nothing.
+        let cost = model
+            .as_ref()
+            .and_then(|model| self.prices.of(model))
+            .map(|price| priced(price, tokens, serving.arms));
         if let Some(meters) = &self.keeping.meters {
             meters.answered(&crate::meter::Answered {
                 tenant: &self.tenant,
@@ -294,6 +299,7 @@ impl Recording {
                 dispatched: serving.dispatched,
                 raced: serving.arms,
                 redacted: serving.filtered.redaction(),
+                cost,
             });
         }
         let Some(store) = self.keeping.store.clone() else {
@@ -302,10 +308,6 @@ impl Recording {
             self.spend(tokens);
             return;
         };
-        let cost = model
-            .as_ref()
-            .and_then(|model| self.prices.of(model))
-            .map(|price| priced(price, tokens, serving.arms));
         let usage = NewUsage {
             trace: self.trace,
             turn: self.turn,

@@ -87,6 +87,7 @@ log_level = "info"
 #
 #   ip.requests            answered, by tenant, api, model and where the answer came from
 #   ip.tokens              spent, by direction — zero on a cache hit, which is the point
+#   ip.cost                what those tokens cost, in micros, where the model is priced
 #   ip.latency             end to end, in ms, buckets from 1 ms to a minute
 #   ip.classified          by the class dispatched at and the level that named it
 #   ip.refused             turned away by a limit, and which quota ran out

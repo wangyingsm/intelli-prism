@@ -31,7 +31,9 @@
 //! and where both could answer a question the row is authoritative. That is what stops
 //! this label set having to grow to cover every question anyone will ever ask.
 
-use ip_core::{Counted, Decider, Difficulty, Hedge, Latency, ModelName, Served, TenantId, Tokens};
+use ip_core::{
+    Counted, Decider, Difficulty, Hedge, Latency, ModelName, Money, Served, TenantId, Tokens,
+};
 use ip_embed::Nearness;
 use ip_filter::Redaction;
 
@@ -97,6 +99,7 @@ pub struct Meters {
     refused: Counter<u64>,
     arms: Counter<u64>,
     redacted: Counter<u64>,
+    cost: Counter<u64>,
 }
 
 impl Meters {
@@ -162,6 +165,14 @@ impl Meters {
                 .with_description("Secrets taken out of a request or its answer.")
                 .with_unit("{secret}")
                 .build(),
+            cost: meter
+                .u64_counter("ip.cost")
+                .with_description(
+                    "What answers cost, at the prices the deployment set, in micros \
+                     of its currency.",
+                )
+                .with_unit("{micro}")
+                .build(),
         }
     }
 
@@ -211,6 +222,13 @@ impl Meters {
             named.push(KeyValue::new("kind", kind.as_str().to_owned()));
             self.redacted
                 .add(u64::try_from(*count).unwrap_or(u64::MAX), &named);
+        }
+        // Micros rather than a float: a counter is integral, and a dashboard dividing
+        // by a million cannot drift the way an accumulated float does. Nothing is added
+        // where nothing priced the model — unlike the tokens above, there is no figure
+        // to add, and a zero would read as an answer that was free.
+        if let Some(cost) = asked.cost {
+            self.cost.add(cost.micros(), &whose);
         }
     }
 
@@ -365,6 +383,9 @@ pub(crate) struct Answered<'a> {
     pub raced: Hedge,
     /// What the filter took out, kind by kind, and empty where it took nothing.
     pub redacted: &'a Redaction,
+    /// What it cost at the prices in force, and nothing at all where nothing priced
+    /// the model.
+    pub cost: Option<Money>,
 }
 
 impl Answered<'_> {
@@ -469,6 +490,7 @@ mod tests {
             dispatched: Dispatched::at(Difficulty::Hard, Decider::Classifier),
             raced: Hedge::NONE,
             redacted: &Redaction::default(),
+            cost: None,
         };
         // Sorted, because labels are a set: the order they are built in is not part
         // of what a series is, and asserting it would break on a harmless rewrite.
@@ -535,6 +557,7 @@ mod tests {
             dispatched: Dispatched::NONE,
             raced: Hedge::NONE,
             redacted: &Redaction::default(),
+            cost: None,
         };
         let named = |labels: Vec<KeyValue>| -> Vec<String> {
             labels.iter().map(|at| at.key.to_string()).collect()
@@ -587,6 +610,7 @@ mod tests {
             dispatched: Dispatched::NONE,
             raced: Hedge::NONE,
             redacted: &Redaction::default(),
+            cost: None,
         };
         let model = asked
             .labels()

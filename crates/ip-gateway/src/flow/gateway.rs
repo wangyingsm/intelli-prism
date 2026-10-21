@@ -806,6 +806,55 @@ mod tests {
         assert!(labels.contains(&"api".to_owned()), "{labels:?}");
     }
 
+    /// What an answer cost, counted beside what it spent, under the same labels.
+    #[tokio::test]
+    async fn what_an_answer_cost_is_counted() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (gateway, exporter, provider) = metered(upstream);
+        let gateway = gateway.with_prices(prices());
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        // 120 in at three a million and 30 out at fifteen: 810 micros, the figure the
+        // usage row carries for the same request.
+        assert_eq!(
+            counted(&exporter, &provider, "ip.cost"),
+            vec![(
+                vec![
+                    ("api".to_owned(), "anthropic".to_owned()),
+                    ("model".to_owned(), "claude-opus-5".to_owned()),
+                    ("outcome".to_owned(), "upstream".to_owned()),
+                    ("tenant".to_owned(), "acme".to_owned()),
+                ],
+                810
+            )]
+        );
+    }
+
+    /// Unlike the tokens, an unpriced answer adds nothing at all: there is no figure,
+    /// and a zero would read as an answer that was free.
+    #[tokio::test]
+    async fn an_answer_nothing_prices_adds_nothing_to_the_cost() {
+        let upstream = FakeUpstream::answering(ANSWERED);
+        let (gateway, exporter, provider) = metered(upstream);
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+
+        assert!(
+            counted(&exporter, &provider, "ip.cost").is_empty(),
+            "an unpriced answer minted a cost series"
+        );
+        // The request itself was counted all the same, so this is the cost series
+        // being absent rather than the whole dashboard being.
+        assert_eq!(counted(&exporter, &provider, "ip.requests").len(), 1);
+    }
+
     /// A cache hit spends nothing, and the zero is the point: a series that appeared
     /// only when tokens were spent could not show what the cache saved.
     #[tokio::test]
