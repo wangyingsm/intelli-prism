@@ -234,6 +234,23 @@ mod tests {
         assert_eq!(semantic.library, None);
     }
 
+    /// The scrape endpoint, uncommented as an operator would take it up.
+    ///
+    /// The log file the section above it shows cannot be taken up here: it names a
+    /// path under `/var/log`, and the key is refused when that directory does not
+    /// exist, which is the point of checking it as the file is read.
+    #[test]
+    fn the_scrape_endpoint_parses_when_taken_up() {
+        let config = ip_config::Config::parse(&taken_from("# [telemetry.scrape]"))
+            .expect("the scrape section parses");
+        let scrape = config.telemetry.scrape.expect("the section is there");
+        assert_eq!(scrape.listen.to_string(), "127.0.0.1:9464");
+        assert_eq!(
+            scrape.token.map(|token| token.expose().to_owned()),
+            Some("replace-me".to_owned())
+        );
+    }
+
     /// The example with one commented section taken up, from its table header to the
     /// end of the file.
     ///

@@ -65,17 +65,25 @@ ttl = 21600
 [telemetry]
 # trace, debug, info, warn or error. Default info.
 log_level = "info"
-# A collector reached over grpc. Traces and metrics are both exported only when this
-# is set, and the collector forwards them wherever your dashboards live. There is no
-# scrape endpoint: nothing new listens, so there is nothing new to guard — and metrics
-# carry a tenant label, which is tenant data and not something to serve unauthenticated.
+# A collector reached over grpc. Logs, traces and metrics all go here when it is set,
+# and the collector forwards them wherever your dashboards live. Setting it never
+# silences the process output: whatever `docker logs` showed before shows the same
+# afterwards, so a collector that is down costs you nothing you already had.
 # otlp_endpoint = "http://localhost:4317/"
 # Share of requests whose trace is exported, 0 to 1. Default 1, every request.
 # Metrics are not sampled: a rate counted from a tenth of the requests is a tenth of
 # the rate, and a histogram of a tenth of them has a tenth of its shape.
 # sample_ratio = 1.0
 #
-# What is counted, once a collector is configured:
+# A file the logs are also written to, rolled daily — for a deployment with no
+# collector, where the process output dies with the process. The directory must exist:
+# the file is checked when this is read, so a mistyped path is a refusal at startup
+# rather than a tree of logs nobody ever looks in. Unset, nothing is written.
+# log_file = "/var/log/intelli-prism/gateway.log"
+# How many rolled files are kept beside the live one, 1 to 365. Default 7.
+# log_keep = 7
+#
+# What is counted, once a collector or a scrape endpoint is configured:
 #
 #   ip.requests            answered, by tenant, api, model and where the answer came from
 #   ip.tokens              spent, by direction — zero on a cache hit, which is the point
@@ -83,7 +91,7 @@ log_level = "info"
 #   ip.classified          by the class dispatched at and the level that named it
 #   ip.refused             turned away by a limit, and which quota ran out
 #   ip.arms                sent upstream; the gap from ip.requests is what hedging costs
-#   ip.redacted            secrets taken out of a request or its answer
+#   ip.redacted            secrets taken out of a request or its answer, by kind
 #   ip.semantic.lookups    turns at the semantic cache: hit, miss, ineligible, unembedded
 #   ip.semantic.nearness   how near the nearest question came, hit or miss
 #
@@ -96,6 +104,23 @@ log_level = "info"
 # fourteen times more for a question about the deployment rather than any one tenant.
 # If your tenant count runs to thousands, the usage rows hold every one of these
 # figures per request and are the better place to ask a per-tenant question.
+# ip.redacted also carries a `kind`, one per secret you named in [filter]: bounded by
+# your own configuration, and nothing a caller sends can mint one. A request a filter
+# looked at and found nothing in adds no series at all — there is no kind to name it
+# by — while the usage row still records the clean nought.
+
+# Serve the numbers for a scraper to come and take them, instead of pushing to a
+# collector — or as well as, since the two are independent. Unset, nothing listens.
+#
+# Its own address, never the gateway's port, so what may reach it is decided by where
+# you bind it. What it serves carries a tenant label, which is tenant data: bind it to
+# the loopback or a private interface, and set a token for a scraper that has to cross
+# a network to reach it. Unset, anything that reaches the address is answered.
+#
+# One path, GET /metrics, in the Prometheus text format. Everything else is a 404.
+# [telemetry.scrape]
+# listen = "127.0.0.1:9464"
+# token = "replace-me"
 
 # One block per upstream llm. The id is what routing rules and api capabilities name.
 # An upstream standing behind several endpoints adds a [[upstream.target]] block for each one

@@ -382,6 +382,33 @@ tenth of the rate.
 series per tenant, a histogram one per bucket per tenant — and what a particular tenant waited
 is in their usage rows, per request, to the millisecond.
 
+### Saying where the logs, and the numbers, are read
+
+- Logs go to the collector the traces and the metrics go to, over the same endpoint and the
+same transport. One `otlp_endpoint` configures all three signals, which is what its name has
+promised since it was written.
+- The export never silences the process output. Whatever `docker logs` or `journalctl` showed
+before shows the same afterwards, because a gateway whose only log sink is the one that has
+just failed is a gateway nobody can diagnose.
+- The bridge does not carry the export's own lines. A collector that starts refusing batches
+makes the exporter say so, and shipping that line would hand it back to the exporter it came
+from; a failure that feeds itself is the one failure a log pipeline must not have.
+- A rolling file beside it, for the deployment that runs no collector: a new file each day, as
+many kept as were asked for, written off the thread that logged. The path is checked when the
+configuration is read rather than at the first line, because the appender would make a missing
+directory rather than refuse, and a mistyped path would quietly become a tree nobody reads.
+- **A scrape endpoint, for the deployment that would rather not run a collector at all.** Its
+own listener on its own address, off unless configured, serving one path and nothing else. Pull
+and push are independent: either, both, or neither. A bearer token is offered rather than
+required, because the deployment this exists for binds it to the loopback and is scraped by the
+agent beside it.
+- Until this, no collector meant no instruments: the meter provider was built only when an
+endpoint was configured, so a standalone gateway counted nothing it could show. The provider is
+now built from whichever readers there are.
+- Redactions are counted by kind. The filter already kept the tally kind by kind; it simply
+never travelled as far as the meter. The sum over kinds is what the counter said before it knew
+the difference, so a dashboard built on the total keeps reading.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -529,9 +556,18 @@ a ruling, knowing the arithmetic: a tenant count that runs to thousands multipli
 by it, and the tenant count is not ours to bound. It is there because *which tenant is doing
 this* is the question a multi-tenant gateway exists to answer. Where it becomes too much, the
 usage rows hold the same figures per request and are the better place to ask.
-- **Metrics need a collector.** There is no scrape endpoint, so a small deployment that would
-rather not run one gets no metrics at all. The trade was deliberate: a `/metrics` listener is a
-new surface to guard, and these carry a tenant label, which is tenant data.
+- **The scrape endpoint is as private as where it is bound.** What it serves carries a tenant
+label, which is tenant data, and the token is optional. An operator who binds it to a routable
+address and sets no token has published their tenants' traffic shape. It is off by default and
+the configuration says this; the gateway does not refuse to serve it.
+- **A clean request no longer adds a zero to the redaction counter.** Counting by kind means
+there is no name to count a nought under, so a filtered request that found nothing adds no
+series rather than a series holding zero. Absent and zero read the same through `rate` and
+`sum`, and the usage row still records the clean nought, which is where that distinction
+belongs — but a dashboard graphing the raw series will see one fewer.
+- **Log lines are not filtered.** M16 takes secrets out of bodies, not out of what the gateway
+writes about them. A log line is written by our own code and holds what our own code put there,
+which is why this has not bitten; it is still a place a secret could reach the collector.
 - **Nothing counts what a request cost in money**, only in tokens. The price of a token is not
 something the gateway knows, and spend records are their own entry below.
 
@@ -592,12 +628,12 @@ management api.
 
 ### Observability, what is left of it
 
-- Logs to open-observe in cluster mode, to a local file standalone. Logs go to the process
-output wherever it runs.
-- Redactions are counted but not by kind. The usage row keeps the kinds as a formatted
-string, which is the wrong direction to read a label out of; counting them apart means
-carrying the structured tally as far as the record, which is a change to what M16 built.
-- A Prometheus scrape endpoint, for a deployment that would rather not run a collector.
+- The usage row still keeps the redaction kinds as a formatted string. The dashboard reads
+them apart now, but a query over the rows — *what did this tenant redact last month* — still
+has to read a string the wrong way round. Turning the column structured is a migration on both
+backends, the codec and the api, and is worth doing the day somebody asks that question of the
+ledger rather than of a graph.
+- Nothing filters a log line. See the caveat above.
 
 ### Security, what is left of it
 
