@@ -14,12 +14,17 @@ use ip_core::TraceId;
 use opentelemetry::trace::{SpanId, TracerProvider as _};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{ExporterBuildError, WithExportConfig};
+use opentelemetry_prometheus::PrometheusExporter;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::error::OTelSdkError;
 use opentelemetry_sdk::logs::{LogExporter, SdkLoggerProvider};
-use opentelemetry_sdk::metrics::{SdkMeterProvider, exporter::PushMetricExporter};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+#[cfg(test)]
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::trace::{
     IdGenerator, RandomIdGenerator, Sampler, SdkTracerProvider, SpanExporter,
 };
+use prometheus::{Encoder, Registry, TextEncoder};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
 use tracing_subscriber::Layer as _;
@@ -50,6 +55,7 @@ pub async fn under<F: Future>(trace: TraceId, work: F) -> F::Output {
 pub struct Telemetry {
     provider: Option<SdkTracerProvider>,
     meter: Option<SdkMeterProvider>,
+    scrape: Option<Registry>,
     logger: Option<SdkLoggerProvider>,
     /// Never read: held so the thread writing the file lives as long as the process,
     /// and flushes what is buffered when it does not.
@@ -77,6 +83,22 @@ impl Telemetry {
         {
             tracing::warn!(%error, "could not flush the logs");
         }
+    }
+
+    /// The numbers as a scraper reads them, and nothing where none was configured.
+    ///
+    /// Gathered on demand rather than kept: what a scrape answers is the state of the
+    /// instruments at the moment it asked, which is the whole difference between
+    /// being scraped and pushing.
+    #[must_use]
+    pub fn gathered(&self) -> Option<String> {
+        let registry = self.scrape.as_ref()?;
+        let mut written = Vec::new();
+        if let Err(error) = TextEncoder::new().encode(&registry.gather(), &mut written) {
+            tracing::warn!(%error, "could not write the metrics out for a scrape");
+            return None;
+        }
+        String::from_utf8(written).ok()
     }
 }
 
@@ -143,9 +165,26 @@ pub fn install(config: &TelemetryConfig) -> Telemetry {
             }
         }
     }
+    let metered = metering(config);
+    if let Some(metered) = &metered {
+        // Registered globally, unlike the tracer, because that is how an instrument is
+        // reached: nothing carries a counter to its meter the way the tracing layer
+        // carries a span to its provider.
+        opentelemetry::global::set_meter_provider(metered.meter.clone());
+        tracing::info!(
+            pushed = config.otlp_endpoint.is_some(),
+            scraped = metered.registry.is_some(),
+            "counting what the gateway does"
+        );
+    }
+    let (meter, scrape) = match metered {
+        Some(metered) => (Some(metered.meter), metered.registry),
+        None => (None, None),
+    };
     Telemetry {
         provider: traced.and_then(Result::ok),
-        meter: config.otlp_endpoint.as_ref().and_then(metering),
+        meter,
+        scrape,
         logger: shipped.and_then(Result::ok),
         _rolling: rolled.and_then(Result::ok).map(|rolled| rolled.guard),
     }
@@ -211,36 +250,100 @@ pub(crate) fn logging<E: LogExporter + 'static>(exporter: E) -> SdkLoggerProvide
         .build()
 }
 
-/// The meter provider, registered for the process so an instrument can be made wherever
-/// one is needed, and handed back so it can be flushed when the process stops.
-///
-/// Registered globally, unlike the tracer, because that is how an instrument is reached:
-/// the tracing layer carries spans to their provider for us, and there is no equivalent
-/// carrying a counter to its meter. Nothing is registered when the exporter will not
-/// build, so the global stays the no-op the sdk starts with and every instrument made
-/// against it costs nothing.
-fn metering(endpoint: &Url) -> Option<SdkMeterProvider> {
-    match exporter(endpoint) {
-        Ok(exporter) => {
-            let meter = meters(exporter);
-            opentelemetry::global::set_meter_provider(meter.clone());
-            tracing::info!(%endpoint, "exporting metrics");
-            Some(meter)
+#[cfg(test)]
+impl Telemetry {
+    /// A process that only gathers for a scrape, for a test that only reads one.
+    pub(crate) fn gathering_into(registry: Registry) -> Self {
+        Self {
+            provider: None,
+            meter: None,
+            scrape: Some(registry),
+            logger: None,
+            _rolling: None,
         }
-        Err(error) => {
-            tracing::error!(%error, %endpoint, "could not export metrics to the collector");
-            None
+    }
+
+    /// A process exporting nothing at all, which is every deployment that configured
+    /// no collector and no scrape.
+    pub(crate) fn quiet() -> Self {
+        Self {
+            provider: None,
+            meter: None,
+            scrape: None,
+            logger: None,
+            _rolling: None,
         }
     }
 }
 
-/// The meter provider itself: a periodic reader over the exporter, under our service
-/// name, which is what a collector files the numbers against.
+/// The meter provider and, when a scrape was configured, the registry it gathers into.
+pub(crate) struct Metering {
+    meter: SdkMeterProvider,
+    registry: Option<Registry>,
+}
+
+/// The meter provider, built over whichever readers were configured, and nothing at all
+/// where neither was.
+///
+/// Both may be on at once: a push to a collector and a scrape of the same numbers are
+/// two ways of asking the same provider, not two providers. Nothing is built where
+/// neither was configured or neither would build, which leaves the global the no-op the
+/// sdk starts with, so every instrument made against it costs nothing.
+fn metering(config: &TelemetryConfig) -> Option<Metering> {
+    let pushed = match config.otlp_endpoint.as_ref().map(exporter) {
+        Some(Err(error)) => {
+            tracing::error!(%error, "could not export metrics to the collector");
+            None
+        }
+        pushed => pushed.and_then(Result::ok),
+    };
+    let pulled = match config.scrape.as_ref().map(|_| gathering()) {
+        Some(Err(error)) => {
+            tracing::error!(%error, "could not gather the metrics for a scrape");
+            None
+        }
+        pulled => pulled.and_then(Result::ok),
+    };
+    if pushed.is_none() && pulled.is_none() {
+        return None;
+    }
+    let mut builder = SdkMeterProvider::builder().with_resource(named());
+    if let Some(exporter) = pushed {
+        builder = builder.with_periodic_exporter(exporter);
+    }
+    let mut registry = None;
+    if let Some((reader, gathers)) = pulled {
+        builder = builder.with_reader(reader);
+        registry = Some(gathers);
+    }
+    Some(Metering {
+        meter: builder.build(),
+        registry,
+    })
+}
+
+/// The reader a scrape is answered from, and the registry it files the numbers in.
+pub(crate) fn gathering() -> Result<(PrometheusExporter, Registry), OTelSdkError> {
+    let registry = Registry::new();
+    let reader = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .build()?;
+    Ok((reader, registry))
+}
+
+/// A provider that only pushes, which is what [`metering`] builds when only a collector
+/// is configured and what a test asserting the push half builds directly.
+#[cfg(test)]
 pub(crate) fn meters<E: PushMetricExporter + 'static>(exporter: E) -> SdkMeterProvider {
     SdkMeterProvider::builder()
         .with_periodic_exporter(exporter)
-        .with_resource(Resource::builder().with_service_name(SERVICE).build())
+        .with_resource(named())
         .build()
+}
+
+/// What the service calls itself to whatever reads its telemetry.
+fn named() -> Resource {
+    Resource::builder().with_service_name(SERVICE).build()
 }
 
 /// The metric exporter the configured collector is reached over, over the same transport
@@ -298,6 +401,7 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+    use ip_config::ScrapeConfig;
     use opentelemetry::logs::{AnyValue, Severity};
     use opentelemetry_sdk::logs::InMemoryLogExporter;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
@@ -393,6 +497,7 @@ mod tests {
         let telemetry = Telemetry {
             provider: None,
             meter: Some(provider),
+            scrape: None,
             logger: None,
             _rolling: None,
         };
@@ -453,6 +558,7 @@ mod tests {
         let quiet = Telemetry {
             provider: None,
             meter: None,
+            scrape: None,
             logger: None,
             _rolling: None,
         };
@@ -536,6 +642,7 @@ mod tests {
         let telemetry = Telemetry {
             provider: None,
             meter: None,
+            scrape: None,
             logger: Some(logging(exporter.clone())),
             _rolling: None,
         };
@@ -546,6 +653,91 @@ mod tests {
             "stopping the process should have flushed what was written"
         );
         drop(telemetry);
+    }
+
+    /// Counts one request against a provider and hands back what a scrape would read.
+    fn scraped(config: &TelemetryConfig) -> Option<String> {
+        use opentelemetry::KeyValue;
+        use opentelemetry::metrics::MeterProvider as _;
+
+        let metered = metering(config)?;
+        metered
+            .meter
+            .meter(SERVICE)
+            .u64_counter("ip.requests")
+            .build()
+            .add(1, &[KeyValue::new("tenant", "acme")]);
+        Telemetry {
+            provider: None,
+            meter: Some(metered.meter),
+            scrape: metered.registry,
+            logger: None,
+            _rolling: None,
+        }
+        .gathered()
+    }
+
+    /// A process nobody asked for numbers from builds no provider at all, so the
+    /// global stays the no-op the sdk starts with and an instrument costs nothing.
+    #[test]
+    fn neither_pushing_nor_scraping_builds_no_provider() {
+        assert!(metering(&TelemetryConfig::default()).is_none());
+    }
+
+    /// A deployment that scrapes and pushes to nobody still counts, which is the whole
+    /// point of the endpoint: before this, no collector meant no instruments.
+    #[test]
+    fn a_scrape_alone_is_enough_to_be_counted() {
+        let config = TelemetryConfig {
+            scrape: Some(ScrapeConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                token: None,
+            }),
+            ..TelemetryConfig::default()
+        };
+        let numbers = scraped(&config).expect("a provider, and a registry to read it from");
+
+        assert!(
+            numbers.contains("ip_requests_total"),
+            "the sdk's dotted name comes out in Prometheus spelling: {numbers}"
+        );
+        assert!(numbers.contains(r#"tenant="acme""#), "{numbers}");
+    }
+
+    /// Both readers on one provider: the collector's periodic export does not take the
+    /// numbers away from the scrape, and neither reader knows about the other.
+    #[tokio::test]
+    async fn pushing_and_scraping_are_not_an_either_or() {
+        let config = TelemetryConfig {
+            otlp_endpoint: Some("http://127.0.0.1:4317".parse().unwrap()),
+            scrape: Some(ScrapeConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                token: None,
+            }),
+            ..TelemetryConfig::default()
+        };
+        let numbers = scraped(&config).expect("a provider built over both readers");
+
+        assert!(
+            numbers.contains("ip_requests_total"),
+            "a collector configured beside the scrape leaves the scrape answering: {numbers}"
+        );
+    }
+
+    /// A deployment that only pushes gathers nothing, and says so rather than serving
+    /// an empty page that reads like a quiet gateway.
+    #[tokio::test]
+    async fn pushing_alone_gathers_nothing_to_scrape() {
+        let config = TelemetryConfig {
+            otlp_endpoint: Some("http://127.0.0.1:4317".parse().unwrap()),
+            ..TelemetryConfig::default()
+        };
+        let metered = metering(&config).expect("a provider for the collector");
+
+        assert!(
+            metered.registry.is_none(),
+            "nothing gathers where nobody asked to be scraped"
+        );
     }
 
     /// What a standalone deployment gets instead of a collector: the line is on disk,

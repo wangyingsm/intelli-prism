@@ -32,7 +32,9 @@ ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features =
 opentelemetry = "0.33.0"
 opentelemetry-appender-tracing = "0.33.1"
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "logs", "trace", "metrics"] }
+opentelemetry-prometheus = "0.33.1"
 opentelemetry_sdk = { version = "0.33.0", features = ["logs"] }
+prometheus = "0.14.0"
 rpassword = "7.5.4"
 serde.workspace = true
 serde_json.workspace = true

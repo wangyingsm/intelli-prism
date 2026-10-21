@@ -493,6 +493,27 @@ pub struct TelemetryConfig {
     /// How many rolled files are kept beside the live one.
     #[serde(default)]
     pub log_keep: LogsKept,
+    /// Where the numbers are served for a scraper to come and take them. Unset,
+    /// nothing is gathered and nothing listens: a deployment that pushes to a
+    /// collector has already said where its metrics go.
+    #[serde(default)]
+    pub scrape: Option<ScrapeConfig>,
+}
+
+/// Where the numbers are served for a scrape.
+///
+/// Its own address rather than the gateway's, so what a scraper may reach is decided
+/// by where it is bound and not by a path on the port the world talks to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScrapeConfig {
+    /// Address the scrape listener binds to.
+    pub listen: SocketAddr,
+    /// What a scraper must carry as a bearer token. Unset, anything that reaches the
+    /// address is answered, which is the deployment this endpoint exists for: one
+    /// node, bound to the loopback, scraped by the agent beside it.
+    #[serde(default)]
+    pub token: Option<Secret>,
 }
 
 /// Where the logs are written, as a directory that exists and a name within it.
@@ -835,6 +856,7 @@ secret = "0123456789abcdef0123456789abcdef"
         assert_eq!(config.telemetry.sample_ratio, SampleRatio::default());
         assert_eq!(config.telemetry.log_file, None);
         assert_eq!(config.telemetry.log_keep, LogsKept::default());
+        assert_eq!(config.telemetry.scrape, None);
         assert_eq!(config.usage, UsageConfig::default());
         assert_eq!(config.usage.retention, None);
         assert_eq!(config.auth.nonce_ttl, Seconds::new(300));
@@ -869,6 +891,22 @@ secret = "0123456789abcdef0123456789abcdef"
             Config::parse(&nowhere).is_err(),
             "a log file nothing can be written to stops the file being read"
         );
+    }
+
+    #[test]
+    fn a_scrape_endpoint_is_configured_by_the_address_it_binds() {
+        let written = format!("{MINIMAL}\n[telemetry.scrape]\nlisten = \"127.0.0.1:9464\"\n");
+        let config = Config::parse(&written).unwrap();
+        let scrape = config.telemetry.scrape.unwrap();
+        assert_eq!(scrape.listen.to_string(), "127.0.0.1:9464");
+        assert_eq!(scrape.token, None, "a token is offered, not required");
+
+        let guarded = format!(
+            "{MINIMAL}\n[telemetry.scrape]\nlisten = \"127.0.0.1:9464\"\ntoken = \"let-me-in\"\n"
+        );
+        let config = Config::parse(&guarded).unwrap();
+        let token = config.telemetry.scrape.unwrap().token.unwrap();
+        assert_eq!(token.expose(), "let-me-in");
     }
 
     #[test]

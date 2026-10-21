@@ -10,6 +10,7 @@ mod manage;
 mod model;
 mod routes;
 mod rules;
+mod scrape;
 mod state;
 mod telemetry;
 mod usage;
@@ -64,7 +65,11 @@ async fn asked_of_the_model(_: cli::ModelCommand) -> Result<(), StartupError> {
 /// Opens everything the configuration names and serves until the kernel says to stop.
 async fn serve(config: &Path) -> Result<(), StartupError> {
     let config = Config::load(config)?;
-    let telemetry = telemetry::install(&config.telemetry);
+    let telemetry = std::sync::Arc::new(telemetry::install(&config.telemetry));
+    let _scraping = match &config.telemetry.scrape {
+        Some(scrape) => Some(scrape::serve(scrape, std::sync::Arc::clone(&telemetry)).await?),
+        None => None,
+    };
 
     let state = AppState::open(&config).await?;
     let _healing = std::sync::Arc::clone(state.feed()).keep_healing();
