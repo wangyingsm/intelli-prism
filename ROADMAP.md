@@ -409,6 +409,31 @@ now built from whichever readers there are.
 never travelled as far as the meter. The sum over kinds is what the counter said before it knew
 the difference, so a dashboard built on the total keeps reading.
 
+### Putting a price on what was spent
+
+- **A price is a row, not a line in a file.** `(model, input, output)` in micros of the
+deployment's currency per million tokens, set through `PUT /_ip/prices` by the system
+administrator and carried to every node by the publication channel and the revision the routing
+rules already use. What a model costs changes without a restart and without editing a file on
+every host — which is what rules out the configuration file that would otherwise be the obvious
+home for it.
+- Money is integers all the way: micros of one currency in the stored price, in the row, in the
+api and in the counter, with no float anywhere to accumulate error. A rate is refused above a
+million currency units per million tokens, so a decimal point in the wrong place is caught at
+the door rather than stored and believed.
+- **A model nothing prices has no cost, which is not a cost of nothing.** The column is
+nullable, the api omits the key rather than sending zero, and the counter mints no series at
+all — while a model priced at zero records zero in all three, because *free* and *unpriced* are
+different facts and a deployment running local models needs to tell them apart.
+- Every answer is priced as it is recorded: the winner's tokens in both directions, plus the
+prompt once more for each arm that lost a race, which the upstream read and billed for whether
+or not it won. An answer out of the cache costs nothing against a price it has, which is the
+number to read against what the cache saved.
+- `GET /_ip/usage` reports `cost_micros` per row, and `GET /_ip/usage/summary` totals the window
+beside `unpriced` — how many of its rows it could not price. A total missing rows reads as
+incomplete rather than as a smaller bill.
+- `ip.cost` beside `ip.tokens`, in micros, under the same labels.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -568,8 +593,25 @@ belongs — but a dashboard graphing the raw series will see one fewer.
 - **Log lines are not filtered.** M16 takes secrets out of bodies, not out of what the gateway
 writes about them. A log line is written by our own code and holds what our own code put there,
 which is why this has not bitten; it is still a place a secret could reach the collector.
-- **Nothing counts what a request cost in money**, only in tokens. The price of a token is not
-something the gateway knows, and spend records are their own entry below.
+- **A hedged request's cost is arithmetic, not a bill.** Only the winner's answer is measured,
+so each arm that lost is costed at the prompt the winner was billed for. An upstream that
+charges an abandoned arm differently, or that hit its own prompt cache on one arm and not
+another, makes the figure wrong in either direction. What is exact is the unhedged request,
+which is almost all of them.
+- **One currency, and it has no name.** Every price is micros of whatever the deployment counts
+in, and nothing converts or labels it. A deployment buying from vendors who bill in different
+currencies converts before setting the price, and nothing in the gateway will catch it if it
+does not.
+- **A price is the deployment's, not a tenant's.** It is what the vendor charges, with no
+per-tenant markup: what a tenant is *charged* is a calculation over these rows and belongs
+wherever the invoices are made.
+- **A row keeps the price in force when it was answered, and is never re-priced.** Changing a
+price changes what the next request costs, not what last month cost — which is what a ledger
+should do, and does mean rows answered before anyone set a price stay unpriced forever. Pricing
+a model is worth doing before the traffic, not after it.
+- **Nothing caps what is spent.** The money is measured, never limited: no budget, no alert, and
+no refusal when a tenant has spent what it was meant to. The entry below says what that would
+take.
 
 ## To be implemented
 
@@ -617,14 +659,27 @@ like any other request.
 
 - Facts and chat session history as long term memory.
 - Knowledge and RAG with a graph run.
-- Spend and audit records. Usage is recorded; what a token costs, and an audit trail of who
-changed what, are not.
+- An audit trail of who changed what. Usage is recorded and so is what it cost; who changed a
+route, a limit or a price is not.
 
 ### Web UI
 
 - Login, the management menu (tenants, users, quota, authorities, LLMs, MCPs, tools, account) and
 the gateway menu (rules, processors, agents, graph run, observe), plus a dashboard. Waits on the
 management api.
+
+### Money, what is left of it
+
+- **A cap on spend**, which is the whole of what M20 left out. The limits machinery already
+counts a thing per scope per window and refuses when it runs out, so money is a third thing
+counted over the same counters, seeded from the rows the way tokens and requests are. Two
+decisions make it more than a fourth column: a cost is known only after the answer, so a money
+cap overshoots by the request that crossed it, the way a token quota already does; and a window
+holding rows nothing priced has to decide whether to refuse on what it cannot see or admit it,
+which is a ruling and not an implementation detail.
+- A per-tenant price or markup. A price today is what the vendor charges this deployment, and
+what a tenant is billed is left outside. Carrying it here means a second table and a decision
+about which of the two a usage row should hold.
 
 ### Observability, what is left of it
 

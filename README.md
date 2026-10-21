@@ -27,6 +27,10 @@ stalling the requests in flight.
 under it, and a row per request: the model, the tokens in each direction, whether the cache
 answered and how long the caller waited. Exported to an OpenTelemetry collector when one is
 configured, and read back over `GET /_ip/usage`.
+- **What that cost in money.** What a model charges is a row set through `PUT /_ip/prices` and
+carried to every node, so each usage row carries what it cost as well as what it spent, and the
+summary totals a window beside the count of rows nothing priced. A model nobody has priced has
+no cost, which is not a cost of nothing.
 - **Dispatch across the endpoints behind a rule.** Round robin, least load or a share each, chosen
 per rule and per configured upstream; a rule can also race a request across two or three of them
 and take the first successful answer, when the body is one the gateway can send more than once. A
