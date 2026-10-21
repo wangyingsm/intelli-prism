@@ -294,6 +294,8 @@ mod tests {
             "xoxb-123456789012-123456789012-abcdefghijklmnopqrst",
             "xoxp-0000000000-0000000000-abcdefghij",
             "xoxa-2-abcdefghijklmno",
+            // The app-level token, which shares nothing with the others but the vendor.
+            "xapp-1-A01234ABCDE-1234567890123-abcdef0123456789",
         ] {
             assert_eq!(found(token), vec![token], "a real token went through");
         }
@@ -304,6 +306,8 @@ mod tests {
             "hugs and xoxo",
             "xoxb-hi",
             "xoxq-abcdefghijkl",
+            "xapp-hi",
+            "xapps-abcdefghijkl",
         ] {
             assert!(
                 found(prose).is_empty(),

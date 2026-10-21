@@ -141,11 +141,12 @@ impl Secret {
             Self::new(named("google-key"), Match::Prefix("AIza".to_owned())),
             // Not a bare `xox` prefix, which the other four can afford and this one
             // cannot: `xoxo` ends an ordinary English sentence. Every token Slack
-            // issues carries a letter and a dash after it, and is far longer than the
-            // ten characters required here.
+            // issues carries a dash after its kind, and is far longer than the ten
+            // characters required here. `xapp-` is the app-level one, which shares
+            // nothing with the others but the vendor.
             Self::new(
                 named("slack-token"),
-                Match::Regexp(r"\bxox[abeprs]-[A-Za-z0-9-]{10,}".to_owned()),
+                Match::Regexp(r"\b(?:xox[abeprs]|xapp)-[A-Za-z0-9-]{10,}".to_owned()),
             ),
             // Written without spaces. A spaced account is common in prose and a shape
             // loose enough to reach it also reaches half a paragraph; mod-97 would have
