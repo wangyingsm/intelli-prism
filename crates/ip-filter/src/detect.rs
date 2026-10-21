@@ -283,6 +283,35 @@ mod tests {
         assert_eq!(found("AKIAIOSFODNN7EXAMPLE"), vec!["AKIAIOSFODNN7EXAMPLE"]);
     }
 
+    /// A slack token is matched by the shape slack issues, not by three letters.
+    ///
+    /// `xoxo` ends an ordinary English sentence, and a detector that redacted it would
+    /// rewrite a caller's prose. The shape and the length floor are both load-bearing:
+    /// the shape refuses the word, the floor refuses `xoxb-hi`.
+    #[test]
+    fn a_slack_token_is_matched_and_a_fond_farewell_is_not() {
+        for token in [
+            "xoxb-123456789012-123456789012-abcdefghijklmnopqrst",
+            "xoxp-0000000000-0000000000-abcdefghij",
+            "xoxa-2-abcdefghijklmno",
+        ] {
+            assert_eq!(found(token), vec![token], "a real token went through");
+        }
+
+        for prose in [
+            "xoxo",
+            "xox",
+            "hugs and xoxo",
+            "xoxb-hi",
+            "xoxq-abcdefghijkl",
+        ] {
+            assert!(
+                found(prose).is_empty(),
+                "{prose} was taken for a slack token"
+            );
+        }
+    }
+
     /// Prose puts a full stop after a key and the key does not end with one.
     #[test]
     fn a_prefix_match_leaves_the_punctuation_behind() {

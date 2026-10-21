@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc e9693f6986dc1da6e76ca2def57c6e22ee8583458bb5a77057619b96eb0a681c # shrinks to before = "", secret = "11010519491231002X", after = "", width = 1
 cc 85ec2ca635ba3180d671507492dbc8b0cacb6f523775985b6b29b625de386b7e # shrinks to text = "a-00@0.aaa", width = 1
+cc e2868233b59ebdd6ea50c8c942b8e0051384a34cf7f0c19079a7f9406b4c4f51 # shrinks to text = "xox", width = 1
