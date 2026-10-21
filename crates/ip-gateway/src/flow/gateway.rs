@@ -1046,6 +1046,38 @@ mod tests {
         assert_eq!(counted(&exporter, &provider, "ip.requests").len(), 1);
     }
 
+    /// A gateway that limits and keeps nothing still enforces its quota.
+    ///
+    /// Spending is counted by the same code that writes a row, so a gateway with neither
+    /// a store nor a meter has to reach that code anyway — otherwise its counters are
+    /// seeded once from the rows and then stand still, and an operator could switch
+    /// quotas off by switching recording off.
+    #[tokio::test]
+    async fn a_gateway_that_records_nothing_still_spends_against_its_quota() {
+        let gateway = limited(
+            FakeUpstream::answering(ANSWERED),
+            vec![allowing(
+                ip_core::Counted::Tokens,
+                ip_core::Period::Month,
+                100,
+            )],
+        );
+
+        // No store, no meters: the answer spends 150 of the 100 the month allows.
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        gateway.settled().await;
+
+        let refused = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
     /// A money cap's refusal is the one every other limit gives, and says it was money.
     ///
     /// Nothing in the refusal path was written for money: the 429, the moment the next

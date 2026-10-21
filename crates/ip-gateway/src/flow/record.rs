@@ -155,8 +155,9 @@ pub(super) struct Recording {
 impl Recording {
     /// What will record this request, now that the route says which api serves it.
     ///
-    /// Nothing at all when nothing is listening, and nothing when no route was
-    /// resolved: a request that never reached an api has no api to be counted under.
+    /// Nothing at all when nothing is listening *and* nothing is limited, and nothing
+    /// when no route was resolved: a request that never reached an api has no api to be
+    /// counted under.
     pub(super) fn of(
         keeping: &Keeping,
         pending: &Pending,
@@ -164,7 +165,10 @@ impl Recording {
         started: Instant,
         ruled: Ruled,
     ) -> Option<Self> {
-        if !keeping.any() {
+        // Limiting counts too, not only keeping: a quota is enforced by what this writes
+        // at the end of a request, so a gateway that limits and records nothing must
+        // still reach that code or its counters never move.
+        if !keeping.any() && ruled.limiting.is_none() {
             return None;
         }
         Some(Self {
