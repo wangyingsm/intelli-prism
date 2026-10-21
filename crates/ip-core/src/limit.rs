@@ -90,6 +90,11 @@ pub enum Counted {
     Tokens,
     /// Requests made, an answer from the cache included.
     Requests,
+    /// Micros of the deployment's currency, over the rows a price could be found for.
+    ///
+    /// Only what is priced is counted, so a cap is as complete as the prices are: a model
+    /// nothing prices spends nothing against it.
+    Money,
 }
 
 impl Counted {
@@ -98,6 +103,7 @@ impl Counted {
         match self {
             Self::Tokens => "tokens",
             Self::Requests => "requests",
+            Self::Money => "money",
         }
     }
 
@@ -106,6 +112,7 @@ impl Counted {
         match name {
             "tokens" => Ok(Self::Tokens),
             "requests" => Ok(Self::Requests),
+            "money" => Ok(Self::Money),
             other => Err(CoreError::UnknownCounted {
                 value: other.to_owned(),
             }),
@@ -289,9 +296,14 @@ mod tests {
 
     #[test]
     fn every_kind_and_period_round_trips_through_its_name() {
-        for counted in [Counted::Tokens, Counted::Requests] {
+        let kinds = [Counted::Tokens, Counted::Requests, Counted::Money];
+        for counted in kinds {
             assert_eq!(Counted::named(counted.name()).unwrap(), counted);
         }
+        // Two kinds sharing a name would round-trip to whichever `named` matched first,
+        // silently turning one stored limit into another.
+        let named: std::collections::BTreeSet<&str> = kinds.iter().map(|at| at.name()).collect();
+        assert_eq!(named.len(), kinds.len(), "two kinds share a name");
         for period in [Period::Minute, Period::Hour, Period::Day, Period::Month] {
             assert_eq!(Period::named(period.name()).unwrap(), period);
         }

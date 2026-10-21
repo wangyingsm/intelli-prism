@@ -272,6 +272,9 @@ macro_rules! backend_suite {
             a_window_sums_what_its_rows_cost,
             a_window_says_how_many_of_its_rows_nothing_priced,
             a_window_of_nothing_costs_nothing,
+            what_a_scope_cost_is_summed_the_way_its_tokens_are,
+            an_unpriced_row_costs_a_scope_nothing,
+            a_scope_that_cost_nothing_sums_to_nothing,
         ]);
     };
     ($open:path) => {

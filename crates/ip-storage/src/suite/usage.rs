@@ -820,3 +820,66 @@ pub(crate) async fn a_window_of_nothing_costs_nothing(store: &impl UsageStore) {
     assert_eq!(sums.cost, Money::ZERO);
     assert_eq!(sums.unpriced, 0);
 }
+
+pub(crate) async fn what_a_scope_cost_is_summed_the_way_its_tokens_are(store: &impl UsageStore) {
+    let now = Timestamp::now();
+    for micros in [810, 1_530] {
+        let priced = NewUsage {
+            cost: Some(Money::from_micros(micros)),
+            ..spent()
+        };
+        store.record_usage(priced).await.unwrap();
+    }
+    let long_ago = Timestamp::from_unix_seconds(now.unix_seconds() - 3600).unwrap();
+    assert_eq!(
+        store
+            .spent(&UsageFilter::default(), Counted::Money, long_ago)
+            .await
+            .unwrap(),
+        2_340
+    );
+}
+
+/// What makes a money cap only as complete as the prices: an unpriced row spends nothing
+/// against it, where the same row spends its tokens against a token quota.
+pub(crate) async fn an_unpriced_row_costs_a_scope_nothing(store: &impl UsageStore) {
+    let now = Timestamp::now();
+    let priced = NewUsage {
+        cost: Some(Money::from_micros(810)),
+        ..spent()
+    };
+    store.record_usage(priced).await.unwrap();
+    store.record_usage(spent()).await.unwrap();
+
+    let long_ago = Timestamp::from_unix_seconds(now.unix_seconds() - 3600).unwrap();
+    let everywhere = UsageFilter::default();
+    assert_eq!(
+        store
+            .spent(&everywhere, Counted::Money, long_ago)
+            .await
+            .unwrap(),
+        810
+    );
+    // The same two rows, counted in tokens, hold both.
+    assert_eq!(
+        store
+            .spent(&everywhere, Counted::Tokens, long_ago)
+            .await
+            .unwrap(),
+        300
+    );
+}
+
+pub(crate) async fn a_scope_that_cost_nothing_sums_to_nothing(store: &impl UsageStore) {
+    assert_eq!(
+        store
+            .spent(
+                &UsageFilter::of_tenant(TenantId::new("acme").unwrap()),
+                Counted::Money,
+                Timestamp::from_unix_seconds(0).unwrap(),
+            )
+            .await
+            .unwrap(),
+        0
+    );
+}

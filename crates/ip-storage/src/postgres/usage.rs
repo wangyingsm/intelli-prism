@@ -115,6 +115,15 @@ impl UsageStore for PostgresStore {
                  AND ($3::TEXT IS NULL OR user_id = $3) \
                  AND ($4::TEXT IS NULL OR api_id = $4)",
             ),
+            // Only the rows a price was found for: a model nothing prices spends nothing
+            // against a money cap, which is what makes the cap as complete as the prices.
+            Counted::Money => sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(SUM(cost_micros), 0)::BIGINT FROM usage \
+                 WHERE created_at >= $1 \
+                 AND ($2::TEXT IS NULL OR tenant_id = $2) \
+                 AND ($3::TEXT IS NULL OR user_id = $3) \
+                 AND ($4::TEXT IS NULL OR api_id = $4)",
+            ),
         };
         let spent = query
             .bind(moment.unix_seconds())

@@ -806,6 +806,42 @@ mod tests {
         assert!(labels.contains(&"api".to_owned()), "{labels:?}");
     }
 
+    /// The cost the gateway computed reaches the cap, which is the whole of the wiring.
+    ///
+    /// The unpriced half is the control, and it is what ruling 2 costs: the same cap over
+    /// the same traffic never refuses when nothing is priced. Without it the first half
+    /// would pass just as well if the cap were never reachable at all.
+    #[tokio::test]
+    async fn a_priced_answer_spends_against_a_money_cap_and_an_unpriced_one_does_not() {
+        let capped = || {
+            vec![allowing(
+                ip_core::Counted::Money,
+                ip_core::Period::Month,
+                800,
+            )]
+        };
+        let ask = || request("/anthropic/messages", "ask");
+
+        // One answer costs 810 micros of the 800 the month allows, so the next is turned
+        // away before it reaches anything.
+        let (recorder, _kept) = Ledger::new();
+        let priced = limited(FakeUpstream::answering(ANSWERED), capped())
+            .recording(recorder)
+            .with_prices(prices());
+        body_of(priced.handle(context(granted()), ask()).await.unwrap()).await;
+        priced.settled().await;
+        let refused = priced.handle(context(granted()), ask()).await.unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The same cap, the same answers, no price for the model they name.
+        let (recorder, _kept) = Ledger::new();
+        let unpriced = limited(FakeUpstream::answering(ANSWERED), capped()).recording(recorder);
+        for _ in 0..3 {
+            body_of(unpriced.handle(context(granted()), ask()).await.unwrap()).await;
+            unpriced.settled().await;
+        }
+    }
+
     /// What an answer cost, counted beside what it spent, under the same labels.
     #[tokio::test]
     async fn what_an_answer_cost_is_counted() {

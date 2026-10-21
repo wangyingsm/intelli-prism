@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 use super::followed::Followed;
 use crate::body::{BoxError, GatewayBody};
 use crate::filter::{Filtered, Reported};
-use crate::limit::{Asking, Limiter, Limits};
+use crate::limit::{Asking, Limiter, Limits, Spent};
 use crate::measure::{Measuring, measure};
 use crate::meter::Meters;
 use crate::price::Prices;
@@ -305,7 +305,10 @@ impl Recording {
         let Some(store) = self.keeping.store.clone() else {
             // Nothing to write, but what was spent still has to be counted against
             // the limits, which is the other half of what this does.
-            self.spend(tokens);
+            self.spend(Spent {
+                tokens: tokens.total(),
+                cost,
+            });
             return;
         };
         let usage = NewUsage {
@@ -326,7 +329,10 @@ impl Recording {
             cost,
         };
         let limiting = self.limiting;
-        let spent = tokens.total();
+        let spent = Spent {
+            tokens: tokens.total(),
+            cost,
+        };
         // A caller never waits on the record of what it already has, and never fails for it.
         self.pending.writing(async move {
             if let Err(error) = store.record_usage(usage).await {
@@ -346,11 +352,10 @@ impl Recording {
     /// The limits are not an observability concern: a gateway keeping no rows still
     /// enforces a quota, and forgetting this when the store became optional would
     /// have let an operator switch quotas off by switching recording off.
-    fn spend(self, tokens: Tokens) {
+    fn spend(self, spent: Spent) {
         let Some(limiting) = self.limiting else {
             return;
         };
-        let spent = tokens.total();
         self.pending.writing(async move {
             limiting
                 .limiter

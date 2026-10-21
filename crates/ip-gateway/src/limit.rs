@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ip_cache::{CacheKey, CacheLevel, Counters, Ttl};
-use ip_core::{Allowance, ApiId, Counted, LimitScope, Period, TenantId, Timestamp, UserId};
+use ip_core::{Allowance, ApiId, Counted, LimitScope, Money, Period, TenantId, Timestamp, UserId};
 use ip_storage::{Limit, UsageFilter, UsageStore};
 
 /// The limits a node holds, matched against each request as it arrives.
@@ -47,6 +47,33 @@ impl Limits {
                 .or_insert(limit);
         }
         deciding.into_values().collect()
+    }
+}
+
+/// What one answer spent, in each of the things a quota counts it in.
+///
+/// One value rather than two arguments because the two travel together from the moment an
+/// answer is measured, and because a caller that passed the tokens and forgot the cost would
+/// leave a money cap counting nothing with nothing to say it was wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Spent {
+    /// Tokens the answer was measured at, in both directions.
+    pub tokens: u64,
+    /// What those cost, and nothing at all where nothing priced the model.
+    pub cost: Option<Money>,
+}
+
+impl Spent {
+    /// What this answer adds to a quota counting `counted`, and nothing where it adds nothing.
+    ///
+    /// A request rate is counted when a request arrives rather than when it is answered, so
+    /// nothing here counts against one.
+    fn against(self, counted: Counted) -> Option<u64> {
+        match counted {
+            Counted::Tokens => Some(self.tokens),
+            Counted::Money => self.cost.map(Money::micros),
+            Counted::Requests => None,
+        }
     }
 }
 
@@ -109,7 +136,9 @@ impl Limiter {
         for limit in limits.applying_to(asking) {
             let decided = match limit.counted {
                 Counted::Requests => self.rate(limit, now).await,
-                Counted::Tokens => self.quota(limit, now).await,
+                // Money is a quota and not a rate: both are there to protect a bill, so
+                // both refuse rather than let through a count they cannot read.
+                Counted::Tokens | Counted::Money => self.quota(limit, now).await,
             };
             if decided != Decision::Allowed {
                 return decided;
@@ -119,17 +148,17 @@ impl Limiter {
     }
 
     /// Records what an answer spent against every quota that counts it.
-    pub async fn spend(&self, limits: &Limits, asking: &Asking, tokens: u64) {
-        if tokens == 0 {
-            return;
-        }
+    pub async fn spend(&self, limits: &Limits, asking: &Asking, spent: Spent) {
         let now = Timestamp::now();
         for limit in limits.applying_to(asking) {
-            if limit.counted != Counted::Tokens {
+            let Some(counted) = spent.against(limit.counted) else {
+                continue;
+            };
+            if counted == 0 {
                 continue;
             }
             let (key, ttl) = counter(limit, now);
-            if let Err(error) = self.counters.count(&key, tokens, ttl).await {
+            if let Err(error) = self.counters.count(&key, counted, ttl).await {
                 tracing::warn!(%error, %key, "could not count what a request spent");
             }
         }
@@ -412,6 +441,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// An answer that spent tokens and cost nothing known.
+    fn tokens(spent: u64) -> Spent {
+        Spent {
+            tokens: spent,
+            cost: None,
+        }
+    }
+
     fn tenant_wide(counted: Counted, period: Period, allowance: u64) -> Limit {
         limit(LimitScope::of_tenant(tenant()), counted, period, allowance)
     }
@@ -454,9 +491,9 @@ pub(crate) mod tests {
         let limits = Limits::new(vec![tenant_wide(Counted::Tokens, Period::Month, 100)]);
 
         assert_eq!(limiter.admit(&limits, &asking()).await, Decision::Allowed);
-        limiter.spend(&limits, &asking(), 99).await;
+        limiter.spend(&limits, &asking(), tokens(99)).await;
         assert_eq!(limiter.admit(&limits, &asking()).await, Decision::Allowed);
-        limiter.spend(&limits, &asking(), 1).await;
+        limiter.spend(&limits, &asking(), tokens(1)).await;
         assert!(matches!(
             limiter.admit(&limits, &asking()).await,
             Decision::Spent {
@@ -464,6 +501,108 @@ pub(crate) mod tests {
                 ..
             }
         ));
+    }
+
+    /// An answer that cost `micros`, spending no tokens worth counting here.
+    fn costing(micros: u64) -> Spent {
+        Spent {
+            tokens: 0,
+            cost: Some(Money::from_micros(micros)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_money_cap_refuses_once_what_was_spent_reaches_it() {
+        let counters = Arc::new(Held::default());
+        let limiter = limiter(Arc::clone(&counters), Rows::holding(0));
+        let limits = Limits::new(vec![tenant_wide(Counted::Money, Period::Month, 1_000_000)]);
+
+        assert_eq!(limiter.admit(&limits, &asking()).await, Decision::Allowed);
+        limiter.spend(&limits, &asking(), costing(999_999)).await;
+        assert_eq!(limiter.admit(&limits, &asking()).await, Decision::Allowed);
+        limiter.spend(&limits, &asking(), costing(1)).await;
+        assert!(matches!(
+            limiter.admit(&limits, &asking()).await,
+            Decision::Spent {
+                counted: Counted::Money,
+                period: Period::Month,
+                ..
+            }
+        ));
+    }
+
+    /// What ruling 2 costs, asserted rather than described: an answer nothing priced spends
+    /// nothing against a money cap, where the same answer spends its tokens against a quota.
+    #[tokio::test]
+    async fn an_answer_nothing_priced_spends_nothing_against_a_money_cap() {
+        let counters = Arc::new(Held::default());
+        let limiter = limiter(Arc::clone(&counters), Rows::holding(0));
+        let capped = Limits::new(vec![tenant_wide(Counted::Money, Period::Month, 10)]);
+        let quota = Limits::new(vec![tenant_wide(Counted::Tokens, Period::Month, 10)]);
+
+        let unpriced = Spent {
+            tokens: 100,
+            cost: None,
+        };
+        limiter.spend(&capped, &asking(), unpriced).await;
+        limiter.spend(&quota, &asking(), unpriced).await;
+
+        assert_eq!(limiter.admit(&capped, &asking()).await, Decision::Allowed);
+        assert!(matches!(
+            limiter.admit(&quota, &asking()).await,
+            Decision::Spent {
+                counted: Counted::Tokens,
+                ..
+            }
+        ));
+    }
+
+    /// A money cap is seeded from the rows like any other, so a cold cache does not hand a
+    /// tenant a fresh allowance.
+    #[tokio::test]
+    async fn a_money_cap_is_seeded_from_what_the_rows_already_cost() {
+        let limiter = limiter(Arc::new(Held::default()), Rows::holding(5_000));
+        let limits = Limits::new(vec![tenant_wide(Counted::Money, Period::Day, 5_000)]);
+        assert!(matches!(
+            limiter.admit(&limits, &asking()).await,
+            Decision::Spent {
+                counted: Counted::Money,
+                ..
+            }
+        ));
+    }
+
+    /// A money cap that cannot read its count refuses, the way a token quota does: both are
+    /// there to protect a bill, and a rate that fails open is there to protect an upstream.
+    #[tokio::test]
+    async fn a_money_cap_that_cannot_be_read_refuses() {
+        let limiter = limiter(Arc::new(Held::default()), Rows::refusing());
+        let limits = Limits::new(vec![tenant_wide(Counted::Money, Period::Month, 1_000)]);
+        assert!(matches!(
+            limiter.admit(&limits, &asking()).await,
+            Decision::Unknown { .. }
+        ));
+    }
+
+    /// A cache hit costs nothing and must not move a cap: `Money::ZERO` is a figure, unlike
+    /// an absent one, and counting it would still be counting nothing.
+    #[tokio::test]
+    async fn an_answer_that_cost_nothing_moves_no_cap() {
+        let counters = Arc::new(Held::default());
+        let limiter = limiter(Arc::clone(&counters), Rows::holding(0));
+        let limits = Limits::new(vec![tenant_wide(Counted::Money, Period::Month, 1)]);
+
+        limiter
+            .spend(
+                &limits,
+                &asking(),
+                Spent {
+                    tokens: 0,
+                    cost: Some(Money::ZERO),
+                },
+            )
+            .await;
+        assert_eq!(limiter.admit(&limits, &asking()).await, Decision::Allowed);
     }
 
     #[tokio::test]
@@ -488,7 +627,7 @@ pub(crate) mod tests {
         let limits = Limits::new(vec![tenant_wide(Counted::Tokens, Period::Month, 100)]);
 
         assert_eq!(limiter.admit(&limits, &asking()).await, Decision::Allowed);
-        limiter.spend(&limits, &asking(), 20).await;
+        limiter.spend(&limits, &asking(), tokens(20)).await;
         assert!(matches!(
             limiter.admit(&limits, &asking()).await,
             Decision::Spent { .. }
@@ -578,7 +717,7 @@ pub(crate) mod tests {
             tenant_wide(Counted::Requests, Period::Minute, 1_000),
         ]);
 
-        limiter.spend(&limits, &asking(), 150).await;
+        limiter.spend(&limits, &asking(), tokens(150)).await;
         let held = counters.0.lock().unwrap();
         let counted: Vec<_> = held
             .iter()
@@ -594,7 +733,7 @@ pub(crate) mod tests {
         let counters = Arc::new(Held::default());
         let limiter = limiter(Arc::clone(&counters), Rows::holding(0));
         let limits = Limits::new(vec![tenant_wide(Counted::Tokens, Period::Month, 1_000)]);
-        limiter.spend(&limits, &asking(), 0).await;
+        limiter.spend(&limits, &asking(), tokens(0)).await;
         assert!(counters.0.lock().unwrap().is_empty());
     }
 
