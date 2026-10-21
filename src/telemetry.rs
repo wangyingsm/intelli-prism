@@ -9,7 +9,7 @@
 
 use std::future::Future;
 
-use ip_config::{SampleRatio, TelemetryConfig};
+use ip_config::{LogFile, LogsKept, SampleRatio, TelemetryConfig};
 use ip_core::TraceId;
 use opentelemetry::trace::{SpanId, TracerProvider as _};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -20,6 +20,8 @@ use opentelemetry_sdk::metrics::{SdkMeterProvider, exporter::PushMetricExporter}
 use opentelemetry_sdk::trace::{
     IdGenerator, RandomIdGenerator, Sampler, SdkTracerProvider, SpanExporter,
 };
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt;
@@ -49,6 +51,9 @@ pub struct Telemetry {
     provider: Option<SdkTracerProvider>,
     meter: Option<SdkMeterProvider>,
     logger: Option<SdkLoggerProvider>,
+    /// Never read: held so the thread writing the file lives as long as the process,
+    /// and flushes what is buffered when it does not.
+    _rolling: Option<WorkerGuard>,
 }
 
 impl Telemetry {
@@ -84,50 +89,91 @@ impl Telemetry {
 /// that takes spans and refuses metrics, or any other pairing, leaves the gateway with
 /// whichever of them works instead of none.
 pub fn install(config: &TelemetryConfig) -> Telemetry {
-    let level = LevelFilter::from(config.log_level);
-    let printed = tracing_subscriber::fmt::layer();
-    let Some(endpoint) = &config.otlp_endpoint else {
-        tracing_subscriber::registry()
-            .with(level)
-            .with(printed)
-            .init();
-        return Telemetry {
-            provider: None,
-            meter: None,
-            logger: None,
-        };
-    };
-    let traced = exporting(endpoint, config.sample_ratio);
-    let shipped = shipping(endpoint);
-    let traces = traced
+    let rolled = config
+        .log_file
         .as_ref()
-        .ok()
+        .map(|file| rolling(file, config.log_keep));
+    let traced = config
+        .otlp_endpoint
+        .as_ref()
+        .map(|endpoint| exporting(endpoint, config.sample_ratio));
+    let shipped = config.otlp_endpoint.as_ref().map(shipping);
+    let written = worked(&rolled).map(|rolled| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(rolled.writer.clone())
+    });
+    let traces = worked(&traced)
         .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer(SERVICE)));
-    let lines = shipped
-        .as_ref()
-        .ok()
+    let lines = worked(&shipped)
         .map(|provider| OpenTelemetryTracingBridge::new(provider).with_filter(ours()));
     tracing_subscriber::registry()
-        .with(level)
-        .with(printed)
+        .with(LevelFilter::from(config.log_level))
+        .with(tracing_subscriber::fmt::layer())
+        .with(written)
         .with(traces)
         .with(lines)
         .init();
-    match &traced {
-        Ok(_) => tracing::info!(%endpoint, ratio = config.sample_ratio.get(), "exporting traces"),
-        Err(error) => {
-            tracing::error!(%error, %endpoint, "could not export traces to the collector")
+    if let (Some(endpoint), Some(traced)) = (&config.otlp_endpoint, &traced) {
+        match traced {
+            Ok(_) => {
+                tracing::info!(%endpoint, ratio = config.sample_ratio.get(), "exporting traces");
+            }
+            Err(error) => {
+                tracing::error!(%error, %endpoint, "could not export traces to the collector");
+            }
         }
     }
-    match &shipped {
-        Ok(_) => tracing::info!(%endpoint, "exporting logs"),
-        Err(error) => tracing::error!(%error, %endpoint, "could not export logs to the collector"),
+    if let (Some(endpoint), Some(shipped)) = (&config.otlp_endpoint, &shipped) {
+        match shipped {
+            Ok(_) => tracing::info!(%endpoint, "exporting logs"),
+            Err(error) => {
+                tracing::error!(%error, %endpoint, "could not export logs to the collector");
+            }
+        }
+    }
+    if let (Some(file), Some(rolled)) = (&config.log_file, &rolled) {
+        let path = file.directory().join(file.name());
+        match rolled {
+            Ok(_) => {
+                tracing::info!(path = %path.display(), keep = config.log_keep.get(), "writing logs to a file");
+            }
+            Err(error) => {
+                tracing::error!(%error, path = %path.display(), "could not open the log file");
+            }
+        }
     }
     Telemetry {
-        provider: traced.ok(),
-        meter: metering(endpoint),
-        logger: shipped.ok(),
+        provider: traced.and_then(Result::ok),
+        meter: config.otlp_endpoint.as_ref().and_then(metering),
+        logger: shipped.and_then(Result::ok),
+        _rolling: rolled.and_then(Result::ok).map(|rolled| rolled.guard),
     }
+}
+
+/// What an attempt that was made and worked produced, and nothing for one that was not
+/// made or did not.
+fn worked<T, E>(outcome: &Option<Result<T, E>>) -> Option<&T> {
+    outcome.as_ref().and_then(|outcome| outcome.as_ref().ok())
+}
+
+/// The file the lines are also written to, and the guard that keeps the thread writing
+/// them alive.
+struct Rolling {
+    writer: NonBlocking,
+    guard: WorkerGuard,
+}
+
+/// Opens the file the logs roll in: a new one each day, as many kept as were asked for,
+/// and the writing done off the thread that logged.
+fn rolling(file: &LogFile, kept: LogsKept) -> Result<Rolling, InitError> {
+    let appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix(file.name())
+        .max_log_files(kept.get())
+        .build(file.directory())?;
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    Ok(Rolling { writer, guard })
 }
 
 /// The machinery an export runs on, whose own logs the bridge must not carry.
@@ -348,6 +394,7 @@ mod tests {
             provider: None,
             meter: Some(provider),
             logger: None,
+            _rolling: None,
         };
         telemetry.shutdown();
 
@@ -407,6 +454,7 @@ mod tests {
             provider: None,
             meter: None,
             logger: None,
+            _rolling: None,
         };
         quiet.shutdown();
     }
@@ -489,6 +537,7 @@ mod tests {
             provider: None,
             meter: None,
             logger: Some(logging(exporter.clone())),
+            _rolling: None,
         };
         telemetry.shutdown();
 
@@ -497,6 +546,62 @@ mod tests {
             "stopping the process should have flushed what was written"
         );
         drop(telemetry);
+    }
+
+    /// What a standalone deployment gets instead of a collector: the line is on disk,
+    /// where it outlives the process that wrote it.
+    #[test]
+    fn a_line_is_written_to_the_rolling_file() {
+        let at = std::env::temp_dir().join(format!("ip-rolling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(&at).unwrap();
+        let file = LogFile::new(at.join("gateway.log")).unwrap();
+
+        let rolled = rolling(&file, LogsKept::default()).unwrap();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(rolled.writer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!("the upstream refused");
+        });
+        // The writing happens on another thread, and dropping the guard is what waits
+        // for it: read before this and the file is empty for reasons of timing.
+        drop(rolled);
+
+        let written: Vec<_> = std::fs::read_dir(&at)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(written.len(), 1, "one file a day, and this is the first");
+        let name = written[0].file_name().unwrap().to_str().unwrap().to_owned();
+        assert!(
+            name.starts_with("gateway.log."),
+            "the day is written into the name: {name}"
+        );
+        let held = std::fs::read_to_string(&written[0]).unwrap();
+        assert!(held.contains("the upstream refused"), "{held}");
+        assert!(
+            held.contains("ERROR"),
+            "the level is written beside it: {held}"
+        );
+        let _ = std::fs::remove_dir_all(&at);
+    }
+
+    /// A file that cannot be opened is reported and nothing else: the printed logs are
+    /// untouched and the server serves.
+    #[test]
+    fn a_file_that_cannot_be_opened_is_refused_rather_than_made() {
+        let at = std::env::temp_dir().join(format!("ip-rolling-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(&at).unwrap();
+        let file = LogFile::new(at.join("gateway.log")).unwrap();
+        std::fs::remove_dir_all(&at).unwrap();
+        std::fs::write(&at, b"not a directory").unwrap();
+
+        assert!(rolling(&file, LogsKept::default()).is_err());
+        let _ = std::fs::remove_file(&at);
     }
 
     /// Drives a future on this thread, so the spans it opens reach the subscriber installed here.

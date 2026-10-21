@@ -107,4 +107,25 @@ pub enum ConfigError {
         /// What the file asked for.
         value: f64,
     },
+
+    /// A log file nothing can be written to. Refused here rather than at the first
+    /// line, because the appender would make a missing directory rather than say so,
+    /// and a typed path would quietly become a new tree nobody reads.
+    #[error("logs cannot be written to {path:?}: {why}")]
+    LogFile {
+        /// What the file asked for.
+        path: PathBuf,
+        /// What is wrong with it.
+        why: String,
+    },
+
+    /// A count of kept log files that keeps nothing, or keeps so many the directory
+    /// is the thing that fills the disk.
+    #[error("between 1 and {limit} log files are kept, not {value}")]
+    LogsKept {
+        /// What the file asked for.
+        value: u16,
+        /// The most that will be kept.
+        limit: u16,
+    },
 }

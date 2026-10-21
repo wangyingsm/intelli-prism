@@ -479,12 +479,134 @@ pub struct TelemetryConfig {
     /// Lowest level that reaches the log.
     #[serde(default)]
     pub log_level: LogLevel,
-    /// Collector traces and metrics are exported to, when one is configured.
+    /// Collector logs, traces and metrics are exported to, when one is configured.
     #[serde(default)]
     pub otlp_endpoint: Option<Url>,
     /// Share of requests whose trace is exported, for an operator who finds every one too costly.
     #[serde(default)]
     pub sample_ratio: SampleRatio,
+    /// File the logs are also written to, rolled daily. Unset, they are printed and
+    /// nothing else, which is what a deployment with a collector wants and what a
+    /// standalone one loses on restart.
+    #[serde(default)]
+    pub log_file: Option<LogFile>,
+    /// How many rolled files are kept beside the live one.
+    #[serde(default)]
+    pub log_keep: LogsKept,
+}
+
+/// Where the logs are written, as a directory that exists and a name within it.
+///
+/// Checked when the file is read rather than when the first line is written: the
+/// appender makes a missing directory instead of refusing, so a mistyped path would
+/// become a tree of logs nobody ever looks in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "PathBuf")]
+pub struct LogFile {
+    directory: PathBuf,
+    name: String,
+}
+
+impl LogFile {
+    /// Takes a path apart into the directory to write in and the name to write under.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::LogFile`] when the path names no file, when its directory does
+    /// not exist, or when the path is itself a directory.
+    pub fn new(path: PathBuf) -> Result<Self, ConfigError> {
+        let refuse = |why: &str| {
+            Err(ConfigError::LogFile {
+                path: path.clone(),
+                why: why.to_owned(),
+            })
+        };
+        if path.is_dir() {
+            return refuse("that is a directory");
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return refuse("a log file has a name");
+        };
+        let name = name.to_owned();
+        let directory = match path.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
+            Some(parent) => parent.to_path_buf(),
+            None => return refuse("a log file has a name"),
+        };
+        if !directory.is_dir() {
+            return refuse("its directory does not exist");
+        }
+        Ok(Self { directory, name })
+    }
+
+    /// The directory the files are rolled in.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// The name the live file is written under, which the rolled ones extend.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl TryFrom<PathBuf> for LogFile {
+    type Error = ConfigError;
+
+    fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
+        Self::new(path)
+    }
+}
+
+/// How many rolled log files are kept beside the live one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "u16")]
+pub struct LogsKept(u16);
+
+impl LogsKept {
+    /// Keeping none of them is keeping no history at all, so one is the fewest.
+    pub const FEWEST: u16 = 1;
+    /// A year of daily files, past which the log directory is the thing filling the disk.
+    pub const MOST: u16 = 365;
+
+    /// Wraps a count after checking it is one.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::LogsKept`] when the count is outside [`LogsKept::FEWEST`] to
+    /// [`LogsKept::MOST`].
+    pub fn new(value: u16) -> Result<Self, ConfigError> {
+        if !(Self::FEWEST..=Self::MOST).contains(&value) {
+            return Err(ConfigError::LogsKept {
+                value,
+                limit: Self::MOST,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// The count as the appender wants it.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Default for LogsKept {
+    /// A week, which is what an operator looking into yesterday's incident needs.
+    fn default() -> Self {
+        Self(7)
+    }
+}
+
+impl TryFrom<u16> for LogsKept {
+    type Error = ConfigError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
 }
 
 /// The share of requests whose trace is exported, from none of them to all.
@@ -711,11 +833,95 @@ secret = "0123456789abcdef0123456789abcdef"
         assert_eq!(config.telemetry.log_level, LogLevel::Info);
         assert_eq!(config.telemetry.otlp_endpoint, None);
         assert_eq!(config.telemetry.sample_ratio, SampleRatio::default());
+        assert_eq!(config.telemetry.log_file, None);
+        assert_eq!(config.telemetry.log_keep, LogsKept::default());
         assert_eq!(config.usage, UsageConfig::default());
         assert_eq!(config.usage.retention, None);
         assert_eq!(config.auth.nonce_ttl, Seconds::new(300));
         assert_eq!(config.auth.jwt.ttl, Seconds::new(6 * 3600));
         assert!(config.upstreams.is_empty());
+    }
+
+    /// A directory under the temporary one, distinct per test and per process.
+    fn scratch(tag: &str) -> PathBuf {
+        let at = std::env::temp_dir().join(format!("ip-log-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(&at).expect("a scratch directory");
+        at
+    }
+
+    #[test]
+    fn a_configured_log_file_is_read_and_checked_as_the_file_is_parsed() {
+        let at = scratch("parsed");
+        let written = format!(
+            "{MINIMAL}\n[telemetry]\nlog_file = \"{}/gateway.log\"\nlog_keep = 30\n",
+            at.display()
+        );
+        let config = Config::parse(&written).unwrap();
+        let file = config.telemetry.log_file.unwrap();
+        assert_eq!(file.directory(), at);
+        assert_eq!(file.name(), "gateway.log");
+        assert_eq!(config.telemetry.log_keep.get(), 30);
+
+        let nowhere =
+            format!("{MINIMAL}\n[telemetry]\nlog_file = \"/no/such/place/gateway.log\"\n");
+        assert!(
+            Config::parse(&nowhere).is_err(),
+            "a log file nothing can be written to stops the file being read"
+        );
+    }
+
+    #[test]
+    fn a_log_file_is_a_directory_that_exists_and_a_name_in_it() {
+        let at = scratch("exists");
+        let file = LogFile::new(at.join("gateway.log")).unwrap();
+        assert_eq!(file.directory(), at);
+        assert_eq!(file.name(), "gateway.log");
+    }
+
+    #[test]
+    fn a_log_file_in_a_directory_that_is_not_there_is_refused() {
+        let at = scratch("absent").join("nowhere");
+        let refusal = LogFile::new(at.join("gateway.log")).unwrap_err();
+        assert!(
+            matches!(&refusal, ConfigError::LogFile { why, .. } if why == "its directory does not exist"),
+            "a mistyped directory must be said out loud, not created: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_not_a_log_file() {
+        let at = scratch("directory");
+        let refusal = LogFile::new(at.clone()).unwrap_err();
+        assert!(
+            matches!(&refusal, ConfigError::LogFile { why, .. } if why == "that is a directory")
+        );
+    }
+
+    #[test]
+    fn a_path_naming_no_file_is_refused() {
+        let refusal = LogFile::new(PathBuf::from("/")).unwrap_err();
+        assert!(matches!(refusal, ConfigError::LogFile { .. }));
+    }
+
+    #[test]
+    fn a_bare_name_is_written_in_the_working_directory() {
+        let file = LogFile::new(PathBuf::from("gateway.log")).unwrap();
+        assert_eq!(file.directory(), Path::new("."));
+        assert_eq!(file.name(), "gateway.log");
+    }
+
+    #[test]
+    fn a_count_of_kept_files_outside_the_limits_is_refused() {
+        for value in [0, LogsKept::MOST + 1] {
+            assert!(matches!(
+                LogsKept::new(value),
+                Err(ConfigError::LogsKept { .. })
+            ));
+        }
+        assert_eq!(LogsKept::new(LogsKept::FEWEST).unwrap().get(), 1);
+        assert_eq!(LogsKept::new(LogsKept::MOST).unwrap().get(), 365);
+        assert_eq!(LogsKept::default().get(), 7);
     }
 
     #[test]
