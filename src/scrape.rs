@@ -5,6 +5,7 @@
 //! the access control a deployment gets for free — the token is for the scraper that
 //! has to cross a network to reach it.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -27,7 +28,8 @@ struct Scraping {
     token: Option<Secret>,
 }
 
-/// Binds the scrape listener and serves it until the process ends.
+/// Binds the scrape listener and serves it until the process ends, answering with the
+/// address it bound and the task serving it.
 ///
 /// # Errors
 ///
@@ -37,18 +39,25 @@ struct Scraping {
 pub async fn serve(
     config: &ScrapeConfig,
     telemetry: Arc<Telemetry>,
-) -> Result<tokio::task::JoinHandle<()>, StartupError> {
-    let address = config.listen;
-    let listener = tokio::net::TcpListener::bind(address)
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), StartupError> {
+    let asked = config.listen;
+    let listener = tokio::net::TcpListener::bind(asked)
         .await
-        .map_err(|source| StartupError::Bind { address, source })?;
+        .map_err(|source| StartupError::Bind {
+            address: asked,
+            source,
+        })?;
+    // What was bound rather than what was asked for: a configuration naming port zero
+    // is answered on a port only the kernel knows, and an operator reads it here.
+    let address = listener.local_addr().unwrap_or(asked);
     tracing::info!(%address, guarded = config.token.is_some(), "serving the numbers to scrape");
     let serving = router(config, telemetry);
-    Ok(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, serving).await {
             tracing::error!(%error, "the scrape listener stopped");
         }
-    }))
+    });
+    Ok((address, task))
 }
 
 /// The one route a scraper calls. Everything else on this listener is a 404.
@@ -210,6 +219,66 @@ mod tests {
             status,
             StatusCode::NOT_FOUND,
             "the data plane is not on this port"
+        );
+    }
+
+    /// Over a real socket, which is the only way to find out that what was bound,
+    /// spawned and routed is the same listener an operator points a scraper at.
+    #[tokio::test]
+    async fn the_bound_listener_answers_a_scraper() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (reader, registry) = crate::telemetry::gathering().unwrap();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        provider
+            .meter("test")
+            .u64_counter("ip.requests")
+            .build()
+            .add(1, &[KeyValue::new("tenant", "acme")]);
+        let config = ScrapeConfig {
+            // Port zero, so the test takes whatever is free rather than racing
+            // whatever else on this machine wanted 9464.
+            listen: "127.0.0.1:0".parse().unwrap(),
+            token: None,
+        };
+        let (address, task) = serve(&config, Arc::new(Telemetry::gathering_into(registry)))
+            .await
+            .expect("the listener binds");
+        assert_ne!(address.port(), 0, "the port it actually got");
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("a scraper reaches it");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: scrape\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answered = String::new();
+        stream.read_to_string(&mut answered).await.unwrap();
+        task.abort();
+
+        assert!(answered.starts_with("HTTP/1.1 200 OK"), "{answered}");
+        assert!(answered.contains("ip_requests_total"), "{answered}");
+        assert!(answered.contains(r#"tenant="acme""#), "{answered}");
+    }
+
+    /// An address already taken stops startup rather than leaving an operator with a
+    /// dashboard that never fills and no line saying why.
+    #[tokio::test]
+    async fn an_address_that_will_not_bind_stops_startup() {
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ScrapeConfig {
+            listen: held.local_addr().unwrap(),
+            token: None,
+        };
+
+        let refused = serve(&config, Arc::new(Telemetry::quiet()))
+            .await
+            .expect_err("the address is taken");
+
+        assert!(
+            matches!(refused, StartupError::Bind { address, .. } if address == config.listen),
+            "the refusal names the address: {refused}"
         );
     }
 

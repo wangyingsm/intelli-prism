@@ -67,7 +67,10 @@ async fn serve(config: &Path) -> Result<(), StartupError> {
     let config = Config::load(config)?;
     let telemetry = std::sync::Arc::new(telemetry::install(&config.telemetry));
     let _scraping = match &config.telemetry.scrape {
-        Some(scrape) => Some(scrape::serve(scrape, std::sync::Arc::clone(&telemetry)).await?),
+        Some(scrape) => {
+            let (_, serving) = scrape::serve(scrape, std::sync::Arc::clone(&telemetry)).await?;
+            Some(serving)
+        }
         None => None,
     };
 
