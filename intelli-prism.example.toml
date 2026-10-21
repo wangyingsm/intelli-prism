@@ -236,9 +236,15 @@ temperature = 0.7
 # announced and not the seven characters that announced it. `check` is optional and
 # names arithmetic that confirms a match: luhn, prc_id or iban.
 #
+# `least` is optional too, and says how far a match must run before it is believed. A
+# short prefix also opens ordinary words — the shipped `sk-` asks for 13 characters so
+# that the locale `sk-SK` is left alone — and anything you declare has no floor unless
+# you set one, so your own prefixes match at whatever length they always did.
+#
 # [[filter.secret]]
 # kind = "corp-token"
 # prefix = "MYCORP-"
+# least = 24
 #
 # [[filter.secret]]
 # kind = "staff-mail"

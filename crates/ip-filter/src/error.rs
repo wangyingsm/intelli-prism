@@ -36,6 +36,10 @@ pub enum FilterError {
         how: &'static str,
     },
 
+    /// A floor of nothing, which is what leaving it unset already means.
+    #[error("a length floor of nought is the same as setting none")]
+    EmptyLeast,
+
     /// A configuration naming a default that does not exist.
     #[error("no secret ships under the name {value}; this build carries {carried}")]
     UnknownDefault {

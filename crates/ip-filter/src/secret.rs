@@ -5,6 +5,7 @@
 //! it into something that can scan is [`crate::Detectors`]'s job, and that is the step
 //! that can fail.
 
+use crate::error::FilterError;
 use crate::kind::Kind;
 
 /// How a secret is recognised.
@@ -74,6 +75,44 @@ pub enum Check {
     Iban,
 }
 
+/// How far a match must run before it is believed.
+///
+/// A short prefix cannot tell a key from a word that opens the same way: `sk-SK` is a
+/// locale and `sk-abcdefghij1234567890` is a key, and nothing but length separates
+/// them. Where a provider issues long tokens behind a short prefix, saying so here is
+/// what keeps the detector off ordinary text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "usize")
+)]
+pub struct Least(usize);
+
+impl Least {
+    /// A floor of this many characters, refusing nought, which is no floor at all.
+    pub fn new(characters: usize) -> Result<Self, FilterError> {
+        if characters == 0 {
+            return Err(FilterError::EmptyLeast);
+        }
+        Ok(Self(characters))
+    }
+
+    /// How many characters it asks for.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl TryFrom<usize> for Least {
+    type Error = FilterError;
+
+    fn try_from(characters: usize) -> Result<Self, Self::Error> {
+        Self::new(characters)
+    }
+}
+
 /// One declared secret: what it is called, how it is recognised, and what confirms it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
@@ -91,6 +130,10 @@ pub struct Secret {
     /// The arithmetic that confirms a match, where the issuer published one.
     #[cfg_attr(feature = "serde", serde(default))]
     pub check: Option<Check>,
+    /// How far a match must run before it is believed, where a shape alone is too
+    /// short to tell a secret from a word. Unset means any length the shape matched.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub least: Option<Least>,
 }
 
 impl Secret {
@@ -101,6 +144,7 @@ impl Secret {
             kind,
             matching,
             check: None,
+            least: None,
         }
     }
 
@@ -108,6 +152,13 @@ impl Secret {
     #[must_use]
     pub fn confirmed_by(mut self, check: Check) -> Self {
         self.check = Some(check);
+        self
+    }
+
+    /// The same, believed only once it runs this far.
+    #[must_use]
+    pub fn at_least(mut self, least: Least) -> Self {
+        self.least = Some(least);
         self
     }
 
@@ -123,6 +174,10 @@ impl Secret {
         let named = |raw: &str| {
             Kind::new(raw).unwrap_or_else(|_| unreachable!("{raw} is a name written in this file"))
         };
+        let floor = |characters: usize| {
+            Least::new(characters)
+                .unwrap_or_else(|_| unreachable!("{characters} is a floor written in this file"))
+        };
         vec![
             // The whole block, not the opening line: a key is useless to redact by its
             // header and catastrophic to let through by its body.
@@ -135,10 +190,14 @@ impl Secret {
             ),
             // The shapes providers actually issue, each as a prefix because that is how
             // an operator thinks of them and how the next provider will be added.
-            Self::new(named("openai-key"), Match::Prefix("sk-".to_owned())),
-            Self::new(named("github-token"), Match::Prefix("ghp_".to_owned())),
-            Self::new(named("aws-key"), Match::Prefix("AKIA".to_owned())),
-            Self::new(named("google-key"), Match::Prefix("AIza".to_owned())),
+            // Each with the floor its provider's tokens clear by a wide margin, because
+            // a short prefix also opens ordinary text: `sk-SK` is a locale. The floors
+            // are well under the real lengths — an openai key runs past fifty — so they
+            // separate prose from secrets without guessing at a format that may change.
+            Self::new(named("openai-key"), Match::Prefix("sk-".to_owned())).at_least(floor(13)),
+            Self::new(named("github-token"), Match::Prefix("ghp_".to_owned())).at_least(floor(20)),
+            Self::new(named("aws-key"), Match::Prefix("AKIA".to_owned())).at_least(floor(20)),
+            Self::new(named("google-key"), Match::Prefix("AIza".to_owned())).at_least(floor(30)),
             // Not a bare `xox` prefix, which the other four can afford and this one
             // cannot: `xoxo` ends an ordinary English sentence. Every token Slack
             // issues carries a dash after its kind, and is far longer than the ten

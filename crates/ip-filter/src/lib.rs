@@ -31,5 +31,5 @@ pub use detect::{Detectors, Finding};
 pub use error::FilterError;
 pub use kind::Kind;
 pub use redact::{Redaction, redact};
-pub use secret::{Check, Match, Secret};
+pub use secret::{Check, Least, Match, Secret};
 pub use stream::{Trickle, WINDOW};

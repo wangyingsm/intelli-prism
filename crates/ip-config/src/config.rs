@@ -1339,6 +1339,53 @@ model = "claude-sonnet-5"
         assert_eq!(named, vec!["email", "corp-token"]);
     }
 
+    /// A declared secret may carry a length floor, and one that does not is unchanged.
+    ///
+    /// The field is documented in the example configuration, so it is read here rather
+    /// than trusted to a derive.
+    #[test]
+    fn a_declared_secret_may_ask_for_a_length() {
+        let filter: FilterConfig = toml::from_str(
+            r#"
+            shipped = []
+
+            [[secret]]
+            kind = "corp-token"
+            prefix = "MYCORP-"
+            least = 24
+
+            [[secret]]
+            kind = "staff-mail"
+            suffix = "@corp.example"
+            "#,
+        )
+        .unwrap();
+        let secrets = filter.secrets().unwrap();
+        assert_eq!(secrets[0].least.map(ip_filter::Least::get), Some(24));
+        assert_eq!(
+            secrets[1].least, None,
+            "a floor nobody asked for was invented"
+        );
+    }
+
+    /// A floor of nought is the same as none, and saying it is almost always a slip.
+    #[test]
+    fn a_declared_floor_of_nothing_is_refused() {
+        let said = toml::from_str::<FilterConfig>(
+            r#"
+            shipped = []
+
+            [[secret]]
+            kind = "corp-token"
+            prefix = "MYCORP-"
+            least = 0
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(said.contains("nought"), "{said}");
+    }
+
     /// Taking none of the shipped ones is a thing an operator may mean.
     #[test]
     fn a_filter_may_take_none_of_the_shipped_secrets() {

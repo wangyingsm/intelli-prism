@@ -7,7 +7,7 @@ use regex::Regex;
 use crate::check;
 use crate::error::FilterError;
 use crate::kind::Kind;
-use crate::secret::{Check, Match, Secret};
+use crate::secret::{Check, Least, Match, Secret};
 
 /// What a prefix or suffix match reaches through.
 ///
@@ -60,6 +60,7 @@ struct Looking {
     kind: Kind,
     how: How,
     check: Option<Check>,
+    least: Option<Least>,
 }
 
 /// A way of matching, ready to run.
@@ -127,6 +128,7 @@ impl Detectors {
                     kind: secret.kind.clone(),
                     how: compiled,
                     check: secret.check,
+                    least: secret.least,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -150,7 +152,8 @@ impl Detectors {
         let mut found: Vec<(usize, Finding)> = Vec::new();
         for (declared, looking) in self.looking.iter().enumerate() {
             for at in looking.how.spans(text) {
-                if confirmed(looking.check, &text[at.clone()]) {
+                let matched = &text[at.clone()];
+                if reaches(looking.least, matched) && confirmed(looking.check, matched) {
                     found.push((
                         declared,
                         Finding {
@@ -221,6 +224,12 @@ fn run_start(text: &str, before: usize) -> usize {
     })
 }
 
+/// Whether a match runs as far as its kind requires. A kind asking for no floor is
+/// taken at whatever length its shape matched.
+fn reaches(least: Option<Least>, text: &str) -> bool {
+    least.is_none_or(|least| text.chars().count() >= least.get())
+}
+
 /// Whether a candidate is confirmed by arithmetic of its own. One declared without a
 /// check is taken at its shape.
 fn confirmed(check: Option<Check>, text: &str) -> bool {
@@ -281,6 +290,59 @@ mod tests {
             vec!["sk-abcdefghij1234"]
         );
         assert_eq!(found("AKIAIOSFODNN7EXAMPLE"), vec!["AKIAIOSFODNN7EXAMPLE"]);
+    }
+
+    /// A short prefix also opens ordinary text, and the floor is what tells them apart.
+    ///
+    /// `sk-SK` is a locale tag and `AIza` could begin any identifier; neither is a
+    /// secret, and before the floor both were redacted out of a caller's body.
+    #[test]
+    fn a_prefix_shorter_than_its_kind_asks_for_is_not_a_secret() {
+        for prose in [
+            "the locale is sk-SK",
+            "sk-x",
+            "ghp_short",
+            "AKIASHORT",
+            "AIzaShort",
+        ] {
+            assert!(found(prose).is_empty(), "{prose} was taken for a secret");
+        }
+
+        // And the real shapes still go, each well past the floor its kind asks for.
+        assert_eq!(
+            found("sk-abcdefghij1234567890"),
+            vec!["sk-abcdefghij1234567890"]
+        );
+        assert_eq!(found("AKIAIOSFODNN7EXAMPLE"), vec!["AKIAIOSFODNN7EXAMPLE"]);
+        assert_eq!(
+            found("ghp_123456789012345678901234567890123456"),
+            vec!["ghp_123456789012345678901234567890123456"]
+        );
+    }
+
+    /// A floor of nought is what leaving it unset already means, so it is refused
+    /// rather than quietly accepted as a kind with no floor.
+    #[test]
+    fn a_floor_of_nothing_is_refused() {
+        assert_eq!(Least::new(0), Err(FilterError::EmptyLeast));
+        assert_eq!(Least::new(1).unwrap().get(), 1);
+    }
+
+    /// A kind that asks for no floor is taken at whatever length its shape matched,
+    /// which is what every operator-declared prefix does.
+    #[test]
+    fn a_kind_asking_for_no_floor_matches_at_any_length() {
+        let detectors = Detectors::of(&[Secret::new(
+            Kind::new("theirs").unwrap(),
+            Match::Prefix("zz-".to_owned()),
+        )])
+        .unwrap();
+        let found: Vec<String> = detectors
+            .find("zz-a")
+            .into_iter()
+            .map(|one| one.text("zz-a").to_owned())
+            .collect();
+        assert_eq!(found, vec!["zz-a"]);
     }
 
     /// A slack token is matched by the shape slack issues, not by three letters.

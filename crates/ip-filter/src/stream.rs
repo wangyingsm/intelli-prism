@@ -258,14 +258,15 @@ mod tests {
     }
 
     /// What per-piece filtering costs, written down rather than left to be discovered.
-    /// The three characters that announce a key are a match on their own, so they are
-    /// replaced — and the key material behind them, in the next piece, goes out whole.
-    /// This is the failure a window exists to prevent, and the test says so plainly.
+    /// Split across two pieces, neither half is a key: the announcement is shorter than
+    /// the floor its kind asks for, and the material behind it arrives with nothing to
+    /// announce it. So the key goes out whole, which is the failure a window exists to
+    /// prevent, and the test says so plainly.
     #[test]
-    fn a_window_of_zero_redacts_the_announcement_and_lets_the_key_through() {
+    fn a_window_of_zero_lets_a_split_key_through() {
         let detectors = defaults();
         let mut trickle = Trickle::new(&detectors, 0);
-        assert_eq!(trickle.push("split sk-"), "split [redacted:openai-key:1]");
+        assert_eq!(trickle.push("split sk-"), "split sk-");
         assert_eq!(
             trickle.push("abcdefghij1234"),
             "abcdefghij1234",
