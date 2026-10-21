@@ -174,7 +174,7 @@ impl TryFrom<u64> for Rate {
 }
 
 /// What one model costs in each direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Price {
     /// What a million tokens sent to the model cost.
     pub input: Rate,

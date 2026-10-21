@@ -7,6 +7,7 @@ use ip_core::{PluginRule, RouteRule};
 
 use crate::error::StorageError;
 use crate::limit::Limit;
+use crate::price::Priced;
 
 /// A count that moves on with every change to a route or a plugin rule, and never goes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,7 +31,7 @@ impl fmt::Display for RuleRevision {
     }
 }
 
-/// Every route, plugin rule and limit, as they stood at one revision.
+/// Every route, plugin rule, limit and price, as they stood at one revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleSet {
     /// The revision the rules were read at.
@@ -41,6 +42,8 @@ pub struct RuleSet {
     pub rules: Vec<PluginRule>,
     /// Every limit set on a tenant or one of its accounts.
     pub limits: Vec<Limit>,
+    /// What each priced model costs.
+    pub prices: Vec<Priced>,
 }
 
 /// Reads how far the rules have moved on, and the rules themselves as of one moment.
@@ -49,8 +52,8 @@ pub trait RevisionStore: Send + Sync {
     /// The revision the rules stand at now.
     async fn rule_revision(&self) -> Result<RuleRevision, StorageError>;
 
-    /// Every route, plugin rule and limit with the revision they stand at, read in one
-    /// transaction so the set is never a mix of two moments.
+    /// Every route, plugin rule, limit and price with the revision they stand at, read in
+    /// one transaction so the set is never a mix of two moments.
     async fn rule_set(&self) -> Result<RuleSet, StorageError>;
 }
 

@@ -29,6 +29,7 @@ use crate::filter::{Filtered, Filtering, Reported};
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::meter::{Looked, Meters, Refused};
+use crate::price::Prices;
 use crate::processor::{ChainSource, FixedChains, ProcessorChain};
 use crate::semantic::{self, Question, SemanticCache};
 use crate::stage::{Authorized, BodyProcessed, Dispatched, ResponseBodyProcessed, Stage};
@@ -84,14 +85,16 @@ pub struct Gateway {
     pending: Pending,
 }
 
-/// The rules in force: the table a request is routed by and the chains it is processed by.
+/// The rules in force: the table a request is routed by, the chains it is processed by,
+/// what it may spend and what it costs.
 ///
-/// The two are held together and replaced together, so no request is ever routed by one set
-/// of rules and processed by another.
+/// They are held together and replaced together, so no request is ever routed by one set
+/// of rules and processed, limited or priced by another.
 struct Routing {
     table: Arc<RoutingTable>,
     chains: Arc<dyn ChainSource>,
     limits: Limits,
+    prices: Prices,
 }
 
 impl Gateway {
@@ -117,6 +120,7 @@ impl Gateway {
                 table: Arc::new(table),
                 chains,
                 limits: Limits::default(),
+                prices: Prices::default(),
             }),
             upstream,
             responses: None,
@@ -134,15 +138,23 @@ impl Gateway {
         }
     }
 
-    /// Puts a new table and new chains in force, for every request that starts after this.
+    /// Puts a new table, new chains, new limits and new prices in force, for every
+    /// request that starts after this.
     ///
     /// Readers never wait for this: a request in flight finishes on the rules it started
     /// with, and the next one picks up the new ones.
-    pub fn replace(&self, table: RoutingTable, chains: Arc<dyn ChainSource>, limits: Limits) {
+    pub fn replace(
+        &self,
+        table: RoutingTable,
+        chains: Arc<dyn ChainSource>,
+        limits: Limits,
+        prices: Prices,
+    ) {
         self.routing.store(Arc::new(Routing {
             table: Arc::new(table),
             chains,
             limits,
+            prices,
         }));
     }
 
@@ -249,6 +261,19 @@ impl Gateway {
             table: Arc::clone(&held.table),
             chains: Arc::clone(&held.chains),
             limits,
+            prices: held.prices.clone(),
+        }));
+        self
+    }
+
+    /// Puts the prices a node starts with in force, leaving its rules as they are.
+    pub fn with_prices(self, prices: Prices) -> Self {
+        let held = self.routing.load();
+        self.routing.store(Arc::new(Routing {
+            table: Arc::clone(&held.table),
+            chains: Arc::clone(&held.chains),
+            limits: held.limits.clone(),
+            prices,
         }));
         self
     }
@@ -264,6 +289,12 @@ impl Gateway {
     /// The rules this flow routes by, as they stand now.
     pub fn table(&self) -> Arc<RoutingTable> {
         Arc::clone(&self.routing.load().table)
+    }
+
+    /// What this flow prices each model at, as it stands now.
+    #[must_use]
+    pub fn prices(&self) -> Prices {
+        self.routing.load().prices.clone()
     }
 
     /// Carries one request through every stage, in the order the types allow.
@@ -2543,6 +2574,7 @@ mod tests {
                 ip_core::Period::Minute,
                 1,
             )]),
+            Prices::default(),
         );
         assert!(
             gateway
@@ -5350,6 +5382,7 @@ mod tests {
             capped_table(&[("one.example.com", ip_core::Difficulty::Routine)]),
             Arc::new(FixedChains::new(ProcessorChain::new())),
             Limits::default(),
+            Prices::default(),
         );
         let second = ask(
             &gateway,

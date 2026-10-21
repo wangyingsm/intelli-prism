@@ -10,7 +10,8 @@ use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_core::RouteRule;
 use ip_gateway::{
-    Dispatcher, Gateway, HyperUpstream, Limiter, Limits, ResponseCache, RouteError, RoutingTable,
+    Dispatcher, Gateway, HyperUpstream, Limiter, Limits, Prices, ResponseCache, RouteError,
+    RoutingTable,
 };
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
@@ -147,6 +148,8 @@ impl AppState {
         let gateway = Gateway::with_chains(table, Arc::new(chains), upstream);
         let limits = Limits::new(ip_storage::LimitStore::limits(store.as_ref()).await?);
         tracing::info!(limits = limits.len(), "limits in force");
+        let prices = Prices::new(ip_storage::PriceStore::prices(store.as_ref()).await?);
+        tracing::info!(prices = prices.len(), "models priced");
         let limiter = Limiter::new(
             Arc::clone(&counters),
             Arc::clone(&backend) as Arc<dyn ip_storage::UsageStore>,
@@ -159,7 +162,8 @@ impl AppState {
             .limiting(Arc::new(limiter))
             .dispatching(Arc::new(dispatcher))
             .sticky_turns(Arc::clone(&cache))
-            .with_limits(limits);
+            .with_limits(limits)
+            .with_prices(prices);
         if let Some(judge) = judge {
             tracing::info!("classifying the opening of turns that name no class");
             gateway = gateway.classifying(judge);

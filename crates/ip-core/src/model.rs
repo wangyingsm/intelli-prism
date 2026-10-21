@@ -8,7 +8,7 @@ use crate::error::CoreError;
 const MODEL_NAME_MAX_BYTES: usize = 128;
 
 /// The name of a model as the upstream spells it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct ModelName(Box<str>);
 

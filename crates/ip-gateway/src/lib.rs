@@ -13,6 +13,7 @@ pub mod hyper_upstream;
 pub mod limit;
 pub mod measure;
 pub mod meter;
+pub mod price;
 pub mod processor;
 pub mod semantic;
 mod sse;
@@ -35,6 +36,7 @@ pub use hyper_upstream::{HyperUpstream, UpstreamSettings};
 pub use limit::{Asking, Decision, Limiter, Limits};
 pub use measure::{Measured, Measuring, measure};
 pub use meter::Meters;
+pub use price::Prices;
 pub use processor::{BodyProcessor, ChainSource, FixedChains, HeaderProcessor, ProcessorChain};
 pub use semantic::{CACHE, NEARNESS, Question, SemanticCache, SemanticSettings, semantic_key};
 pub use stage::{

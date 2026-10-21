@@ -8,14 +8,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ip_gateway::{Gateway, Limits, RoutingTable};
+use ip_gateway::{Gateway, Limits, Prices, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost};
 use tokio::sync::watch;
 
 use ip_cache::{CacheBackend, CacheKey, CacheLevel};
 use ip_core::{Checksum, PluginKind, PluginOrder, PluginRule, PluginScope, RouteRule};
 use ip_storage::{Backend, RuleRevision};
-use ip_storage::{Limit, RuleSet};
+use ip_storage::{Limit, Priced, RuleSet};
 use tokio::task::JoinHandle;
 
 use crate::error::FeedError;
@@ -44,6 +44,10 @@ struct Snapshot {
     /// Absent in a snapshot published before limits were carried, which reads as none of them.
     #[serde(default)]
     limits: Vec<Limit>,
+    /// Absent in a snapshot published before prices were carried, which reads as none of
+    /// them — and a node holding no price records no cost, rather than recording nought.
+    #[serde(default)]
+    prices: Vec<Priced>,
 }
 
 /// One plugin rule on the wire, rebuilt through its own checks when read back.
@@ -80,6 +84,7 @@ impl RuleFeed {
             routes: set.routes,
             rules: set.rules.iter().map(Placed::from).collect(),
             limits: set.limits,
+            prices: set.prices,
         };
         let encoded = serde_json::to_vec(&snapshot).map_err(FeedError::Encode)?;
         self.cache
@@ -113,6 +118,7 @@ impl RuleFeed {
             routes: snapshot.routes,
             rules,
             limits: snapshot.limits,
+            prices: snapshot.prices,
         }))
     }
 
@@ -207,8 +213,12 @@ impl Reloader {
         let chains =
             PluginChains::from_rules(Arc::clone(&self.host), self.store.as_ref(), set.rules)
                 .await?;
-        self.gateway
-            .replace(table, Arc::new(chains), Limits::new(set.limits));
+        self.gateway.replace(
+            table,
+            Arc::new(chains),
+            Limits::new(set.limits),
+            Prices::new(set.prices),
+        );
         Ok(Some(set.revision))
     }
 
@@ -293,12 +303,12 @@ impl TryFrom<Placed> for PluginRule {
 mod tests {
     use ip_cache::{Publication, SledCache};
     use ip_core::{
-        AbsPath, ApiId, Endpoint, Host, NewPluginRule, Port, Protocol, RouteKey, RouteTarget,
-        TenantId, TnKey,
+        AbsPath, ApiId, Endpoint, Host, ModelName, NewPluginRule, Port, Price, Protocol, Rate,
+        RouteKey, RouteTarget, TenantId, TnKey,
     };
     use ip_storage::{
-        NewPlugin, NewTenant, PluginOwner, PluginRuleStore, PluginStore, RevisionStore, RouteStore,
-        SqliteStore, TenantStore,
+        NewPlugin, NewTenant, PluginOwner, PluginRuleStore, PluginStore, PriceStore, RevisionStore,
+        RouteStore, SqliteStore, TenantStore,
     };
 
     use super::*;
@@ -444,6 +454,58 @@ mod tests {
         let revision = state.reload_rules().await.unwrap().unwrap();
         assert_eq!(revision, store.rule_revision().await.unwrap());
         assert_eq!(state.gateway().table().len(), 1);
+    }
+
+    /// A price is set on one node and in force on another: it travels the publication
+    /// the routes and the limits travel, carried by the same revision and the same
+    /// reload, which is the whole of what this commit buys.
+    #[tokio::test]
+    async fn a_price_set_in_the_store_is_in_force_on_this_node() {
+        let (state, store) = node().await;
+        assert!(state.gateway().prices().is_empty());
+        store
+            .put_price(ip_storage::NewPrice {
+                model: ModelName::new("claude-opus-5").unwrap(),
+                price: Price::new(
+                    Rate::new(3_000_000).unwrap(),
+                    Rate::new(15_000_000).unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        state.feed().publish().await.unwrap();
+
+        state.reload_rules().await.unwrap().unwrap();
+
+        let priced = state
+            .gateway()
+            .prices()
+            .of(&ModelName::new("claude-opus-5").unwrap())
+            .expect("the model this node answers for is priced");
+        assert_eq!(priced.input.get(), 3_000_000);
+        assert_eq!(priced.output.get(), 15_000_000);
+    }
+
+    /// A snapshot published by a node from before prices existed carries no such field,
+    /// and the node reading it prices nothing rather than refusing the whole set.
+    #[tokio::test]
+    async fn a_snapshot_from_before_prices_leaves_this_node_pricing_nothing() {
+        let (state, _) = node().await;
+        let older = serde_json::json!({"routes": [], "rules": [], "limits": []});
+        let topic = CacheKey::new(CacheLevel::System, "rules").unwrap();
+        state
+            .feed()
+            .cache()
+            .publish(&topic, 9_999, older.to_string().as_bytes())
+            .await
+            .unwrap();
+
+        state.reload_rules().await.unwrap().unwrap();
+
+        assert!(
+            state.gateway().prices().is_empty(),
+            "nothing priced, and nothing refused"
+        );
     }
 
     #[tokio::test]

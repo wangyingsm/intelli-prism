@@ -4,7 +4,7 @@ use ip_core::{ModelName, Price, Timestamp};
 use crate::error::StorageError;
 
 /// What one model costs, as it is stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Priced {
     /// The model the price is for.
     pub model: ModelName,
