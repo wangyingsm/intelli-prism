@@ -356,6 +356,32 @@ against `multilingual-e5-small` quantized to int8 — 384 numbers in about 6 ms,
 paraphrase at 0.978 against 0.762 for two questions with nothing in common. That floor is why the
 threshold belongs near the top of the range and why the figure is nobody's to default.
 
+### Counting what the gateway does
+
+- Nine instruments pushed to the same collector the traces go to, so an operator who has
+configured one endpoint has configured observability. Nothing new listens and nothing new has
+to be guarded.
+- What a request was: answered by tenant, api, model and where the answer came from; tokens in
+each direction; and how long it took, in buckets that run from a cache hit to a minute because
+the defaults stop at ten seconds and an llm call does not.
+- What was decided: the class each request went at and the level that named it, counting the
+ones nothing would commit to — the share no level will call is what says whether the classifier
+is earning its forward pass.
+- What it cost: requests a limit turned away and which quota ran out, arms actually sent
+upstream against answers given, and secrets taken out.
+- **What the semantic cache was asked, and what came of it**, which is what M17 told operators
+to tune against and could not show them. Every turn is counted — hit, miss, never eligible, or
+the encoder would not answer — because a question that was never asked and one that nearly hit
+want opposite responses and look identical in a request count. And the nearness of the nearest
+candidate goes in a histogram on *every* lookup, not only the ones that hit: a bulge just under
+the threshold is the picture that says lowering it would pay, and a hit-only histogram cannot
+draw it.
+- Metrics are not sampled, however traces are. A rate counted from a tenth of the requests is a
+tenth of the rate.
+- Every counter carries the tenant; neither histogram does. A counter with a tenant costs one
+series per tenant, a histogram one per bucket per tenant — and what a particular tenant waited
+is in their usage rows, per request, to the millisecond.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -498,6 +524,16 @@ decision rather than left to be inferred.
 - **No image ships an embedding model.** The classifier has a `--target classifier` image with its
 artefact inside; the embedder has no equivalent yet, so a deployment that wants this level builds
 with `--features semantic` and mounts an artefact of its own.
+- **The tenant is a label on every counter, and that is the operator's cost to manage.** Taken as
+a ruling, knowing the arithmetic: a tenant count that runs to thousands multiplies each counter
+by it, and the tenant count is not ours to bound. It is there because *which tenant is doing
+this* is the question a multi-tenant gateway exists to answer. Where it becomes too much, the
+usage rows hold the same figures per request and are the better place to ask.
+- **Metrics need a collector.** There is no scrape endpoint, so a small deployment that would
+rather not run one gets no metrics at all. The trade was deliberate: a `/metrics` listener is a
+new surface to guard, and these carry a tenant label, which is tenant data.
+- **Nothing counts what a request cost in money**, only in tokens. The price of a token is not
+something the gateway knows, and spend records are their own entry below.
 
 ## To be implemented
 
@@ -556,10 +592,12 @@ management api.
 
 ### Observability, what is left of it
 
-- Metrics: only traces are exported, and nothing counts requests, tokens or latency for a
-dashboard to read.
 - Logs to open-observe in cluster mode, to a local file standalone. Logs go to the process
 output wherever it runs.
+- Redactions are counted but not by kind. The usage row keeps the kinds as a formatted
+string, which is the wrong direction to read a label out of; counting them apart means
+carrying the structured tally as far as the record, which is a change to what M16 built.
+- A Prometheus scrape endpoint, for a deployment that would rather not run a collector.
 
 ### Security, what is left of it
 

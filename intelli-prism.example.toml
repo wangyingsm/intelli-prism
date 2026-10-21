@@ -65,10 +65,37 @@ ttl = 21600
 [telemetry]
 # trace, debug, info, warn or error. Default info.
 log_level = "info"
-# A collector reached over grpc. Traces are exported only when this is set.
+# A collector reached over grpc. Traces and metrics are both exported only when this
+# is set, and the collector forwards them wherever your dashboards live. There is no
+# scrape endpoint: nothing new listens, so there is nothing new to guard — and metrics
+# carry a tenant label, which is tenant data and not something to serve unauthenticated.
 # otlp_endpoint = "http://localhost:4317/"
 # Share of requests whose trace is exported, 0 to 1. Default 1, every request.
+# Metrics are not sampled: a rate counted from a tenth of the requests is a tenth of
+# the rate, and a histogram of a tenth of them has a tenth of its shape.
 # sample_ratio = 1.0
+#
+# What is counted, once a collector is configured:
+#
+#   ip.requests            answered, by tenant, api, model and where the answer came from
+#   ip.tokens              spent, by direction — zero on a cache hit, which is the point
+#   ip.latency             end to end, in ms, buckets from 1 ms to a minute
+#   ip.classified          by the class dispatched at and the level that named it
+#   ip.refused             turned away by a limit, and which quota ran out
+#   ip.arms                sent upstream; the gap from ip.requests is what hedging costs
+#   ip.redacted            secrets taken out of a request or its answer
+#   ip.semantic.lookups    turns at the semantic cache: hit, miss, ineligible, unembedded
+#   ip.semantic.nearness   how near the nearest question came, hit or miss
+#
+# Names are dotted as OpenTelemetry spells them; a collector exporting to Prometheus
+# turns ip.requests into ip_requests_total itself.
+#
+# On cardinality, which is yours to manage: every counter above carries a `tenant`
+# label, so each one costs a series per tenant per api. The two histograms do not —
+# a histogram costs a series per bucket per label set, which with a tenant would be
+# fourteen times more for a question about the deployment rather than any one tenant.
+# If your tenant count runs to thousands, the usage rows hold every one of these
+# figures per request and are the better place to ask a per-tenant question.
 
 # One block per upstream llm. The id is what routing rules and api capabilities name.
 # An upstream standing behind several endpoints adds a [[upstream.target]] block for each one
