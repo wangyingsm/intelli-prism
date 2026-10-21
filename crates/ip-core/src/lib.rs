@@ -6,6 +6,7 @@ pub mod id;
 pub mod key;
 pub mod limit;
 pub mod model;
+pub mod money;
 pub mod passphrase;
 pub mod plugin;
 pub mod route;
@@ -19,6 +20,7 @@ pub use id::{ApiId, Nonce, TenantId, TurnId, UserId};
 pub use key::{Signature, TnKey, UtKey};
 pub use limit::{Allowance, Counted, LimitScope, Period};
 pub use model::ModelName;
+pub use money::{Money, Price, Rate};
 pub use passphrase::PassphraseHash;
 pub use plugin::{
     Checksum, NewPluginRule, PRIMARY_ORDER_MAX, PluginKind, PluginOrder, PluginRule, PluginScope,

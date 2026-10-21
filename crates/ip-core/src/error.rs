@@ -155,4 +155,14 @@ pub enum CoreError {
         /// What it said they were.
         kinds: String,
     },
+
+    /// A price past anything a vendor has ever charged, which is what a decimal point
+    /// in the wrong place looks like.
+    #[error("a rate of {asked} micros a million is past the {most} this gateway will price")]
+    RateTooDear {
+        /// What was quoted.
+        asked: u64,
+        /// The most it may be.
+        most: u64,
+    },
 }
