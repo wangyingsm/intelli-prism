@@ -1046,6 +1046,67 @@ mod tests {
         assert_eq!(counted(&exporter, &provider, "ip.requests").len(), 1);
     }
 
+    /// A money cap's refusal is the one every other limit gives, and says it was money.
+    ///
+    /// Nothing in the refusal path was written for money: the 429, the moment the next
+    /// stretch begins and the counter's label all come from `Counted` being carried
+    /// through. Asserted rather than assumed, because behaviour that arrives free is
+    /// behaviour nothing would notice losing.
+    #[tokio::test]
+    async fn a_money_cap_refuses_the_way_every_other_limit_does() {
+        use opentelemetry::metrics::MeterProvider as _;
+        let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let gateway = limited(
+            FakeUpstream::answering(ANSWERED),
+            vec![allowing(
+                ip_core::Counted::Money,
+                ip_core::Period::Month,
+                800,
+            )],
+        )
+        .measuring(Arc::new(Meters::new(&provider.meter("test"))))
+        .with_prices(prices());
+
+        // One answer costs 810 micros of the 800 the month allows.
+        let answered = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap();
+        body_of(answered).await;
+        gateway.settled().await;
+
+        let refused = gateway
+            .handle(context(granted()), request("/anthropic/messages", "ask"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let said = refused.to_string();
+        assert!(said.contains("money"), "{said}");
+        assert!(said.contains("per month"), "{said}");
+
+        let seen: Vec<(String, String, u64)> = counted(&exporter, &provider, "ip.refused")
+            .into_iter()
+            .map(|(labels, value)| {
+                let at = |key: &str| {
+                    labels
+                        .iter()
+                        .find(|(name, _)| name == key)
+                        .map(|(_, held)| held.clone())
+                        .unwrap_or_default()
+                };
+                (at("reason"), at("counted"), value)
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("spent".to_owned(), "money".to_owned(), 1)],
+            "a dashboard cannot tell a spent budget from a spent quota"
+        );
+    }
+
     /// What went upstream, which is not what was answered: a hedge sends several and
     /// keeps one, and a cache hit sends none at all.
     #[tokio::test]

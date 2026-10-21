@@ -12,6 +12,11 @@ use crate::manage::Manager;
 use crate::state::AppState;
 
 /// What a tenant and its accounts may spend, under the prefix the router nests it at.
+///
+/// `allowance` is read in whatever `counted` names. For `money` that is micros of the
+/// deployment's currency, the same unit a price and a usage row hold, so a cap of five
+/// currency units is `5000000`. A money cap counts only the rows a price was found for:
+/// a model nothing prices spends nothing against it.
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(list).put(put).delete(remove))
 }
@@ -30,11 +35,12 @@ pub struct LimitView {
     /// The one api it applies to, or absent for every api.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
-    /// `tokens` or `requests`.
+    /// `tokens`, `requests` or `money`.
     pub counted: Counted,
     /// `minute`, `hour`, `day` or `month`.
     pub period: Period,
-    /// How much that stretch allows.
+    /// How much that stretch allows, in whatever `counted` names: tokens, requests, or
+    /// micros of the deployment's currency.
     pub allowance: u64,
     /// When the limit was set, in seconds since the unix epoch.
     pub created_at: Timestamp,
@@ -377,6 +383,51 @@ mod tests {
         let listed: serde_json::Value = serde_json::from_str(&body_of(listed).await).unwrap();
         assert_eq!(listed.as_array().unwrap().len(), 1);
         assert_eq!(listed[0]["allowance"], 1_000_000);
+    }
+
+    /// A money cap goes through the api with no shape of its own: the same route, the same
+    /// body, the same view, and `money` where another limit says `tokens`.
+    #[tokio::test]
+    async fn the_administrator_sets_a_money_cap_and_reads_it_back() {
+        let state = state_over_shared(store().await);
+        let router = crate::routes::router(state.clone());
+        let set = call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            "/_ip/limits",
+            // Five currency units a month, which is micros like every other figure.
+            Some(r#"{"tenant": "acme", "counted": "money", "period": "month", "allowance": 5000000}"#),
+        )
+        .await;
+        assert_eq!(set.status(), StatusCode::CREATED);
+        let view: serde_json::Value = serde_json::from_str(&body_of(set).await).unwrap();
+        assert_eq!(view["counted"], "money");
+        assert_eq!(view["allowance"], 5_000_000);
+
+        // And it survives the column, which stores the name rather than the variant.
+        let listed = call(&router, &state, "root", "GET", "/_ip/limits", None).await;
+        let listed: serde_json::Value = serde_json::from_str(&body_of(listed).await).unwrap();
+        assert_eq!(listed[0]["counted"], "money");
+        assert_eq!(listed[0]["allowance"], 5_000_000);
+    }
+
+    /// A name no kind carries is refused rather than taken for one of them.
+    #[tokio::test]
+    async fn a_thing_counted_that_is_not_one_is_refused() {
+        let state = state_over_shared(store().await);
+        let router = crate::routes::router(state.clone());
+        let set = call(
+            &router,
+            &state,
+            "root",
+            "PUT",
+            "/_ip/limits",
+            Some(r#"{"tenant": "acme", "counted": "dollars", "period": "month", "allowance": 1}"#),
+        )
+        .await;
+        assert_eq!(set.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

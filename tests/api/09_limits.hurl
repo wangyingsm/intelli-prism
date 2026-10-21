@@ -94,3 +94,39 @@ HTTP 204
 
 GET {{host}}/_ip/limits
 HTTP 401
+
+# A money cap goes through the same route with no shape of its own. The allowance is micros
+# of the deployment's currency, the unit a price and a usage row already hold, so five
+# currency units a month is 5000000.
+
+POST {{host}}/_ip/login
+{"user": "root", "passphrase": "{{passphrase}}"}
+HTTP 204
+
+PUT {{host}}/_ip/limits
+x-ip-csrf: 1
+{"tenant": "acme", "counted": "money", "period": "month", "allowance": 5000000}
+HTTP 201
+[Asserts]
+jsonpath "$.counted" == "money"
+jsonpath "$.allowance" == 5000000
+
+GET {{host}}/_ip/limits?tenant=acme
+HTTP 200
+[Asserts]
+jsonpath "$[0].counted" == "money"
+
+# A name no kind carries is refused rather than taken for one of them.
+PUT {{host}}/_ip/limits
+x-ip-csrf: 1
+{"tenant": "acme", "counted": "dollars", "period": "month", "allowance": 1}
+HTTP 422
+
+DELETE {{host}}/_ip/limits
+x-ip-csrf: 1
+{"tenant": "acme", "counted": "money", "period": "month"}
+HTTP 204
+
+POST {{host}}/_ip/logout
+x-ip-csrf: 1
+HTTP 204
