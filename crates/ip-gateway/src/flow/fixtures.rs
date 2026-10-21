@@ -653,6 +653,7 @@ impl UsageStore for Ledger {
             decided_by: usage.decided_by,
             redacted: usage.redacted,
             latency: usage.latency,
+            cost: usage.cost,
             created_at: ip_core::Timestamp::now(),
         };
         let _ = self.written.send(stored.clone());

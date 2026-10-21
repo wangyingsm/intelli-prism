@@ -341,6 +341,7 @@ mod tests {
             decided_by: None,
             redacted: ip_core::Redacted::NONE,
             latency: Latency::from_millis(1_250),
+            cost: None,
         }
     }
 

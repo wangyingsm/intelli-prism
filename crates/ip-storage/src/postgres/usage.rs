@@ -8,7 +8,8 @@ use sqlx::postgres::PgRow;
 
 use super::PostgresStore;
 use crate::codec::{
-    decided_by, decided_by_name, latency, redacted, served as served_of, served_name, token_count,
+    cost, cost_micros, decided_by, decided_by_name, latency, redacted, served as served_of,
+    served_name, token_count,
 };
 use crate::error::{Entity, StorageError};
 use crate::usage::{Decided, NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
@@ -19,8 +20,10 @@ impl UsageStore for PostgresStore {
         let row = sqlx::query(
             "INSERT INTO usage (trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across, dispatched_class, decided_by, redacted, redacted_kinds) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+             created_at, raced_across, dispatched_class, decided_by, redacted, redacted_kinds, \
+             cost_micros) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
+             $18, $19) \
              RETURNING row_id, created_at",
         )
         .bind(usage.trace.to_hex())
@@ -51,6 +54,7 @@ impl UsageStore for PostgresStore {
         .bind(decided_by_name(usage.decided_by))
         .bind(usage.redacted.count().map(i64::from))
         .bind(usage.redacted.kinds().map(str::to_owned))
+        .bind(cost_micros(usage.cost)?)
         .fetch_one(&self.pool)
         .await
         .map_err(StorageError::backend)?;
@@ -71,6 +75,7 @@ impl UsageStore for PostgresStore {
             decided_by: usage.decided_by,
             redacted: usage.redacted,
             latency: usage.latency,
+            cost: usage.cost,
             created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
         })
     }
@@ -79,7 +84,8 @@ impl UsageStore for PostgresStore {
         let row = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across, dispatched_class, decided_by, redacted, redacted_kinds FROM usage WHERE row_id = $1",
+             created_at, raced_across, dispatched_class, decided_by, redacted, redacted_kinds, \
+             cost_micros FROM usage WHERE row_id = $1",
         )
         .bind(row_id.get())
         .fetch_optional(&self.pool)
@@ -250,6 +256,7 @@ pub(super) fn recorded(row: PgRow) -> Result<Usage, StorageError> {
         decided_by: decided_by(row.get("decided_by"))?,
         redacted: redacted(row.get("redacted"), row.get("redacted_kinds"))?,
         latency: latency(row.get("latency_ms"))?,
+        cost: cost(row.get("cost_micros"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })
 }

@@ -1,8 +1,9 @@
 use ip_core::{
-    ApiId, Counted, Decider, Difficulty, Hedge, Host, Latency, ModelName, Port, Redacted, Replica,
-    Served, TenantId, Timestamp, TokenCount, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Decider, Difficulty, Hedge, Host, Latency, ModelName, Money, Port, Redacted,
+    Replica, Served, TenantId, Timestamp, TokenCount, Tokens, TraceId, TurnId, UserId,
 };
 
+use crate::error::{Entity, StorageError};
 use crate::list::Page;
 use crate::store::Backend;
 use crate::usage::{NewUsage, UsageFilter, UsageRowId, UsageStore};
@@ -31,6 +32,7 @@ pub(crate) fn spent() -> NewUsage {
         decided_by: None,
         redacted: Redacted::NONE,
         latency: Latency::from_millis(1_250),
+        cost: None,
     }
 }
 
@@ -702,4 +704,64 @@ pub(crate) async fn a_row_no_filter_looked_at_says_nothing_at_all(store: &impl U
     assert!(!read.redacted.looked());
     assert_eq!(read.redacted.count(), None);
     assert_eq!(read.redacted.kinds(), None);
+}
+
+pub(crate) async fn a_row_says_what_it_cost(store: &impl UsageStore) {
+    let priced = NewUsage {
+        cost: Some(Money::from_micros(810_000)),
+        ..spent()
+    };
+    let recorded = store.record_usage(priced).await.unwrap();
+    assert_eq!(recorded.cost, Some(Money::from_micros(810_000)));
+    let read = store.usage(recorded.row_id).await.unwrap().unwrap();
+    assert_eq!(read.cost, Some(Money::from_micros(810_000)));
+}
+
+/// The distinction the whole column rests on: unpriced is not priced at nothing.
+pub(crate) async fn a_row_nothing_priced_costs_nothing_known(store: &impl UsageStore) {
+    let unpriced = store
+        .usage(store.record_usage(spent()).await.unwrap().row_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unpriced.cost, None);
+
+    let free = NewUsage {
+        cost: Some(Money::ZERO),
+        ..spent()
+    };
+    let free = store
+        .usage(store.record_usage(free).await.unwrap().row_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(free.cost, Some(Money::ZERO));
+}
+
+pub(crate) async fn a_cost_past_what_a_column_holds_is_refused(store: &impl UsageStore) {
+    let dear = NewUsage {
+        cost: Some(Money::from_micros(u64::MAX)),
+        ..spent()
+    };
+    assert!(matches!(
+        store.record_usage(dear).await,
+        Err(StorageError::Malformed {
+            entity: Entity::Usage,
+            ..
+        })
+    ));
+}
+
+pub(crate) async fn a_listed_row_carries_what_it_cost(store: &impl Backend) {
+    let priced = NewUsage {
+        cost: Some(Money::from_micros(42)),
+        ..spent()
+    };
+    store.record_usage(priced).await.unwrap();
+    let listed = store
+        .list_usage(&UsageFilter::default(), Page::default())
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].cost, Some(Money::from_micros(42)));
 }

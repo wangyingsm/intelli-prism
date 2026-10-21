@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{
-    ApiId, Counted, Decider, Difficulty, Hedge, Latency, ModelName, Redacted, Replica, Served,
-    TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
+    ApiId, Counted, Decider, Difficulty, Hedge, Latency, ModelName, Money, Redacted, Replica,
+    Served, TenantId, Timestamp, Tokens, TraceId, TurnId, UserId,
 };
 
 use crate::error::StorageError;
@@ -57,6 +57,9 @@ pub struct Usage {
     pub redacted: Redacted,
     /// How long the caller waited.
     pub latency: Latency,
+    /// What it cost at the prices in force, and nothing at all where nothing priced the
+    /// model, which is not a cost of nothing.
+    pub cost: Option<Money>,
     /// When the request was recorded.
     pub created_at: Timestamp,
 }
@@ -94,6 +97,9 @@ pub struct NewUsage {
     pub redacted: Redacted,
     /// How long the caller waited.
     pub latency: Latency,
+    /// What it cost at the prices in force, and nothing at all where nothing priced the
+    /// model, which is not a cost of nothing.
+    pub cost: Option<Money>,
 }
 
 /// Requests answered and requests paid for, in one snapshot of the rows a filter picks.

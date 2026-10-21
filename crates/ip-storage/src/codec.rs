@@ -1,7 +1,7 @@
 //! How identity and plugin values are spelled in the columns every sql backend stores them in.
 
 use ip_core::{
-    ApiId, Capability, CapabilityScope, Decider, Dialect, Latency, PluginOrder, PluginScope,
+    ApiId, Capability, CapabilityScope, Decider, Dialect, Latency, Money, PluginOrder, PluginScope,
     Redacted, Served, TenantId, TnKey, TokenCount, UserId,
 };
 
@@ -212,6 +212,31 @@ pub(crate) fn redacted(
             detail: format!("a redaction of {count:?} naming {kinds:?} describes nothing"),
         }),
     }
+}
+
+/// What a row cost as its column holds it, refusing a sum past what the column takes.
+pub(crate) fn cost_micros(cost: Option<Money>) -> Result<Option<i64>, StorageError> {
+    cost.map(|cost| {
+        i64::try_from(cost.micros()).map_err(|_| StorageError::Malformed {
+            entity: Entity::Usage,
+            detail: format!("a cost of {cost} is past what a column holds"),
+        })
+    })
+    .transpose()
+}
+
+/// Reads back what a row cost, refusing a negative sum, which no cost is.
+pub(crate) fn cost(micros: Option<i64>) -> Result<Option<Money>, StorageError> {
+    micros
+        .map(|micros| {
+            u64::try_from(micros)
+                .map(Money::from_micros)
+                .map_err(|_| StorageError::Malformed {
+                    entity: Entity::Usage,
+                    detail: format!("a cost of {micros} micros is not a cost"),
+                })
+        })
+        .transpose()
 }
 
 /// The stored name of a provider family.

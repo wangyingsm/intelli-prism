@@ -8,7 +8,8 @@ use sqlx::sqlite::SqliteRow;
 
 use super::SqliteStore;
 use crate::codec::{
-    decided_by, decided_by_name, latency, redacted, served as served_of, served_name, token_count,
+    cost, cost_micros, decided_by, decided_by_name, latency, redacted, served as served_of,
+    served_name, token_count,
 };
 use crate::error::{Entity, StorageError};
 use crate::usage::{Decided, NewUsage, SpentArms, Usage, UsageFilter, UsageRowId, UsageStore};
@@ -19,8 +20,9 @@ impl UsageStore for SqliteStore {
         let row = sqlx::query(
             "INSERT INTO usage (trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across, dispatched_class, decided_by, redacted, redacted_kinds) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             created_at, raced_across, dispatched_class, decided_by, redacted, redacted_kinds, \
+             cost_micros) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              RETURNING row_id, created_at",
         )
         .bind(usage.trace.to_hex())
@@ -51,6 +53,7 @@ impl UsageStore for SqliteStore {
         .bind(decided_by_name(usage.decided_by))
         .bind(usage.redacted.count().map(i64::from))
         .bind(usage.redacted.kinds().map(str::to_owned))
+        .bind(cost_micros(usage.cost)?)
         .fetch_one(&self.pool)
         .await
         .map_err(StorageError::backend)?;
@@ -71,6 +74,7 @@ impl UsageStore for SqliteStore {
             decided_by: usage.decided_by,
             redacted: usage.redacted,
             latency: usage.latency,
+            cost: usage.cost,
             created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
         })
     }
@@ -79,7 +83,8 @@ impl UsageStore for SqliteStore {
         let row = sqlx::query(
             "SELECT row_id, trace_id, turn_id, tenant_id, user_id, api_id, model, \
              input_tokens, output_tokens, served, served_host, served_port, latency_ms, \
-             created_at, raced_across, dispatched_class, decided_by, redacted, redacted_kinds FROM usage WHERE row_id = ?",
+             created_at, raced_across, dispatched_class, decided_by, redacted, redacted_kinds, \
+             cost_micros FROM usage WHERE row_id = ?",
         )
         .bind(row_id.get())
         .fetch_optional(&self.pool)
@@ -250,6 +255,7 @@ pub(super) fn recorded(row: SqliteRow) -> Result<Usage, StorageError> {
         decided_by: decided_by(row.get("decided_by"))?,
         redacted: redacted(row.get("redacted"), row.get("redacted_kinds"))?,
         latency: latency(row.get("latency_ms"))?,
+        cost: cost(row.get("cost_micros"))?,
         created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
     })
 }
@@ -272,7 +278,7 @@ mod tests {
     }
 
     /// Every column whose stored value its own type can refuse, and a value that it refuses.
-    const REFUSED: [&str; 11] = [
+    const REFUSED: [&str; 12] = [
         "UPDATE usage SET served = 'somewhere' WHERE row_id = ?",
         "UPDATE usage SET trace_id = 'not-a-trace' WHERE row_id = ?",
         "UPDATE usage SET input_tokens = 9223372036854775807 WHERE row_id = ?",
@@ -285,6 +291,7 @@ mod tests {
         "UPDATE usage SET redacted_kinds = 'email=1' WHERE row_id = ?",
         "UPDATE usage SET redacted = 2, redacted_kinds = '' WHERE row_id = ?",
         "UPDATE usage SET redacted = -1, redacted_kinds = 'email=1' WHERE row_id = ?",
+        "UPDATE usage SET cost_micros = -1 WHERE row_id = ?",
     ];
 
     #[tokio::test]

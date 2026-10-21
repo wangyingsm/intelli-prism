@@ -265,6 +265,10 @@ macro_rules! backend_suite {
             what_was_sent_upstream_over_nobody_is_nothing,
             what_was_sent_upstream_narrows_to_the_filter,
             what_was_sent_upstream_after_a_moment_excludes_the_moment,
+            a_row_says_what_it_cost,
+            a_row_nothing_priced_costs_nothing_known,
+            a_cost_past_what_a_column_holds_is_refused,
+            a_listed_row_carries_what_it_cost,
         ]);
     };
     ($open:path) => {

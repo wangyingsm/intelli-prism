@@ -295,6 +295,7 @@ impl Recording {
             decided_by: serving.dispatched.decided_by(),
             redacted: serving.filtered.recorded(),
             latency: Latency::from_millis(self.started.elapsed().as_millis()),
+            cost: None,
         };
         let limiting = self.limiting;
         let spent = tokens.total();
