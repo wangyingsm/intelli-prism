@@ -82,11 +82,14 @@ pub(crate) async fn a_write_that_fails_part_way_undoes_the_ones_before_it(
 ) {
     let taken = UserId::new("taken").unwrap();
     store
-        .create_user(NewUser {
-            id: taken.clone(),
-            passphrase: hash(),
-            kind: AccountKind::Regular,
-        })
+        .create_user(
+            NewUser {
+                id: taken.clone(),
+                passphrase: hash(),
+                kind: AccountKind::Regular,
+            },
+            &crate::suite::identity::accounts_by(),
+        )
         .await
         .unwrap();
 

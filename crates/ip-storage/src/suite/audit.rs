@@ -17,11 +17,24 @@ async fn trail(store: &impl Backend) -> Vec<crate::audit::Audited> {
         .unwrap()
 }
 
+/// What was recorded about one kind of thing, newest first.
+///
+/// A test that counts rows narrows to its own entity, because the fixtures that set a
+/// test up now write rows of their own: creating the tenant's account is itself a change
+/// somebody made.
+async fn trail_of(store: &impl Backend, entity: Entity) -> Vec<crate::audit::Audited> {
+    let filter = AuditFilter {
+        entity: Some(entity),
+        ..AuditFilter::default()
+    };
+    store.audits(&filter, Page::default()).await.unwrap()
+}
+
 pub(crate) async fn setting_a_limit_records_who_set_it(store: &impl Backend) {
     tenant_with_user(store).await;
     store.put_limit(monthly(1_000_000), &by()).await.unwrap();
 
-    let trail = trail(store).await;
+    let trail = trail_of(store, Entity::Limit).await;
     assert_eq!(trail.len(), 1, "one change, one record");
     let one = &trail[0];
     assert_eq!(one.actor, UserId::new("alice").unwrap());
@@ -39,7 +52,7 @@ pub(crate) async fn setting_a_limit_again_records_what_it_allowed(store: &impl B
     store.put_limit(monthly(1_000_000), &by()).await.unwrap();
     store.put_limit(monthly(50), &by()).await.unwrap();
 
-    let trail = trail(store).await;
+    let trail = trail_of(store, Entity::Limit).await;
     assert_eq!(trail.len(), 2);
     // Newest first, so the second change is the first row.
     let second = &trail[0];
@@ -60,7 +73,7 @@ pub(crate) async fn removing_a_limit_records_what_was_removed(store: &impl Backe
         .await
         .unwrap();
 
-    let trail = trail(store).await;
+    let trail = trail_of(store, Entity::Limit).await;
     assert_eq!(trail.len(), 2);
     let removal = &trail[0];
     assert_eq!(removal.before.as_ref().unwrap()["allowance"], 1_000_000);
@@ -82,7 +95,7 @@ pub(crate) async fn a_change_that_was_refused_records_nothing(store: &impl Backe
             .await
             .is_err()
     );
-    assert!(trail(store).await.is_empty());
+    assert!(trail_of(store, Entity::Limit).await.is_empty());
 }
 
 /// A limit on a tenant that is not there is refused inside the transaction, after it
@@ -205,7 +218,11 @@ pub(crate) async fn a_tenant_sees_none_of_what_belongs_to_the_deployment(store: 
         .unwrap();
     assert_eq!(theirs.len(), 1, "a price was read as a tenant's");
     assert_eq!(theirs[0].entity, Entity::Limit);
-    assert_eq!(trail(store).await.len(), 2, "both are in the whole trail");
+    assert_eq!(
+        trail_of(store, Entity::Price).await.len(),
+        1,
+        "the price is in the whole trail, under nobody's tenant"
+    );
 }
 
 /// A rule carries more than a name, so what the trail holds of it is the whole of what an
@@ -282,7 +299,7 @@ pub(crate) async fn whose_a_stored_plugin_is_comes_from_who_stored_it(store: &im
         .await
         .unwrap();
 
-    let trail = trail(store).await;
+    let trail = trail_of(store, Entity::Plugin).await;
     assert_eq!(trail.len(), 2);
     let theirs = &trail[0];
     assert_eq!(theirs.entity, Entity::Plugin);
@@ -353,8 +370,8 @@ pub(crate) async fn placing_a_plugin_in_a_chain_records_where_it_was_put(store: 
         .await
         .unwrap();
 
-    let trail = trail(store).await;
-    assert_eq!(trail.len(), 2, "the wasm, then the rule that places it");
+    let trail = trail_of(store, Entity::PluginRule).await;
+    assert_eq!(trail.len(), 1, "one placing, one record");
     let rule = &trail[0];
     assert_eq!(rule.entity, Entity::PluginRule);
     assert_eq!(rule.through, "/_ip/plugin-rules");
@@ -406,6 +423,94 @@ pub(crate) async fn taking_a_plugin_out_of_the_global_chain_names_no_tenant(stor
     assert_eq!(taken.tenant, None, "the global chain is nobody's tenant");
     assert_eq!(taken.before.as_ref().unwrap()["order"], 10);
     assert_eq!(taken.after, None, "nothing is left to describe");
+}
+
+/// **The ruling this milestone turns on.** An account's verifier is the one field the
+/// trail could carry that would be worth stealing, and the trail outlives the account and
+/// is read by people with no business holding it. It is absent from every row, whatever
+/// the change was.
+pub(crate) async fn an_accounts_record_never_holds_its_passphrase(store: &impl Backend) {
+    let by = crate::suite::identity::accounts_by();
+    let made = crate::suite::fixture::new_user();
+    let verifier = made.passphrase.as_str().to_owned();
+    store.create_user(made, &by).await.unwrap();
+    store
+        .set_passphrase(
+            &crate::suite::fixture::user_id(),
+            &crate::suite::fixture::hash(),
+            &by,
+        )
+        .await
+        .unwrap();
+    store
+        .delete_user(&crate::suite::fixture::user_id(), &by)
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 3, "created, changed, removed");
+    for one in &trail {
+        let written = serde_json::to_string(&(&one.before, &one.after)).unwrap();
+        assert!(
+            !written.contains(&verifier) && !written.contains("passphrase"),
+            "a verifier reached the trail: {written}"
+        );
+        assert_eq!(one.entity, Entity::User);
+        assert_eq!(one.tenant, None, "an account is nobody's tenant");
+    }
+}
+
+/// What a passphrase change leaves behind is *that* it happened. Before and after are the
+/// same shape because the only thing that changed is not in that shape, which is the
+/// point — and which reads unambiguously only while the verifier is the sole part of an
+/// account that can be replaced.
+pub(crate) async fn changing_a_passphrase_records_that_it_changed_and_never_what_to(
+    store: &impl Backend,
+) {
+    let by = crate::suite::identity::accounts_by();
+    store
+        .create_user(crate::suite::fixture::new_user(), &by)
+        .await
+        .unwrap();
+    store
+        .set_passphrase(
+            &crate::suite::fixture::user_id(),
+            &crate::suite::fixture::hash(),
+            &by,
+        )
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    let changed = &trail[0];
+    assert_eq!(changed.entity_id, crate::suite::fixture::user_id().as_str());
+    assert_eq!(
+        changed.before, changed.after,
+        "nothing a reader may see changed"
+    );
+    assert!(changed.before.is_some(), "the account was there before");
+}
+
+pub(crate) async fn creating_and_deleting_an_account_record_both_ends(store: &impl Backend) {
+    let by = crate::suite::identity::accounts_by();
+    store
+        .create_user(crate::suite::fixture::new_user(), &by)
+        .await
+        .unwrap();
+    store
+        .delete_user(&crate::suite::fixture::user_id(), &by)
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 2);
+    assert_eq!(
+        trail[1].before, None,
+        "nothing was there before it was made"
+    );
+    assert_eq!(trail[1].after.as_ref().unwrap()["kind"], "regular");
+    assert_eq!(trail[0].after, None, "nothing is left to describe");
+    assert_eq!(trail[0].before.as_ref().unwrap()["kind"], "regular");
 }
 
 /// The actor is whoever the handler said, not a name the store invents.

@@ -4,7 +4,7 @@ use std::path::Path;
 use ip_auth::{Passphrase, PassphraseHasher};
 use ip_config::Config;
 use ip_core::UserId;
-use ip_storage::{AccountKind, NewUser};
+use ip_storage::{AccountKind, By, NewUser};
 use zeroize::Zeroizing;
 
 use crate::cli::AdminCommand;
@@ -67,11 +67,15 @@ async fn create_sysadmin(
     let store = open_store(&config.storage).await?.backend();
     let hashed = PassphraseHasher::new().hash(passphrase)?;
     store
-        .create_user(NewUser {
-            id: user.clone(),
-            passphrase: hashed,
-            kind: AccountKind::SystemAdministrator,
-        })
+        .create_user(
+            NewUser {
+                id: user.clone(),
+                passphrase: hashed,
+                kind: AccountKind::SystemAdministrator,
+            },
+            // The first account there is, so it is recorded as having created itself.
+            &By::new(user.clone(), "admin create-sysadmin"),
+        )
         .await?;
     println!("created the system administrator {user}");
     Ok(())

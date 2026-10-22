@@ -423,11 +423,14 @@ mod tests {
             ("erin", AccountKind::Regular),
         ] {
             store
-                .create_user(NewUser {
-                    id: id(user),
-                    passphrase: hashed(),
-                    kind,
-                })
+                .create_user(
+                    NewUser {
+                        id: id(user),
+                        passphrase: hashed(),
+                        kind,
+                    },
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+                )
                 .await
                 .unwrap();
         }

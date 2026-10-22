@@ -69,6 +69,35 @@ pub struct User {
     pub created_at: Timestamp,
 }
 
+impl crate::audit::Auditable for User {
+    fn entity(&self) -> crate::error::Entity {
+        crate::error::Entity::User
+    }
+
+    fn entity_id(&self) -> String {
+        self.id.to_string()
+    }
+
+    /// An account is the deployment's: it exists before it is attached to any tenant, and
+    /// may be attached to several.
+    fn tenant(&self) -> Option<TenantId> {
+        None
+    }
+
+    /// The passphrase verifier is deliberately absent. It is the one field this trail
+    /// could carry that would be worth stealing, and the trail is kept for years and read
+    /// by people with no business holding it. A change to it is therefore recorded as a
+    /// change with nothing visible in it — which is unambiguous only while the passphrase
+    /// is the sole thing about an account that can be replaced.
+    fn audited(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id.as_str(),
+            "kind": crate::codec::account_kind_name(self.kind),
+            "created_at": self.created_at.unix_seconds(),
+        })
+    }
+}
+
 /// A user about to be created.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewUser {

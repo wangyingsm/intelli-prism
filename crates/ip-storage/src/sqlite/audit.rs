@@ -109,6 +109,7 @@ mod tests {
     use crate::price::PriceStore;
     use crate::route::RouteStore;
     use crate::sqlite::fixture::*;
+    use crate::store::UserStore;
     use crate::suite::limit::{by, monthly};
     use crate::suite::price::priced_at;
 
@@ -243,6 +244,34 @@ mod tests {
         assert!(
             store.rules().await.unwrap().is_empty(),
             "the rule survived a transaction that could not record it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_whose_record_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .create_user(
+                    crate::suite::fixture::new_user(),
+                    &crate::suite::identity::accounts_by(),
+                )
+                .await
+                .is_err(),
+            "an account was created with nothing to record it"
+        );
+        assert!(
+            store
+                .user(&crate::suite::fixture::user_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "the account survived a transaction that could not record it"
         );
     }
 }

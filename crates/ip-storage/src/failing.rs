@@ -90,9 +90,9 @@ impl TenantStore for FailingStore {
 
 #[async_trait]
 impl UserStore for FailingStore {
-    async fn create_user(&self, new: NewUser) -> Result<User, StorageError> {
+    async fn create_user(&self, new: NewUser, by: &By) -> Result<User, StorageError> {
         self.answering()?;
-        self.inner.create_user(new).await
+        self.inner.create_user(new, by).await
     }
 
     async fn user(&self, id: &UserId) -> Result<Option<User>, StorageError> {
@@ -104,14 +104,15 @@ impl UserStore for FailingStore {
         &self,
         id: &UserId,
         passphrase: &PassphraseHash,
+        by: &By,
     ) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.set_passphrase(id, passphrase).await
+        self.inner.set_passphrase(id, passphrase, by).await
     }
 
-    async fn delete_user(&self, id: &UserId) -> Result<(), StorageError> {
+    async fn delete_user(&self, id: &UserId, by: &By) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.delete_user(id).await
+        self.inner.delete_user(id, by).await
     }
 }
 

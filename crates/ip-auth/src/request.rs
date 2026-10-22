@@ -215,11 +215,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_user(NewUser {
-                id: user_id(),
-                passphrase: hash(),
-                kind,
-            })
+            .create_user(
+                NewUser {
+                    id: user_id(),
+                    passphrase: hash(),
+                    kind,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         store
@@ -311,11 +314,14 @@ mod tests {
         let (store, key) = fixture(AccountKind::Regular, Standing::Member).await;
         let bob = UserId::new("bob").unwrap();
         store
-            .create_user(NewUser {
-                id: bob.clone(),
-                passphrase: hash(),
-                kind: AccountKind::Regular,
-            })
+            .create_user(
+                NewUser {
+                    id: bob.clone(),
+                    passphrase: hash(),
+                    kind: AccountKind::Regular,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         store
@@ -396,11 +402,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_user(NewUser {
-                id: user_id(),
-                passphrase: hash(),
-                kind: AccountKind::Regular,
-            })
+            .create_user(
+                NewUser {
+                    id: user_id(),
+                    passphrase: hash(),
+                    kind: AccountKind::Regular,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -422,11 +431,14 @@ mod tests {
             Err(AuthError::UnknownUser { .. })
         ));
         store
-            .create_user(NewUser {
-                id: user_id(),
-                passphrase: hash(),
-                kind: AccountKind::Regular,
-            })
+            .create_user(
+                NewUser {
+                    id: user_id(),
+                    passphrase: hash(),
+                    kind: AccountKind::Regular,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         assert!(matches!(

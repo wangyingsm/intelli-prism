@@ -90,11 +90,14 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .create_user(NewUser {
-                    id: user.clone(),
-                    passphrase: hashed(),
-                    kind: AccountKind::Regular,
-                })
+                .create_user(
+                    NewUser {
+                        id: user.clone(),
+                        passphrase: hashed(),
+                        kind: AccountKind::Regular,
+                    },
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+                )
                 .await
                 .unwrap();
             store

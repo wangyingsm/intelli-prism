@@ -213,7 +213,10 @@ pub(crate) async fn deleting_a_user_takes_the_limits_named_for_it(store: &impl B
         .await
         .unwrap();
 
-    store.delete_user(&new_user().id).await.unwrap();
+    store
+        .delete_user(&new_user().id, &crate::suite::identity::accounts_by())
+        .await
+        .unwrap();
     let held = store.limits().await.unwrap();
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].scope.user, None);

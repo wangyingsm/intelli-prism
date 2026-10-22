@@ -3,6 +3,7 @@ use ip_core::{Grant, Grants, PassphraseHash, TenantId, Timestamp, UserId};
 use sqlx::{Row, SqliteConnection};
 
 use super::SqliteStore;
+use crate::audit::{By, NewAudit};
 use crate::codec::{
     account_kind, account_kind_name, capability, capability_name, scope, standing, standing_name,
     tenant_key,
@@ -16,6 +17,115 @@ use crate::transaction::member_remove::{
     MemberRemoveBegun, MemberRemoveTransactional, MemberRemoveTxn,
 };
 use crate::transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
+
+/// Creates an account and records it, both on the one connection its caller commits.
+///
+/// Apart from the method so that every way out of it is a `?` the caller can roll back,
+/// rather than a return that leaves a transaction open.
+async fn adding(
+    connection: &mut SqliteConnection,
+    new: NewUser,
+    by: &By,
+) -> Result<User, StorageError> {
+    let added = insert_user(&mut *connection, new).await?;
+    super::audit::record(connection, NewAudit::created(by.clone(), &added)).await?;
+    Ok(added)
+}
+
+/// Replaces an account's passphrase and records that it was replaced, on the one
+/// connection its caller commits.
+async fn replacing(
+    connection: &mut SqliteConnection,
+    id: &UserId,
+    passphrase: &PassphraseHash,
+    by: &By,
+) -> Result<(), StorageError> {
+    let before = read_user(&mut *connection, id).await?;
+    let updated = sqlx::query("UPDATE users SET passphrase = ? WHERE id = ?")
+        .bind(passphrase.as_str())
+        .bind(id.as_str())
+        .execute(&mut *connection)
+        .await
+        .map_err(StorageError::backend)?
+        .rows_affected();
+    if updated == 0 {
+        return Err(StorageError::NotFound {
+            entity: Entity::User,
+            id: id.to_string(),
+        });
+    }
+    // A row was updated, so something was there to read a moment ago in the same
+    // transaction; an absent before here would mean the two disagree.
+    let Some(before) = before else {
+        return Err(StorageError::Malformed {
+            entity: Entity::User,
+            detail: "a passphrase was replaced on an account nothing could read".to_owned(),
+        });
+    };
+    // Before and after are the same shape on purpose: the verifier is not in it, so what
+    // the trail says is that the account was changed here, not what it was changed to.
+    super::audit::record(
+        connection,
+        NewAudit::changed(by.clone(), Some(&before), &before),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Deletes an account and records the deletion, on the one connection its caller commits.
+async fn dropping(
+    connection: &mut SqliteConnection,
+    id: &UserId,
+    by: &By,
+) -> Result<(), StorageError> {
+    let before = read_user(&mut *connection, id).await?;
+    let deleted = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(id.as_str())
+        .execute(&mut *connection)
+        .await
+        .map_err(StorageError::backend)?
+        .rows_affected();
+    if deleted == 0 {
+        return Err(StorageError::NotFound {
+            entity: Entity::User,
+            id: id.to_string(),
+        });
+    }
+    // A row was deleted, so something was there to read a moment ago in the same
+    // transaction; an absent before here would mean the two disagree.
+    let Some(before) = before else {
+        return Err(StorageError::Malformed {
+            entity: Entity::User,
+            detail: "an account was deleted that nothing could read".to_owned(),
+        });
+    };
+    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await?;
+    Ok(())
+}
+
+/// One account, over whichever connection it is given. Read inside the transaction that
+/// is about to change it, so the before it records is the before that was replaced.
+pub(super) async fn read_user(
+    connection: &mut SqliteConnection,
+    id: &UserId,
+) -> Result<Option<User>, StorageError> {
+    let Some(row) =
+        sqlx::query("SELECT row_id, passphrase, kind, created_at FROM users WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(StorageError::backend)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(User {
+        row_id: UserRowId::new(row.get("row_id")),
+        id: id.clone(),
+        passphrase: PassphraseHash::new(row.get("passphrase"))?,
+        kind: account_kind(row.get("kind"))?,
+        created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
+    }))
+}
 
 /// Writes a tenant row over whichever connection it is given, so a transaction and the pool
 /// run the same statement.
@@ -225,64 +335,55 @@ impl TenantStore for SqliteStore {
 
 #[async_trait]
 impl UserStore for SqliteStore {
-    async fn create_user(&self, new: NewUser) -> Result<User, StorageError> {
-        insert_user(&mut *self.connection().await?, new).await
+    async fn create_user(&self, new: NewUser, by: &By) -> Result<User, StorageError> {
+        // One transaction, so an account that lands without its record is not a state
+        // this store can be left in, and neither is a record whose account rolled back.
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        // Rolled back by hand rather than by dropping it: a transaction left to its
+        // `Drop` keeps the connection's locks until the pool gets round to it, and a
+        // scratch schema being torn down behind it waits for ever.
+        match adding(&mut transaction, new, by).await {
+            Ok(added) => transaction
+                .commit()
+                .await
+                .map_err(StorageError::backend)
+                .map(|()| added),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn user(&self, id: &UserId) -> Result<Option<User>, StorageError> {
-        let Some(row) =
-            sqlx::query("SELECT row_id, passphrase, kind, created_at FROM users WHERE id = ?")
-                .bind(id.as_str())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(StorageError::backend)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(User {
-            row_id: UserRowId::new(row.get("row_id")),
-            id: id.clone(),
-            passphrase: PassphraseHash::new(row.get("passphrase"))?,
-            kind: account_kind(row.get("kind"))?,
-            created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
-        }))
+        read_user(&mut *self.connection().await?, id).await
     }
 
     async fn set_passphrase(
         &self,
         id: &UserId,
         passphrase: &PassphraseHash,
+        by: &By,
     ) -> Result<(), StorageError> {
-        let updated = sqlx::query("UPDATE users SET passphrase = ? WHERE id = ?")
-            .bind(passphrase.as_str())
-            .bind(id.as_str())
-            .execute(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-            .rows_affected();
-        if updated == 0 {
-            return Err(StorageError::NotFound {
-                entity: Entity::User,
-                id: id.to_string(),
-            });
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        match replacing(&mut transaction, id, passphrase, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
-        Ok(())
     }
 
-    async fn delete_user(&self, id: &UserId) -> Result<(), StorageError> {
-        let deleted = sqlx::query("DELETE FROM users WHERE id = ?")
-            .bind(id.as_str())
-            .execute(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-            .rows_affected();
-        if deleted == 0 {
-            return Err(StorageError::NotFound {
-                entity: Entity::User,
-                id: id.to_string(),
-            });
+    async fn delete_user(&self, id: &UserId, by: &By) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        match dropping(&mut transaction, id, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
-        Ok(())
     }
 }
 

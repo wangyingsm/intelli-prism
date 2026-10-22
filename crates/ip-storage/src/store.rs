@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{Grant, Grants, PassphraseHash, TenantId, UserId};
 
-use crate::audit::AuditStore;
+use crate::audit::{AuditStore, By};
 use crate::error::StorageError;
 use crate::limit::LimitStore;
 use crate::list::ListStore;
@@ -29,20 +29,23 @@ pub trait TenantStore: Send + Sync {
 #[async_trait]
 pub trait UserStore: Send + Sync {
     /// Creates a user, or reports a conflict when the id is taken.
-    async fn create_user(&self, new: NewUser) -> Result<User, StorageError>;
+    async fn create_user(&self, new: NewUser, by: &By) -> Result<User, StorageError>;
 
     /// Reads one user.
     async fn user(&self, id: &UserId) -> Result<Option<User>, StorageError>;
 
     /// Replaces a user's passphrase verifier.
+    ///
+    /// What the trail records of this is that it happened, never what it was changed to.
     async fn set_passphrase(
         &self,
         id: &UserId,
         passphrase: &PassphraseHash,
+        by: &By,
     ) -> Result<(), StorageError>;
 
     /// Deletes a user, or reports it missing.
-    async fn delete_user(&self, id: &UserId) -> Result<(), StorageError>;
+    async fn delete_user(&self, id: &UserId, by: &By) -> Result<(), StorageError>;
 }
 
 /// Reads and writes the many to many attachment of users to tenants.
@@ -188,7 +191,7 @@ mod tests {
 
     #[async_trait]
     impl UserStore for MemoryStore {
-        async fn create_user(&self, new: NewUser) -> Result<User, StorageError> {
+        async fn create_user(&self, new: NewUser, _by: &By) -> Result<User, StorageError> {
             let mut users = self.users.lock().unwrap();
             if users.contains_key(&new.id) {
                 return Err(StorageError::Conflict {
@@ -215,6 +218,7 @@ mod tests {
             &self,
             id: &UserId,
             passphrase: &PassphraseHash,
+            _by: &By,
         ) -> Result<(), StorageError> {
             match self.users.lock().unwrap().get_mut(id) {
                 Some(user) => {
@@ -228,7 +232,7 @@ mod tests {
             }
         }
 
-        async fn delete_user(&self, id: &UserId) -> Result<(), StorageError> {
+        async fn delete_user(&self, id: &UserId, _by: &By) -> Result<(), StorageError> {
             self.users
                 .lock()
                 .unwrap()
@@ -376,7 +380,10 @@ mod tests {
     async fn the_whole_surface_is_reachable_through_one_trait_object() {
         let store = store();
         let tenant = store.create_tenant(new_tenant()).await.unwrap();
-        let user = store.create_user(new_user()).await.unwrap();
+        let user = store
+            .create_user(new_user(), &crate::suite::identity::accounts_by())
+            .await
+            .unwrap();
         store
             .attach(Membership {
                 user: user.id.clone(),
@@ -422,7 +429,10 @@ mod tests {
     async fn every_created_row_gets_its_own_primary_key() {
         let store = store();
         let tenant = store.create_tenant(new_tenant()).await.unwrap();
-        let user = store.create_user(new_user()).await.unwrap();
+        let user = store
+            .create_user(new_user(), &crate::suite::identity::accounts_by())
+            .await
+            .unwrap();
         assert_eq!(tenant.row_id, TenantRowId::new(1));
         assert_eq!(user.row_id, UserRowId::new(2));
     }
@@ -444,7 +454,9 @@ mod tests {
     async fn deleting_what_is_absent_reports_it_missing() {
         let store = store();
         assert!(matches!(
-            store.delete_user(&user_id()).await,
+            store
+                .delete_user(&user_id(), &crate::suite::identity::accounts_by())
+                .await,
             Err(StorageError::NotFound {
                 entity: Entity::User,
                 ..

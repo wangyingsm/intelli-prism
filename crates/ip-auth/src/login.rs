@@ -240,11 +240,14 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let hasher = PassphraseHasher::new();
         store
-            .create_user(NewUser {
-                id: alice(),
-                passphrase: hasher.hash(&passphrase("correct horse staple")).unwrap(),
-                kind,
-            })
+            .create_user(
+                NewUser {
+                    id: alice(),
+                    passphrase: hasher.hash(&passphrase("correct horse staple")).unwrap(),
+                    kind,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         let tokens = SessionTokens::new("intelli-prism", SECRET, Duration::from_secs(3600));
@@ -398,11 +401,14 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         let hasher = PassphraseHasher::new();
         store
-            .create_user(NewUser {
-                id: alice(),
-                passphrase: hasher.hash(&passphrase("correct horse staple")).unwrap(),
-                kind: AccountKind::Regular,
-            })
+            .create_user(
+                NewUser {
+                    id: alice(),
+                    passphrase: hasher.hash(&passphrase("correct horse staple")).unwrap(),
+                    kind: AccountKind::Regular,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         let cache = Arc::new(ip_cache::FailingCache::new(Arc::new(

@@ -253,13 +253,16 @@ secret = "0123456789abcdef0123456789abcdef"
             .await
             .unwrap();
         store
-            .create_user(NewUser {
-                id: user_id(),
-                passphrase: PassphraseHasher::new()
-                    .hash(&Passphrase::new(PASSPHRASE).unwrap())
-                    .unwrap(),
-                kind,
-            })
+            .create_user(
+                NewUser {
+                    id: user_id(),
+                    passphrase: PassphraseHasher::new()
+                        .hash(&Passphrase::new(PASSPHRASE).unwrap())
+                        .unwrap(),
+                    kind,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         store
@@ -454,13 +457,16 @@ secret = "0123456789abcdef0123456789abcdef"
         let outsider = UserId::new("bob").unwrap();
         state
             .store()
-            .create_user(NewUser {
-                id: outsider.clone(),
-                passphrase: PassphraseHasher::new()
-                    .hash(&Passphrase::new(PASSPHRASE).unwrap())
-                    .unwrap(),
-                kind: AccountKind::Regular,
-            })
+            .create_user(
+                NewUser {
+                    id: outsider.clone(),
+                    passphrase: PassphraseHasher::new()
+                        .hash(&Passphrase::new(PASSPHRASE).unwrap())
+                        .unwrap(),
+                    kind: AccountKind::Regular,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         // Granted inside the tenant, but attached to no tenant at all.

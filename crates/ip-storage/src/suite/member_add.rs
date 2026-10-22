@@ -121,11 +121,14 @@ pub(crate) async fn a_user_id_that_is_taken_conflicts(store: &impl MemberAddStor
     store.create_tenant(new_tenant()).await.unwrap();
     let taken = UserId::new("taken").unwrap();
     store
-        .create_user(NewUser {
-            id: taken.clone(),
-            passphrase: hash(),
-            kind: AccountKind::Regular,
-        })
+        .create_user(
+            NewUser {
+                id: taken.clone(),
+                passphrase: hash(),
+                kind: AccountKind::Regular,
+            },
+            &crate::suite::identity::accounts_by(),
+        )
         .await
         .unwrap();
 

@@ -51,11 +51,14 @@ async fn two_tenants(store: &impl Backend) {
         .await
         .unwrap();
     store
-        .create_user(NewUser {
-            id: their_user(),
-            passphrase: hash(),
-            kind: AccountKind::Regular,
-        })
+        .create_user(
+            NewUser {
+                id: their_user(),
+                passphrase: hash(),
+                kind: AccountKind::Regular,
+            },
+            &crate::suite::identity::accounts_by(),
+        )
         .await
         .unwrap();
     store

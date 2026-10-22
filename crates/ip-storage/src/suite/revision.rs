@@ -94,7 +94,10 @@ pub(crate) async fn rules_a_deleted_user_takes_with_it_move_the_revision_on(stor
     tenant_with_user(store).await;
     alice_rule(store).await;
     let before = revision(store).await;
-    store.delete_user(&user_id()).await.unwrap();
+    store
+        .delete_user(&user_id(), &crate::suite::identity::accounts_by())
+        .await
+        .unwrap();
     assert!(revision(store).await > before);
     assert!(store.rules().await.unwrap().is_empty());
 }

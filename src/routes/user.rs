@@ -8,8 +8,8 @@ use axum::routing::{get, post};
 use ip_auth::{Passphrase, PassphraseHasher};
 use ip_core::{Capability, CapabilityScope, PassphraseHash, TenantId, Timestamp, UserId};
 use ip_storage::{
-    AccountKind, IdentityDialect, MemberAddBegun, MemberAddTransactional, MemberAddTxn, Membership,
-    NewUser, Standing, Storage, StorageError, User, UserWithMembership,
+    AccountKind, By, IdentityDialect, MemberAddBegun, MemberAddTransactional, MemberAddTxn,
+    Membership, NewUser, Standing, Storage, StorageError, User, UserWithMembership,
 };
 
 use super::{standing_name, store_refusal};
@@ -17,6 +17,9 @@ use crate::manage::Manager;
 use crate::state::{AppState, Stores};
 
 /// Every endpoint that manages user accounts, under the prefix the router nests them at.
+/// What the audit trail records a change to an account as having come through.
+const ENDPOINT: &str = "/_ip/users";
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(create))
@@ -174,7 +177,8 @@ async fn remove(
         )
             .into_response();
     }
-    match store.delete_user(&user).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match store.delete_user(&user, &by).await {
         Ok(()) => {
             state.feed().after_change().await;
             StatusCode::NO_CONTENT.into_response()
@@ -346,11 +350,14 @@ mod tests {
             ("dave", AccountKind::Regular),
         ] {
             store
-                .create_user(NewUser {
-                    id: id(user),
-                    passphrase: hashed(),
-                    kind,
-                })
+                .create_user(
+                    NewUser {
+                        id: id(user),
+                        passphrase: hashed(),
+                        kind,
+                    },
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+                )
                 .await
                 .unwrap();
         }

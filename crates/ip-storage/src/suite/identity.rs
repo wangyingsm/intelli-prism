@@ -1,9 +1,15 @@
 use ip_core::{ApiId, Capability, CapabilityScope, Grant, PassphraseHash, TenantId, TnKey, UserId};
 
 use super::fixture::*;
+use crate::audit::By;
 use crate::error::{Entity, StorageError};
 use crate::model::{AccountKind, Membership, NewTenant, NewUser, Standing, TenantRowId};
 use crate::store::Storage;
+
+/// The account every suite test writes an account as, through the endpoint that does.
+pub(crate) fn accounts_by() -> By {
+    By::new(crate::suite::fixture::user_id(), "/_ip/users")
+}
 
 fn api_grant(user: &UserId, tenant: &TenantId, capability: Capability) -> Grant {
     Grant::new(
@@ -55,9 +61,9 @@ pub(crate) async fn a_repeated_tenant_id_conflicts(store: &impl Storage) {
 }
 
 pub(crate) async fn a_repeated_user_id_conflicts(store: &impl Storage) {
-    store.create_user(new_user()).await.unwrap();
+    store.create_user(new_user(), &accounts_by()).await.unwrap();
     assert!(matches!(
-        store.create_user(new_user()).await,
+        store.create_user(new_user(), &accounts_by()).await,
         Err(StorageError::Conflict {
             entity: Entity::User,
             ..
@@ -66,12 +72,12 @@ pub(crate) async fn a_repeated_user_id_conflicts(store: &impl Storage) {
 }
 
 pub(crate) async fn a_user_round_trips_and_its_passphrase_can_be_replaced(store: &impl Storage) {
-    let created = store.create_user(new_user()).await.unwrap();
+    let created = store.create_user(new_user(), &accounts_by()).await.unwrap();
     assert_eq!(store.user(&user_id()).await.unwrap(), Some(created));
     let replacement =
         PassphraseHash::new("$argon2id$v=19$m=19456,t=2,p=1$b3RoZXI$b3RoZXJoYXNo").unwrap();
     store
-        .set_passphrase(&user_id(), &replacement)
+        .set_passphrase(&user_id(), &replacement, &accounts_by())
         .await
         .unwrap();
     assert_eq!(
@@ -82,11 +88,14 @@ pub(crate) async fn a_user_round_trips_and_its_passphrase_can_be_replaced(store:
 
 pub(crate) async fn the_account_kind_survives_a_round_trip(store: &impl Storage) {
     store
-        .create_user(NewUser {
-            id: user_id(),
-            passphrase: hash(),
-            kind: AccountKind::SystemAdministrator,
-        })
+        .create_user(
+            NewUser {
+                id: user_id(),
+                passphrase: hash(),
+                kind: AccountKind::SystemAdministrator,
+            },
+            &accounts_by(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -104,7 +113,9 @@ pub(crate) async fn deleting_what_is_absent_reports_it_missing(store: &impl Stor
         })
     ));
     assert!(matches!(
-        store.set_passphrase(&user_id(), &hash()).await,
+        store
+            .set_passphrase(&user_id(), &hash(), &accounts_by())
+            .await,
         Err(StorageError::NotFound {
             entity: Entity::User,
             ..
@@ -132,7 +143,7 @@ pub(crate) async fn attaching_twice_replaces_the_standing(store: &impl Storage) 
 pub(crate) async fn attaching_to_a_tenant_that_is_not_there_reports_it_missing(
     store: &impl Storage,
 ) {
-    store.create_user(new_user()).await.unwrap();
+    store.create_user(new_user(), &accounts_by()).await.unwrap();
     assert!(matches!(
         store
             .attach(Membership {
@@ -175,7 +186,7 @@ pub(crate) async fn deleting_a_user_takes_its_memberships_with_it(store: &impl S
         })
         .await
         .unwrap();
-    store.delete_user(&user_id()).await.unwrap();
+    store.delete_user(&user_id(), &accounts_by()).await.unwrap();
     assert_eq!(store.user(&user_id()).await.unwrap(), None);
     assert!(
         store
@@ -185,7 +196,7 @@ pub(crate) async fn deleting_a_user_takes_its_memberships_with_it(store: &impl S
             .is_empty()
     );
     assert!(matches!(
-        store.delete_user(&user_id()).await,
+        store.delete_user(&user_id(), &accounts_by()).await,
         Err(StorageError::NotFound {
             entity: Entity::User,
             ..

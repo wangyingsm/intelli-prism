@@ -50,7 +50,10 @@ pub(crate) mod fixture {
 
     pub(crate) async fn tenant_with_user(store: &(impl TenantStore + UserStore)) -> (Tenant, User) {
         let tenant = store.create_tenant(new_tenant()).await.unwrap();
-        let user = store.create_user(new_user()).await.unwrap();
+        let user = store
+            .create_user(new_user(), &crate::suite::identity::accounts_by())
+            .await
+            .unwrap();
         (tenant, user)
     }
 }
@@ -226,6 +229,9 @@ macro_rules! backend_suite {
             letting_go_of_a_plugin_records_what_was_held,
             placing_a_plugin_in_a_chain_records_where_it_was_put,
             taking_a_plugin_out_of_the_global_chain_names_no_tenant,
+            an_accounts_record_never_holds_its_passphrase,
+            changing_a_passphrase_records_that_it_changed_and_never_what_to,
+            creating_and_deleting_an_account_record_both_ends,
             the_trail_names_the_account_that_asked,
         ]);
     };

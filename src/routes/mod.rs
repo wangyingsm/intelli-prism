@@ -562,12 +562,15 @@ secret = "0123456789abcdef0123456789abcdef"
             .await
             .unwrap();
         store
-            .create_user(NewUser {
-                id: user_id(),
-                passphrase: PassphraseHash::new("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA")
-                    .unwrap(),
-                kind: AccountKind::Regular,
-            })
+            .create_user(
+                NewUser {
+                    id: user_id(),
+                    passphrase: PassphraseHash::new("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA")
+                        .unwrap(),
+                    kind: AccountKind::Regular,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
             .await
             .unwrap();
         store
@@ -659,7 +662,14 @@ secret = "0123456789abcdef0123456789abcdef"
         let hashed = ip_auth::PassphraseHasher::new()
             .hash(&Passphrase::new("correct horse staple").unwrap())
             .unwrap();
-        store.set_passphrase(&user_id(), &hashed).await.unwrap();
+        store
+            .set_passphrase(
+                &user_id(),
+                &hashed,
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+            )
+            .await
+            .unwrap();
         let gateway = Gateway::new(
             table(),
             ProcessorChain::new(),

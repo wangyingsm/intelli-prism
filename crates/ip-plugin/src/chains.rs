@@ -188,12 +188,15 @@ mod tests {
         }
         for user in ["alice", "bob"] {
             store
-                .create_user(NewUser {
-                    id: UserId::new(user).unwrap(),
-                    passphrase: PassphraseHash::new("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA")
-                        .unwrap(),
-                    kind: AccountKind::Regular,
-                })
+                .create_user(
+                    NewUser {
+                        id: UserId::new(user).unwrap(),
+                        passphrase: PassphraseHash::new("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA")
+                            .unwrap(),
+                        kind: AccountKind::Regular,
+                    },
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/users"),
+                )
                 .await
                 .unwrap();
         }

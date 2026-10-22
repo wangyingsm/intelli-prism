@@ -8,13 +8,13 @@ use crate::list::Page;
 
 /// Who made a change, and what they came through.
 ///
-/// `through` is a literal written in this repository's routers, never anything a caller
-/// sends, so the trail cannot be made to say a request arrived somewhere it did not.
+/// `through` is a literal written in this repository, never anything a caller sends, so
+/// the trail cannot be made to say a request arrived somewhere it did not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct By {
     /// The account that made the change.
     pub actor: UserId,
-    /// The endpoint it came through, as the router nests it.
+    /// The endpoint it came through as the router nests it, or the command that ran it.
     pub through: &'static str,
 }
 

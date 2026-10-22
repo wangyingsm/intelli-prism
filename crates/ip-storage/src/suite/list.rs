@@ -34,11 +34,14 @@ async fn five_members(store: &impl Backend) -> Vec<UserId> {
     for n in 1..=5 {
         let id = user(&format!("m{n}"));
         store
-            .create_user(NewUser {
-                id: id.clone(),
-                passphrase: hash(),
-                kind: AccountKind::Regular,
-            })
+            .create_user(
+                NewUser {
+                    id: id.clone(),
+                    passphrase: hash(),
+                    kind: AccountKind::Regular,
+                },
+                &crate::suite::identity::accounts_by(),
+            )
             .await
             .unwrap();
         store
