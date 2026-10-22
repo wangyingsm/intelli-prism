@@ -224,6 +224,8 @@ macro_rules! backend_suite {
             removing_a_route_records_where_it_pointed,
             whose_a_stored_plugin_is_comes_from_who_stored_it,
             letting_go_of_a_plugin_records_what_was_held,
+            placing_a_plugin_in_a_chain_records_where_it_was_put,
+            taking_a_plugin_out_of_the_global_chain_names_no_tenant,
             the_trail_names_the_account_that_asked,
         ]);
     };

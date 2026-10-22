@@ -28,7 +28,10 @@ async fn alice_rule(store: &impl Backend) {
         api: None,
     };
     store
-        .put_rule(NewPluginRule::new(record.checksum, PluginOrder::new(100), scope).unwrap())
+        .put_rule(
+            NewPluginRule::new(record.checksum, PluginOrder::new(100), scope).unwrap(),
+            &crate::suite::plugin::rules_by(),
+        )
         .await
         .unwrap();
 }
@@ -69,6 +72,7 @@ pub(crate) async fn every_change_to_a_plugin_rule_moves_the_revision_on(store: &
             Some(&tenant_id()),
             PluginKind::ReqBody,
             PluginOrder::new(100),
+            &crate::suite::plugin::rules_by(),
         )
         .await
         .unwrap();

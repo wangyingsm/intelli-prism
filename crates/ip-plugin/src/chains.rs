@@ -232,7 +232,10 @@ mod tests {
 
     async fn place(store: &SqliteStore, checksum: Checksum, order: u8, scope: PluginScope) {
         store
-            .put_rule(NewPluginRule::new(checksum, PluginOrder::new(order), scope).unwrap())
+            .put_rule(
+                NewPluginRule::new(checksum, PluginOrder::new(order), scope).unwrap(),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugin-rules"),
+            )
             .await
             .unwrap();
     }

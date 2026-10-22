@@ -105,7 +105,7 @@ fn read(payload: Option<String>) -> Result<Option<serde_json::Value>, StorageErr
 #[cfg(test)]
 mod tests {
     use crate::limit::LimitStore;
-    use crate::plugin::PluginStore;
+    use crate::plugin::{PluginRuleStore, PluginStore};
     use crate::price::PriceStore;
     use crate::route::RouteStore;
     use crate::sqlite::fixture::*;
@@ -207,6 +207,42 @@ mod tests {
         assert!(
             store.plugins().await.unwrap().is_empty(),
             "the plugin survived a transaction that could not record it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_whose_record_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        let stored = store
+            .put_plugin(
+                crate::suite::plugin::plugin(ip_core::PluginKind::ReqBody, b"module"),
+                &crate::suite::plugin::by(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .put_rule(
+                    ip_core::NewPluginRule::new(
+                        stored.checksum,
+                        ip_core::PluginOrder::new(10),
+                        ip_core::PluginScope::Global,
+                    )
+                    .unwrap(),
+                    &crate::suite::plugin::rules_by(),
+                )
+                .await
+                .is_err(),
+            "a rule was placed with nothing to record it"
+        );
+        assert!(
+            store.rules().await.unwrap().is_empty(),
+            "the rule survived a transaction that could not record it"
         );
     }
 }

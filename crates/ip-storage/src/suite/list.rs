@@ -208,7 +208,10 @@ pub(crate) async fn rules_are_listed_by_chain_newest_first(store: &impl Backend)
     ];
     for (order, scope) in placements {
         store
-            .put_rule(NewPluginRule::new(record.checksum, PluginOrder::new(order), scope).unwrap())
+            .put_rule(
+                NewPluginRule::new(record.checksum, PluginOrder::new(order), scope).unwrap(),
+                &crate::suite::plugin::rules_by(),
+            )
             .await
             .unwrap();
     }

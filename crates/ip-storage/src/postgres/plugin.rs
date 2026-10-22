@@ -6,7 +6,7 @@ use sqlx::{PgConnection, Row};
 
 use super::PostgresStore;
 use super::identity::tenant_row_id;
-use crate::audit::By;
+use crate::audit::{By, NewAudit};
 use crate::codec::{plugin_order, plugin_scope, plugin_size};
 use crate::error::{Entity, StorageError, is_foreign_key_violation, is_unique_violation};
 use crate::plugin::{
@@ -111,57 +111,23 @@ impl PluginStore for PostgresStore {
 
 #[async_trait]
 impl PluginRuleStore for PostgresStore {
-    async fn put_rule(&self, rule: NewPluginRule) -> Result<PluginRule, StorageError> {
-        let (tenant_row_id, user_row_id, api) = match rule.scope() {
-            PluginScope::Global => (None, None, None),
-            PluginScope::Tenant { tenant, user, api } => {
-                let tenant_row_id = self.tenant_row_id(tenant).await?.get();
-                let user_row_id = match user {
-                    Some(user) => Some(self.user_row_id(user).await?.get()),
-                    None => None,
-                };
-                (Some(tenant_row_id), user_row_id, api.clone())
+    async fn put_rule(&self, rule: NewPluginRule, by: &By) -> Result<PluginRule, StorageError> {
+        // One transaction, so a rule that lands without its record is not a state this
+        // store can be left in, and neither is a record whose rule rolled back.
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        // Rolled back by hand rather than by dropping it: a transaction left to its
+        // `Drop` keeps the connection's locks until the pool gets round to it, and a
+        // scratch schema being torn down behind it waits for ever.
+        match placing(&mut transaction, rule, by).await {
+            Ok(placed) => transaction
+                .commit()
+                .await
+                .map_err(StorageError::backend)
+                .map(|()| placed),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
             }
-        };
-
-        let plugin = sqlx::query(
-            "SELECT p.row_id, p.kind FROM plugins p \
-             JOIN plugin_owners o ON o.plugin_row_id = p.row_id \
-             WHERE p.checksum = $1 AND o.tenant_row_id IS NOT DISTINCT FROM $2",
-        )
-        .bind(rule.checksum().to_hex())
-        .bind(tenant_row_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(StorageError::backend)?
-        .ok_or_else(|| StorageError::NotFound {
-            entity: Entity::Plugin,
-            id: rule.checksum().to_string(),
-        })?;
-        let plugin_row_id: i64 = plugin.get("row_id");
-        let kind: PluginKind = plugin.get::<String, _>("kind").parse()?;
-
-        let result = sqlx::query(
-            "INSERT INTO plugin_rules \
-             (plugin_row_id, tenant_row_id, user_row_id, api_id, kind, position, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(plugin_row_id)
-        .bind(tenant_row_id)
-        .bind(user_row_id)
-        .bind(api.as_ref().map(|api| api.as_str()))
-        .bind(kind.name())
-        .bind(i64::from(rule.order().get()))
-        .bind(Timestamp::now().unix_seconds())
-        .execute(&self.pool)
-        .await;
-        match result {
-            Ok(_) => Ok(rule.with_kind(kind)),
-            Err(error) if is_unique_violation(&error) => Err(StorageError::Conflict {
-                entity: Entity::PluginRule,
-                id: format!("{kind} {}", rule.order()),
-            }),
-            Err(error) => Err(StorageError::backend(error)),
         }
     }
 
@@ -170,33 +136,16 @@ impl PluginRuleStore for PostgresStore {
         tenant: Option<&TenantId>,
         kind: PluginKind,
         order: PluginOrder,
+        by: &By,
     ) -> Result<(), StorageError> {
-        let query = match tenant {
-            Some(tenant) => sqlx::query(
-                "DELETE FROM plugin_rules \
-                 WHERE tenant_row_id = (SELECT row_id FROM tenants WHERE id = $1) \
-                 AND kind = $2 AND position = $3",
-            )
-            .bind(tenant.as_str()),
-            None => sqlx::query(
-                "DELETE FROM plugin_rules \
-                 WHERE tenant_row_id IS NULL AND kind = $1 AND position = $2",
-            ),
-        };
-        let deleted = query
-            .bind(kind.name())
-            .bind(i64::from(order.get()))
-            .execute(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-            .rows_affected();
-        if deleted == 0 {
-            return Err(StorageError::NotFound {
-                entity: Entity::PluginRule,
-                id: format!("{kind} {order}"),
-            });
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        match displacing(&mut transaction, tenant, kind, order, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     async fn rules_for_tenant(&self, tenant: &TenantId) -> Result<Vec<PluginRule>, StorageError> {
@@ -219,6 +168,144 @@ impl PluginRuleStore for PostgresStore {
     async fn rules(&self) -> Result<Vec<PluginRule>, StorageError> {
         read_rules(&mut *self.connection().await?).await
     }
+}
+
+/// Places a rule and records the placing, both on the one connection its caller commits.
+///
+/// Apart from the method so that every way out of it is a `?` the caller can roll back,
+/// rather than a return that leaves a transaction open.
+async fn placing(
+    connection: &mut PgConnection,
+    rule: NewPluginRule,
+    by: &By,
+) -> Result<PluginRule, StorageError> {
+    let (tenant_row_id, user_row_id, api) = match rule.scope() {
+        PluginScope::Global => (None, None, None),
+        PluginScope::Tenant { tenant, user, api } => {
+            let tenant_row_id = tenant_row_id(connection, tenant).await?.get();
+            let user_row_id = match user {
+                Some(user) => Some(super::identity::user_row_id(connection, user).await?.get()),
+                None => None,
+            };
+            (Some(tenant_row_id), user_row_id, api.clone())
+        }
+    };
+
+    let plugin = sqlx::query(
+        "SELECT p.row_id, p.kind FROM plugins p \
+         JOIN plugin_owners o ON o.plugin_row_id = p.row_id \
+         WHERE p.checksum = $1 AND o.tenant_row_id IS NOT DISTINCT FROM $2",
+    )
+    .bind(rule.checksum().to_hex())
+    .bind(tenant_row_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?
+    .ok_or_else(|| StorageError::NotFound {
+        entity: Entity::Plugin,
+        id: rule.checksum().to_string(),
+    })?;
+    let plugin_row_id: i64 = plugin.get("row_id");
+    let kind: PluginKind = plugin.get::<String, _>("kind").parse()?;
+
+    let result = sqlx::query(
+        "INSERT INTO plugin_rules \
+         (plugin_row_id, tenant_row_id, user_row_id, api_id, kind, position, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(plugin_row_id)
+    .bind(tenant_row_id)
+    .bind(user_row_id)
+    .bind(api.as_ref().map(|api| api.as_str()))
+    .bind(kind.name())
+    .bind(i64::from(rule.order().get()))
+    .bind(Timestamp::now().unix_seconds())
+    .execute(&mut *connection)
+    .await;
+    let placed = match result {
+        Ok(_) => rule.with_kind(kind),
+        Err(error) if is_unique_violation(&error) => {
+            return Err(StorageError::Conflict {
+                entity: Entity::PluginRule,
+                id: format!("{kind} {}", rule.order()),
+            });
+        }
+        Err(error) => return Err(StorageError::backend(error)),
+    };
+    // A placing never replaces: the order a chain already uses is refused above, so
+    // there is nothing here that was there before.
+    super::audit::record(connection, NewAudit::created(by.clone(), &placed)).await?;
+    Ok(placed)
+}
+
+/// Removes a rule and records the removal, on the one connection its caller commits.
+async fn displacing(
+    connection: &mut PgConnection,
+    tenant: Option<&TenantId>,
+    kind: PluginKind,
+    order: PluginOrder,
+    by: &By,
+) -> Result<(), StorageError> {
+    let before = read_rule(connection, tenant, kind, order).await?;
+    let query = match tenant {
+        Some(tenant) => sqlx::query(
+            "DELETE FROM plugin_rules \
+             WHERE tenant_row_id = (SELECT row_id FROM tenants WHERE id = $1) \
+             AND kind = $2 AND position = $3",
+        )
+        .bind(tenant.as_str()),
+        None => sqlx::query(
+            "DELETE FROM plugin_rules WHERE tenant_row_id IS NULL AND kind = $1 AND position = $2",
+        ),
+    };
+    let deleted = query
+        .bind(kind.name())
+        .bind(i64::from(order.get()))
+        .execute(&mut *connection)
+        .await
+        .map_err(StorageError::backend)?
+        .rows_affected();
+    if deleted == 0 {
+        return Err(StorageError::NotFound {
+            entity: Entity::PluginRule,
+            id: format!("{kind} {order}"),
+        });
+    }
+    // A row was deleted, so something was there to read a moment ago in the same
+    // transaction; an absent before here would mean the two disagree.
+    let Some(before) = before else {
+        return Err(StorageError::Malformed {
+            entity: Entity::PluginRule,
+            detail: "a rule was removed that nothing could read".to_owned(),
+        });
+    };
+    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await?;
+    Ok(())
+}
+
+/// The rule at one kind and order in one chain, and nothing where that place is free.
+/// Read inside the transaction that is about to change it.
+async fn read_rule(
+    connection: &mut PgConnection,
+    tenant: Option<&TenantId>,
+    kind: PluginKind,
+    order: PluginOrder,
+) -> Result<Option<PluginRule>, StorageError> {
+    let row = sqlx::query(
+        "SELECT p.checksum, r.kind, r.position, t.id AS tenant_id, u.id AS user_id, \
+         r.api_id FROM plugin_rules r \
+         JOIN plugins p ON p.row_id = r.plugin_row_id \
+         LEFT JOIN tenants t ON t.row_id = r.tenant_row_id \
+         LEFT JOIN users u ON u.row_id = r.user_row_id \
+         WHERE COALESCE(t.id, '') = $1 AND r.kind = $2 AND r.position = $3",
+    )
+    .bind(tenant.map_or("", TenantId::as_str))
+    .bind(kind.name())
+    .bind(i64::from(order.get()))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?;
+    row.as_ref().map(plugin_rule).transpose()
 }
 
 /// Every plugin rule, over whichever connection it is given.

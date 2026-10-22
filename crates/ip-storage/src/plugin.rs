@@ -122,6 +122,43 @@ impl crate::audit::Auditable for AuditedPlugin<'_> {
     }
 }
 
+impl crate::audit::Auditable for PluginRule {
+    fn entity(&self) -> crate::error::Entity {
+        crate::error::Entity::PluginRule
+    }
+
+    fn entity_id(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.scope().tenant().map_or("global", TenantId::as_str),
+            self.kind(),
+            self.order()
+        )
+    }
+
+    fn tenant(&self) -> Option<TenantId> {
+        self.scope().tenant().cloned()
+    }
+
+    fn audited(&self) -> serde_json::Value {
+        let (user, api) = match self.scope() {
+            PluginScope::Global => (None, None),
+            PluginScope::Tenant { user, api, .. } => (
+                user.as_ref().map(ip_core::UserId::as_str),
+                api.as_ref().map(ip_core::ApiId::as_str),
+            ),
+        };
+        serde_json::json!({
+            "checksum": self.checksum().to_hex(),
+            "kind": self.kind().name(),
+            "order": self.order().get(),
+            "tenant": self.scope().tenant().map(TenantId::as_str),
+            "user": user,
+            "api": api,
+        })
+    }
+}
+
 /// Wasm about to be stored, which is named by its own checksum once written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewPlugin {
@@ -184,7 +221,7 @@ pub trait PluginStore: Send + Sync {
 pub trait PluginRuleStore: Send + Sync {
     /// Places a stored plugin, taking its kind from the plugin itself. Refuses a plugin the
     /// rule's chain does not own, and an order its tenant already uses for that kind.
-    async fn put_rule(&self, rule: NewPluginRule) -> Result<PluginRule, StorageError>;
+    async fn put_rule(&self, rule: NewPluginRule, by: &By) -> Result<PluginRule, StorageError>;
 
     /// Removes the rule at one kind and order, in a tenant or in the global chain.
     async fn remove_rule(
@@ -192,6 +229,7 @@ pub trait PluginRuleStore: Send + Sync {
         tenant: Option<&TenantId>,
         kind: PluginKind,
         order: PluginOrder,
+        by: &By,
     ) -> Result<(), StorageError>;
 
     /// Every rule that could join a chain inside this tenant, the global ones included.
@@ -309,7 +347,11 @@ mod tests {
 
     #[async_trait]
     impl PluginRuleStore for MemoryPlugins {
-        async fn put_rule(&self, rule: NewPluginRule) -> Result<PluginRule, StorageError> {
+        async fn put_rule(
+            &self,
+            rule: NewPluginRule,
+            _by: &By,
+        ) -> Result<PluginRule, StorageError> {
             let owner = PluginOwner::of_scope(rule.scope());
             let owned = self
                 .owners
@@ -348,6 +390,7 @@ mod tests {
             tenant: Option<&TenantId>,
             kind: PluginKind,
             order: PluginOrder,
+            _by: &By,
         ) -> Result<(), StorageError> {
             let mut rules = self.rules.lock().unwrap();
             let before = rules.len();
@@ -501,12 +544,20 @@ mod tests {
             .unwrap();
         let rules: Arc<dyn PluginRuleStore> = held;
         let placed = rules
-            .put_rule(rule(record.checksum, 100, tenant_wide(acme())))
+            .put_rule(
+                rule(record.checksum, 100, tenant_wide(acme())),
+                &crate::suite::plugin::rules_by(),
+            )
             .await
             .unwrap();
         assert_eq!(rules.rules().await.unwrap(), vec![placed.clone()]);
         rules
-            .remove_rule(Some(&acme()), placed.kind(), placed.order())
+            .remove_rule(
+                Some(&acme()),
+                placed.kind(),
+                placed.order(),
+                &crate::suite::plugin::rules_by(),
+            )
             .await
             .unwrap();
         assert!(rules.rules().await.unwrap().is_empty());
@@ -527,7 +578,10 @@ mod tests {
             .await
             .unwrap();
         let placed = held
-            .put_rule(rule(record.checksum, 100, tenant_wide(acme())))
+            .put_rule(
+                rule(record.checksum, 100, tenant_wide(acme())),
+                &crate::suite::plugin::rules_by(),
+            )
             .await
             .unwrap();
         assert_eq!(placed.kind(), PluginKind::RespHeader);
@@ -537,8 +591,11 @@ mod tests {
     async fn a_rule_naming_a_plugin_that_is_not_stored_is_refused() {
         let held = both();
         assert!(matches!(
-            held.put_rule(rule(Checksum::of(b"absent"), 100, tenant_wide(acme())))
-                .await,
+            held.put_rule(
+                rule(Checksum::of(b"absent"), 100, tenant_wide(acme())),
+                &crate::suite::plugin::rules_by()
+            )
+            .await,
             Err(StorageError::NotFound {
                 entity: Entity::Plugin,
                 ..
@@ -557,16 +614,23 @@ mod tests {
             .put_plugin(wasm(b"two"), &crate::suite::plugin::by())
             .await
             .unwrap();
-        held.put_rule(rule(first.checksum, 100, tenant_wide(acme())))
-            .await
-            .unwrap();
+        held.put_rule(
+            rule(first.checksum, 100, tenant_wide(acme())),
+            &crate::suite::plugin::rules_by(),
+        )
+        .await
+        .unwrap();
         let user_scoped = ip_core::PluginScope::Tenant {
             tenant: acme(),
             user: Some(ip_core::UserId::new("bob").unwrap()),
             api: None,
         };
         assert!(matches!(
-            held.put_rule(rule(second.checksum, 100, user_scoped)).await,
+            held.put_rule(
+                rule(second.checksum, 100, user_scoped),
+                &crate::suite::plugin::rules_by()
+            )
+            .await,
             Err(StorageError::Conflict {
                 entity: Entity::PluginRule,
                 ..
@@ -581,9 +645,12 @@ mod tests {
             .put_plugin(wasm(b"module"), &crate::suite::plugin::by())
             .await
             .unwrap();
-        held.put_rule(rule(record.checksum, 100, tenant_wide(acme())))
-            .await
-            .unwrap();
+        held.put_rule(
+            rule(record.checksum, 100, tenant_wide(acme())),
+            &crate::suite::plugin::rules_by(),
+        )
+        .await
+        .unwrap();
         let globex = TenantId::new("globex").unwrap();
         held.put_plugin(
             owned_by(b"module", PluginOwner::Tenant(globex.clone())),
@@ -592,9 +659,12 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            held.put_rule(rule(record.checksum, 100, tenant_wide(globex)))
-                .await
-                .is_ok()
+            held.put_rule(
+                rule(record.checksum, 100, tenant_wide(globex)),
+                &crate::suite::plugin::rules_by()
+            )
+            .await
+            .is_ok()
         );
     }
 
@@ -611,15 +681,24 @@ mod tests {
                 .await
                 .unwrap();
         }
-        held.put_rule(rule(record.checksum, 10, ip_core::PluginScope::Global))
-            .await
-            .unwrap();
-        held.put_rule(rule(record.checksum, 100, tenant_wide(acme())))
-            .await
-            .unwrap();
-        held.put_rule(rule(record.checksum, 100, tenant_wide(globex)))
-            .await
-            .unwrap();
+        held.put_rule(
+            rule(record.checksum, 10, ip_core::PluginScope::Global),
+            &crate::suite::plugin::rules_by(),
+        )
+        .await
+        .unwrap();
+        held.put_rule(
+            rule(record.checksum, 100, tenant_wide(acme())),
+            &crate::suite::plugin::rules_by(),
+        )
+        .await
+        .unwrap();
+        held.put_rule(
+            rule(record.checksum, 100, tenant_wide(globex)),
+            &crate::suite::plugin::rules_by(),
+        )
+        .await
+        .unwrap();
         let seen = held.rules_for_tenant(&acme()).await.unwrap();
         assert_eq!(seen.len(), 2);
         assert!(
@@ -635,9 +714,12 @@ mod tests {
             .put_plugin(wasm(b"module"), &crate::suite::plugin::by())
             .await
             .unwrap();
-        held.put_rule(rule(record.checksum, 100, tenant_wide(acme())))
-            .await
-            .unwrap();
+        held.put_rule(
+            rule(record.checksum, 100, tenant_wide(acme())),
+            &crate::suite::plugin::rules_by(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             held.disown_plugin(
                 &record.checksum,
@@ -662,7 +744,11 @@ mod tests {
         let globex = tenant_wide(TenantId::new("globex").unwrap());
         for (order, scope) in [(10, ip_core::PluginScope::Global), (100, globex)] {
             assert!(matches!(
-                held.put_rule(rule(record.checksum, order, scope)).await,
+                held.put_rule(
+                    rule(record.checksum, order, scope),
+                    &crate::suite::plugin::rules_by()
+                )
+                .await,
                 Err(StorageError::NotFound {
                     entity: Entity::Plugin,
                     ..
@@ -675,8 +761,13 @@ mod tests {
     async fn removing_a_rule_that_is_absent_reports_it_missing() {
         let held = both();
         assert!(matches!(
-            held.remove_rule(Some(&acme()), PluginKind::ReqBody, PluginOrder::new(100))
-                .await,
+            held.remove_rule(
+                Some(&acme()),
+                PluginKind::ReqBody,
+                PluginOrder::new(100),
+                &crate::suite::plugin::rules_by()
+            )
+            .await,
             Err(StorageError::NotFound {
                 entity: Entity::PluginRule,
                 ..

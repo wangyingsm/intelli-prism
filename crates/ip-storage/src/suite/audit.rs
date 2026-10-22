@@ -323,6 +323,91 @@ pub(crate) async fn letting_go_of_a_plugin_records_what_was_held(store: &impl Ba
     assert_eq!(gone.after, None, "nothing is left to describe");
 }
 
+/// Placing a plugin in a chain is a creation, never a replacement: the order a chain
+/// already uses is refused rather than overwritten, so the before is always nothing.
+pub(crate) async fn placing_a_plugin_in_a_chain_records_where_it_was_put(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let stored = store
+        .put_plugin(
+            crate::suite::plugin::owned_by(
+                PluginKind::ReqBody,
+                b"module",
+                crate::plugin::PluginOwner::Tenant(tenant_id()),
+            ),
+            &crate::suite::plugin::by(),
+        )
+        .await
+        .unwrap();
+    let placed = ip_core::NewPluginRule::new(
+        stored.checksum,
+        ip_core::PluginOrder::new(100),
+        ip_core::PluginScope::Tenant {
+            tenant: tenant_id(),
+            user: None,
+            api: None,
+        },
+    )
+    .unwrap();
+    store
+        .put_rule(placed, &crate::suite::plugin::rules_by())
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 2, "the wasm, then the rule that places it");
+    let rule = &trail[0];
+    assert_eq!(rule.entity, Entity::PluginRule);
+    assert_eq!(rule.through, "/_ip/plugin-rules");
+    assert_eq!(rule.tenant, Some(tenant_id()));
+    assert_eq!(rule.before, None, "a placing never replaces");
+    assert_eq!(rule.after.as_ref().unwrap()["order"], 100);
+    assert_eq!(
+        rule.after.as_ref().unwrap()["checksum"],
+        stored.checksum.to_hex()
+    );
+}
+
+/// Taking a plugin out of the global chain is the deployment's change, not a tenant's.
+pub(crate) async fn taking_a_plugin_out_of_the_global_chain_names_no_tenant(store: &impl Backend) {
+    let stored = store
+        .put_plugin(
+            crate::suite::plugin::plugin(PluginKind::ReqBody, b"module"),
+            &crate::suite::plugin::by(),
+        )
+        .await
+        .unwrap();
+    let by = crate::suite::plugin::rules_by();
+    store
+        .put_rule(
+            ip_core::NewPluginRule::new(
+                stored.checksum,
+                ip_core::PluginOrder::new(10),
+                ip_core::PluginScope::Global,
+            )
+            .unwrap(),
+            &by,
+        )
+        .await
+        .unwrap();
+    store
+        .remove_rule(
+            None,
+            PluginKind::ReqBody,
+            ip_core::PluginOrder::new(10),
+            &by,
+        )
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 3);
+    let taken = &trail[0];
+    assert_eq!(taken.entity, Entity::PluginRule);
+    assert_eq!(taken.tenant, None, "the global chain is nobody's tenant");
+    assert_eq!(taken.before.as_ref().unwrap()["order"], 10);
+    assert_eq!(taken.after, None, "nothing is left to describe");
+}
+
 /// The actor is whoever the handler said, not a name the store invents.
 pub(crate) async fn the_trail_names_the_account_that_asked(store: &impl Backend) {
     tenant_with_user(store).await;

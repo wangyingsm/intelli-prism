@@ -369,7 +369,10 @@ mod tests {
             api: None,
         };
         store
-            .put_rule(NewPluginRule::new(plugin.checksum, PluginOrder::new(100), scope).unwrap())
+            .put_rule(
+                NewPluginRule::new(plugin.checksum, PluginOrder::new(100), scope).unwrap(),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugin-rules"),
+            )
             .await
             .unwrap();
         let cache = Arc::new(SledCache::temporary().unwrap());
@@ -597,6 +600,7 @@ mod tests {
             .put_rule(
                 NewPluginRule::new(plugin.checksum, PluginOrder::new(10), PluginScope::Global)
                     .unwrap(),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugin-rules"),
             )
             .await
             .unwrap();

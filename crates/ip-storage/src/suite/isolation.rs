@@ -209,6 +209,7 @@ pub(crate) async fn rules_in_one_tenants_chain_are_not_listed_for_another(store:
                 },
             )
             .unwrap(),
+            &crate::suite::plugin::rules_by(),
         )
         .await
         .unwrap();

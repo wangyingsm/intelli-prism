@@ -222,9 +222,9 @@ impl PluginStore for FailingStore {
 
 #[async_trait]
 impl PluginRuleStore for FailingStore {
-    async fn put_rule(&self, rule: NewPluginRule) -> Result<PluginRule, StorageError> {
+    async fn put_rule(&self, rule: NewPluginRule, by: &By) -> Result<PluginRule, StorageError> {
         self.answering()?;
-        self.inner.put_rule(rule).await
+        self.inner.put_rule(rule, by).await
     }
 
     async fn remove_rule(
@@ -232,9 +232,10 @@ impl PluginRuleStore for FailingStore {
         tenant: Option<&TenantId>,
         kind: PluginKind,
         order: PluginOrder,
+        by: &By,
     ) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.remove_rule(tenant, kind, order).await
+        self.inner.remove_rule(tenant, kind, order, by).await
     }
 
     async fn rules_for_tenant(&self, tenant: &TenantId) -> Result<Vec<PluginRule>, StorageError> {

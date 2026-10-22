@@ -1124,6 +1124,7 @@ capacity = 128
             .put_rule(
                 NewPluginRule::new(broken.checksum, PluginOrder::new(10), PluginScope::Global)
                     .unwrap(),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugin-rules"),
             )
             .await
             .unwrap();

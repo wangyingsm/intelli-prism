@@ -26,6 +26,9 @@ use crate::state::AppState;
 /// What the audit trail records a plugin stored or let go of as having come through.
 const STORE_ENDPOINT: &str = "/_ip/plugins";
 
+/// What the audit trail records a rule placed or removed as having come through.
+const RULES_ENDPOINT: &str = "/_ip/plugin-rules";
+
 pub fn store_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_plugins).post(upload))
@@ -260,7 +263,8 @@ async fn place_rule(
         Ok(rule) => rule,
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     };
-    match state.store().put_rule(rule).await {
+    let by = By::new(manager.user().clone(), RULES_ENDPOINT);
+    match state.store().put_rule(rule, &by).await {
         Ok(placed) => {
             state.feed().after_change().await;
             (StatusCode::CREATED, Json(RuleView::from(&placed))).into_response()
@@ -289,7 +293,12 @@ async fn remove_rule(
     match state
         .stores()
         .backend()
-        .remove_rule(owner.tenant(), kind, PluginOrder::new(order))
+        .remove_rule(
+            owner.tenant(),
+            kind,
+            PluginOrder::new(order),
+            &By::new(manager.user().clone(), RULES_ENDPOINT),
+        )
         .await
     {
         Ok(()) => {

@@ -19,6 +19,11 @@ pub(crate) fn by() -> By {
     By::new(crate::suite::fixture::user_id(), "/_ip/plugins")
 }
 
+/// The account every suite test places a rule as, through the endpoint that places one.
+pub(crate) fn rules_by() -> By {
+    By::new(crate::suite::fixture::user_id(), "/_ip/plugin-rules")
+}
+
 /// A plugin of `kind` whose wasm is `body`, stored for the global chain.
 pub(crate) fn plugin(kind: PluginKind, body: &[u8]) -> NewPlugin {
     owned_by(kind, body, PluginOwner::Global)
@@ -140,7 +145,7 @@ pub(crate) async fn a_plugin_a_rule_still_uses_is_not_removed_until_the_rule_goe
     tenant_with_user(store).await;
     let record = stored_for(store, PluginKind::ReqBody, b"module", &[acme()]).await;
     store
-        .put_rule(placed(record.checksum, 100, acme_wide()))
+        .put_rule(placed(record.checksum, 100, acme_wide()), &rules_by())
         .await
         .unwrap();
     match store.disown_plugin(&record.checksum, &acme(), &by()).await {
@@ -155,6 +160,7 @@ pub(crate) async fn a_plugin_a_rule_still_uses_is_not_removed_until_the_rule_goe
             Some(&tenant_id()),
             PluginKind::ReqBody,
             PluginOrder::new(100),
+            &rules_by(),
         )
         .await
         .unwrap();
@@ -202,7 +208,7 @@ pub(crate) async fn every_rule_scope_round_trips(store: &impl PluginBackend) {
     for (order, scope) in scopes {
         expected.push(
             store
-                .put_rule(placed(record.checksum, order, scope))
+                .put_rule(placed(record.checksum, order, scope), &rules_by())
                 .await
                 .unwrap(),
         );
@@ -218,7 +224,7 @@ pub(crate) async fn a_stored_rule_takes_its_kind_from_the_plugin(store: &impl Pl
     tenant_with_user(store).await;
     let record = stored_for(store, PluginKind::RespHeader, b"module", &[acme()]).await;
     let rule = store
-        .put_rule(placed(record.checksum, 100, acme_wide()))
+        .put_rule(placed(record.checksum, 100, acme_wide()), &rules_by())
         .await
         .unwrap();
     assert_eq!(rule.kind(), PluginKind::RespHeader);
@@ -232,7 +238,10 @@ pub(crate) async fn a_rule_naming_an_absent_plugin_is_refused(store: &impl Plugi
     tenant_with_user(store).await;
     assert!(matches!(
         store
-            .put_rule(placed(Checksum::of(b"absent"), 100, acme_wide()))
+            .put_rule(
+                placed(Checksum::of(b"absent"), 100, acme_wide()),
+                &rules_by()
+            )
             .await,
         Err(StorageError::NotFound {
             entity: Entity::Plugin,
@@ -248,7 +257,7 @@ pub(crate) async fn a_rule_in_a_tenant_that_is_not_there_is_refused(store: &impl
         .unwrap();
     assert!(matches!(
         store
-            .put_rule(placed(record.checksum, 100, acme_wide()))
+            .put_rule(placed(record.checksum, 100, acme_wide()), &rules_by())
             .await,
         Err(StorageError::NotFound {
             entity: Entity::Tenant,
@@ -264,12 +273,12 @@ pub(crate) async fn an_order_a_tenant_already_uses_for_that_kind_is_refused(
     let first = stored_for(store, PluginKind::ReqBody, b"one", &[acme()]).await;
     let second = stored_for(store, PluginKind::ReqBody, b"two", &[acme()]).await;
     store
-        .put_rule(placed(first.checksum, 100, acme_wide()))
+        .put_rule(placed(first.checksum, 100, acme_wide()), &rules_by())
         .await
         .unwrap();
     assert!(matches!(
         store
-            .put_rule(placed(second.checksum, 100, alice_only()))
+            .put_rule(placed(second.checksum, 100, alice_only()), &rules_by())
             .await,
         Err(StorageError::Conflict {
             entity: Entity::PluginRule,
@@ -283,12 +292,12 @@ pub(crate) async fn the_same_order_under_another_kind_is_allowed(store: &impl Pl
     let request = stored_for(store, PluginKind::ReqBody, b"one", &[acme()]).await;
     let response = stored_for(store, PluginKind::RespBody, b"two", &[acme()]).await;
     store
-        .put_rule(placed(request.checksum, 100, acme_wide()))
+        .put_rule(placed(request.checksum, 100, acme_wide()), &rules_by())
         .await
         .unwrap();
     assert!(
         store
-            .put_rule(placed(response.checksum, 100, acme_wide()))
+            .put_rule(placed(response.checksum, 100, acme_wide()), &rules_by())
             .await
             .is_ok()
     );
@@ -316,23 +325,29 @@ pub(crate) async fn a_tenant_reads_its_own_rules_and_the_global_ones(store: &imp
     )
     .await;
     store
-        .put_rule(placed(record.checksum, 10, PluginScope::Global))
+        .put_rule(
+            placed(record.checksum, 10, PluginScope::Global),
+            &rules_by(),
+        )
         .await
         .unwrap();
     store
-        .put_rule(placed(record.checksum, 100, acme_wide()))
+        .put_rule(placed(record.checksum, 100, acme_wide()), &rules_by())
         .await
         .unwrap();
     store
-        .put_rule(placed(
-            record.checksum,
-            100,
-            PluginScope::Tenant {
-                tenant: globex,
-                user: None,
-                api: None,
-            },
-        ))
+        .put_rule(
+            placed(
+                record.checksum,
+                100,
+                PluginScope::Tenant {
+                    tenant: globex,
+                    user: None,
+                    api: None,
+                },
+            ),
+            &rules_by(),
+        )
         .await
         .unwrap();
     let seen = store.rules_for_tenant(&tenant_id()).await.unwrap();
@@ -349,7 +364,7 @@ pub(crate) async fn rules_come_back_highest_order_first(store: &impl PluginBacke
     let record = stored_for(store, PluginKind::ReqBody, b"module", &[acme()]).await;
     for order in [100, 200, 150] {
         store
-            .put_rule(placed(record.checksum, order, acme_wide()))
+            .put_rule(placed(record.checksum, order, acme_wide()), &rules_by())
             .await
             .unwrap();
     }
@@ -373,11 +388,14 @@ pub(crate) async fn deleting_a_tenant_takes_its_rules_with_it(store: &impl Plugi
     )
     .await;
     store
-        .put_rule(placed(record.checksum, 10, PluginScope::Global))
+        .put_rule(
+            placed(record.checksum, 10, PluginScope::Global),
+            &rules_by(),
+        )
         .await
         .unwrap();
     store
-        .put_rule(placed(record.checksum, 100, acme_wide()))
+        .put_rule(placed(record.checksum, 100, acme_wide()), &rules_by())
         .await
         .unwrap();
     store.delete_tenant(&tenant_id()).await.unwrap();
@@ -398,15 +416,18 @@ pub(crate) async fn removing_a_global_rule_leaves_a_tenant_rule_at_the_same_kind
     )
     .await;
     store
-        .put_rule(placed(record.checksum, 10, PluginScope::Global))
+        .put_rule(
+            placed(record.checksum, 10, PluginScope::Global),
+            &rules_by(),
+        )
         .await
         .unwrap();
     store
-        .put_rule(placed(record.checksum, 100, acme_wide()))
+        .put_rule(placed(record.checksum, 100, acme_wide()), &rules_by())
         .await
         .unwrap();
     store
-        .remove_rule(None, PluginKind::ReqBody, PluginOrder::new(10))
+        .remove_rule(None, PluginKind::ReqBody, PluginOrder::new(10), &rules_by())
         .await
         .unwrap();
     assert_eq!(store.rules().await.unwrap().len(), 1);
@@ -470,7 +491,10 @@ pub(crate) async fn a_chain_places_only_the_plugins_it_owns(store: &impl PluginB
     let record = stored_for(store, PluginKind::ReqBody, b"module", &[acme()]).await;
     assert!(matches!(
         store
-            .put_rule(placed(record.checksum, 10, PluginScope::Global))
+            .put_rule(
+                placed(record.checksum, 10, PluginScope::Global),
+                &rules_by()
+            )
             .await,
         Err(StorageError::NotFound {
             entity: Entity::Plugin,
@@ -479,7 +503,7 @@ pub(crate) async fn a_chain_places_only_the_plugins_it_owns(store: &impl PluginB
     ));
     assert!(
         store
-            .put_rule(placed(record.checksum, 100, acme_wide()))
+            .put_rule(placed(record.checksum, 100, acme_wide()), &rules_by())
             .await
             .is_ok()
     );
