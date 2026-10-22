@@ -8,14 +8,16 @@ use crate::audit::{AuditFilter, AuditStore, Audited, NewAudit};
 use crate::error::{Entity, StorageError};
 use crate::list::Page;
 
-/// Records one change, over the same connection the change itself was written on.
+/// Records one change, over the same connection the change itself was written on, and
+/// says when it was recorded.
 ///
 /// Takes a connection rather than the store so that it can only be called from inside a
 /// transaction that is also writing the thing being described.
 pub(super) async fn record(
     connection: &mut SqliteConnection,
     audit: NewAudit,
-) -> Result<(), StorageError> {
+) -> Result<Timestamp, StorageError> {
+    let created_at = Timestamp::now();
     sqlx::query(
         "INSERT INTO audit \
          (actor, through, entity, entity_id, tenant, before, after, created_at) \
@@ -28,11 +30,11 @@ pub(super) async fn record(
     .bind(audit.tenant.as_ref().map(TenantId::as_str))
     .bind(written(audit.before.as_ref())?)
     .bind(written(audit.after.as_ref())?)
-    .bind(Timestamp::now().unix_seconds())
+    .bind(created_at.unix_seconds())
     .execute(&mut *connection)
     .await
     .map_err(StorageError::backend)?;
-    Ok(())
+    Ok(created_at)
 }
 
 /// One payload as the column holds it, and nothing where there is nothing to hold.
@@ -103,6 +105,7 @@ fn read(payload: Option<String>) -> Result<Option<serde_json::Value>, StorageErr
 #[cfg(test)]
 mod tests {
     use crate::limit::LimitStore;
+    use crate::plugin::PluginStore;
     use crate::price::PriceStore;
     use crate::route::RouteStore;
     use crate::sqlite::fixture::*;
@@ -178,6 +181,32 @@ mod tests {
         assert!(
             store.routes().await.unwrap().is_empty(),
             "the rule survived a transaction that could not record it"
+        );
+    }
+
+    /// The typestate flow will not compile without its recording step, so this proves the
+    /// weaker thing the others do: the step runs inside the transaction it belongs to.
+    #[tokio::test]
+    async fn a_plugin_whose_record_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .put_plugin(
+                    crate::suite::plugin::plugin(ip_core::PluginKind::ReqBody, b"module"),
+                    &crate::suite::plugin::by(),
+                )
+                .await
+                .is_err(),
+            "wasm was stored with nothing to record it"
+        );
+        assert!(
+            store.plugins().await.unwrap().is_empty(),
+            "the plugin survived a transaction that could not record it"
         );
     }
 }

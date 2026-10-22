@@ -1053,11 +1053,14 @@ secret = "0123456789abcdef0123456789abcdef"
     async fn a_stored_wasm_plugin_rewrites_a_proxied_response() {
         let (store, key) = seeded_store(true).await;
         let plugin = store
-            .put_plugin(NewPlugin {
-                kind: PluginKind::RespBody,
-                wasm: wat::parse_str(REWRITE).unwrap(),
-                owner: PluginOwner::Tenant(tenant_id()),
-            })
+            .put_plugin(
+                NewPlugin {
+                    kind: PluginKind::RespBody,
+                    wasm: wat::parse_str(REWRITE).unwrap(),
+                    owner: PluginOwner::Tenant(tenant_id()),
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugins"),
+            )
             .await
             .unwrap();
         store

@@ -1,11 +1,12 @@
 //! Ending one owner's hold on a plugin, and removing the wasm once nobody holds it.
 
-use ip_core::Checksum;
+use ip_core::{Checksum, Timestamp};
 use typestate_txn::transaction;
 
 use super::PluginDialect;
+use crate::audit::{By, NewAudit};
 use crate::error::StorageError;
-use crate::plugin::{PluginDisowned, PluginOwner, PluginRecord};
+use crate::plugin::{AuditedPlugin, PluginDisowned, PluginOwner, PluginRecord};
 
 transaction! {
     name: PluginDisown,
@@ -21,6 +22,13 @@ transaction! {
         }
         sweep() -> swept: bool as Swept {
             DB::delete_unowned(carrier, &plugin).await?
+        }
+        record(by: By, owner: PluginOwner) -> recorded_at: Timestamp as Recorded {
+            DB::insert_audit(
+                carrier,
+                NewAudit::removed(by, &AuditedPlugin::new(&plugin, &owner)),
+            )
+            .await?
         }
     }
 }

@@ -110,7 +110,8 @@ async fn removing(
             detail: "a price was removed that nothing could read".to_owned(),
         });
     };
-    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await
+    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await?;
+    Ok(())
 }
 
 /// What one model costs, and nothing where nothing prices it. Read inside the transaction

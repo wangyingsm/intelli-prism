@@ -3,6 +3,7 @@ use ip_core::{
 };
 
 use super::fixture::*;
+use crate::audit::By;
 use crate::error::{Entity, StorageError};
 use crate::model::NewTenant;
 use crate::plugin::{NewPlugin, PluginOwner, PluginRecord, PluginRuleStore, PluginStore};
@@ -12,6 +13,11 @@ use crate::store::Storage;
 pub(crate) trait PluginBackend: Storage + PluginStore + PluginRuleStore {}
 
 impl<T> PluginBackend for T where T: Storage + PluginStore + PluginRuleStore {}
+
+/// The account every suite test stores a plugin as, through the endpoint that uploads one.
+pub(crate) fn by() -> By {
+    By::new(crate::suite::fixture::user_id(), "/_ip/plugins")
+}
 
 /// A plugin of `kind` whose wasm is `body`, stored for the global chain.
 pub(crate) fn plugin(kind: PluginKind, body: &[u8]) -> NewPlugin {
@@ -42,7 +48,7 @@ pub(crate) async fn stored_for(
     for owner in owners {
         record = Some(
             store
-                .put_plugin(owned_by(kind, body, owner.clone()))
+                .put_plugin(owned_by(kind, body, owner.clone()), &by())
                 .await
                 .unwrap(),
         );
@@ -72,7 +78,7 @@ fn alice_only() -> PluginScope {
 
 pub(crate) async fn a_plugin_round_trips_with_its_wasm(store: &impl PluginBackend) {
     let record = store
-        .put_plugin(plugin(PluginKind::ReqBody, b"\0asm module"))
+        .put_plugin(plugin(PluginKind::ReqBody, b"\0asm module"), &by())
         .await
         .unwrap();
     assert_eq!(record.checksum, Checksum::of(b"\0asm module"));
@@ -84,11 +90,11 @@ pub(crate) async fn a_plugin_round_trips_with_its_wasm(store: &impl PluginBacken
 
 pub(crate) async fn storing_the_same_plugin_twice_keeps_one_row(store: &impl PluginBackend) {
     let first = store
-        .put_plugin(plugin(PluginKind::ReqBody, b"module"))
+        .put_plugin(plugin(PluginKind::ReqBody, b"module"), &by())
         .await
         .unwrap();
     let second = store
-        .put_plugin(plugin(PluginKind::ReqBody, b"module"))
+        .put_plugin(plugin(PluginKind::ReqBody, b"module"), &by())
         .await
         .unwrap();
     assert_eq!(first, second);
@@ -97,11 +103,11 @@ pub(crate) async fn storing_the_same_plugin_twice_keeps_one_row(store: &impl Plu
 
 pub(crate) async fn listing_plugins_reports_their_size(store: &impl PluginBackend) {
     store
-        .put_plugin(plugin(PluginKind::ReqBody, b"123456"))
+        .put_plugin(plugin(PluginKind::ReqBody, b"123456"), &by())
         .await
         .unwrap();
     store
-        .put_plugin(plugin(PluginKind::RespBody, b"12"))
+        .put_plugin(plugin(PluginKind::RespBody, b"12"), &by())
         .await
         .unwrap();
     let sizes: Vec<usize> = store
@@ -119,7 +125,7 @@ pub(crate) async fn removing_a_plugin_that_is_absent_reports_it_missing(
 ) {
     assert!(matches!(
         store
-            .disown_plugin(&Checksum::of(b"absent"), &PluginOwner::Global)
+            .disown_plugin(&Checksum::of(b"absent"), &PluginOwner::Global, &by())
             .await,
         Err(StorageError::NotFound {
             entity: Entity::Plugin,
@@ -137,7 +143,7 @@ pub(crate) async fn a_plugin_a_rule_still_uses_is_not_removed_until_the_rule_goe
         .put_rule(placed(record.checksum, 100, acme_wide()))
         .await
         .unwrap();
-    match store.disown_plugin(&record.checksum, &acme()).await {
+    match store.disown_plugin(&record.checksum, &acme(), &by()).await {
         Err(StorageError::InUse {
             entity: Entity::Plugin,
             ..
@@ -154,7 +160,7 @@ pub(crate) async fn a_plugin_a_rule_still_uses_is_not_removed_until_the_rule_goe
         .unwrap();
     assert!(
         store
-            .disown_plugin(&record.checksum, &acme())
+            .disown_plugin(&record.checksum, &acme(), &by())
             .await
             .unwrap()
     );
@@ -237,7 +243,7 @@ pub(crate) async fn a_rule_naming_an_absent_plugin_is_refused(store: &impl Plugi
 
 pub(crate) async fn a_rule_in_a_tenant_that_is_not_there_is_refused(store: &impl PluginBackend) {
     let record = store
-        .put_plugin(plugin(PluginKind::ReqBody, b"module"))
+        .put_plugin(plugin(PluginKind::ReqBody, b"module"), &by())
         .await
         .unwrap();
     assert!(matches!(
@@ -421,14 +427,14 @@ pub(crate) async fn the_same_wasm_is_stored_once_and_goes_with_its_last_owner(
 
     assert!(
         !store
-            .disown_plugin(&record.checksum, &acme())
+            .disown_plugin(&record.checksum, &acme(), &by())
             .await
             .unwrap()
     );
     assert!(store.plugin(&record.checksum).await.unwrap().is_some());
     assert!(
         store
-            .disown_plugin(&record.checksum, &PluginOwner::Global)
+            .disown_plugin(&record.checksum, &PluginOwner::Global, &by())
             .await
             .unwrap()
     );
@@ -438,12 +444,12 @@ pub(crate) async fn the_same_wasm_is_stored_once_and_goes_with_its_last_owner(
 pub(crate) async fn wasm_stored_as_another_kind_is_refused(store: &impl PluginBackend) {
     tenant_with_user(store).await;
     store
-        .put_plugin(plugin(PluginKind::ReqBody, b"module"))
+        .put_plugin(plugin(PluginKind::ReqBody, b"module"), &by())
         .await
         .unwrap();
     assert!(matches!(
         store
-            .put_plugin(owned_by(PluginKind::RespBody, b"module", acme()))
+            .put_plugin(owned_by(PluginKind::RespBody, b"module", acme()), &by())
             .await,
         Err(StorageError::Conflict {
             entity: Entity::Plugin,
@@ -452,7 +458,7 @@ pub(crate) async fn wasm_stored_as_another_kind_is_refused(store: &impl PluginBa
     ));
     assert!(
         store
-            .disown_plugin(&Checksum::of(b"module"), &acme())
+            .disown_plugin(&Checksum::of(b"module"), &acme(), &by())
             .await
             .is_err(),
         "the refused upload recorded an owner anyway"
@@ -483,7 +489,7 @@ pub(crate) async fn an_owner_that_is_not_there_leaves_no_wasm_behind(store: &imp
     let nowhere = PluginOwner::Tenant(TenantId::new("nowhere").unwrap());
     assert!(matches!(
         store
-            .put_plugin(owned_by(PluginKind::ReqBody, b"module", nowhere))
+            .put_plugin(owned_by(PluginKind::ReqBody, b"module", nowhere), &by())
             .await,
         Err(StorageError::NotFound {
             entity: Entity::Tenant,

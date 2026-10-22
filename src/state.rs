@@ -1110,11 +1110,14 @@ capacity = 128
         let _ = std::fs::remove_file(&path);
         let store = SqliteStore::open(&path).await.unwrap();
         let broken = store
-            .put_plugin(NewPlugin {
-                kind: PluginKind::ReqBody,
-                wasm: wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap(),
-                owner: PluginOwner::Global,
-            })
+            .put_plugin(
+                NewPlugin {
+                    kind: PluginKind::ReqBody,
+                    wasm: wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap(),
+                    owner: PluginOwner::Global,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugins"),
+            )
             .await
             .unwrap();
         store

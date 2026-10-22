@@ -194,9 +194,9 @@ impl RouteStore for FailingStore {
 
 #[async_trait]
 impl PluginStore for FailingStore {
-    async fn put_plugin(&self, new: NewPlugin) -> Result<PluginRecord, StorageError> {
+    async fn put_plugin(&self, new: NewPlugin, by: &By) -> Result<PluginRecord, StorageError> {
         self.answering()?;
-        self.inner.put_plugin(new).await
+        self.inner.put_plugin(new, by).await
     }
 
     async fn plugin(&self, checksum: &Checksum) -> Result<Option<Plugin>, StorageError> {
@@ -213,9 +213,10 @@ impl PluginStore for FailingStore {
         &self,
         checksum: &Checksum,
         owner: &PluginOwner,
+        by: &By,
     ) -> Result<bool, StorageError> {
         self.answering()?;
-        self.inner.disown_plugin(checksum, owner).await
+        self.inner.disown_plugin(checksum, owner, by).await
     }
 }
 

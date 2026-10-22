@@ -1,4 +1,4 @@
-use ip_core::{Allowance, Counted, LimitScope, Period, UserId};
+use ip_core::{Allowance, Counted, LimitScope, Period, PluginKind, UserId};
 
 use crate::audit::{AuditFilter, By};
 use crate::error::Entity;
@@ -255,6 +255,72 @@ pub(crate) async fn removing_a_route_records_where_it_pointed(store: &impl Backe
         "https://api.example.com:443/v1"
     );
     assert_eq!(removal.after, None, "nothing is left to describe");
+}
+
+/// A plugin is a tenant's when a tenant stored it and the deployment's when the global
+/// chain did, so what the trail says it belongs to comes from the owner. The first entity
+/// here whose tenant is a property of the value rather than of the kind of thing it is.
+pub(crate) async fn whose_a_stored_plugin_is_comes_from_who_stored_it(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let by = crate::suite::plugin::by();
+    store
+        .put_plugin(
+            crate::suite::plugin::plugin(PluginKind::ReqBody, b"one"),
+            &by,
+        )
+        .await
+        .unwrap();
+    store
+        .put_plugin(
+            crate::suite::plugin::owned_by(
+                PluginKind::ReqBody,
+                b"two",
+                crate::plugin::PluginOwner::Tenant(tenant_id()),
+            ),
+            &by,
+        )
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 2);
+    let theirs = &trail[0];
+    assert_eq!(theirs.entity, Entity::Plugin);
+    assert_eq!(theirs.tenant, Some(tenant_id()));
+    assert_eq!(
+        theirs.after.as_ref().unwrap()["owner"],
+        tenant_id().as_str()
+    );
+    assert_eq!(theirs.after.as_ref().unwrap()["kind"], "req_body");
+    assert_eq!(theirs.before, None, "nothing was stored there before");
+    assert_eq!(trail[1].tenant, None, "the global chain is nobody's tenant");
+    assert_eq!(trail[1].after.as_ref().unwrap()["owner"], "global");
+}
+
+/// Letting go of a plugin is a removal: the trail says what was held and nothing after.
+pub(crate) async fn letting_go_of_a_plugin_records_what_was_held(store: &impl Backend) {
+    let by = crate::suite::plugin::by();
+    let stored = store
+        .put_plugin(
+            crate::suite::plugin::plugin(PluginKind::ReqBody, b"module"),
+            &by,
+        )
+        .await
+        .unwrap();
+    store
+        .disown_plugin(&stored.checksum, &crate::plugin::PluginOwner::Global, &by)
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 2);
+    let gone = &trail[0];
+    assert_eq!(gone.entity_id, stored.checksum.to_string());
+    assert_eq!(
+        gone.before.as_ref().unwrap()["checksum"],
+        stored.checksum.to_hex()
+    );
+    assert_eq!(gone.after, None, "nothing is left to describe");
 }
 
 /// The actor is whoever the handler said, not a name the store invents.

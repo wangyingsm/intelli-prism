@@ -215,11 +215,14 @@ mod tests {
         let mut checksum = None;
         for owner in owners {
             let record = store
-                .put_plugin(NewPlugin {
-                    kind,
-                    wasm: wat::parse_str(text).unwrap(),
-                    owner,
-                })
+                .put_plugin(
+                    NewPlugin {
+                        kind,
+                        wasm: wat::parse_str(text).unwrap(),
+                        owner,
+                    },
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugins"),
+                )
                 .await
                 .unwrap();
             checksum = Some(record.checksum);

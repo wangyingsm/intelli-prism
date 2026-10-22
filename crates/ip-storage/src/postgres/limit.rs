@@ -142,7 +142,8 @@ async fn removing(
             detail: "a limit was removed that nothing could read".to_owned(),
         });
     };
-    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await
+    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await?;
+    Ok(())
 }
 
 /// The one limit a scope holds of this thing over this stretch, and nothing where it

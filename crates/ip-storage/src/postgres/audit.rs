@@ -8,14 +8,16 @@ use crate::audit::{AuditFilter, AuditStore, Audited, NewAudit};
 use crate::error::{Entity, StorageError};
 use crate::list::Page;
 
-/// Records one change, over the same connection the change itself was written on.
+/// Records one change, over the same connection the change itself was written on, and
+/// says when it was recorded.
 ///
 /// Takes a connection rather than the store so that it can only be called from inside a
 /// transaction that is also writing the thing being described.
 pub(super) async fn record(
     connection: &mut PgConnection,
     audit: NewAudit,
-) -> Result<(), StorageError> {
+) -> Result<Timestamp, StorageError> {
+    let created_at = Timestamp::now();
     sqlx::query(
         "INSERT INTO audit \
          (actor, through, entity, entity_id, tenant, before, after, created_at) \
@@ -28,11 +30,11 @@ pub(super) async fn record(
     .bind(audit.tenant.as_ref().map(TenantId::as_str))
     .bind(written(audit.before.as_ref())?)
     .bind(written(audit.after.as_ref())?)
-    .bind(Timestamp::now().unix_seconds())
+    .bind(created_at.unix_seconds())
     .execute(&mut *connection)
     .await
     .map_err(StorageError::backend)?;
-    Ok(())
+    Ok(created_at)
 }
 
 /// One payload as the column holds it, and nothing where there is nothing to hold.

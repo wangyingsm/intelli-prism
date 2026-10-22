@@ -254,7 +254,10 @@ pub(crate) async fn plugins_are_listed_to_the_chain_that_owns_them(store: &impl 
         (&b"three"[..], PluginOwner::Global),
     ] {
         store
-            .put_plugin(owned_by(PluginKind::ReqBody, body, owner))
+            .put_plugin(
+                owned_by(PluginKind::ReqBody, body, owner),
+                &crate::suite::plugin::by(),
+            )
             .await
             .unwrap();
     }

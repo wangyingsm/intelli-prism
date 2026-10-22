@@ -353,11 +353,14 @@ mod tests {
             .await
             .unwrap();
         let plugin = store
-            .put_plugin(NewPlugin {
-                kind: PluginKind::RespBody,
-                wasm: b"module".to_vec(),
-                owner: PluginOwner::Tenant(acme.clone()),
-            })
+            .put_plugin(
+                NewPlugin {
+                    kind: PluginKind::RespBody,
+                    wasm: b"module".to_vec(),
+                    owner: PluginOwner::Tenant(acme.clone()),
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugins"),
+            )
             .await
             .unwrap();
         let scope = PluginScope::Tenant {
@@ -580,11 +583,14 @@ mod tests {
         state.reload_rules().await.unwrap();
 
         let plugin = store
-            .put_plugin(NewPlugin {
-                kind: PluginKind::ReqBody,
-                wasm: b"not wasm at all".to_vec(),
-                owner: PluginOwner::Global,
-            })
+            .put_plugin(
+                NewPlugin {
+                    kind: PluginKind::ReqBody,
+                    wasm: b"not wasm at all".to_vec(),
+                    owner: PluginOwner::Global,
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/plugins"),
+            )
             .await
             .unwrap();
         store

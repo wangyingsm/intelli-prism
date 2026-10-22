@@ -6,6 +6,7 @@ use sqlx::{PgConnection, Row};
 
 use super::PostgresStore;
 use super::identity::tenant_row_id;
+use crate::audit::By;
 use crate::codec::{plugin_order, plugin_scope, plugin_size};
 use crate::error::{Entity, StorageError, is_foreign_key_violation, is_unique_violation};
 use crate::plugin::{
@@ -43,13 +44,15 @@ pub(super) fn plugin_rule(row: &sqlx::postgres::PgRow) -> Result<PluginRule, Sto
 
 #[async_trait]
 impl PluginStore for PostgresStore {
-    async fn put_plugin(&self, new: NewPlugin) -> Result<PluginRecord, StorageError> {
+    async fn put_plugin(&self, new: NewPlugin, by: &By) -> Result<PluginRecord, StorageError> {
         let uploaded = self
             .begin_plugin_upload()
             .await?
             .store_wasm(new.kind, new.wasm)
             .await?
-            .own(new.owner)
+            .own(new.owner.clone())
+            .await?
+            .record(by.clone(), new.owner)
             .await?
             .commit()
             .await?;
@@ -89,6 +92,7 @@ impl PluginStore for PostgresStore {
         &self,
         checksum: &Checksum,
         owner: &PluginOwner,
+        by: &By,
     ) -> Result<bool, StorageError> {
         let disowned = self
             .begin_plugin_disown()
@@ -96,6 +100,8 @@ impl PluginStore for PostgresStore {
             .disown(*checksum, owner.clone())
             .await?
             .sweep()
+            .await?
+            .record(by.clone(), owner.clone())
             .await?
             .commit()
             .await?;
@@ -383,6 +389,16 @@ pub(super) async fn delete_unowned(
 }
 
 #[async_trait]
+impl crate::transaction::AuditDialect for sqlx::Postgres {
+    async fn insert_audit(
+        connection: &mut PgConnection,
+        audit: crate::audit::NewAudit,
+    ) -> Result<Timestamp, StorageError> {
+        super::audit::record(connection, audit).await
+    }
+}
+
+#[async_trait]
 impl PluginDialect for sqlx::Postgres {
     async fn insert_wasm(
         connection: &mut PgConnection,
@@ -452,7 +468,10 @@ mod tests {
         };
         let (_, user) = tenant_with_user(&store).await;
         let record = store
-            .put_plugin(plugin(PluginKind::ReqBody, b"module"))
+            .put_plugin(
+                plugin(PluginKind::ReqBody, b"module"),
+                &crate::suite::plugin::by(),
+            )
             .await
             .unwrap();
         let written = sqlx::query(
@@ -474,7 +493,10 @@ mod tests {
         };
         let (tenant, _) = tenant_with_user(&store).await;
         let record = store
-            .put_plugin(plugin(PluginKind::ReqBody, b"module"))
+            .put_plugin(
+                plugin(PluginKind::ReqBody, b"module"),
+                &crate::suite::plugin::by(),
+            )
             .await
             .unwrap();
         let written = sqlx::query(

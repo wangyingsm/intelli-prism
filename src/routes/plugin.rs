@@ -10,7 +10,9 @@ use ip_core::{
     UserId,
 };
 use ip_plugin::{PluginHost, PluginLimits};
-use ip_storage::{Entity, Listed, NewPlugin, PluginOwner, PluginRecord, Standing, StorageError};
+use ip_storage::{
+    By, Entity, Listed, NewPlugin, PluginOwner, PluginRecord, Standing, StorageError,
+};
 
 use super::{Paged, store_refusal};
 use crate::manage::Manager;
@@ -21,6 +23,9 @@ use crate::state::AppState;
 /// Who calls decides whose plugins these are: the system administrator's are the global
 /// chain's, and a tenant owner's are its tenant's. Wasm is stored once however many own it,
 /// but each owner sees, places and lets go of only its own.
+/// What the audit trail records a plugin stored or let go of as having come through.
+const STORE_ENDPOINT: &str = "/_ip/plugins";
+
 pub fn store_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_plugins).post(upload))
@@ -139,7 +144,10 @@ async fn upload(
         return refusal;
     }
     let backend = state.store();
-    let stored = backend.put_plugin(NewPlugin { kind, wasm, owner }).await;
+    let by = By::new(manager.user().clone(), STORE_ENDPOINT);
+    let stored = backend
+        .put_plugin(NewPlugin { kind, wasm, owner }, &by)
+        .await;
     match stored {
         Ok(record) => (StatusCode::CREATED, Json(PluginView::from(record))).into_response(),
         Err(error) => store_refusal(error),
@@ -163,7 +171,11 @@ async fn disown(
     match state
         .stores()
         .backend()
-        .disown_plugin(&checksum, &owner)
+        .disown_plugin(
+            &checksum,
+            &owner,
+            &By::new(manager.user().clone(), STORE_ENDPOINT),
+        )
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),

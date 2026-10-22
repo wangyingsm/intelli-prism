@@ -4,8 +4,9 @@ use ip_core::{PluginKind, Timestamp};
 use typestate_txn::transaction;
 
 use super::PluginDialect;
+use crate::audit::{By, NewAudit};
 use crate::error::StorageError;
-use crate::plugin::{PluginOwner, PluginRecord, PluginUploaded};
+use crate::plugin::{AuditedPlugin, PluginOwner, PluginRecord, PluginUploaded};
 
 transaction! {
     name: PluginUpload,
@@ -21,6 +22,13 @@ transaction! {
         }
         own(owner: PluginOwner) -> owned_at: Timestamp as Owned {
             DB::insert_owner(carrier, &plugin, &owner).await?
+        }
+        record(by: By, owner: PluginOwner) -> recorded_at: Timestamp as Recorded {
+            DB::insert_audit(
+                carrier,
+                NewAudit::created(by, &AuditedPlugin::new(&plugin, &owner)),
+            )
+            .await?
         }
     }
 }

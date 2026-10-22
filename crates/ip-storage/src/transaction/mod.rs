@@ -14,9 +14,23 @@ use async_trait::async_trait;
 use ip_core::{Checksum, PluginKind, TenantId, Timestamp, UserId};
 use sqlx::Database;
 
+use crate::audit::NewAudit;
 use crate::error::StorageError;
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{PluginOwner, PluginRecord};
+
+/// The audit write one backend contributes, in its own dialect.
+///
+/// A supertrait of every workflow's dialect, so the step that records what a transaction
+/// did is available wherever a transaction is.
+#[async_trait]
+pub trait AuditDialect: Database {
+    /// Records a change, saying when it was recorded.
+    async fn insert_audit(
+        connection: &mut Self::Connection,
+        audit: NewAudit,
+    ) -> Result<Timestamp, StorageError>;
+}
 
 /// The identity writes one backend contributes, in its own dialect.
 ///
@@ -60,7 +74,7 @@ pub trait IdentityDialect: Database {
 
 /// The plugin writes one backend contributes, in its own dialect.
 #[async_trait]
-pub trait PluginDialect: Database {
+pub trait PluginDialect: AuditDialect {
     /// Stores wasm once under its checksum and hands back what is stored there, refusing wasm
     /// stored already as another kind.
     async fn insert_wasm(

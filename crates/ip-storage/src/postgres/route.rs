@@ -117,7 +117,8 @@ async fn setting(
         connection,
         NewAudit::changed(by.clone(), before.as_ref(), &rule),
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Removes a rule and records the removal, on the one connection its caller commits.
@@ -154,7 +155,8 @@ async fn removing(
             detail: "a route was removed that nothing could read".to_owned(),
         });
     };
-    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await
+    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await?;
+    Ok(())
 }
 
 /// The rule under one key, over whichever connection it is given. Read inside the

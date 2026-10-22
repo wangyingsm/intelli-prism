@@ -124,11 +124,14 @@ pub(crate) async fn grants_on_one_account_are_not_listed_for_another(store: &imp
 pub(crate) async fn plugins_one_tenant_owns_are_not_listed_for_another(store: &impl Backend) {
     two_tenants(store).await;
     store
-        .put_plugin(owned_by(
-            PluginKind::ReqHeader,
-            b"\0asm\x01\0\0\0theirs",
-            PluginOwner::Tenant(theirs()),
-        ))
+        .put_plugin(
+            owned_by(
+                PluginKind::ReqHeader,
+                b"\0asm\x01\0\0\0theirs",
+                PluginOwner::Tenant(theirs()),
+            ),
+            &crate::suite::plugin::by(),
+        )
         .await
         .unwrap();
     for owner in [
