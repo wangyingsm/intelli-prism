@@ -103,8 +103,10 @@ fn read(payload: Option<String>) -> Result<Option<serde_json::Value>, StorageErr
 #[cfg(test)]
 mod tests {
     use crate::limit::LimitStore;
+    use crate::price::PriceStore;
     use crate::sqlite::fixture::*;
     use crate::suite::limit::{by, monthly};
+    use crate::suite::price::priced_at;
 
     /// The other half of the pair: a change whose record cannot be written does not
     /// happen either.
@@ -128,6 +130,29 @@ mod tests {
         assert!(
             store.limits().await.unwrap().is_empty(),
             "the limit survived a transaction that could not record it"
+        );
+    }
+
+    /// Held per family rather than once: the transaction is written out again in each
+    /// one, so it is each one that can be written without it.
+    #[tokio::test]
+    async fn a_price_whose_record_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .put_price(priced_at(3_000_000, 15_000_000), &crate::suite::price::by())
+                .await
+                .is_err(),
+            "a price was set with nothing to record it"
+        );
+        assert!(
+            store.prices().await.unwrap().is_empty(),
+            "the price survived a transaction that could not record it"
         );
     }
 }

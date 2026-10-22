@@ -7,6 +7,7 @@ use crate::list::Page;
 use crate::store::Backend;
 use crate::suite::fixture::{tenant_id, tenant_with_user};
 use crate::suite::limit::{by, monthly};
+use crate::suite::price::priced_at;
 
 /// Everything recorded, newest first.
 async fn trail(store: &impl Backend) -> Vec<crate::audit::Audited> {
@@ -142,6 +143,69 @@ pub(crate) async fn the_trail_is_narrowed_to_what_the_filter_names(store: &impl 
             .is_empty(),
         "a limit was recorded as something else"
     );
+}
+
+/// A price is the deployment's, so its record names no tenant. The first entry of that
+/// shape, and the reason the column is nullable at all.
+pub(crate) async fn pricing_a_model_records_that_it_belongs_to_nobody(store: &impl Backend) {
+    store
+        .put_price(priced_at(3_000_000, 15_000_000), &crate::suite::price::by())
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 1);
+    let one = &trail[0];
+    assert_eq!(one.entity, Entity::Price);
+    assert_eq!(one.entity_id, "claude-opus-5");
+    assert_eq!(one.through, "/_ip/prices");
+    assert_eq!(one.tenant, None, "a price belongs to the deployment");
+    assert_eq!(one.before, None);
+    assert_eq!(one.after.as_ref().unwrap()["input"], 3_000_000);
+    assert_eq!(one.after.as_ref().unwrap()["output"], 15_000_000);
+}
+
+pub(crate) async fn repricing_and_unpricing_a_model_record_what_it_cost(store: &impl Backend) {
+    let by = crate::suite::price::by();
+    store
+        .put_price(priced_at(3_000_000, 15_000_000), &by)
+        .await
+        .unwrap();
+    store
+        .put_price(priced_at(1_000_000, 5_000_000), &by)
+        .await
+        .unwrap();
+    store
+        .remove_price(&crate::suite::price::model(), &by)
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 3);
+    let removal = &trail[0];
+    assert_eq!(removal.before.as_ref().unwrap()["input"], 1_000_000);
+    assert_eq!(removal.after, None, "nothing is left to describe");
+    let repricing = &trail[1];
+    assert_eq!(repricing.before.as_ref().unwrap()["input"], 3_000_000);
+    assert_eq!(repricing.after.as_ref().unwrap()["input"], 1_000_000);
+}
+
+/// What belongs to the deployment is nobody's tenant trail, and is still in the whole one.
+pub(crate) async fn a_tenant_sees_none_of_what_belongs_to_the_deployment(store: &impl Backend) {
+    tenant_with_user(store).await;
+    store.put_limit(monthly(10), &by()).await.unwrap();
+    store
+        .put_price(priced_at(3_000_000, 15_000_000), &crate::suite::price::by())
+        .await
+        .unwrap();
+
+    let theirs = store
+        .audits(&AuditFilter::of_tenant(tenant_id()), Page::default())
+        .await
+        .unwrap();
+    assert_eq!(theirs.len(), 1, "a price was read as a tenant's");
+    assert_eq!(theirs[0].entity, Entity::Limit);
+    assert_eq!(trail(store).await.len(), 2, "both are in the whole trail");
 }
 
 /// The actor is whoever the handler said, not a name the store invents.

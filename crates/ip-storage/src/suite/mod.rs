@@ -217,6 +217,9 @@ macro_rules! backend_suite {
             a_change_that_was_refused_records_nothing,
             a_write_that_fails_leaves_no_record,
             the_trail_is_narrowed_to_what_the_filter_names,
+            pricing_a_model_records_that_it_belongs_to_nobody,
+            repricing_and_unpricing_a_model_record_what_it_cost,
+            a_tenant_sees_none_of_what_belongs_to_the_deployment,
             the_trail_names_the_account_that_asked,
         ]);
     };

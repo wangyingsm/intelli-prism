@@ -403,14 +403,14 @@ impl LimitStore for FailingStore {
 
 #[async_trait]
 impl PriceStore for FailingStore {
-    async fn put_price(&self, price: NewPrice) -> Result<Priced, StorageError> {
+    async fn put_price(&self, price: NewPrice, by: &By) -> Result<Priced, StorageError> {
         self.answering()?;
-        self.inner.put_price(price).await
+        self.inner.put_price(price, by).await
     }
 
-    async fn remove_price(&self, model: &ModelName) -> Result<(), StorageError> {
+    async fn remove_price(&self, model: &ModelName, by: &By) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.remove_price(model).await
+        self.inner.remove_price(model, by).await
     }
 
     async fn prices(&self) -> Result<Vec<Priced>, StorageError> {

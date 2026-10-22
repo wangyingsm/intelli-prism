@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ip_core::{ModelName, Price, Rate, Timestamp};
-use ip_storage::{NewPrice, Priced};
+use ip_storage::{By, NewPrice, Priced};
 
 use super::store_refusal;
 use crate::manage::Manager;
@@ -20,6 +20,9 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(list).put(put).delete(remove))
 }
+
+/// What the audit trail records a change here as having come through.
+const ENDPOINT: &str = "/_ip/prices";
 
 /// One model's price, as the api reports it.
 #[derive(Debug, serde::Serialize)]
@@ -79,7 +82,8 @@ async fn put(State(state): State<AppState>, manager: Manager, body: Bytes) -> Re
         model: quoted.model,
         price: Price::new(quoted.input, quoted.output),
     };
-    match state.store().put_price(setting).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match state.store().put_price(setting, &by).await {
         Ok(priced) => {
             state.feed().after_change().await;
             // The price as stored, so the caller learns when it was set without asking
@@ -102,7 +106,8 @@ async fn remove(State(state): State<AppState>, manager: Manager, body: Bytes) ->
         Ok(named) => named,
         Err(rejection) => return rejection.into_response(),
     };
-    match state.store().remove_price(&named.model).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match state.store().remove_price(&named.model, &by).await {
         Ok(()) => {
             state.feed().after_change().await;
             StatusCode::NO_CONTENT.into_response()

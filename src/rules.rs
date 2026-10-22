@@ -464,13 +464,16 @@ mod tests {
         let (state, store) = node().await;
         assert!(state.gateway().prices().is_empty());
         store
-            .put_price(ip_storage::NewPrice {
-                model: ModelName::new("claude-opus-5").unwrap(),
-                price: Price::new(
-                    Rate::new(3_000_000).unwrap(),
-                    Rate::new(15_000_000).unwrap(),
-                ),
-            })
+            .put_price(
+                ip_storage::NewPrice {
+                    model: ModelName::new("claude-opus-5").unwrap(),
+                    price: Price::new(
+                        Rate::new(3_000_000).unwrap(),
+                        Rate::new(15_000_000).unwrap(),
+                    ),
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/prices"),
+            )
             .await
             .unwrap();
         state.feed().publish().await.unwrap();
