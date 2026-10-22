@@ -1,9 +1,15 @@
 use ip_core::{Allowance, ApiId, Counted, LimitScope, Period, TenantId, UserId};
 
+use crate::audit::By;
 use crate::error::{Entity, StorageError};
 use crate::limit::NewLimit;
 use crate::store::Backend;
 use crate::suite::fixture::{new_user, tenant_id, tenant_with_user, user_id};
+
+/// The account every suite test writes as, through the endpoint that sets a limit.
+pub(crate) fn by() -> By {
+    By::new(user_id(), "/_ip/limits")
+}
 
 /// A limit over a whole tenant: a million tokens a month.
 pub(crate) fn monthly(allowance: u64) -> NewLimit {
@@ -17,7 +23,7 @@ pub(crate) fn monthly(allowance: u64) -> NewLimit {
 
 pub(crate) async fn a_limit_round_trips(store: &impl Backend) {
     tenant_with_user(store).await;
-    let set = store.put_limit(monthly(1_000_000)).await.unwrap();
+    let set = store.put_limit(monthly(1_000_000), &by()).await.unwrap();
     assert_eq!(set.scope, LimitScope::of_tenant(tenant_id()));
     assert_eq!(set.counted, Counted::Tokens);
     assert_eq!(set.period, Period::Month);
@@ -39,11 +45,14 @@ pub(crate) async fn every_scope_shape_round_trips(store: &impl Backend) {
         .enumerate()
     {
         store
-            .put_limit(NewLimit {
-                scope: scope.clone(),
-                allowance: Allowance::new(at as u64 + 1).unwrap(),
-                ..monthly(1)
-            })
+            .put_limit(
+                NewLimit {
+                    scope: scope.clone(),
+                    allowance: Allowance::new(at as u64 + 1).unwrap(),
+                    ..monthly(1)
+                },
+                &by(),
+            )
             .await
             .unwrap();
     }
@@ -60,8 +69,8 @@ pub(crate) async fn every_scope_shape_round_trips(store: &impl Backend) {
 
 pub(crate) async fn setting_the_same_limit_again_replaces_what_it_allows(store: &impl Backend) {
     tenant_with_user(store).await;
-    store.put_limit(monthly(1_000_000)).await.unwrap();
-    store.put_limit(monthly(2_000_000)).await.unwrap();
+    store.put_limit(monthly(1_000_000), &by()).await.unwrap();
+    store.put_limit(monthly(2_000_000), &by()).await.unwrap();
 
     let held = store.limits().await.unwrap();
     assert_eq!(held.len(), 1);
@@ -77,11 +86,14 @@ pub(crate) async fn one_scope_holds_a_limit_per_thing_counted_and_period(store: 
         (Counted::Requests, Period::Hour),
     ] {
         store
-            .put_limit(NewLimit {
-                counted,
-                period,
-                ..monthly(10)
-            })
+            .put_limit(
+                NewLimit {
+                    counted,
+                    period,
+                    ..monthly(10)
+                },
+                &by(),
+            )
             .await
             .unwrap();
     }
@@ -91,17 +103,20 @@ pub(crate) async fn one_scope_holds_a_limit_per_thing_counted_and_period(store: 
 pub(crate) async fn removing_a_limit_leaves_the_others(store: &impl Backend) {
     tenant_with_user(store).await;
     let scope = LimitScope::of_tenant(tenant_id());
-    store.put_limit(monthly(10)).await.unwrap();
+    store.put_limit(monthly(10), &by()).await.unwrap();
     store
-        .put_limit(NewLimit {
-            period: Period::Day,
-            ..monthly(5)
-        })
+        .put_limit(
+            NewLimit {
+                period: Period::Day,
+                ..monthly(5)
+            },
+            &by(),
+        )
         .await
         .unwrap();
 
     store
-        .remove_limit(&scope, Counted::Tokens, Period::Month)
+        .remove_limit(&scope, Counted::Tokens, Period::Month, &by())
         .await
         .unwrap();
     let held = store.limits().await.unwrap();
@@ -116,7 +131,8 @@ pub(crate) async fn removing_a_limit_that_is_absent_reports_it_missing(store: &i
             .remove_limit(
                 &LimitScope::of_tenant(tenant_id()),
                 Counted::Tokens,
-                Period::Month
+                Period::Month,
+                &by()
             )
             .await,
         Err(StorageError::NotFound {
@@ -130,10 +146,13 @@ pub(crate) async fn a_limit_on_a_tenant_that_is_not_there_is_refused(store: &imp
     let nowhere = LimitScope::of_tenant(TenantId::new("nowhere").unwrap());
     assert!(matches!(
         store
-            .put_limit(NewLimit {
-                scope: nowhere,
-                ..monthly(10)
-            })
+            .put_limit(
+                NewLimit {
+                    scope: nowhere,
+                    ..monthly(10)
+                },
+                &by()
+            )
             .await,
         Err(StorageError::NotFound {
             entity: Entity::Tenant,
@@ -147,10 +166,13 @@ pub(crate) async fn a_limit_on_a_user_that_is_not_there_is_refused(store: &impl 
     let nobody = LimitScope::of_tenant(tenant_id()).of_user(UserId::new("nobody").unwrap());
     assert!(matches!(
         store
-            .put_limit(NewLimit {
-                scope: nobody,
-                ..monthly(10)
-            })
+            .put_limit(
+                NewLimit {
+                    scope: nobody,
+                    ..monthly(10)
+                },
+                &by()
+            )
             .await,
         Err(StorageError::NotFound {
             entity: Entity::User,
@@ -161,12 +183,15 @@ pub(crate) async fn a_limit_on_a_user_that_is_not_there_is_refused(store: &impl 
 
 pub(crate) async fn deleting_a_tenant_takes_its_limits_with_it(store: &impl Backend) {
     tenant_with_user(store).await;
-    store.put_limit(monthly(10)).await.unwrap();
+    store.put_limit(monthly(10), &by()).await.unwrap();
     store
-        .put_limit(NewLimit {
-            scope: LimitScope::of_tenant(tenant_id()).of_user(user_id()),
-            ..monthly(5)
-        })
+        .put_limit(
+            NewLimit {
+                scope: LimitScope::of_tenant(tenant_id()).of_user(user_id()),
+                ..monthly(5)
+            },
+            &by(),
+        )
         .await
         .unwrap();
 
@@ -176,12 +201,15 @@ pub(crate) async fn deleting_a_tenant_takes_its_limits_with_it(store: &impl Back
 
 pub(crate) async fn deleting_a_user_takes_the_limits_named_for_it(store: &impl Backend) {
     tenant_with_user(store).await;
-    store.put_limit(monthly(10)).await.unwrap();
+    store.put_limit(monthly(10), &by()).await.unwrap();
     store
-        .put_limit(NewLimit {
-            scope: LimitScope::of_tenant(tenant_id()).of_user(user_id()),
-            ..monthly(5)
-        })
+        .put_limit(
+            NewLimit {
+                scope: LimitScope::of_tenant(tenant_id()).of_user(user_id()),
+                ..monthly(5)
+            },
+            &by(),
+        )
         .await
         .unwrap();
 
@@ -194,7 +222,7 @@ pub(crate) async fn deleting_a_user_takes_the_limits_named_for_it(store: &impl B
 pub(crate) async fn every_change_to_a_limit_moves_the_revision_on(store: &impl Backend) {
     tenant_with_user(store).await;
     let before = store.rule_revision().await.unwrap();
-    store.put_limit(monthly(10)).await.unwrap();
+    store.put_limit(monthly(10), &by()).await.unwrap();
     let set = store.rule_revision().await.unwrap();
     assert!(
         set > before,
@@ -206,6 +234,7 @@ pub(crate) async fn every_change_to_a_limit_moves_the_revision_on(store: &impl B
             &LimitScope::of_tenant(tenant_id()),
             Counted::Tokens,
             Period::Month,
+            &by(),
         )
         .await
         .unwrap();
@@ -221,11 +250,14 @@ pub(crate) async fn limits_come_newest_first_a_page_at_a_time(store: &impl Backe
         (Counted::Requests, Period::Minute),
     ] {
         store
-            .put_limit(NewLimit {
-                counted,
-                period,
-                ..monthly(10)
-            })
+            .put_limit(
+                NewLimit {
+                    counted,
+                    period,
+                    ..monthly(10)
+                },
+                &by(),
+            )
             .await
             .unwrap();
     }
@@ -252,7 +284,7 @@ pub(crate) async fn limits_come_newest_first_a_page_at_a_time(store: &impl Backe
 
 pub(crate) async fn a_listed_limit_is_the_one_that_was_set(store: &impl Backend) {
     tenant_with_user(store).await;
-    let set = store.put_limit(monthly(1_000)).await.unwrap();
+    let set = store.put_limit(monthly(1_000), &by()).await.unwrap();
     assert_eq!(
         store
             .list_limits(Some(&tenant_id()), crate::list::Page::default())
@@ -264,7 +296,7 @@ pub(crate) async fn a_listed_limit_is_the_one_that_was_set(store: &impl Backend)
 
 pub(crate) async fn a_list_holds_only_the_tenant_it_names(store: &impl Backend) {
     tenant_with_user(store).await;
-    store.put_limit(monthly(10)).await.unwrap();
+    store.put_limit(monthly(10), &by()).await.unwrap();
     assert!(
         store
             .list_limits(

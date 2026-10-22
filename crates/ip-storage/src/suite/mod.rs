@@ -1,5 +1,6 @@
 //! Tests every storage backend must pass, written once and run against each backend.
 
+pub(crate) mod audit;
 pub(crate) mod identity;
 pub(crate) mod isolation;
 pub(crate) mod limit;
@@ -208,6 +209,17 @@ macro_rules! backend_suite {
             a_list_holds_only_the_tenant_it_names,
         ]);
     };
+    (audit, $open:path) => {
+        $crate::suite::backend_suite!(@module audit, $open, [
+            setting_a_limit_records_who_set_it,
+            setting_a_limit_again_records_what_it_allowed,
+            removing_a_limit_records_what_was_removed,
+            a_change_that_was_refused_records_nothing,
+            a_write_that_fails_leaves_no_record,
+            the_trail_is_narrowed_to_what_the_filter_names,
+            the_trail_names_the_account_that_asked,
+        ]);
+    };
     (price, $open:path) => {
         $crate::suite::backend_suite!(@module price, $open, [
             a_price_round_trips,
@@ -288,6 +300,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(revision, $open);
         $crate::suite::backend_suite!(usage, $open);
         $crate::suite::backend_suite!(limit, $open);
+        $crate::suite::backend_suite!(audit, $open);
         $crate::suite::backend_suite!(price, $open);
         $crate::suite::backend_suite!(isolation, $open);
     };

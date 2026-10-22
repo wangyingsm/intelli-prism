@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{Grant, Grants, PassphraseHash, TenantId, UserId};
 
+use crate::audit::AuditStore;
 use crate::error::StorageError;
 use crate::limit::LimitStore;
 use crate::list::ListStore;
@@ -103,6 +104,7 @@ pub trait Backend:
     + UsageStore
     + LimitStore
     + PriceStore
+    + AuditStore
 {
 }
 
@@ -116,6 +118,7 @@ impl<T> Backend for T where
         + UsageStore
         + LimitStore
         + PriceStore
+        + AuditStore
 {
 }
 

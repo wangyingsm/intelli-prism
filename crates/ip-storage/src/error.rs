@@ -101,6 +101,54 @@ pub enum Entity {
     Limit,
     /// What a model costs.
     Price,
+    /// One recorded change.
+    Audit,
+}
+
+impl Entity {
+    /// The name the audit trail stores this under.
+    ///
+    /// Apart from `Display`, which writes for a human reading an error: this one is
+    /// written into a column and read back, so it may not change to read better.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Tenant => "tenant",
+            Self::User => "user",
+            Self::Membership => "membership",
+            Self::Grant => "grant",
+            Self::Route => "route",
+            Self::Plugin => "plugin",
+            Self::PluginRule => "plugin-rule",
+            Self::RuleRevision => "rule-revision",
+            Self::Usage => "usage",
+            Self::Limit => "limit",
+            Self::Price => "price",
+            Self::Audit => "audit",
+        }
+    }
+
+    /// Reads it back from that name, refusing one this code does not carry.
+    pub fn named(name: &str) -> Result<Self, StorageError> {
+        match name {
+            "tenant" => Ok(Self::Tenant),
+            "user" => Ok(Self::User),
+            "membership" => Ok(Self::Membership),
+            "grant" => Ok(Self::Grant),
+            "route" => Ok(Self::Route),
+            "plugin" => Ok(Self::Plugin),
+            "plugin-rule" => Ok(Self::PluginRule),
+            "rule-revision" => Ok(Self::RuleRevision),
+            "usage" => Ok(Self::Usage),
+            "limit" => Ok(Self::Limit),
+            "price" => Ok(Self::Price),
+            "audit" => Ok(Self::Audit),
+            other => Err(StorageError::Malformed {
+                entity: Self::Audit,
+                detail: format!("unknown entity {other:?}"),
+            }),
+        }
+    }
 }
 
 impl fmt::Display for Entity {
@@ -117,6 +165,7 @@ impl fmt::Display for Entity {
             Self::Usage => "usage",
             Self::Limit => "limit",
             Self::Price => "price",
+            Self::Audit => "audit",
         })
     }
 }

@@ -26,6 +26,7 @@ use crate::list::Page;
 use crate::model::{AccountKind, Membership, NewTenant, NewUser, Standing};
 use crate::plugin::PluginOwner;
 use crate::store::Backend;
+use crate::suite::limit::by;
 use crate::usage::UsageFilter;
 
 /// The tenant whose rows must never be handed to anybody else.
@@ -144,7 +145,7 @@ pub(crate) async fn plugins_one_tenant_owns_are_not_listed_for_another(store: &i
 
 pub(crate) async fn limits_on_one_tenant_are_not_listed_for_another(store: &impl Backend) {
     two_tenants(store).await;
-    store.put_limit(monthly(10)).await.unwrap();
+    store.put_limit(monthly(10), &by()).await.unwrap();
     let listed = store
         .list_limits(Some(&theirs()), Page::default())
         .await

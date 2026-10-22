@@ -1,5 +1,6 @@
 //! Storage traits and the backends that satisfy them.
 
+pub mod audit;
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 mod codec;
 pub mod error;
@@ -23,6 +24,7 @@ mod suite;
 pub mod transaction;
 pub mod usage;
 
+pub use audit::{AuditFilter, AuditStore, Auditable, Audited, By, NewAudit};
 pub use error::{Entity, StorageError};
 #[cfg(feature = "testing")]
 pub use failing::FailingStore;

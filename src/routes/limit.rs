@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use ip_core::{Allowance, ApiId, Counted, LimitScope, Period, TenantId, Timestamp, UserId};
-use ip_storage::{Limit, NewLimit, Standing};
+use ip_storage::{By, Limit, NewLimit, Standing};
 
 use super::{Paged, store_refusal};
 use crate::manage::Manager;
@@ -23,6 +23,9 @@ pub fn router() -> Router<AppState> {
 
 /// A refusal, boxed so the ordinary answer is not paid for by every caller.
 type Refusal = Box<Response<Body>>;
+
+/// What the audit trail records a change here as having come through.
+const ENDPOINT: &str = "/_ip/limits";
 
 /// One limit as the api reports it.
 #[derive(Debug, serde::Serialize)]
@@ -154,7 +157,8 @@ async fn put(State(state): State<AppState>, manager: Manager, body: Bytes) -> Re
         period: setting.period,
         allowance,
     };
-    match state.store().put_limit(limit).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match state.store().put_limit(limit, &by).await {
         Ok(limit) => {
             state.feed().after_change().await;
             (StatusCode::CREATED, Json(LimitView::from(limit))).into_response()
@@ -174,7 +178,12 @@ async fn remove(State(state): State<AppState>, manager: Manager, body: Bytes) ->
     }
     match state
         .store()
-        .remove_limit(&scope, setting.counted, setting.period)
+        .remove_limit(
+            &scope,
+            setting.counted,
+            setting.period,
+            &By::new(manager.user().clone(), ENDPOINT),
+        )
         .await
     {
         Ok(()) => {

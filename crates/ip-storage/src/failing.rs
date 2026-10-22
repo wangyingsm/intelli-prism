@@ -9,6 +9,7 @@ use ip_core::{
     PluginKind, PluginOrder, PluginRule, RouteKey, RouteRule, TenantId, Timestamp, UserId,
 };
 
+use crate::audit::{AuditFilter, AuditStore, Audited, By};
 use crate::error::{StorageError, ToldToFail};
 use crate::limit::{Limit, LimitStore, NewLimit};
 use crate::list::{ListStore, Listed, Page};
@@ -369,10 +370,18 @@ impl UsageStore for FailingStore {
 }
 
 #[async_trait]
-impl LimitStore for FailingStore {
-    async fn put_limit(&self, limit: NewLimit) -> Result<Limit, StorageError> {
+impl AuditStore for FailingStore {
+    async fn audits(&self, filter: &AuditFilter, page: Page) -> Result<Vec<Audited>, StorageError> {
         self.answering()?;
-        self.inner.put_limit(limit).await
+        self.inner.audits(filter, page).await
+    }
+}
+
+#[async_trait]
+impl LimitStore for FailingStore {
+    async fn put_limit(&self, limit: NewLimit, by: &By) -> Result<Limit, StorageError> {
+        self.answering()?;
+        self.inner.put_limit(limit, by).await
     }
 
     async fn remove_limit(
@@ -380,9 +389,10 @@ impl LimitStore for FailingStore {
         scope: &LimitScope,
         counted: Counted,
         period: Period,
+        by: &By,
     ) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.remove_limit(scope, counted, period).await
+        self.inner.remove_limit(scope, counted, period, by).await
     }
 
     async fn limits(&self) -> Result<Vec<Limit>, StorageError> {
