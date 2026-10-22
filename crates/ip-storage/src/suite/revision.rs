@@ -37,11 +37,20 @@ pub(crate) async fn every_change_to_a_route_moves_the_revision_on(store: &impl B
     let mut seen = revision(store).await;
     let first = rule("gateway.local", "/v1", "one.example.com");
     let replaced = rule("gateway.local", "/v1", "two.example.com");
-    store.put_route(first).await.unwrap();
+    store
+        .put_route(first, &crate::suite::route::by())
+        .await
+        .unwrap();
     for change in 0..2 {
         match change {
-            0 => store.put_route(replaced.clone()).await.unwrap(),
-            _ => store.remove_route(&replaced.key).await.unwrap(),
+            0 => store
+                .put_route(replaced.clone(), &crate::suite::route::by())
+                .await
+                .unwrap(),
+            _ => store
+                .remove_route(&replaced.key, &crate::suite::route::by())
+                .await
+                .unwrap(),
         }
         let now = revision(store).await;
         assert!(now > seen, "change {change} left the revision at {now}");
@@ -105,7 +114,10 @@ pub(crate) async fn changes_to_nothing_a_node_holds_leave_the_revision_alone(sto
 pub(crate) async fn the_rule_set_is_read_at_the_revision_it_names(store: &impl Backend) {
     tenant_with_user(store).await;
     let route = rule("gateway.local", "/v1", "api.example.com");
-    store.put_route(route.clone()).await.unwrap();
+    store
+        .put_route(route.clone(), &crate::suite::route::by())
+        .await
+        .unwrap();
     alice_rule(store).await;
 
     let set = store.rule_set().await.unwrap();

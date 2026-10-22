@@ -345,7 +345,13 @@ mod tests {
             })
             .await
             .unwrap();
-        store.put_route(route("/v1")).await.unwrap();
+        store
+            .put_route(
+                route("/v1"),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/routes"),
+            )
+            .await
+            .unwrap();
         let plugin = store
             .put_plugin(NewPlugin {
                 kind: PluginKind::RespBody,
@@ -395,7 +401,13 @@ mod tests {
         let (feed, store, _) = feed().await;
         feed.publish().await.unwrap();
         // A change whose publish never happened, as when the cache was down.
-        store.put_route(route("/v2")).await.unwrap();
+        store
+            .put_route(
+                route("/v2"),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/routes"),
+            )
+            .await
+            .unwrap();
         let behind = feed.published().await.unwrap().unwrap();
         assert!(behind.revision < store.rule_revision().await.unwrap());
 
@@ -448,7 +460,13 @@ mod tests {
     async fn what_is_published_becomes_what_this_node_serves() {
         let (state, store) = node().await;
         assert!(state.gateway().table().is_empty());
-        store.put_route(route("/v1")).await.unwrap();
+        store
+            .put_route(
+                route("/v1"),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/routes"),
+            )
+            .await
+            .unwrap();
         state.feed().publish().await.unwrap();
 
         let revision = state.reload_rules().await.unwrap().unwrap();
@@ -514,7 +532,13 @@ mod tests {
     #[tokio::test]
     async fn rules_that_cannot_be_built_leave_the_ones_in_hand_serving() {
         let (state, store) = node().await;
-        store.put_route(route("/v1")).await.unwrap();
+        store
+            .put_route(
+                route("/v1"),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/routes"),
+            )
+            .await
+            .unwrap();
         state.feed().publish().await.unwrap();
         state.reload_rules().await.unwrap();
 
@@ -545,7 +569,13 @@ mod tests {
     #[tokio::test]
     async fn a_global_plugin_that_will_not_load_leaves_the_rules_in_hand_serving() {
         let (state, store) = node().await;
-        store.put_route(route("/v1")).await.unwrap();
+        store
+            .put_route(
+                route("/v1"),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/routes"),
+            )
+            .await
+            .unwrap();
         state.feed().publish().await.unwrap();
         state.reload_rules().await.unwrap();
 
@@ -600,7 +630,13 @@ mod tests {
 
         let following = state.keep_rules_in_step();
         for path in ["/v1", "/v2"] {
-            store.put_route(route(path)).await.unwrap();
+            store
+                .put_route(
+                    route(path),
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/routes"),
+                )
+                .await
+                .unwrap();
         }
         assert!(
             store.rule_revision().await.unwrap().get() > ahead,
@@ -616,7 +652,13 @@ mod tests {
     async fn following_puts_a_change_in_force_of_its_own_accord() {
         let (state, store) = node().await;
         let following = state.keep_rules_in_step();
-        store.put_route(route("/v1")).await.unwrap();
+        store
+            .put_route(
+                route("/v1"),
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/routes"),
+            )
+            .await
+            .unwrap();
         state.feed().publish().await.unwrap();
         assert!(
             serves(&state, 1).await,
@@ -624,7 +666,13 @@ mod tests {
         );
 
         for path in ["/v2", "/v3"] {
-            store.put_route(route(path)).await.unwrap();
+            store
+                .put_route(
+                    route(path),
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/routes"),
+                )
+                .await
+                .unwrap();
             state.feed().publish().await.unwrap();
         }
         assert!(serves(&state, 3).await, "the newest change never landed");

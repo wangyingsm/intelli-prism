@@ -1,7 +1,48 @@
 use async_trait::async_trait;
 use ip_core::{RouteKey, RouteRule};
 
+use crate::audit::By;
 use crate::error::StorageError;
+
+impl crate::audit::Auditable for RouteRule {
+    fn entity(&self) -> crate::error::Entity {
+        crate::error::Entity::Route
+    }
+
+    fn entity_id(&self) -> String {
+        self.key.to_string()
+    }
+
+    /// A route is the deployment's: every tenant's requests are dispatched by the one table.
+    fn tenant(&self) -> Option<ip_core::TenantId> {
+        None
+    }
+
+    fn audited(&self) -> serde_json::Value {
+        let targets: Vec<serde_json::Value> = self
+            .target
+            .weighted()
+            .iter()
+            .map(|weighted| {
+                serde_json::json!({
+                    "endpoint": weighted.endpoint.to_string(),
+                    "weight": weighted.weight.get(),
+                    "serves": weighted.serves.map(ip_core::Difficulty::name),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "api": self.api.as_str(),
+            "key": self.key.to_string(),
+            "targets": targets,
+            "strategy": self.strategy.name(),
+            "hedge": self.hedge.get(),
+            "hedge_delay": self.hedge_delay.get(),
+            "caller_speaks": self.caller_speaks.map(ip_core::Dialect::name),
+            "upstream_speaks": self.upstream_speaks.map(ip_core::Dialect::name),
+        })
+    }
+}
 
 /// Reads and writes the routing rules held in the database.
 ///
@@ -10,10 +51,10 @@ use crate::error::StorageError;
 #[async_trait]
 pub trait RouteStore: Send + Sync {
     /// Records a rule, replacing whatever the key routed to before.
-    async fn put_route(&self, rule: RouteRule) -> Result<(), StorageError>;
+    async fn put_route(&self, rule: RouteRule, by: &By) -> Result<(), StorageError>;
 
     /// Removes the rule under a key, or reports it missing.
-    async fn remove_route(&self, key: &RouteKey) -> Result<(), StorageError>;
+    async fn remove_route(&self, key: &RouteKey, by: &By) -> Result<(), StorageError>;
 
     /// Reads the rule under one key.
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError>;
@@ -30,20 +71,21 @@ mod tests {
 
     use super::*;
     use crate::error::Entity;
+    use crate::suite::route::by;
 
     #[derive(Default)]
     struct MemoryRoutes(Mutex<Vec<RouteRule>>);
 
     #[async_trait]
     impl RouteStore for MemoryRoutes {
-        async fn put_route(&self, rule: RouteRule) -> Result<(), StorageError> {
+        async fn put_route(&self, rule: RouteRule, _by: &By) -> Result<(), StorageError> {
             let mut held = self.0.lock().unwrap();
             held.retain(|existing| existing.key != rule.key);
             held.push(rule);
             Ok(())
         }
 
-        async fn remove_route(&self, key: &RouteKey) -> Result<(), StorageError> {
+        async fn remove_route(&self, key: &RouteKey, _by: &By) -> Result<(), StorageError> {
             let mut held = self.0.lock().unwrap();
             let before = held.len();
             held.retain(|existing| &existing.key != key);
@@ -101,10 +143,10 @@ mod tests {
     async fn the_surface_is_reachable_through_one_trait_object() {
         let store = store();
         let rule = rule("gateway.local", "/v1/messages", "api.example.com");
-        store.put_route(rule.clone()).await.unwrap();
+        store.put_route(rule.clone(), &by()).await.unwrap();
         assert_eq!(store.route(&rule.key).await.unwrap(), Some(rule.clone()));
         assert_eq!(store.routes().await.unwrap(), vec![rule.clone()]);
-        store.remove_route(&rule.key).await.unwrap();
+        store.remove_route(&rule.key, &by()).await.unwrap();
         assert_eq!(store.route(&rule.key).await.unwrap(), None);
     }
 
@@ -112,11 +154,11 @@ mod tests {
     async fn writing_the_same_key_replaces_its_target() {
         let store = store();
         store
-            .put_route(rule("gateway.local", "/v1", "first.example.com"))
+            .put_route(rule("gateway.local", "/v1", "first.example.com"), &by())
             .await
             .unwrap();
         let second = rule("gateway.local", "/v1", "second.example.com");
-        store.put_route(second.clone()).await.unwrap();
+        store.put_route(second.clone(), &by()).await.unwrap();
         assert_eq!(store.routes().await.unwrap(), vec![second]);
     }
 
@@ -124,11 +166,11 @@ mod tests {
     async fn keys_differing_only_by_path_are_different_rules() {
         let store = store();
         store
-            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .put_route(rule("gateway.local", "/v1", "api.example.com"), &by())
             .await
             .unwrap();
         store
-            .put_route(rule("gateway.local", "/v2", "api.example.com"))
+            .put_route(rule("gateway.local", "/v2", "api.example.com"), &by())
             .await
             .unwrap();
         assert_eq!(store.routes().await.unwrap().len(), 2);
@@ -139,7 +181,7 @@ mod tests {
         let store = store();
         let key = ip_core::RouteKey::new(endpoint("gateway.local", "/v1"));
         assert!(matches!(
-            store.remove_route(&key).await,
+            store.remove_route(&key, &by()).await,
             Err(StorageError::NotFound {
                 entity: Entity::Route,
                 ..

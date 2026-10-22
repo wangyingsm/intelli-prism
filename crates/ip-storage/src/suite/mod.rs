@@ -220,6 +220,8 @@ macro_rules! backend_suite {
             pricing_a_model_records_that_it_belongs_to_nobody,
             repricing_and_unpricing_a_model_record_what_it_cost,
             a_tenant_sees_none_of_what_belongs_to_the_deployment,
+            routing_a_key_somewhere_else_records_both_targets,
+            removing_a_route_records_where_it_pointed,
             the_trail_names_the_account_that_asked,
         ]);
     };

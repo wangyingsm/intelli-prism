@@ -6,133 +6,196 @@ use ip_core::{
 use sqlx::{Row, SqliteConnection};
 
 use super::SqliteStore;
+use crate::audit::{By, NewAudit};
 use crate::codec::{dialect, dialect_name};
 use crate::error::{Entity, StorageError};
 use crate::route::RouteStore;
 
 #[async_trait]
 impl RouteStore for SqliteStore {
-    async fn put_route(&self, rule: RouteRule) -> Result<(), StorageError> {
-        let key = rule.key.endpoint();
+    async fn put_route(&self, rule: RouteRule, by: &By) -> Result<(), StorageError> {
+        // One transaction, already, for the rule and its endpoints; the record joins them,
+        // so a rule that lands without its record is not a state this store can be left in.
         let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
-        let route_row_id: i64 = sqlx::query_scalar(
-            "INSERT INTO routes \
-             (api_id, key_protocol, key_host, key_port, key_path, strategy, hedge, hedge_delay, \
-             caller_speaks, upstream_speaks, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
-             api_id = excluded.api_id, strategy = excluded.strategy, hedge = excluded.hedge, \
-             hedge_delay = excluded.hedge_delay, \
-             caller_speaks = excluded.caller_speaks, \
-             upstream_speaks = excluded.upstream_speaks \
-             RETURNING row_id",
-        )
-        .bind(rule.api.as_str())
-        .bind(key.protocol.name())
-        .bind(key.host.as_str())
-        .bind(i64::from(key.port.get()))
-        .bind(key.path.as_str())
-        .bind(rule.strategy.name())
-        .bind(i64::from(rule.hedge.get()))
-        .bind(i64::from(rule.hedge_delay.get()))
-        .bind(dialect_name(rule.caller_speaks))
-        .bind(dialect_name(rule.upstream_speaks))
-        .bind(Timestamp::now().unix_seconds())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(StorageError::backend)?;
-
-        sqlx::query("DELETE FROM route_targets WHERE route_row_id = ?")
-            .bind(route_row_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(StorageError::backend)?;
-
-        for (position, weighted) in rule.target.weighted().iter().enumerate() {
-            let endpoint = &weighted.endpoint;
-            sqlx::query(
-                "INSERT INTO route_targets \
-                 (route_row_id, position, protocol, host, port, path, weight, serves) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(route_row_id)
-            .bind(i64::try_from(position).unwrap_or(i64::MAX))
-            .bind(endpoint.protocol.name())
-            .bind(endpoint.host.as_str())
-            .bind(i64::from(endpoint.port.get()))
-            .bind(endpoint.path.as_str())
-            .bind(i64::from(weighted.weight.get()))
-            .bind(weighted.serves.map(Difficulty::name))
-            .execute(&mut *transaction)
-            .await
-            .map_err(StorageError::backend)?;
+        // Rolled back by hand rather than by dropping it: a transaction left to its
+        // `Drop` keeps the connection's locks until the pool gets round to it, and a
+        // scratch schema being torn down behind it waits for ever.
+        match setting(&mut transaction, rule, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
-
-        transaction.commit().await.map_err(StorageError::backend)
     }
 
-    async fn remove_route(&self, key: &RouteKey) -> Result<(), StorageError> {
-        let endpoint = key.endpoint();
-        let deleted = sqlx::query(
-            "DELETE FROM routes WHERE key_protocol = ? AND key_host = ? \
-             AND key_port = ? AND key_path = ?",
-        )
-        .bind(endpoint.protocol.name())
-        .bind(endpoint.host.as_str())
-        .bind(i64::from(endpoint.port.get()))
-        .bind(endpoint.path.as_str())
-        .execute(&self.pool)
-        .await
-        .map_err(StorageError::backend)?
-        .rows_affected();
-        if deleted == 0 {
-            return Err(StorageError::NotFound {
-                entity: Entity::Route,
-                id: key.to_string(),
-            });
+    async fn remove_route(&self, key: &RouteKey, by: &By) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        match removing(&mut transaction, key, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
-        let endpoint = key.endpoint();
-        let rows = sqlx::query(
-            "SELECT r.api_id, r.strategy, r.hedge, r.hedge_delay, r.caller_speaks, \
-             r.upstream_speaks, t.protocol, t.host, t.port, \
-             t.path, t.weight, \
-             t.serves \
-             FROM routes r \
-             JOIN route_targets t ON t.route_row_id = r.row_id \
-             WHERE r.key_protocol = ? AND r.key_host = ? AND r.key_port = ? AND r.key_path = ? \
-             ORDER BY t.position",
-        )
-        .bind(endpoint.protocol.name())
-        .bind(endpoint.host.as_str())
-        .bind(i64::from(endpoint.port.get()))
-        .bind(endpoint.path.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(StorageError::backend)?;
-        let Some(first) = rows.first() else {
-            return Ok(None);
-        };
-        let api = ApiId::new(first.get("api_id"))?;
-        let targets = rows.iter().map(target_of).collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(RouteRule {
-            api,
-            key: key.clone(),
-            target: RouteTarget::from_weighted(targets)?,
-            strategy: strategy_of(first)?,
-            hedge: hedge_of(first)?,
-            hedge_delay: hedge_delay_of(first)?,
-            caller_speaks: dialect(first.get("caller_speaks"))?,
-            upstream_speaks: dialect(first.get("upstream_speaks"))?,
-        }))
+        read_route(&mut *self.connection().await?, key).await
     }
 
     async fn routes(&self) -> Result<Vec<RouteRule>, StorageError> {
         read_routes(&mut *self.connection().await?).await
     }
+}
+
+/// Records a rule and the change, both on the one connection its caller commits.
+///
+/// Apart from the method so that every way out of it is a `?` the caller can roll back,
+/// rather than a return that leaves a transaction open.
+async fn setting(
+    connection: &mut SqliteConnection,
+    rule: RouteRule,
+    by: &By,
+) -> Result<(), StorageError> {
+    let before = read_route(connection, &rule.key).await?;
+    let key = rule.key.endpoint();
+    let route_row_id: i64 = sqlx::query_scalar(
+        "INSERT INTO routes \
+         (api_id, key_protocol, key_host, key_port, key_path, strategy, hedge, hedge_delay, \
+         caller_speaks, upstream_speaks, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (key_protocol, key_host, key_port, key_path) DO UPDATE SET \
+         api_id = excluded.api_id, strategy = excluded.strategy, hedge = excluded.hedge, \
+         hedge_delay = excluded.hedge_delay, \
+         caller_speaks = excluded.caller_speaks, \
+         upstream_speaks = excluded.upstream_speaks \
+         RETURNING row_id",
+    )
+    .bind(rule.api.as_str())
+    .bind(key.protocol.name())
+    .bind(key.host.as_str())
+    .bind(i64::from(key.port.get()))
+    .bind(key.path.as_str())
+    .bind(rule.strategy.name())
+    .bind(i64::from(rule.hedge.get()))
+    .bind(i64::from(rule.hedge_delay.get()))
+    .bind(dialect_name(rule.caller_speaks))
+    .bind(dialect_name(rule.upstream_speaks))
+    .bind(Timestamp::now().unix_seconds())
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?;
+
+    sqlx::query("DELETE FROM route_targets WHERE route_row_id = ?")
+        .bind(route_row_id)
+        .execute(&mut *connection)
+        .await
+        .map_err(StorageError::backend)?;
+
+    for (position, weighted) in rule.target.weighted().iter().enumerate() {
+        let endpoint = &weighted.endpoint;
+        sqlx::query(
+            "INSERT INTO route_targets \
+             (route_row_id, position, protocol, host, port, path, weight, serves) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(route_row_id)
+        .bind(i64::try_from(position).unwrap_or(i64::MAX))
+        .bind(endpoint.protocol.name())
+        .bind(endpoint.host.as_str())
+        .bind(i64::from(endpoint.port.get()))
+        .bind(endpoint.path.as_str())
+        .bind(i64::from(weighted.weight.get()))
+        .bind(weighted.serves.map(Difficulty::name))
+        .execute(&mut *connection)
+        .await
+        .map_err(StorageError::backend)?;
+    }
+
+    super::audit::record(
+        connection,
+        NewAudit::changed(by.clone(), before.as_ref(), &rule),
+    )
+    .await
+}
+
+/// Removes a rule and records the removal, on the one connection its caller commits.
+async fn removing(
+    connection: &mut SqliteConnection,
+    key: &RouteKey,
+    by: &By,
+) -> Result<(), StorageError> {
+    let before = read_route(connection, key).await?;
+    let endpoint = key.endpoint();
+    let deleted = sqlx::query(
+        "DELETE FROM routes WHERE key_protocol = ? AND key_host = ? \
+         AND key_port = ? AND key_path = ?",
+    )
+    .bind(endpoint.protocol.name())
+    .bind(endpoint.host.as_str())
+    .bind(i64::from(endpoint.port.get()))
+    .bind(endpoint.path.as_str())
+    .execute(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?
+    .rows_affected();
+    if deleted == 0 {
+        return Err(StorageError::NotFound {
+            entity: Entity::Route,
+            id: key.to_string(),
+        });
+    }
+    // A row was deleted, so something was there to read a moment ago in the same
+    // transaction; an absent before here would mean the two disagree.
+    let Some(before) = before else {
+        return Err(StorageError::Malformed {
+            entity: Entity::Route,
+            detail: "a route was removed that nothing could read".to_owned(),
+        });
+    };
+    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await
+}
+
+/// The rule under one key, over whichever connection it is given. Read inside the
+/// transaction that is about to change it, so the before it records is what was replaced.
+pub(super) async fn read_route(
+    connection: &mut SqliteConnection,
+    key: &RouteKey,
+) -> Result<Option<RouteRule>, StorageError> {
+    let endpoint = key.endpoint();
+    let rows = sqlx::query(
+        "SELECT r.api_id, r.strategy, r.hedge, r.hedge_delay, r.caller_speaks, \
+         r.upstream_speaks, t.protocol, t.host, t.port, \
+         t.path, t.weight, \
+         t.serves \
+         FROM routes r \
+         JOIN route_targets t ON t.route_row_id = r.row_id \
+         WHERE r.key_protocol = ? AND r.key_host = ? AND r.key_port = ? AND r.key_path = ? \
+         ORDER BY t.position",
+    )
+    .bind(endpoint.protocol.name())
+    .bind(endpoint.host.as_str())
+    .bind(i64::from(endpoint.port.get()))
+    .bind(endpoint.path.as_str())
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?;
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let api = ApiId::new(first.get("api_id"))?;
+    let targets = rows.iter().map(target_of).collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(RouteRule {
+        api,
+        key: key.clone(),
+        target: RouteTarget::from_weighted(targets)?,
+        strategy: strategy_of(first)?,
+        hedge: hedge_of(first)?,
+        hedge_delay: hedge_delay_of(first)?,
+        caller_speaks: dialect(first.get("caller_speaks"))?,
+        upstream_speaks: dialect(first.get("upstream_speaks"))?,
+    }))
 }
 
 /// Every stored routing rule, over whichever connection it is given.
@@ -236,7 +299,7 @@ fn hedge_delay_of(row: &sqlx::sqlite::SqliteRow) -> Result<HedgeDelay, StorageEr
 mod tests {
     use super::*;
     use crate::sqlite::fixture::*;
-    use crate::suite::route::rule;
+    use crate::suite::route::{by, rule};
 
     /// Writes a route around the driver, so a row the code could not have written is read back.
     async fn broken_route(store: &SqliteStore, key_protocol: &str, protocol: &str, port: i64) {
@@ -264,8 +327,8 @@ mod tests {
     async fn removing_a_route_takes_its_endpoints_with_it() {
         let store = store().await;
         let rule = rule("gateway.local", "/v1", "one.example.com");
-        store.put_route(rule.clone()).await.unwrap();
-        store.remove_route(&rule.key).await.unwrap();
+        store.put_route(rule.clone(), &by()).await.unwrap();
+        store.remove_route(&rule.key, &by()).await.unwrap();
         let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_targets")
             .fetch_one(&store.pool)
             .await
@@ -300,7 +363,7 @@ mod tests {
     async fn a_stored_hedge_this_gateway_will_not_race_is_refused_on_read() {
         let store = store().await;
         store
-            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .put_route(rule("gateway.local", "/v1", "api.example.com"), &by())
             .await
             .unwrap();
         sqlx::query("UPDATE routes SET hedge = 99")
@@ -318,7 +381,7 @@ mod tests {
     async fn a_hedge_of_nothing_cannot_be_written_even_around_the_driver() {
         let store = store().await;
         store
-            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .put_route(rule("gateway.local", "/v1", "api.example.com"), &by())
             .await
             .unwrap();
         assert!(
@@ -334,7 +397,7 @@ mod tests {
     async fn a_stored_hedge_delay_this_code_cannot_hold_is_refused_on_read() {
         let store = store().await;
         store
-            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .put_route(rule("gateway.local", "/v1", "api.example.com"), &by())
             .await
             .unwrap();
         sqlx::query("UPDATE routes SET hedge_delay = 70000")
@@ -359,7 +422,7 @@ mod tests {
         use crate::list::ListStore;
         let store = store().await;
         store
-            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .put_route(rule("gateway.local", "/v1", "api.example.com"), &by())
             .await
             .unwrap();
         sqlx::query("UPDATE routes SET upstream_speaks = 'cohere'")
@@ -388,7 +451,7 @@ mod tests {
         use crate::list::ListStore;
         let store = store().await;
         store
-            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .put_route(rule("gateway.local", "/v1", "api.example.com"), &by())
             .await
             .unwrap();
         sqlx::query("UPDATE routes SET hedge_delay = 70000")
@@ -409,7 +472,7 @@ mod tests {
     async fn a_stored_class_this_code_does_not_carry_is_refused_on_read() {
         let store = store().await;
         store
-            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .put_route(rule("gateway.local", "/v1", "api.example.com"), &by())
             .await
             .unwrap();
         sqlx::query("UPDATE route_targets SET serves = 'impossible'")
@@ -430,7 +493,7 @@ mod tests {
         use crate::list::ListStore;
         let store = store().await;
         store
-            .put_route(rule("gateway.local", "/v1", "api.example.com"))
+            .put_route(rule("gateway.local", "/v1", "api.example.com"), &by())
             .await
             .unwrap();
         sqlx::query("UPDATE route_targets SET serves = 'impossible'")

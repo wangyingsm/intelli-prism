@@ -104,6 +104,7 @@ fn read(payload: Option<String>) -> Result<Option<serde_json::Value>, StorageErr
 mod tests {
     use crate::limit::LimitStore;
     use crate::price::PriceStore;
+    use crate::route::RouteStore;
     use crate::sqlite::fixture::*;
     use crate::suite::limit::{by, monthly};
     use crate::suite::price::priced_at;
@@ -153,6 +154,30 @@ mod tests {
         assert!(
             store.prices().await.unwrap().is_empty(),
             "the price survived a transaction that could not record it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_whose_record_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .put_route(
+                    crate::suite::route::rule("gateway.local", "/v1", "api.example.com"),
+                    &crate::suite::route::by(),
+                )
+                .await
+                .is_err(),
+            "a rule was stored with nothing to record it"
+        );
+        assert!(
+            store.routes().await.unwrap().is_empty(),
+            "the rule survived a transaction that could not record it"
         );
     }
 }

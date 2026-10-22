@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ip_core::{RouteKey, RouteRule, Timestamp};
-use ip_storage::Page;
+use ip_storage::{By, Page};
 
 use super::{Paged, store_refusal};
 use crate::manage::Manager;
@@ -19,6 +19,9 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(list).put(put).delete(remove))
 }
+
+/// What the audit trail records a change here as having come through.
+const ENDPOINT: &str = "/_ip/routes";
 
 /// One rule in force, and where it comes from.
 #[derive(Debug, serde::Serialize)]
@@ -120,7 +123,8 @@ async fn put(State(state): State<AppState>, manager: Manager, body: Bytes) -> Re
         )
             .into_response();
     }
-    match state.store().put_route(rule).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match state.store().put_route(rule, &by).await {
         Ok(()) => {
             state.feed().after_change().await;
             StatusCode::NO_CONTENT.into_response()
@@ -138,7 +142,8 @@ async fn remove(State(state): State<AppState>, manager: Manager, body: Bytes) ->
         Ok(key) => key,
         Err(rejection) => return rejection.into_response(),
     };
-    match state.store().remove_route(&key).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match state.store().remove_route(&key, &by).await {
         Ok(()) => {
             state.feed().after_change().await;
             StatusCode::NO_CONTENT.into_response()
@@ -672,7 +677,10 @@ mod tests {
     async fn a_stored_rule_the_configuration_claims_is_listed_as_unused() {
         let store = store().await;
         store
-            .put_route(rule("/v1", "stored.example.com"))
+            .put_route(
+                rule("/v1", "stored.example.com"),
+                &By::new(ip_core::UserId::new("root").unwrap(), ENDPOINT),
+            )
             .await
             .unwrap();
         let state = state_over(store).configuring(vec![rule("/v1", "configured.example.com")]);
@@ -709,7 +717,10 @@ mod tests {
         let store = store().await;
         for path in ["/stored-old", "/stored-new"] {
             store
-                .put_route(rule(path, "api.example.com"))
+                .put_route(
+                    rule(path, "api.example.com"),
+                    &By::new(ip_core::UserId::new("root").unwrap(), ENDPOINT),
+                )
                 .await
                 .unwrap();
         }

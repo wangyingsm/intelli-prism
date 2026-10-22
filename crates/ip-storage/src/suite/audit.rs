@@ -208,6 +208,55 @@ pub(crate) async fn a_tenant_sees_none_of_what_belongs_to_the_deployment(store: 
     assert_eq!(trail(store).await.len(), 2, "both are in the whole trail");
 }
 
+/// A rule carries more than a name, so what the trail holds of it is the whole of what an
+/// operator can set — which is what makes a routing change readable a year later.
+pub(crate) async fn routing_a_key_somewhere_else_records_both_targets(store: &impl Backend) {
+    let by = crate::suite::route::by();
+    let first = crate::suite::route::rule("gateway.local", "/v1", "first.example.com");
+    store.put_route(first.clone(), &by).await.unwrap();
+    store
+        .put_route(
+            crate::suite::route::rule("gateway.local", "/v1", "second.example.com"),
+            &by,
+        )
+        .await
+        .unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 2);
+    let moved = &trail[0];
+    assert_eq!(moved.entity, Entity::Route);
+    assert_eq!(moved.entity_id, first.key.to_string());
+    assert_eq!(moved.through, "/_ip/routes");
+    assert_eq!(moved.tenant, None, "a route is the deployment's");
+    assert_eq!(
+        moved.before.as_ref().unwrap()["targets"][0]["endpoint"],
+        "https://first.example.com:443/v1"
+    );
+    assert_eq!(
+        moved.after.as_ref().unwrap()["targets"][0]["endpoint"],
+        "https://second.example.com:443/v1"
+    );
+    assert_eq!(moved.after.as_ref().unwrap()["api"], "anthropic");
+    assert_eq!(moved.after.as_ref().unwrap()["strategy"], "round_robin");
+}
+
+pub(crate) async fn removing_a_route_records_where_it_pointed(store: &impl Backend) {
+    let by = crate::suite::route::by();
+    let rule = crate::suite::route::rule("gateway.local", "/v1", "api.example.com");
+    store.put_route(rule.clone(), &by).await.unwrap();
+    store.remove_route(&rule.key, &by).await.unwrap();
+
+    let trail = trail(store).await;
+    assert_eq!(trail.len(), 2);
+    let removal = &trail[0];
+    assert_eq!(
+        removal.before.as_ref().unwrap()["targets"][0]["endpoint"],
+        "https://api.example.com:443/v1"
+    );
+    assert_eq!(removal.after, None, "nothing is left to describe");
+}
+
 /// The actor is whoever the handler said, not a name the store invents.
 pub(crate) async fn the_trail_names_the_account_that_asked(store: &impl Backend) {
     tenant_with_user(store).await;

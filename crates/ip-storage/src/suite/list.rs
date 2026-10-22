@@ -168,7 +168,10 @@ pub(crate) async fn routes_are_listed_newest_first_with_every_target(store: &imp
         rule("gateway.local", "/v3", "api.example.com"),
     ];
     for rule in &rules {
-        store.put_route(rule.clone()).await.unwrap();
+        store
+            .put_route(rule.clone(), &crate::suite::route::by())
+            .await
+            .unwrap();
     }
 
     let listed = store.list_routes(Page::default()).await.unwrap();

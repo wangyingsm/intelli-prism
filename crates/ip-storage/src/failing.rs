@@ -171,14 +171,14 @@ impl GrantStore for FailingStore {
 
 #[async_trait]
 impl RouteStore for FailingStore {
-    async fn put_route(&self, rule: RouteRule) -> Result<(), StorageError> {
+    async fn put_route(&self, rule: RouteRule, by: &By) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.put_route(rule).await
+        self.inner.put_route(rule, by).await
     }
 
-    async fn remove_route(&self, key: &RouteKey) -> Result<(), StorageError> {
+    async fn remove_route(&self, key: &RouteKey, by: &By) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.remove_route(key).await
+        self.inner.remove_route(key, by).await
     }
 
     async fn route(&self, key: &RouteKey) -> Result<Option<RouteRule>, StorageError> {
