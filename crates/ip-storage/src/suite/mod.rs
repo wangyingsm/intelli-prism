@@ -243,6 +243,11 @@ macro_rules! backend_suite {
             changing_a_passphrase_records_that_it_changed_and_never_what_to,
             creating_and_deleting_an_account_record_both_ends,
             the_trail_names_the_account_that_asked,
+            handing_a_grant_over_records_who_handed_it,
+            handing_over_a_grant_already_held_records_nothing_twice,
+            taking_a_grant_back_records_what_went,
+            taking_back_a_grant_that_is_not_held_records_nothing,
+            a_grant_against_an_account_belongs_to_no_tenant,
         ]);
     };
     (price, $open:path) => {

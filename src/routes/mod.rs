@@ -602,6 +602,10 @@ secret = "0123456789abcdef0123456789abcdef"
                         },
                     )
                     .unwrap(),
+                    &ip_storage::By::new(
+                        ip_core::UserId::new("root").unwrap(),
+                        "/_ip/tenants/{tenant}/members/{user}/grants",
+                    ),
                 )
                 .await
                 .unwrap();

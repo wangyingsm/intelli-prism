@@ -71,14 +71,50 @@ pub trait MembershipStore: Send + Sync {
     async fn members_of_tenant(&self, tenant: &TenantId) -> Result<Vec<Membership>, StorageError>;
 }
 
+impl crate::audit::Auditable for Grant {
+    fn entity(&self) -> crate::error::Entity {
+        crate::error::Entity::Grant
+    }
+
+    /// The capability and whose it is, spelled the way the two endpoints that hand grants
+    /// out spell them in their own paths.
+    fn entity_id(&self) -> String {
+        let capability = crate::codec::capability_name(self.capability());
+        match (self.scope().tenant(), self.scope().api()) {
+            (None, _) => format!("{capability} on {}", self.scope().user()),
+            (Some(tenant), None) => format!("{capability} on {}@{tenant}", self.scope().user()),
+            (Some(tenant), Some(api)) => {
+                format!("{capability} on {}@{tenant}/{api}", self.scope().user())
+            }
+        }
+    }
+
+    /// Whichever tenant the grant is held inside, and none for one held against an account
+    /// itself: `TenantMgr` is the deployment's to hand out, so it belongs in nobody's trail.
+    fn tenant(&self) -> Option<TenantId> {
+        self.scope().tenant().cloned()
+    }
+
+    /// A grant holds nothing secret, so this is all of it. Which scope it is granted at is
+    /// read off the two that are absent: both for an account, the api alone for a tenant.
+    fn audited(&self) -> serde_json::Value {
+        serde_json::json!({
+            "capability": crate::codec::capability_name(self.capability()),
+            "user": self.scope().user().as_str(),
+            "tenant": self.scope().tenant().map(TenantId::as_str),
+            "api": self.scope().api().map(ip_core::ApiId::as_str),
+        })
+    }
+}
+
 /// Reads and writes explicit capability grants.
 #[async_trait]
 pub trait GrantStore: Send + Sync {
     /// Records a grant. Granting what is already held changes nothing.
-    async fn grant(&self, grant: &Grant) -> Result<(), StorageError>;
+    async fn grant(&self, grant: &Grant, by: &By) -> Result<(), StorageError>;
 
     /// Removes a grant, or reports it missing.
-    async fn revoke(&self, grant: &Grant) -> Result<(), StorageError>;
+    async fn revoke(&self, grant: &Grant, by: &By) -> Result<(), StorageError>;
 
     /// Every grant one user holds, at every scope.
     async fn grants_of(&self, user: &UserId) -> Result<Grants, StorageError>;
@@ -300,7 +336,7 @@ mod tests {
 
     #[async_trait]
     impl GrantStore for MemoryStore {
-        async fn grant(&self, grant: &Grant) -> Result<(), StorageError> {
+        async fn grant(&self, grant: &Grant, _by: &By) -> Result<(), StorageError> {
             let mut grants = self.grants.lock().unwrap();
             if !grants.contains(grant) {
                 grants.push(grant.clone());
@@ -308,7 +344,7 @@ mod tests {
             Ok(())
         }
 
-        async fn revoke(&self, grant: &Grant) -> Result<(), StorageError> {
+        async fn revoke(&self, grant: &Grant, _by: &By) -> Result<(), StorageError> {
             let mut grants = self.grants.lock().unwrap();
             let before = grants.len();
             grants.retain(|held| held != grant);
@@ -407,7 +443,10 @@ mod tests {
             },
         )
         .unwrap();
-        store.grant(&grant).await.unwrap();
+        store
+            .grant(&grant, &crate::suite::identity::grants_by())
+            .await
+            .unwrap();
 
         assert_eq!(
             store.tenant(&tenant.id).await.unwrap(),

@@ -6,11 +6,17 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use ip_core::{ApiId, CapabilityScope, Grant, Grants, TenantId, Timestamp, UserId};
-use ip_storage::{AccountKind, Listed, Standing, Storage, StorageError};
+use ip_storage::{AccountKind, By, Listed, Standing, Storage, StorageError};
 
 use super::{Paged, capability_name, capability_named, store_refusal};
 use crate::manage::Manager;
 use crate::state::AppState;
+
+/// The endpoint a grant inside a tenant is handed out through, as the router nests it.
+const MEMBER_ENDPOINT: &str = "/_ip/tenants/{tenant}/members/{user}/grants";
+
+/// The endpoint a grant against an account itself is handed out through, as the router nests it.
+const ACCOUNT_ENDPOINT: &str = "/_ip/users/{user}/grants";
 
 /// The grants one member holds inside one tenant, under the prefix the router nests them at.
 ///
@@ -193,7 +199,8 @@ async fn grant(state: &AppState, manager: &Manager, named: Named) -> Response<Bo
         )
             .into_response();
     }
-    match store.grant(&named.grant).await {
+    let by = By::new(manager.user().clone(), MEMBER_ENDPOINT);
+    match store.grant(&named.grant, &by).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => store_refusal(error),
     }
@@ -216,7 +223,8 @@ async fn revoke(state: &AppState, manager: &Manager, named: Named) -> Response<B
         )
             .into_response();
     }
-    match store.revoke(&named.grant).await {
+    let by = By::new(manager.user().clone(), MEMBER_ENDPOINT);
+    match store.revoke(&named.grant, &by).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => store_refusal(error),
     }
@@ -304,7 +312,8 @@ async fn grant_on_account(
         Ok(grant) => grant,
         Err(refusal) => return *refusal,
     };
-    match state.store().grant(&grant).await {
+    let by = By::new(manager.user().clone(), ACCOUNT_ENDPOINT);
+    match state.store().grant(&grant, &by).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => store_refusal(error),
     }
@@ -320,7 +329,8 @@ async fn revoke_on_account(
         Ok(grant) => grant,
         Err(refusal) => return *refusal,
     };
-    match state.store().revoke(&grant).await {
+    let by = By::new(manager.user().clone(), ACCOUNT_ENDPOINT);
+    match state.store().revoke(&grant, &by).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => store_refusal(error),
     }
@@ -468,6 +478,10 @@ mod tests {
                     },
                 )
                 .unwrap(),
+                &ip_storage::By::new(
+                    ip_core::UserId::new("root").unwrap(),
+                    "/_ip/tenants/{tenant}/members/{user}/grants",
+                ),
             )
             .await
             .unwrap();

@@ -492,7 +492,13 @@ mod tests {
             api: ApiId::new("chat").unwrap(),
         };
         store
-            .grant(&Grant::new(Capability::ApiAccess, scope.clone()).unwrap())
+            .grant(
+                &Grant::new(Capability::ApiAccess, scope.clone()).unwrap(),
+                &ip_storage::By::new(
+                    ip_core::UserId::new("root").unwrap(),
+                    "/_ip/tenants/{tenant}/members/{user}/grants",
+                ),
+            )
             .await
             .unwrap();
         let verifier = verifier(store);

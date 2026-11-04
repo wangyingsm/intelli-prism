@@ -34,6 +34,74 @@ async fn attaching(
     Ok(())
 }
 
+/// Hands a grant over and records it, both on the one connection its caller commits.
+///
+/// Granting what is already held is not a change, so it writes no record: a row saying a
+/// capability was handed over on a day nothing happened is worse than no row at all.
+async fn granting(
+    connection: &mut SqliteConnection,
+    grant: &Grant,
+    by: &By,
+) -> Result<(), StorageError> {
+    let user_row_id = user_row_id(&mut *connection, grant.scope().user()).await?;
+    let tenant_row_id = match grant.scope().tenant() {
+        Some(tenant) => Some(tenant_row_id(&mut *connection, tenant).await?.get()),
+        None => None,
+    };
+    let result = sqlx::query(
+        "INSERT INTO grants (user_row_id, tenant_row_id, api_id, capability, created_at) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(user_row_id.get())
+    .bind(tenant_row_id)
+    .bind(grant.scope().api().map(|api| api.as_str()))
+    .bind(capability_name(grant.capability()))
+    .bind(Timestamp::now().unix_seconds())
+    .execute(&mut *connection)
+    .await;
+    match result {
+        Ok(_) => {
+            super::audit::record(connection, NewAudit::created(by.clone(), grant)).await?;
+            Ok(())
+        }
+        Err(error) if is_unique_violation(&error) => Ok(()),
+        Err(error) => Err(StorageError::backend(error)),
+    }
+}
+
+/// Takes a grant back and records it, both on the one connection its caller commits.
+async fn revoking(
+    connection: &mut SqliteConnection,
+    grant: &Grant,
+    by: &By,
+) -> Result<(), StorageError> {
+    let user_row_id = user_row_id(&mut *connection, grant.scope().user()).await?;
+    let tenant_row_id = match grant.scope().tenant() {
+        Some(tenant) => Some(tenant_row_id(&mut *connection, tenant).await?.get()),
+        None => None,
+    };
+    let deleted = sqlx::query(
+        "DELETE FROM grants WHERE user_row_id = ? AND tenant_row_id IS ? \
+         AND api_id IS ? AND capability = ?",
+    )
+    .bind(user_row_id.get())
+    .bind(tenant_row_id)
+    .bind(grant.scope().api().map(|api| api.as_str()))
+    .bind(capability_name(grant.capability()))
+    .execute(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?
+    .rows_affected();
+    if deleted == 0 {
+        return Err(StorageError::NotFound {
+            entity: Entity::Grant,
+            id: format!("{:?}", grant.capability()),
+        });
+    }
+    super::audit::record(connection, NewAudit::removed(by.clone(), grant)).await?;
+    Ok(())
+}
+
 /// One attachment, over whichever connection it is given. Read inside the transaction that
 /// is about to change it, so the before it records is the standing that was replaced.
 pub(super) async fn read_membership(
@@ -566,55 +634,32 @@ impl MembershipStore for SqliteStore {
 
 #[async_trait]
 impl GrantStore for SqliteStore {
-    async fn grant(&self, grant: &Grant) -> Result<(), StorageError> {
-        let user_row_id = self.user_row_id(grant.scope().user()).await?;
-        let tenant_row_id = match grant.scope().tenant() {
-            Some(tenant) => Some(self.tenant_row_id(tenant).await?.get()),
-            None => None,
-        };
-        let result = sqlx::query(
-            "INSERT INTO grants (user_row_id, tenant_row_id, api_id, capability, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(user_row_id.get())
-        .bind(tenant_row_id)
-        .bind(grant.scope().api().map(|api| api.as_str()))
-        .bind(capability_name(grant.capability()))
-        .bind(Timestamp::now().unix_seconds())
-        .execute(&self.pool)
-        .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(error) if is_unique_violation(&error) => Ok(()),
-            Err(error) => Err(StorageError::backend(error)),
+    async fn grant(&self, grant: &Grant, by: &By) -> Result<(), StorageError> {
+        // One transaction, so a grant that lands without its record is not a state this
+        // store can be left in, and neither is a record whose grant rolled back.
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        // Rolled back by hand rather than by dropping it: a transaction left to its
+        // `Drop` keeps the connection's locks until the pool gets round to it, and a
+        // scratch schema being torn down behind it waits for ever.
+        match granting(&mut transaction, grant, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
     }
 
-    async fn revoke(&self, grant: &Grant) -> Result<(), StorageError> {
-        let user_row_id = self.user_row_id(grant.scope().user()).await?;
-        let tenant_row_id = match grant.scope().tenant() {
-            Some(tenant) => Some(self.tenant_row_id(tenant).await?.get()),
-            None => None,
-        };
-        let deleted = sqlx::query(
-            "DELETE FROM grants WHERE user_row_id = ? AND tenant_row_id IS ? \
-             AND api_id IS ? AND capability = ?",
-        )
-        .bind(user_row_id.get())
-        .bind(tenant_row_id)
-        .bind(grant.scope().api().map(|api| api.as_str()))
-        .bind(capability_name(grant.capability()))
-        .execute(&self.pool)
-        .await
-        .map_err(StorageError::backend)?
-        .rows_affected();
-        if deleted == 0 {
-            return Err(StorageError::NotFound {
-                entity: Entity::Grant,
-                id: format!("{:?}", grant.capability()),
-            });
+    async fn revoke(&self, grant: &Grant, by: &By) -> Result<(), StorageError> {
+        // One transaction, for the reason `grant` runs in one.
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        match revoking(&mut transaction, grant, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     async fn grants_of(&self, user: &UserId) -> Result<Grants, StorageError> {

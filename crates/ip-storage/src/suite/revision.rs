@@ -115,6 +115,7 @@ pub(crate) async fn changes_to_nothing_a_node_holds_leave_the_revision_alone(sto
                 CapabilityScope::User { user: user_id() },
             )
             .unwrap(),
+            &crate::suite::identity::grants_by(),
         )
         .await
         .unwrap();

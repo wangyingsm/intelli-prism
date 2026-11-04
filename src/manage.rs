@@ -449,7 +449,13 @@ secret = "0123456789abcdef0123456789abcdef"
         };
         state
             .store()
-            .grant(&Grant::new(Capability::UserMgr, scope).unwrap())
+            .grant(
+                &Grant::new(Capability::UserMgr, scope).unwrap(),
+                &ip_storage::By::new(
+                    ip_core::UserId::new("root").unwrap(),
+                    "/_ip/tenants/{tenant}/members/{user}/grants",
+                ),
+            )
             .await
             .unwrap();
         let cookie = cookie_of(&state).await;
@@ -485,7 +491,13 @@ secret = "0123456789abcdef0123456789abcdef"
         };
         state
             .store()
-            .grant(&Grant::new(Capability::UserMgr, scope.clone()).unwrap())
+            .grant(
+                &Grant::new(Capability::UserMgr, scope.clone()).unwrap(),
+                &ip_storage::By::new(
+                    ip_core::UserId::new("root").unwrap(),
+                    "/_ip/tenants/{tenant}/members/{user}/grants",
+                ),
+            )
             .await
             .unwrap();
         let manager = Manager {

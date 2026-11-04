@@ -71,7 +71,10 @@ async fn member_of_two(store: &impl MemberRemoveStore) -> [Grant; 4] {
         .unwrap(),
     ];
     for grant in &grants {
-        store.grant(grant).await.unwrap();
+        store
+            .grant(grant, &crate::suite::identity::grants_by())
+            .await
+            .unwrap();
     }
     grants
 }

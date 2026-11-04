@@ -739,3 +739,106 @@ pub(crate) async fn taking_a_member_out_records_the_attachment_that_went(
     assert_eq!(trail[0].before.as_ref().unwrap()["standing"], "member");
     assert_eq!(trail[0].tenant, Some(tenant_id()));
 }
+
+/// A grant handed over inside a tenant, recorded with the capability, whose it is, and the
+/// api it is held against.
+pub(crate) async fn handing_a_grant_over_records_who_handed_it(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let by = crate::suite::identity::grants_by();
+    store.grant(&api_access(), &by).await.unwrap();
+
+    let trail = trail_of(store, Entity::Grant).await;
+    assert_eq!(trail.len(), 1, "one change, one record");
+    let one = &trail[0];
+    assert_eq!(one.actor, UserId::new("alice").unwrap());
+    assert_eq!(one.through, "/_ip/tenants/{tenant}/members/{user}/grants");
+    assert_eq!(one.entity_id, "api_access on alice@acme/chat");
+    assert_eq!(one.tenant, Some(tenant_id()));
+    assert_eq!(one.before, None, "nothing was there before");
+    let after = one.after.as_ref().unwrap();
+    assert_eq!(after["capability"], "api_access");
+    assert_eq!(after["user"], "alice");
+    assert_eq!(after["tenant"], "acme");
+    assert_eq!(after["api"], "chat");
+}
+
+/// Granting what is already held changes nothing, and a trail that says otherwise is worse
+/// than one that says nothing: it would put a capability's arrival on the wrong day.
+pub(crate) async fn handing_over_a_grant_already_held_records_nothing_twice(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let by = crate::suite::identity::grants_by();
+    store.grant(&api_access(), &by).await.unwrap();
+    store.grant(&api_access(), &by).await.unwrap();
+
+    assert_eq!(trail_of(store, Entity::Grant).await.len(), 1);
+}
+
+/// Taking a grant back records what went, which is the half of a capability's life an
+/// incident asks about as often as the half that handed it over.
+pub(crate) async fn taking_a_grant_back_records_what_went(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let by = crate::suite::identity::grants_by();
+    store.grant(&api_access(), &by).await.unwrap();
+    store.revoke(&api_access(), &by).await.unwrap();
+
+    let trail = trail_of(store, Entity::Grant).await;
+    assert_eq!(trail.len(), 2, "handed over, then taken back");
+    assert_eq!(trail[0].after, None, "nothing is left to describe");
+    assert_eq!(
+        trail[0].before.as_ref().unwrap()["capability"],
+        "api_access"
+    );
+    assert_eq!(trail[0].entity_id, "api_access on alice@acme/chat");
+}
+
+/// Refusing to take back what is not held records nothing: there was no change to record.
+pub(crate) async fn taking_back_a_grant_that_is_not_held_records_nothing(store: &impl Backend) {
+    tenant_with_user(store).await;
+    assert!(
+        store
+            .revoke(&api_access(), &crate::suite::identity::grants_by())
+            .await
+            .is_err()
+    );
+
+    assert!(trail_of(store, Entity::Grant).await.is_empty());
+}
+
+/// A grant held against an account itself belongs to the deployment, not to a tenant, so no
+/// tenant owner reading its own trail is shown somebody else's `TenantMgr`.
+pub(crate) async fn a_grant_against_an_account_belongs_to_no_tenant(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let grant = ip_core::Grant::new(
+        ip_core::Capability::TenantMgr,
+        ip_core::CapabilityScope::User {
+            user: crate::suite::fixture::user_id(),
+        },
+    )
+    .unwrap();
+    store
+        .grant(&grant, &crate::suite::identity::grants_by())
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Grant).await;
+    assert_eq!(trail.len(), 1);
+    assert_eq!(trail[0].tenant, None, "the deployment's, not a tenant's");
+    assert_eq!(trail[0].entity_id, "tenant_mgr on alice");
+    assert_eq!(
+        trail[0].after.as_ref().unwrap()["tenant"],
+        serde_json::Value::Null
+    );
+}
+
+/// The one grant every test above hands over.
+fn api_access() -> ip_core::Grant {
+    ip_core::Grant::new(
+        ip_core::Capability::ApiAccess,
+        ip_core::CapabilityScope::Api {
+            user: crate::suite::fixture::user_id(),
+            tenant: tenant_id(),
+            api: ip_core::ApiId::new("chat").unwrap(),
+        },
+    )
+    .unwrap()
+}

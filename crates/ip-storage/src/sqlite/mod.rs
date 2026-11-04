@@ -12,12 +12,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use ip_core::{TenantId, UserId};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::error::StorageError;
-use crate::model::{TenantRowId, UserRowId};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: u32 = 8;
@@ -67,14 +65,6 @@ impl SqliteStore {
     /// Closes every pooled connection.
     pub async fn close(&self) {
         self.pool.close().await;
-    }
-
-    async fn tenant_row_id(&self, id: &TenantId) -> Result<TenantRowId, StorageError> {
-        identity::tenant_row_id(&mut *self.connection().await?, id).await
-    }
-
-    async fn user_row_id(&self, id: &UserId) -> Result<UserRowId, StorageError> {
-        identity::user_row_id(&mut *self.connection().await?, id).await
     }
 
     /// One connection out of the pool, for the writes a transaction also runs.

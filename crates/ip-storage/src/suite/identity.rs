@@ -24,6 +24,14 @@ pub(crate) fn members_by() -> By {
     )
 }
 
+/// The account every suite test hands a grant over as, through the endpoint that does.
+pub(crate) fn grants_by() -> By {
+    By::new(
+        crate::suite::fixture::user_id(),
+        "/_ip/tenants/{tenant}/members/{user}/grants",
+    )
+}
+
 fn api_grant(user: &UserId, tenant: &TenantId, capability: Capability) -> Grant {
     Grant::new(
         capability,
@@ -296,7 +304,10 @@ pub(crate) async fn deleting_a_tenant_takes_its_memberships_and_grants_with_it(
         .await
         .unwrap();
     store
-        .grant(&api_grant(&user_id(), &tenant_id(), Capability::ApiAccess))
+        .grant(
+            &api_grant(&user_id(), &tenant_id(), Capability::ApiAccess),
+            &crate::suite::identity::grants_by(),
+        )
         .await
         .unwrap();
     store
@@ -316,8 +327,14 @@ pub(crate) async fn deleting_a_tenant_takes_its_memberships_and_grants_with_it(
 pub(crate) async fn granting_the_same_capability_twice_changes_nothing(store: &impl Storage) {
     tenant_with_user(store).await;
     let grant = api_grant(&user_id(), &tenant_id(), Capability::ApiAccess);
-    store.grant(&grant).await.unwrap();
-    store.grant(&grant).await.unwrap();
+    store
+        .grant(&grant, &crate::suite::identity::grants_by())
+        .await
+        .unwrap();
+    store
+        .grant(&grant, &crate::suite::identity::grants_by())
+        .await
+        .unwrap();
     assert_eq!(store.grants_of(&user_id()).await.unwrap().len(), 1);
 }
 
@@ -338,7 +355,10 @@ pub(crate) async fn every_scope_shape_round_trips(store: &impl Storage) {
     .unwrap();
     let api_scoped = api_grant(&user_id(), &tenant_id(), Capability::ApiAccess);
     for grant in [&user_scoped, &tenant_scoped, &api_scoped] {
-        store.grant(grant).await.unwrap();
+        store
+            .grant(grant, &crate::suite::identity::grants_by())
+            .await
+            .unwrap();
     }
     let held = store.grants_of(&user_id()).await.unwrap();
     assert_eq!(held.len(), 3);
@@ -356,11 +376,15 @@ pub(crate) async fn grants_in_a_tenant_exclude_the_user_scoped_ones(store: &impl
                 CapabilityScope::User { user: user_id() },
             )
             .unwrap(),
+            &crate::suite::identity::grants_by(),
         )
         .await
         .unwrap();
     let api_scoped = api_grant(&user_id(), &tenant_id(), Capability::ApiAccess);
-    store.grant(&api_scoped).await.unwrap();
+    store
+        .grant(&api_scoped, &crate::suite::identity::grants_by())
+        .await
+        .unwrap();
     let held = store
         .grants_in_tenant(&user_id(), &tenant_id())
         .await
@@ -373,7 +397,10 @@ pub(crate) async fn revoking_what_is_not_held_reports_it_missing(store: &impl St
     tenant_with_user(store).await;
     assert!(matches!(
         store
-            .revoke(&api_grant(&user_id(), &tenant_id(), Capability::ApiAccess))
+            .revoke(
+                &api_grant(&user_id(), &tenant_id(), Capability::ApiAccess),
+                &crate::suite::identity::grants_by()
+            )
             .await,
         Err(StorageError::NotFound {
             entity: Entity::Grant,
@@ -386,9 +413,18 @@ pub(crate) async fn revoking_removes_only_the_named_grant(store: &impl Storage) 
     tenant_with_user(store).await;
     let access = api_grant(&user_id(), &tenant_id(), Capability::ApiAccess);
     let limits = api_grant(&user_id(), &tenant_id(), Capability::LimitMgr);
-    store.grant(&access).await.unwrap();
-    store.grant(&limits).await.unwrap();
-    store.revoke(&limits).await.unwrap();
+    store
+        .grant(&access, &crate::suite::identity::grants_by())
+        .await
+        .unwrap();
+    store
+        .grant(&limits, &crate::suite::identity::grants_by())
+        .await
+        .unwrap();
+    store
+        .revoke(&limits, &crate::suite::identity::grants_by())
+        .await
+        .unwrap();
     let held = store.grants_of(&user_id()).await.unwrap();
     assert_eq!(held.len(), 1);
     assert!(held.holds(Capability::ApiAccess, access.scope()));

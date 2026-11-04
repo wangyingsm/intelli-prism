@@ -506,7 +506,13 @@ mod tests {
                 api: ApiId::new("chat").unwrap(),
             };
             store
-                .grant(&Grant::new(capability, scope).unwrap())
+                .grant(
+                    &Grant::new(capability, scope).unwrap(),
+                    &ip_storage::By::new(
+                        ip_core::UserId::new("root").unwrap(),
+                        "/_ip/tenants/{tenant}/members/{user}/grants",
+                    ),
+                )
                 .await
                 .unwrap();
         }

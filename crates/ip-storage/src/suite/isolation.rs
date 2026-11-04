@@ -108,7 +108,10 @@ pub(crate) async fn grants_inside_one_tenant_are_not_listed_for_another(store: &
         tenant: theirs(),
     };
     store
-        .grant(&Grant::new(Capability::Observer, scope).unwrap())
+        .grant(
+            &Grant::new(Capability::Observer, scope).unwrap(),
+            &crate::suite::identity::grants_by(),
+        )
         .await
         .unwrap();
     // Asked for the same account inside the tenant that is not theirs.
@@ -123,7 +126,10 @@ pub(crate) async fn grants_on_one_account_are_not_listed_for_another(store: &imp
     two_tenants(store).await;
     let scope = CapabilityScope::User { user: their_user() };
     store
-        .grant(&Grant::new(Capability::TenantMgr, scope).unwrap())
+        .grant(
+            &Grant::new(Capability::TenantMgr, scope).unwrap(),
+            &crate::suite::identity::grants_by(),
+        )
         .await
         .unwrap();
     let listed = store

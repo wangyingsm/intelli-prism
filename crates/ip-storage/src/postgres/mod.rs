@@ -10,12 +10,10 @@ mod usage;
 
 use std::str::FromStr;
 
-use ip_core::{TenantId, UserId};
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use crate::error::StorageError;
-use crate::model::{TenantRowId, UserRowId};
 
 const MAX_CONNECTIONS: u32 = 16;
 
@@ -54,14 +52,6 @@ impl PostgresStore {
     /// Closes every pooled connection.
     pub async fn close(&self) {
         self.pool.close().await;
-    }
-
-    async fn tenant_row_id(&self, id: &TenantId) -> Result<TenantRowId, StorageError> {
-        identity::tenant_row_id(&mut *self.connection().await?, id).await
-    }
-
-    async fn user_row_id(&self, id: &UserId) -> Result<UserRowId, StorageError> {
-        identity::user_row_id(&mut *self.connection().await?, id).await
     }
 
     /// One connection out of the pool, for the writes a transaction also runs.

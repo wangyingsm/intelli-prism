@@ -336,7 +336,16 @@ mod tests {
             .unwrap(),
             Grant::new(Capability::UserMgr, in_acme("erin")).unwrap(),
         ] {
-            store.grant(&grant).await.unwrap();
+            store
+                .grant(
+                    &grant,
+                    &ip_storage::By::new(
+                        ip_core::UserId::new("root").unwrap(),
+                        "/_ip/tenants/{tenant}/members/{user}/grants",
+                    ),
+                )
+                .await
+                .unwrap();
         }
 
         let state = state_over(store);

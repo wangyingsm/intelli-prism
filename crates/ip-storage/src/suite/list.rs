@@ -139,7 +139,10 @@ pub(crate) async fn grants_are_listed_newest_first_by_where_they_are_held(store:
         .unwrap(),
     ];
     for grant in &held {
-        store.grant(grant).await.unwrap();
+        store
+            .grant(grant, &crate::suite::identity::grants_by())
+            .await
+            .unwrap();
     }
 
     let in_acme = store

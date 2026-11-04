@@ -109,7 +109,7 @@ mod tests {
     use crate::price::PriceStore;
     use crate::route::RouteStore;
     use crate::sqlite::fixture::*;
-    use crate::store::{MembershipStore, TenantStore, UserStore};
+    use crate::store::{GrantStore, MembershipStore, TenantStore, UserStore};
     use crate::suite::limit::{by, monthly};
     use crate::suite::price::priced_at;
 
@@ -333,6 +333,36 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the attachment survived a transaction that could not record it"
+        );
+    }
+    #[tokio::test]
+    async fn a_grant_whose_record_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        let (_, user) = tenant_with_user(&store).await;
+        let grant = ip_core::Grant::new(
+            ip_core::Capability::ApiAccess,
+            ip_core::CapabilityScope::Api {
+                user: user.id.clone(),
+                tenant: tenant_id(),
+                api: ip_core::ApiId::new("chat").unwrap(),
+            },
+        )
+        .unwrap();
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .grant(&grant, &crate::suite::identity::grants_by())
+                .await
+                .is_err(),
+            "a grant was handed over with nothing to record it"
+        );
+        assert!(
+            store.grants_of(&user.id).await.unwrap().is_empty(),
+            "the grant survived a transaction that could not record it"
         );
     }
 }

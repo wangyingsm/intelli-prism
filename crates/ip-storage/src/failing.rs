@@ -145,14 +145,14 @@ impl MembershipStore for FailingStore {
 
 #[async_trait]
 impl GrantStore for FailingStore {
-    async fn grant(&self, grant: &Grant) -> Result<(), StorageError> {
+    async fn grant(&self, grant: &Grant, by: &By) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.grant(grant).await
+        self.inner.grant(grant, by).await
     }
 
-    async fn revoke(&self, grant: &Grant) -> Result<(), StorageError> {
+    async fn revoke(&self, grant: &Grant, by: &By) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.revoke(grant).await
+        self.inner.revoke(grant, by).await
     }
 
     async fn grants_of(&self, user: &UserId) -> Result<Grants, StorageError> {
