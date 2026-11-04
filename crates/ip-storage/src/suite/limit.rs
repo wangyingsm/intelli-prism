@@ -195,7 +195,10 @@ pub(crate) async fn deleting_a_tenant_takes_its_limits_with_it(store: &impl Back
         .await
         .unwrap();
 
-    store.delete_tenant(&tenant_id()).await.unwrap();
+    store
+        .delete_tenant(&tenant_id(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     assert!(store.limits().await.unwrap().is_empty());
 }
 

@@ -339,10 +339,13 @@ mod tests {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         let acme = TenantId::new("acme").unwrap();
         store
-            .create_tenant(NewTenant {
-                id: acme.clone(),
-                key: TnKey::generate().unwrap(),
-            })
+            .create_tenant(
+                NewTenant {
+                    id: acme.clone(),
+                    key: TnKey::generate().unwrap(),
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/tenants"),
+            )
             .await
             .unwrap();
         store

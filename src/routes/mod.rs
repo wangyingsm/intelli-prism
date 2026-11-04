@@ -555,10 +555,13 @@ secret = "0123456789abcdef0123456789abcdef"
         let store = SqliteStore::in_memory().await.unwrap();
         let key = TnKey::generate().unwrap();
         store
-            .create_tenant(NewTenant {
-                id: tenant_id(),
-                key: key.clone(),
-            })
+            .create_tenant(
+                NewTenant {
+                    id: tenant_id(),
+                    key: key.clone(),
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/tenants"),
+            )
             .await
             .unwrap();
         store

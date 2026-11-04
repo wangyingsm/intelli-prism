@@ -119,8 +119,15 @@ pub(crate) async fn the_trail_is_narrowed_to_what_the_filter_names(store: &impl 
     tenant_with_user(store).await;
     store.put_limit(monthly(10), &by()).await.unwrap();
 
-    let mine = AuditFilter::of_tenant(tenant_id());
-    assert_eq!(store.audits(&mine, Page::default()).await.unwrap().len(), 1);
+    let mine = store
+        .audits(&AuditFilter::of_tenant(tenant_id()), Page::default())
+        .await
+        .unwrap();
+    // Two, because a tenant's own creation belongs in the trail that tenant is shown,
+    // and the fixture created it.
+    assert_eq!(mine.len(), 2);
+    assert_eq!(mine[0].entity, Entity::Limit);
+    assert_eq!(mine[1].entity, Entity::Tenant);
 
     let theirs = AuditFilter::of_tenant(ip_core::TenantId::new("other").unwrap());
     assert!(
@@ -216,8 +223,9 @@ pub(crate) async fn a_tenant_sees_none_of_what_belongs_to_the_deployment(store: 
         .audits(&AuditFilter::of_tenant(tenant_id()), Page::default())
         .await
         .unwrap();
-    assert_eq!(theirs.len(), 1, "a price was read as a tenant's");
+    assert_eq!(theirs.len(), 2, "a price was read as a tenant's");
     assert_eq!(theirs[0].entity, Entity::Limit);
+    assert_eq!(theirs[1].entity, Entity::Tenant, "its own creation");
     assert_eq!(
         trail_of(store, Entity::Price).await.len(),
         1,
@@ -520,4 +528,81 @@ pub(crate) async fn the_trail_names_the_account_that_asked(store: &impl Backend)
     store.put_limit(monthly(10), &bob).await.unwrap();
 
     assert_eq!(trail(store).await[0].actor, UserId::new("bob").unwrap());
+}
+
+pub(crate) async fn creating_and_deleting_a_tenant_record_both_ends(store: &impl Backend) {
+    let by = crate::suite::identity::tenants_by();
+    store
+        .create_tenant(crate::suite::fixture::new_tenant(), &by)
+        .await
+        .unwrap();
+    store.delete_tenant(&tenant_id(), &by).await.unwrap();
+
+    let trail = trail_of(store, Entity::Tenant).await;
+    assert_eq!(trail.len(), 2);
+    assert_eq!(trail[1].through, "/_ip/tenants");
+    assert_eq!(
+        trail[1].before, None,
+        "nothing was there before it was made"
+    );
+    assert_eq!(trail[1].after.as_ref().unwrap()["id"], "acme");
+    assert_eq!(trail[0].after, None, "nothing is left to describe");
+    assert_eq!(trail[0].before.as_ref().unwrap()["id"], "acme");
+}
+
+/// The root key is held to the rule an account's verifier is held to, and the test looks
+/// for the secret itself rather than for the shape that is meant to leave it out.
+pub(crate) async fn a_tenants_record_never_holds_its_root_key(store: &impl Backend) {
+    let by = crate::suite::identity::tenants_by();
+    let made = crate::suite::fixture::new_tenant();
+    let secret = made.key.to_hex();
+    store.create_tenant(made, &by).await.unwrap();
+    store.delete_tenant(&tenant_id(), &by).await.unwrap();
+
+    let trail = trail_of(store, Entity::Tenant).await;
+    assert_eq!(trail.len(), 2, "created, removed");
+    for one in &trail {
+        let written = serde_json::to_string(&(&one.before, &one.after)).unwrap();
+        assert!(
+            !written.contains(&secret) && !written.contains("key"),
+            "a root key reached the trail: {written}"
+        );
+        assert_eq!(one.tenant, Some(tenant_id()), "a tenant's own");
+    }
+}
+
+/// Creating a tenant with its owner is two things somebody did, in one transaction, so it
+/// is two records that land together or not at all.
+pub(crate) async fn creating_a_tenant_with_its_owner_records_both(
+    store: &(impl Backend + crate::transaction::user_create::UserCreateTransactional),
+) {
+    let by = crate::suite::identity::tenants_by();
+    store
+        .begin_user_create()
+        .await
+        .unwrap()
+        .create_tenant(crate::suite::fixture::new_tenant())
+        .await
+        .unwrap()
+        .create_user(crate::suite::fixture::new_user())
+        .await
+        .unwrap()
+        .attach(crate::model::Standing::Owner)
+        .await
+        .unwrap()
+        .record(by)
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+
+    let tenants = trail_of(store, Entity::Tenant).await;
+    assert_eq!(tenants.len(), 1);
+    assert_eq!(tenants[0].entity_id, "acme");
+    assert_eq!(tenants[0].through, "/_ip/tenants");
+    let accounts = trail_of(store, Entity::User).await;
+    assert_eq!(accounts.len(), 1, "the owner was created here too");
+    assert_eq!(accounts[0].entity_id, "alice");
+    assert_eq!(accounts[0].tenant, None, "an account is nobody's tenant");
 }

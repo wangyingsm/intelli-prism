@@ -206,10 +206,13 @@ mod tests {
     async fn store() -> SqliteStore {
         let store = SqliteStore::in_memory().await.unwrap();
         store
-            .create_tenant(NewTenant {
-                id: TenantId::new("acme").unwrap(),
-                key: TnKey::generate().unwrap(),
-            })
+            .create_tenant(
+                NewTenant {
+                    id: TenantId::new("acme").unwrap(),
+                    key: TnKey::generate().unwrap(),
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/tenants"),
+            )
             .await
             .unwrap();
         for (user, kind) in [

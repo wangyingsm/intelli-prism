@@ -109,7 +109,7 @@ mod tests {
     use crate::price::PriceStore;
     use crate::route::RouteStore;
     use crate::sqlite::fixture::*;
-    use crate::store::UserStore;
+    use crate::store::{TenantStore, UserStore};
     use crate::suite::limit::{by, monthly};
     use crate::suite::price::priced_at;
 
@@ -272,6 +272,34 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the account survived a transaction that could not record it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_whose_record_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .create_tenant(
+                    crate::suite::fixture::new_tenant(),
+                    &crate::suite::identity::tenants_by(),
+                )
+                .await
+                .is_err(),
+            "a tenant was created with nothing to record it"
+        );
+        assert!(
+            store
+                .tenant(&crate::suite::fixture::tenant_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "the tenant survived a transaction that could not record it"
         );
     }
 }

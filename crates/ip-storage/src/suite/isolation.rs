@@ -44,10 +44,13 @@ fn their_user() -> ip_core::UserId {
 async fn two_tenants(store: &impl Backend) {
     tenant_with_user(store).await;
     store
-        .create_tenant(NewTenant {
-            id: theirs(),
-            key: TnKey::generate().unwrap(),
-        })
+        .create_tenant(
+            NewTenant {
+                id: theirs(),
+                key: TnKey::generate().unwrap(),
+            },
+            &crate::suite::identity::tenants_by(),
+        )
         .await
         .unwrap();
     store

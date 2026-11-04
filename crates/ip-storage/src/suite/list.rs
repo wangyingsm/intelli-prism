@@ -29,7 +29,10 @@ fn items<T: Clone>(listed: &[Listed<T>]) -> Vec<T> {
 
 /// Acme with five members, attached one after another from `m1` to `m5`.
 async fn five_members(store: &impl Backend) -> Vec<UserId> {
-    store.create_tenant(new_tenant()).await.unwrap();
+    store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     let mut members = Vec::new();
     for n in 1..=5 {
         let id = user(&format!("m{n}"));
@@ -103,10 +106,13 @@ pub(crate) async fn a_moment_to_list_after_keeps_what_came_before_it_out(store: 
 pub(crate) async fn grants_are_listed_newest_first_by_where_they_are_held(store: &impl Backend) {
     tenant_with_user(store).await;
     store
-        .create_tenant(NewTenant {
-            id: globex(),
-            key: TnKey::generate().unwrap(),
-        })
+        .create_tenant(
+            NewTenant {
+                id: globex(),
+                key: TnKey::generate().unwrap(),
+            },
+            &crate::suite::identity::tenants_by(),
+        )
         .await
         .unwrap();
     let inside = |tenant: TenantId| CapabilityScope::Tenant {
@@ -247,10 +253,13 @@ pub(crate) async fn rules_are_listed_by_chain_newest_first(store: &impl Backend)
 pub(crate) async fn plugins_are_listed_to_the_chain_that_owns_them(store: &impl Backend) {
     tenant_with_user(store).await;
     store
-        .create_tenant(NewTenant {
-            id: globex(),
-            key: TnKey::generate().unwrap(),
-        })
+        .create_tenant(
+            NewTenant {
+                id: globex(),
+                key: TnKey::generate().unwrap(),
+            },
+            &crate::suite::identity::tenants_by(),
+        )
         .await
         .unwrap();
     let acme = PluginOwner::Tenant(tenant_id());

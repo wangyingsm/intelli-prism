@@ -72,9 +72,9 @@ impl FailingStore {
 
 #[async_trait]
 impl TenantStore for FailingStore {
-    async fn create_tenant(&self, new: NewTenant) -> Result<Tenant, StorageError> {
+    async fn create_tenant(&self, new: NewTenant, by: &By) -> Result<Tenant, StorageError> {
         self.answering()?;
-        self.inner.create_tenant(new).await
+        self.inner.create_tenant(new, by).await
     }
 
     async fn tenant(&self, id: &TenantId) -> Result<Option<Tenant>, StorageError> {
@@ -82,9 +82,9 @@ impl TenantStore for FailingStore {
         self.inner.tenant(id).await
     }
 
-    async fn delete_tenant(&self, id: &TenantId) -> Result<(), StorageError> {
+    async fn delete_tenant(&self, id: &TenantId, by: &By) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.delete_tenant(id).await
+        self.inner.delete_tenant(id, by).await
     }
 }
 
@@ -472,7 +472,10 @@ mod tests {
             id: TenantId::new("acme").unwrap(),
             key: ip_core::TnKey::generate().unwrap(),
         };
-        store.create_tenant(tenant).await.unwrap();
+        store
+            .create_tenant(tenant, &crate::suite::identity::tenants_by())
+            .await
+            .unwrap();
         assert!(
             store
                 .tenant(&TenantId::new("acme").unwrap())

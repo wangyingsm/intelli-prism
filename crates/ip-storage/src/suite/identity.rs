@@ -11,6 +11,11 @@ pub(crate) fn accounts_by() -> By {
     By::new(crate::suite::fixture::user_id(), "/_ip/users")
 }
 
+/// The account every suite test writes a tenant as, through the endpoint that does.
+pub(crate) fn tenants_by() -> By {
+    By::new(crate::suite::fixture::user_id(), "/_ip/tenants")
+}
+
 fn api_grant(user: &UserId, tenant: &TenantId, capability: Capability) -> Grant {
     Grant::new(
         capability,
@@ -29,7 +34,10 @@ pub(crate) async fn a_fresh_database_is_migrated_and_empty(store: &impl Storage)
 }
 
 pub(crate) async fn a_tenant_round_trips_with_its_key_intact(store: &impl Storage) {
-    let created = store.create_tenant(new_tenant()).await.unwrap();
+    let created = store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     let read = store.tenant(&tenant_id()).await.unwrap().unwrap();
     assert_eq!(read.row_id, created.row_id);
     assert_eq!(read.key, created.key);
@@ -37,12 +45,18 @@ pub(crate) async fn a_tenant_round_trips_with_its_key_intact(store: &impl Storag
 }
 
 pub(crate) async fn the_primary_key_is_an_integer_the_backend_assigns(store: &impl Storage) {
-    let first = store.create_tenant(new_tenant()).await.unwrap();
+    let first = store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     let second = store
-        .create_tenant(NewTenant {
-            id: TenantId::new("globex").unwrap(),
-            key: TnKey::generate().unwrap(),
-        })
+        .create_tenant(
+            NewTenant {
+                id: TenantId::new("globex").unwrap(),
+                key: TnKey::generate().unwrap(),
+            },
+            &crate::suite::identity::tenants_by(),
+        )
         .await
         .unwrap();
     assert_eq!(first.row_id, TenantRowId::new(1));
@@ -50,9 +64,14 @@ pub(crate) async fn the_primary_key_is_an_integer_the_backend_assigns(store: &im
 }
 
 pub(crate) async fn a_repeated_tenant_id_conflicts(store: &impl Storage) {
-    store.create_tenant(new_tenant()).await.unwrap();
+    store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     assert!(matches!(
-        store.create_tenant(new_tenant()).await,
+        store
+            .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+            .await,
         Err(StorageError::Conflict {
             entity: Entity::Tenant,
             ..
@@ -106,7 +125,9 @@ pub(crate) async fn the_account_kind_survives_a_round_trip(store: &impl Storage)
 
 pub(crate) async fn deleting_what_is_absent_reports_it_missing(store: &impl Storage) {
     assert!(matches!(
-        store.delete_tenant(&tenant_id()).await,
+        store
+            .delete_tenant(&tenant_id(), &crate::suite::identity::tenants_by())
+            .await,
         Err(StorageError::NotFound {
             entity: Entity::Tenant,
             ..
@@ -160,7 +181,10 @@ pub(crate) async fn attaching_to_a_tenant_that_is_not_there_reports_it_missing(
 }
 
 pub(crate) async fn attaching_a_user_that_is_not_there_reports_it_missing(store: &impl Storage) {
-    store.create_tenant(new_tenant()).await.unwrap();
+    store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     assert!(matches!(
         store
             .attach(Membership {
@@ -249,7 +273,10 @@ pub(crate) async fn deleting_a_tenant_takes_its_memberships_and_grants_with_it(
         .grant(&api_grant(&user_id(), &tenant_id(), Capability::ApiAccess))
         .await
         .unwrap();
-    store.delete_tenant(&tenant_id()).await.unwrap();
+    store
+        .delete_tenant(&tenant_id(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     assert!(
         store
             .memberships_of_user(&user_id())

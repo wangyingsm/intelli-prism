@@ -26,10 +26,13 @@ fn elsewhere() -> TenantId {
 async fn member_of_two(store: &impl MemberRemoveStore) -> [Grant; 4] {
     tenant_with_user(store).await;
     store
-        .create_tenant(NewTenant {
-            id: elsewhere(),
-            key: TnKey::generate().unwrap(),
-        })
+        .create_tenant(
+            NewTenant {
+                id: elsewhere(),
+                key: TnKey::generate().unwrap(),
+            },
+            &crate::suite::identity::tenants_by(),
+        )
         .await
         .unwrap();
     for tenant in [tenant_id(), elsewhere()] {

@@ -19,7 +19,10 @@ impl<T> MemberAddStore for T where
 }
 
 pub(crate) async fn a_member_lands_with_its_attachment(store: &impl MemberAddStore) {
-    store.create_tenant(new_tenant()).await.unwrap();
+    store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
 
     let added = store
         .begin_member_add()
@@ -50,7 +53,10 @@ pub(crate) async fn a_member_lands_with_its_attachment(store: &impl MemberAddSto
 }
 
 pub(crate) async fn a_member_nobody_commits_leaves_no_user_behind(store: &impl MemberAddStore) {
-    store.create_tenant(new_tenant()).await.unwrap();
+    store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
 
     let attached = store
         .begin_member_add()
@@ -97,7 +103,10 @@ pub(crate) async fn a_tenant_that_is_not_there_takes_the_user_with_it(store: &im
 }
 
 pub(crate) async fn a_member_may_be_added_as_the_owner(store: &impl MemberAddStore) {
-    store.create_tenant(new_tenant()).await.unwrap();
+    store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
 
     let added = store
         .begin_member_add()
@@ -118,7 +127,10 @@ pub(crate) async fn a_member_may_be_added_as_the_owner(store: &impl MemberAddSto
 }
 
 pub(crate) async fn a_user_id_that_is_taken_conflicts(store: &impl MemberAddStore) {
-    store.create_tenant(new_tenant()).await.unwrap();
+    store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     let taken = UserId::new("taken").unwrap();
     store
         .create_user(

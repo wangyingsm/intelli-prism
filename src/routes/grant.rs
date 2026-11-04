@@ -407,10 +407,13 @@ mod tests {
         let store = SqliteStore::in_memory().await.unwrap();
         for name in ["acme", "globex"] {
             store
-                .create_tenant(NewTenant {
-                    id: tenant(name),
-                    key: TnKey::generate().unwrap(),
-                })
+                .create_tenant(
+                    NewTenant {
+                        id: tenant(name),
+                        key: TnKey::generate().unwrap(),
+                    },
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/tenants"),
+                )
                 .await
                 .unwrap();
         }

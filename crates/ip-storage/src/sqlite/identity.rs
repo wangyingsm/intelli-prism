@@ -18,6 +18,70 @@ use crate::transaction::member_remove::{
 };
 use crate::transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
 
+/// Creates a tenant and records it, both on the one connection its caller commits.
+async fn adding_tenant(
+    connection: &mut SqliteConnection,
+    new: NewTenant,
+    by: &By,
+) -> Result<Tenant, StorageError> {
+    let added = insert_tenant(&mut *connection, new).await?;
+    super::audit::record(connection, NewAudit::created(by.clone(), &added)).await?;
+    Ok(added)
+}
+
+/// Deletes a tenant and records the deletion, on the one connection its caller commits.
+async fn dropping_tenant(
+    connection: &mut SqliteConnection,
+    id: &TenantId,
+    by: &By,
+) -> Result<(), StorageError> {
+    let before = read_tenant(&mut *connection, id).await?;
+    let deleted = sqlx::query("DELETE FROM tenants WHERE id = ?")
+        .bind(id.as_str())
+        .execute(&mut *connection)
+        .await
+        .map_err(StorageError::backend)?
+        .rows_affected();
+    if deleted == 0 {
+        return Err(StorageError::NotFound {
+            entity: Entity::Tenant,
+            id: id.to_string(),
+        });
+    }
+    // A row was deleted, so something was there to read a moment ago in the same
+    // transaction; an absent before here would mean the two disagree.
+    let Some(before) = before else {
+        return Err(StorageError::Malformed {
+            entity: Entity::Tenant,
+            detail: "a tenant was deleted that nothing could read".to_owned(),
+        });
+    };
+    super::audit::record(connection, NewAudit::removed(by.clone(), &before)).await?;
+    Ok(())
+}
+
+/// One tenant, over whichever connection it is given. Read inside the transaction that is
+/// about to change it, so the before it records is the before that went.
+pub(super) async fn read_tenant(
+    connection: &mut SqliteConnection,
+    id: &TenantId,
+) -> Result<Option<Tenant>, StorageError> {
+    let Some(row) = sqlx::query("SELECT row_id, key, created_at FROM tenants WHERE id = ?")
+        .bind(id.as_str())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(StorageError::backend)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Tenant {
+        row_id: TenantRowId::new(row.get("row_id")),
+        id: id.clone(),
+        key: tenant_key(row.get("key"))?,
+        created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
+    }))
+}
+
 /// Creates an account and records it, both on the one connection its caller commits.
 ///
 /// Apart from the method so that every way out of it is a `?` the caller can roll back,
@@ -295,41 +359,39 @@ pub(super) async fn user_row_id(
 
 #[async_trait]
 impl TenantStore for SqliteStore {
-    async fn create_tenant(&self, new: NewTenant) -> Result<Tenant, StorageError> {
-        insert_tenant(&mut *self.connection().await?, new).await
+    async fn create_tenant(&self, new: NewTenant, by: &By) -> Result<Tenant, StorageError> {
+        // One transaction, so a tenant that lands without its record is not a state this
+        // store can be left in, and neither is a record whose tenant rolled back.
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        // Rolled back by hand rather than by dropping it: a transaction left to its
+        // `Drop` keeps the connection's locks until the pool gets round to it, and a
+        // scratch schema being torn down behind it waits for ever.
+        match adding_tenant(&mut transaction, new, by).await {
+            Ok(added) => transaction
+                .commit()
+                .await
+                .map_err(StorageError::backend)
+                .map(|()| added),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn tenant(&self, id: &TenantId) -> Result<Option<Tenant>, StorageError> {
-        let Some(row) = sqlx::query("SELECT row_id, key, created_at FROM tenants WHERE id = ?")
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Tenant {
-            row_id: TenantRowId::new(row.get("row_id")),
-            id: id.clone(),
-            key: tenant_key(row.get("key"))?,
-            created_at: Timestamp::from_unix_seconds(row.get("created_at"))?,
-        }))
+        read_tenant(&mut *self.connection().await?, id).await
     }
 
-    async fn delete_tenant(&self, id: &TenantId) -> Result<(), StorageError> {
-        let deleted = sqlx::query("DELETE FROM tenants WHERE id = ?")
-            .bind(id.as_str())
-            .execute(&self.pool)
-            .await
-            .map_err(StorageError::backend)?
-            .rows_affected();
-        if deleted == 0 {
-            return Err(StorageError::NotFound {
-                entity: Entity::Tenant,
-                id: id.to_string(),
-            });
+    async fn delete_tenant(&self, id: &TenantId, by: &By) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        match dropping_tenant(&mut transaction, id, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
-        Ok(())
     }
 }
 

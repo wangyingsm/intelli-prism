@@ -37,7 +37,7 @@ pub trait AuditDialect: Database {
 /// Sqlite binds `?` and postgres binds `$1`, so the statements cannot be shared. What is
 /// shared is the order they run in, which each workflow fixes at compile time.
 #[async_trait]
-pub trait IdentityDialect: Database {
+pub trait IdentityDialect: AuditDialect {
     /// Writes a tenant row.
     async fn insert_tenant(
         connection: &mut Self::Connection,

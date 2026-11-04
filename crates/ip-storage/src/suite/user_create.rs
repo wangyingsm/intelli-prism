@@ -30,6 +30,9 @@ pub(crate) async fn a_committed_transaction_lands_every_write(store: &impl UserC
         .attach(Standing::Owner)
         .await
         .unwrap()
+        .record(crate::suite::identity::tenants_by())
+        .await
+        .unwrap()
         .commit()
         .await
         .unwrap();
@@ -130,6 +133,9 @@ pub(crate) async fn a_transaction_reads_back_what_it_has_written(store: &impl Us
         .attach(Standing::Owner)
         .await
         .unwrap()
+        .record(crate::suite::identity::tenants_by())
+        .await
+        .unwrap()
         .commit()
         .await
         .unwrap();
@@ -158,6 +164,9 @@ pub(crate) async fn an_owner_is_attached_to_the_tenant_the_transaction_wrote(
         .attach(Standing::Member)
         .await
         .unwrap()
+        .record(crate::suite::identity::tenants_by())
+        .await
+        .unwrap()
         .commit()
         .await
         .unwrap();
@@ -167,7 +176,10 @@ pub(crate) async fn an_owner_is_attached_to_the_tenant_the_transaction_wrote(
 }
 
 pub(crate) async fn writes_outside_a_transaction_are_not_rolled_back(store: &impl UserCreateStore) {
-    store.create_tenant(new_tenant()).await.unwrap();
+    store
+        .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     drop(store.begin_user_create().await.unwrap());
     assert!(store.tenant(&tenant_id()).await.unwrap().is_some());
 }

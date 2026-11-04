@@ -16,13 +16,13 @@ use crate::usage::UsageStore;
 #[async_trait]
 pub trait TenantStore: Send + Sync {
     /// Creates a tenant, or reports a conflict when the id is taken.
-    async fn create_tenant(&self, new: NewTenant) -> Result<Tenant, StorageError>;
+    async fn create_tenant(&self, new: NewTenant, by: &By) -> Result<Tenant, StorageError>;
 
     /// Reads one tenant.
     async fn tenant(&self, id: &TenantId) -> Result<Option<Tenant>, StorageError>;
 
     /// Deletes a tenant, or reports it missing.
-    async fn delete_tenant(&self, id: &TenantId) -> Result<(), StorageError>;
+    async fn delete_tenant(&self, id: &TenantId, by: &By) -> Result<(), StorageError>;
 }
 
 /// Reads and writes users.
@@ -154,7 +154,7 @@ mod tests {
 
     #[async_trait]
     impl TenantStore for MemoryStore {
-        async fn create_tenant(&self, new: NewTenant) -> Result<Tenant, StorageError> {
+        async fn create_tenant(&self, new: NewTenant, _by: &By) -> Result<Tenant, StorageError> {
             let mut tenants = self.tenants.lock().unwrap();
             if tenants.contains_key(&new.id) {
                 return Err(StorageError::Conflict {
@@ -176,7 +176,7 @@ mod tests {
             Ok(self.tenants.lock().unwrap().get(id).cloned())
         }
 
-        async fn delete_tenant(&self, id: &TenantId) -> Result<(), StorageError> {
+        async fn delete_tenant(&self, id: &TenantId, _by: &By) -> Result<(), StorageError> {
             self.tenants
                 .lock()
                 .unwrap()
@@ -379,7 +379,10 @@ mod tests {
     #[tokio::test]
     async fn the_whole_surface_is_reachable_through_one_trait_object() {
         let store = store();
-        let tenant = store.create_tenant(new_tenant()).await.unwrap();
+        let tenant = store
+            .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+            .await
+            .unwrap();
         let user = store
             .create_user(new_user(), &crate::suite::identity::accounts_by())
             .await
@@ -428,7 +431,10 @@ mod tests {
     #[tokio::test]
     async fn every_created_row_gets_its_own_primary_key() {
         let store = store();
-        let tenant = store.create_tenant(new_tenant()).await.unwrap();
+        let tenant = store
+            .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+            .await
+            .unwrap();
         let user = store
             .create_user(new_user(), &crate::suite::identity::accounts_by())
             .await
@@ -440,9 +446,14 @@ mod tests {
     #[tokio::test]
     async fn creating_the_same_tenant_twice_conflicts() {
         let store = store();
-        store.create_tenant(new_tenant()).await.unwrap();
+        store
+            .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+            .await
+            .unwrap();
         assert!(matches!(
-            store.create_tenant(new_tenant()).await,
+            store
+                .create_tenant(new_tenant(), &crate::suite::identity::tenants_by())
+                .await,
             Err(StorageError::Conflict {
                 entity: Entity::Tenant,
                 ..

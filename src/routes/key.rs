@@ -230,10 +230,13 @@ mod tests {
             ("globex", TnKey::generate().unwrap()),
         ] {
             store
-                .create_tenant(NewTenant {
-                    id: tenant(name),
-                    key,
-                })
+                .create_tenant(
+                    NewTenant {
+                        id: tenant(name),
+                        key,
+                    },
+                    &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/tenants"),
+                )
                 .await
                 .unwrap();
         }

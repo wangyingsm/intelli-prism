@@ -1,8 +1,10 @@
 //! Creating a tenant together with the owner account that represents it.
 
+use ip_core::Timestamp;
 use typestate_txn::transaction;
 
 use super::IdentityDialect;
+use crate::audit::{By, NewAudit};
 use crate::error::StorageError;
 use crate::model::{Membership, NewTenant, NewUser, Standing, Tenant, TenantWithOwner, User};
 
@@ -29,6 +31,11 @@ transaction! {
             };
             DB::insert_membership(carrier, membership.clone()).await?;
             membership
+        }
+        record(by: By) -> recorded_at: Timestamp as Recorded {
+            let at = DB::insert_audit(carrier, NewAudit::created(by.clone(), &tenant)).await?;
+            DB::insert_audit(carrier, NewAudit::created(by, &owner)).await?;
+            at
         }
     }
 }

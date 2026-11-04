@@ -108,11 +108,17 @@ pub(crate) async fn what_a_tenant_spent_outlives_the_tenant(
     store: &(impl UsageStore + crate::store::TenantStore),
 ) {
     let tenant = store
-        .create_tenant(crate::suite::fixture::new_tenant())
+        .create_tenant(
+            crate::suite::fixture::new_tenant(),
+            &crate::suite::identity::tenants_by(),
+        )
         .await
         .unwrap();
     let recorded = store.record_usage(spent()).await.unwrap();
-    store.delete_tenant(&tenant.id).await.unwrap();
+    store
+        .delete_tenant(&tenant.id, &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     assert_eq!(
         store.usage(recorded.row_id).await.unwrap().unwrap(),
         recorded

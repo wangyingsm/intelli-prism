@@ -307,10 +307,13 @@ pub(crate) async fn a_tenant_reads_its_own_rules_and_the_global_ones(store: &imp
     tenant_with_user(store).await;
     let globex = TenantId::new("globex").unwrap();
     store
-        .create_tenant(NewTenant {
-            id: globex.clone(),
-            key: TnKey::generate().unwrap(),
-        })
+        .create_tenant(
+            NewTenant {
+                id: globex.clone(),
+                key: TnKey::generate().unwrap(),
+            },
+            &crate::suite::identity::tenants_by(),
+        )
         .await
         .unwrap();
     let record = stored_for(
@@ -398,7 +401,10 @@ pub(crate) async fn deleting_a_tenant_takes_its_rules_with_it(store: &impl Plugi
         .put_rule(placed(record.checksum, 100, acme_wide()), &rules_by())
         .await
         .unwrap();
-    store.delete_tenant(&tenant_id()).await.unwrap();
+    store
+        .delete_tenant(&tenant_id(), &crate::suite::identity::tenants_by())
+        .await
+        .unwrap();
     let left = store.rules().await.unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].scope(), &PluginScope::Global);

@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 use ip_auth::{Passphrase, PassphraseHasher};
 use ip_core::{Capability, CapabilityScope, PassphraseHash, TenantId, Timestamp, TnKey, UserId};
 use ip_storage::{
-    AccountKind, IdentityDialect, NewTenant, NewUser, Standing, Storage, StorageError, Tenant,
+    AccountKind, By, IdentityDialect, NewTenant, NewUser, Standing, Storage, StorageError, Tenant,
     TenantWithOwner, UserCreateBegun, UserCreateTransactional, UserCreateTxn,
 };
 
@@ -22,6 +22,9 @@ pub fn router() -> Router<AppState> {
         .route("/", post(create))
         .route("/{tenant}", get(read).delete(remove))
 }
+
+/// What the audit trail records a change here as having come through.
+const ENDPOINT: &str = "/_ip/tenants";
 
 /// What creating a tenant is asked for.
 #[derive(Debug, serde::Deserialize)]
@@ -57,7 +60,7 @@ pub struct CreatedTenant {
     pub created_at: Timestamp,
 }
 
-/// Everything the three writes need, so the service takes one argument.
+/// Everything the four writes need, so the service takes one argument.
 pub struct NewTenantWithOwner {
     /// The tenant to create.
     pub tenant: TenantId,
@@ -67,11 +70,13 @@ pub struct NewTenantWithOwner {
     pub owner: UserId,
     /// That account's verifier.
     pub passphrase: PassphraseHash,
+    /// Who is creating all three, and through what.
+    pub by: By,
 }
 
 /// Creates a tenant, the account that owns it, and their attachment.
 ///
-/// One endpoint, three writes, one transaction: the typestate is what keeps the writes in
+/// One endpoint, four writes, one transaction: the typestate is what keeps the writes in
 /// their only workable order, and the transaction is what keeps a failure halfway through
 /// from leaving a tenant nobody owns.
 async fn create(
@@ -100,6 +105,7 @@ async fn create(
         key,
         owner,
         passphrase,
+        by: By::new(manager.user().clone(), ENDPOINT),
     };
     match create_with_owner(state.stores(), new).await {
         Ok(created) => (StatusCode::CREATED, Json(CreatedTenant::from(created))).into_response(),
@@ -143,7 +149,8 @@ async fn remove(
     let Ok(tenant) = TenantId::new(&tenant) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match store.delete_tenant(&tenant).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match store.delete_tenant(&tenant, &by).await {
         Ok(()) => {
             state.feed().after_change().await;
             StatusCode::NO_CONTENT.into_response()
@@ -200,7 +207,7 @@ async fn create_with_owner(
     }
 }
 
-/// The three writes, in the order the typestate allows them in.
+/// The four writes, in the order the typestate allows them in.
 async fn in_one_transaction<DB: IdentityDialect>(
     transaction: UserCreateTxn<DB, UserCreateBegun>,
     new: NewTenantWithOwner,
@@ -218,6 +225,8 @@ async fn in_one_transaction<DB: IdentityDialect>(
         })
         .await?
         .attach(Standing::Owner)
+        .await?
+        .record(new.by)
         .await?
         .commit()
         .await
@@ -270,10 +279,13 @@ mod tests {
     async fn fixture() -> (Router, AppState) {
         let store = SqliteStore::in_memory().await.unwrap();
         store
-            .create_tenant(NewTenant {
-                id: tenant_id(),
-                key: TnKey::generate().unwrap(),
-            })
+            .create_tenant(
+                NewTenant {
+                    id: tenant_id(),
+                    key: TnKey::generate().unwrap(),
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/tenants"),
+            )
             .await
             .unwrap();
         for (id, kind) in [
@@ -478,10 +490,13 @@ mod tests {
         let cookie = cookie_of(&state, &member_id()).await;
         state
             .store()
-            .create_tenant(NewTenant {
-                id: TenantId::new("globex").unwrap(),
-                key: TnKey::generate().unwrap(),
-            })
+            .create_tenant(
+                NewTenant {
+                    id: TenantId::new("globex").unwrap(),
+                    key: TnKey::generate().unwrap(),
+                },
+                &ip_storage::By::new(ip_core::UserId::new("root").unwrap(), "/_ip/tenants"),
+            )
             .await
             .unwrap();
 

@@ -45,6 +45,31 @@ pub struct Tenant {
     pub created_at: Timestamp,
 }
 
+impl crate::audit::Auditable for Tenant {
+    fn entity(&self) -> crate::error::Entity {
+        crate::error::Entity::Tenant
+    }
+
+    fn entity_id(&self) -> String {
+        self.id.to_string()
+    }
+
+    /// Its own: what is done to a tenant belongs in the trail that tenant is shown.
+    fn tenant(&self) -> Option<TenantId> {
+        Some(self.id.clone())
+    }
+
+    /// The root key is deliberately absent, for the reason the passphrase verifier is
+    /// absent from an account: every `UtKey` under the tenant is derived from it, so a
+    /// trail carrying it would hand its reader every key the tenant ever issues.
+    fn audited(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id.as_str(),
+            "created_at": self.created_at.unix_seconds(),
+        })
+    }
+}
+
 /// A tenant about to be created.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewTenant {
@@ -139,6 +164,8 @@ pub struct TenantWithOwner {
     pub owner: User,
     /// How the owner is attached to it.
     pub membership: Membership,
+    /// When the pair was recorded as created.
+    pub recorded_at: Timestamp,
 }
 
 /// A user and the attachment created with it.
