@@ -233,7 +233,7 @@ impl From<MemberRemoved> for DetachedView {
         Self {
             user: removed.membership.user.to_string(),
             tenant: removed.membership.tenant.to_string(),
-            revoked: removed.revoked,
+            revoked: removed.revoked.len() as u64,
         }
     }
 }

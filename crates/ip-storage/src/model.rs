@@ -1,4 +1,4 @@
-use ip_core::{PassphraseHash, TenantId, Timestamp, TnKey, UserId};
+use ip_core::{Grant, PassphraseHash, TenantId, Timestamp, TnKey, UserId};
 
 /// Surrogate primary key of a stored tenant row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -204,13 +204,13 @@ pub struct UserWithMembership {
     pub recorded_at: Timestamp,
 }
 
-/// An attachment that was removed, and how many grants went with it.
+/// An attachment that was removed, and the grants that went with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberRemoved {
     /// The attachment as it was.
     pub membership: Membership,
-    /// How many grants the user held inside that tenant, all now revoked.
-    pub revoked: u64,
+    /// Every grant the user held inside that tenant, all now revoked.
+    pub revoked: Vec<Grant>,
     /// When the removal was recorded.
     pub recorded_at: Timestamp,
 }

@@ -112,6 +112,7 @@ mod tests {
     use crate::store::{GrantStore, MembershipStore, TenantStore, UserStore};
     use crate::suite::limit::{by, monthly};
     use crate::suite::price::priced_at;
+    use crate::transaction::member_remove::MemberRemoveTransactional;
 
     /// The other half of the pair: a change whose record cannot be written does not
     /// happen either.
@@ -363,6 +364,70 @@ mod tests {
         assert!(
             store.grants_of(&user.id).await.unwrap().is_empty(),
             "the grant survived a transaction that could not record it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_whose_records_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        let (_, user) = tenant_with_user(&store).await;
+        store
+            .attach(
+                crate::model::Membership {
+                    user: user.id.clone(),
+                    tenant: tenant_id(),
+                    standing: crate::model::Standing::Member,
+                },
+                &crate::suite::identity::members_by(),
+            )
+            .await
+            .unwrap();
+        let grant = ip_core::Grant::new(
+            ip_core::Capability::ApiAccess,
+            ip_core::CapabilityScope::Api {
+                user: user.id.clone(),
+                tenant: tenant_id(),
+                api: ip_core::ApiId::new("chat").unwrap(),
+            },
+        )
+        .unwrap();
+        store
+            .grant(&grant, &crate::suite::identity::grants_by())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .begin_member_remove()
+                .await
+                .unwrap()
+                .detach(user.id.clone(), tenant_id())
+                .await
+                .unwrap()
+                .revoke_grants()
+                .await
+                .unwrap()
+                .record(crate::suite::identity::members_by())
+                .await
+                .is_err(),
+            "a member was taken out with nothing to record the sweep"
+        );
+        assert_eq!(
+            store.grants_of(&user.id).await.unwrap().len(),
+            1,
+            "the swept grant survived a transaction that could not record it"
+        );
+        assert!(
+            store
+                .membership(&user.id, &tenant_id())
+                .await
+                .unwrap()
+                .is_some(),
+            "and so did the attachment it went with"
         );
     }
 }

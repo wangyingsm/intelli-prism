@@ -830,6 +830,145 @@ pub(crate) async fn a_grant_against_an_account_belongs_to_no_tenant(store: &impl
     );
 }
 
+/// Leaving a tenant records every grant the sweep took away, one row each, so an incident
+/// asking what somebody lost on the way out is not left with a count.
+pub(crate) async fn leaving_a_tenant_records_every_grant_it_took_away(
+    store: &(impl Backend + crate::transaction::member_remove::MemberRemoveTransactional),
+) {
+    a_member_holding(
+        store,
+        &[api_access(), inside_the_tenant(), on_the_account()],
+    )
+    .await;
+    detach_the_member(store).await;
+
+    let swept: Vec<_> = trail_of(store, Entity::Grant)
+        .await
+        .into_iter()
+        .filter(|one| one.after.is_none())
+        .collect();
+    assert_eq!(swept.len(), 2, "the two held inside, and not the third");
+    let ids: Vec<&str> = swept.iter().map(|one| one.entity_id.as_str()).collect();
+    assert!(ids.contains(&"api_access on alice@acme/chat"));
+    assert!(ids.contains(&"user_mgr on alice@acme"));
+    for one in &swept {
+        assert_eq!(one.tenant, Some(tenant_id()), "the tenant it was held in");
+        assert_eq!(
+            one.through, "/_ip/tenants/{tenant}/members",
+            "the endpoint that took the member out, not the one that grants"
+        );
+        assert_eq!(one.before.as_ref().unwrap()["user"], "alice");
+    }
+}
+
+/// The grant held against the account itself survives being taken out of a tenant, and the
+/// trail says nothing about it: a tenant's sweep is not the deployment's business.
+pub(crate) async fn leaving_a_tenant_leaves_what_is_held_outside_it(
+    store: &(impl Backend + crate::transaction::member_remove::MemberRemoveTransactional),
+) {
+    a_member_holding(store, &[api_access(), on_the_account()]).await;
+    detach_the_member(store).await;
+
+    let left = store
+        .grants_of(&crate::suite::fixture::user_id())
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 1, "the account's own grant is still held");
+    let swept: Vec<_> = trail_of(store, Entity::Grant)
+        .await
+        .into_iter()
+        .filter(|one| one.after.is_none())
+        .collect();
+    assert_eq!(swept.len(), 1);
+    assert_eq!(swept[0].entity_id, "api_access on alice@acme/chat");
+}
+
+/// A member who held nothing inside leaves no grant rows behind: the sweep found nothing, and
+/// a row saying otherwise would invent a revocation that never happened.
+pub(crate) async fn leaving_a_tenant_holding_nothing_records_only_the_attachment(
+    store: &(impl Backend + crate::transaction::member_remove::MemberRemoveTransactional),
+) {
+    a_member_holding(store, &[]).await;
+    detach_the_member(store).await;
+
+    assert!(
+        trail_of(store, Entity::Grant).await.is_empty(),
+        "nothing was swept, so nothing is recorded"
+    );
+    assert_eq!(
+        trail_of(store, Entity::Membership).await.len(),
+        2,
+        "attached, then removed"
+    );
+}
+
+/// Attaches the fixture's account to the fixture's tenant, holding the grants given.
+async fn a_member_holding(store: &impl Backend, grants: &[ip_core::Grant]) {
+    tenant_with_user(store).await;
+    store
+        .attach(
+            crate::model::Membership {
+                user: crate::suite::fixture::user_id(),
+                tenant: tenant_id(),
+                standing: crate::model::Standing::Member,
+            },
+            &crate::suite::identity::members_by(),
+        )
+        .await
+        .unwrap();
+    for grant in grants {
+        store
+            .grant(grant, &crate::suite::identity::grants_by())
+            .await
+            .unwrap();
+    }
+}
+
+/// Runs the whole removal, through the endpoint that detaches a member.
+async fn detach_the_member(
+    store: &(impl Backend + crate::transaction::member_remove::MemberRemoveTransactional),
+) {
+    store
+        .begin_member_remove()
+        .await
+        .unwrap()
+        .detach(crate::suite::fixture::user_id(), tenant_id())
+        .await
+        .unwrap()
+        .revoke_grants()
+        .await
+        .unwrap()
+        .record(crate::suite::identity::members_by())
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+}
+
+/// A grant held across the whole tenant rather than against one api.
+fn inside_the_tenant() -> ip_core::Grant {
+    ip_core::Grant::new(
+        ip_core::Capability::UserMgr,
+        ip_core::CapabilityScope::Tenant {
+            user: crate::suite::fixture::user_id(),
+            tenant: tenant_id(),
+        },
+    )
+    .unwrap()
+}
+
+/// A grant held against the account itself, which no tenant's sweep reaches.
+fn on_the_account() -> ip_core::Grant {
+    ip_core::Grant::new(
+        ip_core::Capability::TenantMgr,
+        ip_core::CapabilityScope::User {
+            user: crate::suite::fixture::user_id(),
+        },
+    )
+    .unwrap()
+}
+
 /// The one grant every test above hands over.
 fn api_access() -> ip_core::Grant {
     ip_core::Grant::new(

@@ -248,6 +248,9 @@ macro_rules! backend_suite {
             taking_a_grant_back_records_what_went,
             taking_back_a_grant_that_is_not_held_records_nothing,
             a_grant_against_an_account_belongs_to_no_tenant,
+            leaving_a_tenant_records_every_grant_it_took_away,
+            leaving_a_tenant_leaves_what_is_held_outside_it,
+            leaving_a_tenant_holding_nothing_records_only_the_attachment,
         ]);
     };
     (price, $open:path) => {

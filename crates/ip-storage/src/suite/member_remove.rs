@@ -82,7 +82,7 @@ async fn member_of_two(store: &impl MemberRemoveStore) -> [Grant; 4] {
 pub(crate) async fn a_member_leaves_with_every_grant_it_held_inside(
     store: &impl MemberRemoveStore,
 ) {
-    let [_, _, observer, tenant_mgr] = member_of_two(store).await;
+    let [user_mgr, api_access, observer, tenant_mgr] = member_of_two(store).await;
 
     let removed = store
         .begin_member_remove()
@@ -103,7 +103,13 @@ pub(crate) async fn a_member_leaves_with_every_grant_it_held_inside(
 
     assert_eq!(removed.membership.tenant, tenant_id());
     assert_eq!(removed.membership.standing, Standing::Member);
-    assert_eq!(removed.revoked, 2);
+    assert_eq!(
+        removed.revoked.len(),
+        2,
+        "both grants held inside came back"
+    );
+    assert!(removed.revoked.contains(&user_mgr));
+    assert!(removed.revoked.contains(&api_access));
     assert!(
         store
             .membership(&user_id(), &tenant_id())

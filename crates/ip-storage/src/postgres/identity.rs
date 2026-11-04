@@ -414,24 +414,32 @@ pub(super) async fn delete_membership(
 }
 
 /// Revokes every grant one user holds inside one tenant over whichever connection it is
-/// given, reporting how many it held.
+/// given, handing back the ones that went.
+///
+/// The grants come back rather than a count because the trail records one row each, and a
+/// count cannot answer which capability somebody lost on the way out of a tenant.
 pub(super) async fn delete_grants_in_tenant(
     connection: &mut PgConnection,
     user: &UserId,
     tenant: &TenantId,
-) -> Result<u64, StorageError> {
-    let deleted = sqlx::query(
+) -> Result<Vec<Grant>, StorageError> {
+    let rows = sqlx::query(
         "DELETE FROM grants \
          WHERE user_row_id = (SELECT row_id FROM users WHERE id = $1) \
-         AND tenant_row_id = (SELECT row_id FROM tenants WHERE id = $2)",
+         AND tenant_row_id = (SELECT row_id FROM tenants WHERE id = $2) \
+         RETURNING api_id, capability",
     )
     .bind(user.as_str())
     .bind(tenant.as_str())
-    .execute(connection)
+    .fetch_all(connection)
     .await
-    .map_err(StorageError::backend)?
-    .rows_affected();
-    Ok(deleted)
+    .map_err(StorageError::backend)?;
+    rows.into_iter()
+        .map(|row| {
+            let scope = scope(user, Some(tenant.as_str().to_owned()), row.get("api_id"))?;
+            Ok(Grant::new(capability(row.get("capability"))?, scope)?)
+        })
+        .collect()
 }
 
 /// The primary key of a tenant row, or a report that there is none.
@@ -503,7 +511,7 @@ impl IdentityDialect for sqlx::Postgres {
         connection: &mut PgConnection,
         user: &UserId,
         tenant: &TenantId,
-    ) -> Result<u64, StorageError> {
+    ) -> Result<Vec<Grant>, StorageError> {
         delete_grants_in_tenant(connection, user, tenant).await
     }
 }

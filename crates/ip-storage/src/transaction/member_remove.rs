@@ -1,6 +1,6 @@
 //! Detaching a user from a tenant, together with everything it held inside it.
 
-use ip_core::{TenantId, Timestamp, UserId};
+use ip_core::{Grant, TenantId, Timestamp, UserId};
 use typestate_txn::transaction;
 
 use super::IdentityDialect;
@@ -20,10 +20,15 @@ transaction! {
         detach(user: UserId, tenant: TenantId) -> membership: Membership as Detached {
             DB::delete_membership(carrier, &user, &tenant).await?
         }
-        revoke_grants() -> revoked: u64 as GrantsRevoked {
+        revoke_grants() -> revoked: Vec<Grant> as GrantsRevoked {
             DB::delete_grants_in_tenant(carrier, &membership.user, &membership.tenant).await?
         }
         record(by: By) -> recorded_at: Timestamp as Recorded {
+            // One row per grant swept, not one for the sweep: a count cannot answer which
+            // capability somebody lost on the way out of a tenant.
+            for grant in &revoked {
+                DB::insert_audit(carrier, NewAudit::removed(by.clone(), grant)).await?;
+            }
             DB::insert_audit(carrier, NewAudit::removed(by, &membership)).await?
         }
     }

@@ -11,7 +11,7 @@ pub mod plugin_upload;
 pub mod user_create;
 
 use async_trait::async_trait;
-use ip_core::{Checksum, PluginKind, TenantId, Timestamp, UserId};
+use ip_core::{Checksum, Grant, PluginKind, TenantId, Timestamp, UserId};
 use sqlx::Database;
 
 use crate::audit::NewAudit;
@@ -64,12 +64,12 @@ pub trait IdentityDialect: AuditDialect {
         tenant: &TenantId,
     ) -> Result<Membership, StorageError>;
 
-    /// Revokes every grant one user holds inside one tenant, reporting how many it held.
+    /// Revokes every grant one user holds inside one tenant, handing back the ones that went.
     async fn delete_grants_in_tenant(
         connection: &mut Self::Connection,
         user: &UserId,
         tenant: &TenantId,
-    ) -> Result<u64, StorageError>;
+    ) -> Result<Vec<Grant>, StorageError>;
 }
 
 /// The plugin writes one backend contributes, in its own dialect.
