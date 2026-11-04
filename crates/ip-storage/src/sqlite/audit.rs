@@ -109,7 +109,7 @@ mod tests {
     use crate::price::PriceStore;
     use crate::route::RouteStore;
     use crate::sqlite::fixture::*;
-    use crate::store::{TenantStore, UserStore};
+    use crate::store::{MembershipStore, TenantStore, UserStore};
     use crate::suite::limit::{by, monthly};
     use crate::suite::price::priced_at;
 
@@ -300,6 +300,39 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the tenant survived a transaction that could not record it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attachment_whose_record_cannot_be_written_is_rolled_back() {
+        let store = store().await;
+        let (_, user) = tenant_with_user(&store).await;
+        sqlx::query("DROP TABLE audit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .attach(
+                    crate::model::Membership {
+                        user: user.id.clone(),
+                        tenant: tenant_id(),
+                        standing: crate::model::Standing::Owner,
+                    },
+                    &crate::suite::identity::members_by(),
+                )
+                .await
+                .is_err(),
+            "an account was attached with nothing to record it"
+        );
+        assert!(
+            store
+                .membership(&user.id, &tenant_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "the attachment survived a transaction that could not record it"
         );
     }
 }

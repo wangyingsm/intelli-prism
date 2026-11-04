@@ -48,11 +48,14 @@ async fn five_members(store: &impl Backend) -> Vec<UserId> {
             .await
             .unwrap();
         store
-            .attach(Membership {
-                user: id.clone(),
-                tenant: tenant_id(),
-                standing: Standing::Member,
-            })
+            .attach(
+                Membership {
+                    user: id.clone(),
+                    tenant: tenant_id(),
+                    standing: Standing::Member,
+                },
+                &crate::suite::identity::members_by(),
+            )
             .await
             .unwrap();
         members.push(id);

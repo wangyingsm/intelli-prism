@@ -118,9 +118,9 @@ impl UserStore for FailingStore {
 
 #[async_trait]
 impl MembershipStore for FailingStore {
-    async fn attach(&self, membership: Membership) -> Result<(), StorageError> {
+    async fn attach(&self, membership: Membership, by: &By) -> Result<(), StorageError> {
         self.answering()?;
-        self.inner.attach(membership).await
+        self.inner.attach(membership, by).await
     }
 
     async fn membership(

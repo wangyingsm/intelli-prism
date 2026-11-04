@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use ip_core::{Capability, CapabilityScope, TenantId, Timestamp, UserId};
 use ip_storage::{
-    AccountKind, IdentityDialect, Listed, MemberRemoveBegun, MemberRemoveTransactional,
+    AccountKind, By, IdentityDialect, Listed, MemberRemoveBegun, MemberRemoveTransactional,
     MemberRemoveTxn, MemberRemoved, Membership, Standing, StorageError,
 };
 
@@ -21,6 +21,9 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list))
         .route("/{user}", put(attach).delete(detach))
 }
+
+/// What the audit trail records a change here as having come through.
+const ENDPOINT: &str = "/_ip/tenants/{tenant}/members";
 
 /// One account in a tenant.
 #[derive(Debug, serde::Serialize)]
@@ -111,7 +114,8 @@ async fn attach(
         tenant,
         standing: Standing::Member,
     };
-    match store.attach(membership.clone()).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match store.attach(membership.clone(), &by).await {
         Ok(()) => (StatusCode::CREATED, Json(MemberView::from(membership))).into_response(),
         Err(error) => store_refusal(error),
     }
@@ -140,7 +144,8 @@ async fn detach(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return store_refusal(error),
     }
-    match remove_member(state.stores(), user, tenant).await {
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match remove_member(state.stores(), user, tenant, by).await {
         Ok(removed) => Json(DetachedView::from(removed)).into_response(),
         Err(error) => store_refusal(error),
     }
@@ -172,29 +177,33 @@ async fn remove_member(
     stores: &Stores,
     user: UserId,
     tenant: TenantId,
+    by: By,
 ) -> Result<MemberRemoved, StorageError> {
     match stores {
         #[cfg(any(feature = "standalone-storage", test))]
         Stores::Sqlite(store) => {
-            in_one_transaction(store.begin_member_remove().await?, user, tenant).await
+            in_one_transaction(store.begin_member_remove().await?, user, tenant, by).await
         }
         #[cfg(feature = "fast-storage")]
         Stores::Postgres(store) => {
-            in_one_transaction(store.begin_member_remove().await?, user, tenant).await
+            in_one_transaction(store.begin_member_remove().await?, user, tenant, by).await
         }
     }
 }
 
-/// The two writes, in the order the typestate allows them in.
+/// The three writes, in the order the typestate allows them in.
 async fn in_one_transaction<DB: IdentityDialect>(
     transaction: MemberRemoveTxn<DB, MemberRemoveBegun>,
     user: UserId,
     tenant: TenantId,
+    by: By,
 ) -> Result<MemberRemoved, StorageError> {
     transaction
         .detach(user, tenant)
         .await?
         .revoke_grants()
+        .await?
+        .record(by)
         .await?
         .commit()
         .await
@@ -300,11 +309,17 @@ mod tests {
             ("dave", "globex", Standing::Owner),
         ] {
             store
-                .attach(Membership {
-                    user: id(user),
-                    tenant: tenant(in_tenant),
-                    standing,
-                })
+                .attach(
+                    Membership {
+                        user: id(user),
+                        tenant: tenant(in_tenant),
+                        standing,
+                    },
+                    &ip_storage::By::new(
+                        ip_core::UserId::new("root").unwrap(),
+                        "/_ip/tenants/{tenant}/members",
+                    ),
+                )
                 .await
                 .unwrap();
         }

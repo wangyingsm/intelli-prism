@@ -264,11 +264,17 @@ mod tests {
             ("dave", "globex", Standing::Owner),
         ] {
             store
-                .attach(Membership {
-                    user: id(user),
-                    tenant: tenant(in_tenant),
-                    standing,
-                })
+                .attach(
+                    Membership {
+                        user: id(user),
+                        tenant: tenant(in_tenant),
+                        standing,
+                    },
+                    &ip_storage::By::new(
+                        ip_core::UserId::new("root").unwrap(),
+                        "/_ip/tenants/{tenant}/members",
+                    ),
+                )
                 .await
                 .unwrap();
         }

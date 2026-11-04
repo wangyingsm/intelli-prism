@@ -1,9 +1,10 @@
 //! Creating a user and attaching it to a tenant that is already there.
 
-use ip_core::TenantId;
+use ip_core::{TenantId, Timestamp};
 use typestate_txn::transaction;
 
 use super::IdentityDialect;
+use crate::audit::{By, NewAudit};
 use crate::error::StorageError;
 use crate::model::{Membership, NewUser, Standing, User, UserWithMembership};
 
@@ -27,6 +28,11 @@ transaction! {
             };
             DB::insert_membership(carrier, membership.clone()).await?;
             membership
+        }
+        record(by: By) -> recorded_at: Timestamp as Recorded {
+            let at = DB::insert_audit(carrier, NewAudit::created(by.clone(), &user)).await?;
+            DB::insert_audit(carrier, NewAudit::created(by, &membership)).await?;
+            at
         }
     }
 }

@@ -34,6 +34,9 @@ pub(crate) async fn a_member_lands_with_its_attachment(store: &impl MemberAddSto
         .attach(tenant_id(), Standing::Member)
         .await
         .unwrap()
+        .record(crate::suite::identity::members_by())
+        .await
+        .unwrap()
         .commit()
         .await
         .unwrap();
@@ -116,6 +119,9 @@ pub(crate) async fn a_member_may_be_added_as_the_owner(store: &impl MemberAddSto
         .await
         .unwrap()
         .attach(tenant_id(), Standing::Owner)
+        .await
+        .unwrap()
+        .record(crate::suite::identity::members_by())
         .await
         .unwrap()
         .commit()

@@ -55,7 +55,7 @@ pub trait UserStore: Send + Sync {
 #[async_trait]
 pub trait MembershipStore: Send + Sync {
     /// Attaches a user to a tenant, replacing any standing it already had there.
-    async fn attach(&self, membership: Membership) -> Result<(), StorageError>;
+    async fn attach(&self, membership: Membership, by: &By) -> Result<(), StorageError>;
 
     /// Reads one user's standing inside one tenant.
     async fn membership(
@@ -247,7 +247,7 @@ mod tests {
 
     #[async_trait]
     impl MembershipStore for MemoryStore {
-        async fn attach(&self, membership: Membership) -> Result<(), StorageError> {
+        async fn attach(&self, membership: Membership, _by: &By) -> Result<(), StorageError> {
             let mut memberships = self.memberships.lock().unwrap();
             memberships
                 .retain(|held| held.user != membership.user || held.tenant != membership.tenant);
@@ -388,11 +388,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .attach(Membership {
-                user: user.id.clone(),
-                tenant: tenant.id.clone(),
-                standing: Standing::Owner,
-            })
+            .attach(
+                Membership {
+                    user: user.id.clone(),
+                    tenant: tenant.id.clone(),
+                    standing: Standing::Owner,
+                },
+                &crate::suite::identity::members_by(),
+            )
             .await
             .unwrap();
         let grant = Grant::new(
@@ -480,11 +483,14 @@ mod tests {
         let store = store();
         for standing in [Standing::Owner, Standing::Member] {
             store
-                .attach(Membership {
-                    user: user_id(),
-                    tenant: tenant_id(),
-                    standing,
-                })
+                .attach(
+                    Membership {
+                        user: user_id(),
+                        tenant: tenant_id(),
+                        standing,
+                    },
+                    &crate::suite::identity::members_by(),
+                )
                 .await
                 .unwrap();
         }

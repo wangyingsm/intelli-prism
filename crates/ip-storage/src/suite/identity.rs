@@ -16,6 +16,14 @@ pub(crate) fn tenants_by() -> By {
     By::new(crate::suite::fixture::user_id(), "/_ip/tenants")
 }
 
+/// The account every suite test attaches a member as, through the endpoint that does.
+pub(crate) fn members_by() -> By {
+    By::new(
+        crate::suite::fixture::user_id(),
+        "/_ip/tenants/{tenant}/members",
+    )
+}
+
 fn api_grant(user: &UserId, tenant: &TenantId, capability: Capability) -> Grant {
     Grant::new(
         capability,
@@ -148,11 +156,14 @@ pub(crate) async fn attaching_twice_replaces_the_standing(store: &impl Storage) 
     tenant_with_user(store).await;
     for standing in [Standing::Owner, Standing::Member] {
         store
-            .attach(Membership {
-                user: user_id(),
-                tenant: tenant_id(),
-                standing,
-            })
+            .attach(
+                Membership {
+                    user: user_id(),
+                    tenant: tenant_id(),
+                    standing,
+                },
+                &crate::suite::identity::members_by(),
+            )
             .await
             .unwrap();
     }
@@ -167,11 +178,14 @@ pub(crate) async fn attaching_to_a_tenant_that_is_not_there_reports_it_missing(
     store.create_user(new_user(), &accounts_by()).await.unwrap();
     assert!(matches!(
         store
-            .attach(Membership {
-                user: user_id(),
-                tenant: tenant_id(),
-                standing: Standing::Member,
-            })
+            .attach(
+                Membership {
+                    user: user_id(),
+                    tenant: tenant_id(),
+                    standing: Standing::Member,
+                },
+                &crate::suite::identity::members_by()
+            )
             .await,
         Err(StorageError::NotFound {
             entity: Entity::Tenant,
@@ -187,11 +201,14 @@ pub(crate) async fn attaching_a_user_that_is_not_there_reports_it_missing(store:
         .unwrap();
     assert!(matches!(
         store
-            .attach(Membership {
-                user: user_id(),
-                tenant: tenant_id(),
-                standing: Standing::Member,
-            })
+            .attach(
+                Membership {
+                    user: user_id(),
+                    tenant: tenant_id(),
+                    standing: Standing::Member,
+                },
+                &crate::suite::identity::members_by()
+            )
             .await,
         Err(StorageError::NotFound {
             entity: Entity::User,
@@ -203,11 +220,14 @@ pub(crate) async fn attaching_a_user_that_is_not_there_reports_it_missing(store:
 pub(crate) async fn deleting_a_user_takes_its_memberships_with_it(store: &impl Storage) {
     tenant_with_user(store).await;
     store
-        .attach(Membership {
-            user: user_id(),
-            tenant: tenant_id(),
-            standing: Standing::Member,
-        })
+        .attach(
+            Membership {
+                user: user_id(),
+                tenant: tenant_id(),
+                standing: Standing::Member,
+            },
+            &crate::suite::identity::members_by(),
+        )
         .await
         .unwrap();
     store.delete_user(&user_id(), &accounts_by()).await.unwrap();
@@ -231,11 +251,14 @@ pub(crate) async fn deleting_a_user_takes_its_memberships_with_it(store: &impl S
 pub(crate) async fn a_tenant_is_listed_from_both_sides(store: &impl Storage) {
     tenant_with_user(store).await;
     store
-        .attach(Membership {
-            user: user_id(),
-            tenant: tenant_id(),
-            standing: Standing::Owner,
-        })
+        .attach(
+            Membership {
+                user: user_id(),
+                tenant: tenant_id(),
+                standing: Standing::Owner,
+            },
+            &crate::suite::identity::members_by(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -262,11 +285,14 @@ pub(crate) async fn deleting_a_tenant_takes_its_memberships_and_grants_with_it(
 ) {
     tenant_with_user(store).await;
     store
-        .attach(Membership {
-            user: user_id(),
-            tenant: tenant_id(),
-            standing: Standing::Member,
-        })
+        .attach(
+            Membership {
+                user: user_id(),
+                tenant: tenant_id(),
+                standing: Standing::Member,
+            },
+            &crate::suite::identity::members_by(),
+        )
         .await
         .unwrap();
     store

@@ -1,9 +1,10 @@
 //! Detaching a user from a tenant, together with everything it held inside it.
 
-use ip_core::{TenantId, UserId};
+use ip_core::{TenantId, Timestamp, UserId};
 use typestate_txn::transaction;
 
 use super::IdentityDialect;
+use crate::audit::{By, NewAudit};
 use crate::error::StorageError;
 use crate::model::{MemberRemoved, Membership};
 
@@ -21,6 +22,9 @@ transaction! {
         }
         revoke_grants() -> revoked: u64 as GrantsRevoked {
             DB::delete_grants_in_tenant(carrier, &membership.user, &membership.tenant).await?
+        }
+        record(by: By) -> recorded_at: Timestamp as Recorded {
+            DB::insert_audit(carrier, NewAudit::removed(by, &membership)).await?
         }
     }
 }

@@ -59,7 +59,7 @@ pub struct Attachment {
     pub standing: &'static str,
 }
 
-/// Everything the two writes need, so the service takes one argument.
+/// Everything the three writes need, so the service takes one argument.
 pub struct NewMember {
     /// The account to create.
     pub user: UserId,
@@ -67,6 +67,8 @@ pub struct NewMember {
     pub tenant: TenantId,
     /// Its verifier.
     pub passphrase: PassphraseHash,
+    /// Who is creating both, and through what.
+    pub by: By,
 }
 
 /// Creates an account and attaches it to one tenant.
@@ -107,6 +109,7 @@ async fn create(
         user,
         tenant,
         passphrase,
+        by: By::new(manager.user().clone(), ENDPOINT),
     };
     match add_member(state.stores(), new).await {
         Ok(added) => (StatusCode::CREATED, Json(UserView::from(added))).into_response(),
@@ -255,7 +258,7 @@ async fn add_member(stores: &Stores, new: NewMember) -> Result<UserWithMembershi
     }
 }
 
-/// The two writes, in the order the typestate allows them in.
+/// The three writes, in the order the typestate allows them in.
 async fn in_one_transaction<DB: IdentityDialect>(
     transaction: MemberAddTxn<DB, MemberAddBegun>,
     new: NewMember,
@@ -268,6 +271,8 @@ async fn in_one_transaction<DB: IdentityDialect>(
         })
         .await?
         .attach(new.tenant, Standing::Member)
+        .await?
+        .record(new.by)
         .await?
         .commit()
         .await
@@ -372,11 +377,17 @@ mod tests {
             ("carol", "globex", Standing::Member),
         ] {
             store
-                .attach(Membership {
-                    user: id(user),
-                    tenant: tenant(in_tenant),
-                    standing,
-                })
+                .attach(
+                    Membership {
+                        user: id(user),
+                        tenant: tenant(in_tenant),
+                        standing,
+                    },
+                    &ip_storage::By::new(
+                        ip_core::UserId::new("root").unwrap(),
+                        "/_ip/tenants/{tenant}/members",
+                    ),
+                )
                 .await
                 .unwrap();
         }

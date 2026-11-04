@@ -18,6 +18,50 @@ use crate::transaction::member_remove::{
 };
 use crate::transaction::user_create::{UserCreateBegun, UserCreateTransactional, UserCreateTxn};
 
+/// Attaches a user and records the attachment, both on the one connection its caller commits.
+async fn attaching(
+    connection: &mut PgConnection,
+    membership: Membership,
+    by: &By,
+) -> Result<(), StorageError> {
+    let before = read_membership(&mut *connection, &membership.user, &membership.tenant).await?;
+    insert_membership(&mut *connection, membership.clone()).await?;
+    super::audit::record(
+        connection,
+        NewAudit::changed(by.clone(), before.as_ref(), &membership),
+    )
+    .await?;
+    Ok(())
+}
+
+/// One attachment, over whichever connection it is given. Read inside the transaction that
+/// is about to change it, so the before it records is the standing that was replaced.
+pub(super) async fn read_membership(
+    connection: &mut PgConnection,
+    user: &UserId,
+    tenant: &TenantId,
+) -> Result<Option<Membership>, StorageError> {
+    let Some(row) = sqlx::query(
+        "SELECT m.standing FROM memberships m \
+         JOIN tenants t ON t.row_id = m.tenant_row_id \
+         JOIN users u ON u.row_id = m.user_row_id \
+         WHERE t.id = $1 AND u.id = $2",
+    )
+    .bind(tenant.as_str())
+    .bind(user.as_str())
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(StorageError::backend)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Membership {
+        user: user.clone(),
+        tenant: tenant.clone(),
+        standing: standing(row.get("standing"))?,
+    }))
+}
+
 /// Creates a tenant and records it, both on the one connection its caller commits.
 async fn adding_tenant(
     connection: &mut PgConnection,
@@ -522,8 +566,20 @@ impl UserStore for PostgresStore {
 
 #[async_trait]
 impl MembershipStore for PostgresStore {
-    async fn attach(&self, membership: Membership) -> Result<(), StorageError> {
-        insert_membership(&mut *self.connection().await?, membership).await
+    async fn attach(&self, membership: Membership, by: &By) -> Result<(), StorageError> {
+        // One transaction, so an attachment that lands without its record is not a state
+        // this store can be left in, and neither is a record whose attachment rolled back.
+        let mut transaction = self.pool.begin().await.map_err(StorageError::backend)?;
+        // Rolled back by hand rather than by dropping it: a transaction left to its
+        // `Drop` keeps the connection's locks until the pool gets round to it, and a
+        // scratch schema being torn down behind it waits for ever.
+        match attaching(&mut transaction, membership, by).await {
+            Ok(()) => transaction.commit().await.map_err(StorageError::backend),
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn membership(
@@ -531,25 +587,7 @@ impl MembershipStore for PostgresStore {
         user: &UserId,
         tenant: &TenantId,
     ) -> Result<Option<Membership>, StorageError> {
-        let Some(row) = sqlx::query(
-            "SELECT m.standing FROM memberships m \
-             JOIN tenants t ON t.row_id = m.tenant_row_id \
-             JOIN users u ON u.row_id = m.user_row_id \
-             WHERE t.id = $1 AND u.id = $2",
-        )
-        .bind(tenant.as_str())
-        .bind(user.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(StorageError::backend)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Membership {
-            user: user.clone(),
-            tenant: tenant.clone(),
-            standing: standing(row.get("standing"))?,
-        }))
+        read_membership(&mut *self.connection().await?, user, tenant).await
     }
 
     async fn memberships_of_user(&self, user: &UserId) -> Result<Vec<Membership>, StorageError> {

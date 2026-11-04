@@ -606,3 +606,136 @@ pub(crate) async fn creating_a_tenant_with_its_owner_records_both(
     assert_eq!(accounts[0].entity_id, "alice");
     assert_eq!(accounts[0].tenant, None, "an account is nobody's tenant");
 }
+
+/// An attachment is the tenant's, so its record names the tenant rather than nothing — it
+/// is what an owner reading its own trail is shown.
+pub(crate) async fn attaching_an_account_records_the_tenant_it_joined(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let by = crate::suite::identity::members_by();
+    store
+        .attach(
+            crate::model::Membership {
+                user: crate::suite::fixture::user_id(),
+                tenant: tenant_id(),
+                standing: crate::model::Standing::Member,
+            },
+            &by,
+        )
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Membership).await;
+    assert_eq!(trail.len(), 1, "one change, one record");
+    let one = &trail[0];
+    assert_eq!(one.through, "/_ip/tenants/{tenant}/members");
+    assert_eq!(one.entity_id, "alice@acme", "named as the api names it");
+    assert_eq!(one.tenant, Some(tenant_id()));
+    assert_eq!(one.before, None, "the account was not in it before");
+    assert_eq!(one.after.as_ref().unwrap()["standing"], "member");
+}
+
+/// Attaching again replaces a standing, and the before is what makes that readable: the
+/// question after an incident is not who changed it but what it was.
+pub(crate) async fn promoting_an_account_records_what_it_was(store: &impl Backend) {
+    tenant_with_user(store).await;
+    let by = crate::suite::identity::members_by();
+    for standing in [
+        crate::model::Standing::Member,
+        crate::model::Standing::Owner,
+    ] {
+        store
+            .attach(
+                crate::model::Membership {
+                    user: crate::suite::fixture::user_id(),
+                    tenant: tenant_id(),
+                    standing,
+                },
+                &by,
+            )
+            .await
+            .unwrap();
+    }
+
+    let trail = trail_of(store, Entity::Membership).await;
+    assert_eq!(trail.len(), 2);
+    // Newest first, so the promotion is the first row.
+    assert_eq!(trail[0].before.as_ref().unwrap()["standing"], "member");
+    assert_eq!(trail[0].after.as_ref().unwrap()["standing"], "owner");
+}
+
+/// Adding a member creates an account and attaches it, which is two things somebody did,
+/// in one transaction.
+pub(crate) async fn adding_a_member_records_the_account_and_the_attachment(
+    store: &(impl Backend + crate::transaction::member_add::MemberAddTransactional),
+) {
+    store
+        .create_tenant(
+            crate::suite::fixture::new_tenant(),
+            &crate::suite::identity::tenants_by(),
+        )
+        .await
+        .unwrap();
+    store
+        .begin_member_add()
+        .await
+        .unwrap()
+        .create_user(crate::suite::fixture::new_user())
+        .await
+        .unwrap()
+        .attach(tenant_id(), crate::model::Standing::Member)
+        .await
+        .unwrap()
+        .record(crate::suite::identity::members_by())
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+
+    assert_eq!(trail_of(store, Entity::User).await.len(), 1);
+    let attached = trail_of(store, Entity::Membership).await;
+    assert_eq!(attached.len(), 1);
+    assert_eq!(attached[0].entity_id, "alice@acme");
+    assert_eq!(attached[0].after.as_ref().unwrap()["standing"], "member");
+}
+
+/// Taking a member out records the attachment that went, with the standing it held — what
+/// is *not* here is the grants that went with it, which have their own records.
+pub(crate) async fn taking_a_member_out_records_the_attachment_that_went(
+    store: &(impl Backend + crate::transaction::member_remove::MemberRemoveTransactional),
+) {
+    tenant_with_user(store).await;
+    store
+        .attach(
+            crate::model::Membership {
+                user: crate::suite::fixture::user_id(),
+                tenant: tenant_id(),
+                standing: crate::model::Standing::Member,
+            },
+            &crate::suite::identity::members_by(),
+        )
+        .await
+        .unwrap();
+    store
+        .begin_member_remove()
+        .await
+        .unwrap()
+        .detach(crate::suite::fixture::user_id(), tenant_id())
+        .await
+        .unwrap()
+        .revoke_grants()
+        .await
+        .unwrap()
+        .record(crate::suite::identity::members_by())
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Membership).await;
+    assert_eq!(trail.len(), 2, "attached, then removed");
+    assert_eq!(trail[0].after, None, "nothing is left to describe");
+    assert_eq!(trail[0].before.as_ref().unwrap()["standing"], "member");
+    assert_eq!(trail[0].tenant, Some(tenant_id()));
+}

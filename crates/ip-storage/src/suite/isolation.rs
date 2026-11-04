@@ -65,11 +65,14 @@ async fn two_tenants(store: &impl Backend) {
         .await
         .unwrap();
     store
-        .attach(Membership {
-            user: their_user(),
-            tenant: theirs(),
-            standing: Standing::Member,
-        })
+        .attach(
+            Membership {
+                user: their_user(),
+                tenant: theirs(),
+                standing: Standing::Member,
+            },
+            &crate::suite::identity::members_by(),
+        )
         .await
         .unwrap();
 }
@@ -77,11 +80,14 @@ async fn two_tenants(store: &impl Backend) {
 pub(crate) async fn members_of_one_tenant_are_not_listed_for_another(store: &impl Backend) {
     two_tenants(store).await;
     store
-        .attach(Membership {
-            user: super::fixture::user_id(),
-            tenant: super::fixture::tenant_id(),
-            standing: Standing::Member,
-        })
+        .attach(
+            Membership {
+                user: super::fixture::user_id(),
+                tenant: super::fixture::tenant_id(),
+                standing: Standing::Member,
+            },
+            &crate::suite::identity::members_by(),
+        )
         .await
         .unwrap();
     let listed = store

@@ -305,11 +305,17 @@ mod tests {
                 .unwrap();
         }
         store
-            .attach(Membership {
-                user: member_id(),
-                tenant: tenant_id(),
-                standing: Standing::Member,
-            })
+            .attach(
+                Membership {
+                    user: member_id(),
+                    tenant: tenant_id(),
+                    standing: Standing::Member,
+                },
+                &ip_storage::By::new(
+                    ip_core::UserId::new("root").unwrap(),
+                    "/_ip/tenants/{tenant}/members",
+                ),
+            )
             .await
             .unwrap();
 

@@ -37,11 +37,14 @@ async fn member_of_two(store: &impl MemberRemoveStore) -> [Grant; 4] {
         .unwrap();
     for tenant in [tenant_id(), elsewhere()] {
         store
-            .attach(Membership {
-                user: user_id(),
-                tenant,
-                standing: Standing::Member,
-            })
+            .attach(
+                Membership {
+                    user: user_id(),
+                    tenant,
+                    standing: Standing::Member,
+                },
+                &crate::suite::identity::members_by(),
+            )
             .await
             .unwrap();
     }
@@ -86,6 +89,9 @@ pub(crate) async fn a_member_leaves_with_every_grant_it_held_inside(
         .await
         .unwrap()
         .revoke_grants()
+        .await
+        .unwrap()
+        .record(crate::suite::identity::members_by())
         .await
         .unwrap()
         .commit()

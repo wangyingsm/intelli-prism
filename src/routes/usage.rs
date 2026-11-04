@@ -400,11 +400,17 @@ mod tests {
             ("carol", "other", Standing::Owner),
         ] {
             store
-                .attach(Membership {
-                    user: user(id),
-                    tenant: tenant(tenant_id),
-                    standing,
-                })
+                .attach(
+                    Membership {
+                        user: user(id),
+                        tenant: tenant(tenant_id),
+                        standing,
+                    },
+                    &ip_storage::By::new(
+                        ip_core::UserId::new("root").unwrap(),
+                        "/_ip/tenants/{tenant}/members",
+                    ),
+                )
                 .await
                 .unwrap();
         }

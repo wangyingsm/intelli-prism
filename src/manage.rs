@@ -269,11 +269,17 @@ secret = "0123456789abcdef0123456789abcdef"
             .await
             .unwrap();
         store
-            .attach(Membership {
-                user: user_id(),
-                tenant: tenant_id(),
-                standing,
-            })
+            .attach(
+                Membership {
+                    user: user_id(),
+                    tenant: tenant_id(),
+                    standing,
+                },
+                &ip_storage::By::new(
+                    ip_core::UserId::new("root").unwrap(),
+                    "/_ip/tenants/{tenant}/members",
+                ),
+            )
             .await
             .unwrap();
 

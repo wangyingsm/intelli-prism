@@ -155,6 +155,31 @@ pub struct Membership {
     pub standing: Standing,
 }
 
+impl crate::audit::Auditable for Membership {
+    fn entity(&self) -> crate::error::Entity {
+        crate::error::Entity::Membership
+    }
+
+    /// Spelled the way an attachment is named everywhere else it is reported missing.
+    fn entity_id(&self) -> String {
+        format!("{}@{}", self.user, self.tenant)
+    }
+
+    /// The tenant it is in: an attachment is a change to that tenant's membership, and the
+    /// owner reading its own trail is the reader it is kept for.
+    fn tenant(&self) -> Option<TenantId> {
+        Some(self.tenant.clone())
+    }
+
+    fn audited(&self) -> serde_json::Value {
+        serde_json::json!({
+            "user": self.user.as_str(),
+            "tenant": self.tenant.as_str(),
+            "standing": crate::codec::standing_name(self.standing),
+        })
+    }
+}
+
 /// A tenant, the owner account created with it, and their attachment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TenantWithOwner {
@@ -175,6 +200,8 @@ pub struct UserWithMembership {
     pub user: User,
     /// How it is attached to its tenant.
     pub membership: Membership,
+    /// When the pair was recorded as created.
+    pub recorded_at: Timestamp,
 }
 
 /// An attachment that was removed, and how many grants went with it.
@@ -184,6 +211,8 @@ pub struct MemberRemoved {
     pub membership: Membership,
     /// How many grants the user held inside that tenant, all now revoked.
     pub revoked: u64,
+    /// When the removal was recorded.
+    pub recorded_at: Timestamp,
 }
 
 /// What a user is within one tenant.
