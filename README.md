@@ -84,10 +84,9 @@ does, and runs the `.hurl` files beside it in order.
 version 0.1.0, and nothing about it is stable — the configuration format, the storage schema, the
 wire headers and the plugin interface all still change without ceremony.
 
-Large parts of the design are unbuilt: there is no web ui, no agents, no semantic cache, and no
-metrics beyond the traces. The pieces that do exist are tested, but they have never run under real
-traffic, and no security review has been done. Read `ROADMAP.md` before assuming a feature is
-there.
+Large parts of the design are unbuilt: there is no web ui, no system agents, no run graph, and no
+long term memory. The pieces that do exist are tested, but they have never run under real traffic,
+and no security review has been done. Read `ROADMAP.md` before assuming a feature is there.
 
 ## License
 
