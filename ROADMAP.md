@@ -451,6 +451,30 @@ because it protects an upstream; a quota and a cap fail closed because they prot
 - An answer out of the cache costs nothing and moves no cap, which is the same arithmetic that
 makes a hit free in the ledger.
 
+### An audit trail of who changed what
+
+- **A change and the record of it are one transaction.** The row is written over the same
+connection as the change it describes, so neither can exist without the other: no change lands
+unrecorded, and a record whose change rolled back is not a state the store can be left in. There
+is no public method for writing one, because a public method for writing one would be a way to
+record a change that never happened.
+- **What a row carries is declared apart from how the thing is stored**, and that separation is
+the whole point. A passphrase hash, a tenant's root key and an upstream credential are absent
+because nothing put them there on purpose, so a column added to a table is missing from the trail
+until somebody decides it belongs. The table is meant to be kept for years and read by people who
+need none of those.
+- **A row names what the api names**: the account, the endpoint as the router spells it, the kind
+of thing, and which one in the spelling its own endpoint uses — `api_access on alice@acme/chat`,
+`alice@acme`, the checksum of a plugin — plus what it was before and what it became.
+- **A refused change records nothing, and neither does a change that changed nothing.** Granting
+a capability already held writes no row: one saying it was handed over on a day nothing happened
+would put its arrival on the wrong date, which is worse than silence.
+- **Taking a member out of a tenant records each grant it lost, one row apiece.** A count cannot
+answer which capability somebody left with, which is the question an incident actually asks.
+- Read over `GET /_ip/audit`, newest first and paged, narrowed by tenant, actor and kind. The
+system administrator reads every tenant; anyone else names the tenant it is asking about and must
+hold `Observer` inside it, which an owner does by standing.
+
 ## Shipped with a caveat
 
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
@@ -637,6 +661,17 @@ for the same reason: a cost is known only once the answer is. A single request c
 carry a tenant past its cap, and the next one is refused.
 - **A cap refuses; it does not warn.** There is no soft threshold, no alert and no webhook. An
 operator who wants to know before the wall reads the summary.
+- **Nothing prunes the audit trail.** Usage rows have a sweep and a keeping period; audit rows
+have neither, so the table only grows. That is the right default for a trail — a retention policy
+that quietly deletes evidence is worse than a large table — but it is the operator's to manage,
+and a deployment that needs rows dropped on a schedule has nothing here to do it with.
+- **A trail records management writes, not traffic.** What a request did is the usage ledger's
+business; this table answers who changed the configuration. Neither is derivable from the other.
+- **What belongs to no tenant is the administrator's alone to read.** An account, a route and a
+price are recorded against no tenant, and a tenant-scoped caller must name a tenant — so a tenant
+owner cannot read who created an account inside its tenant, or who changed a route its traffic
+takes. This is the isolation working as intended rather than a gap, but it does mean a tenant's
+own trail is narrower than a tenant owner may expect.
 
 ## To be implemented
 
@@ -684,8 +719,6 @@ like any other request.
 
 - Facts and chat session history as long term memory.
 - Knowledge and RAG with a graph run.
-- An audit trail of who changed what. Usage is recorded and so is what it cost; who changed a
-route, a limit or a price is not.
 
 ### Web UI
 

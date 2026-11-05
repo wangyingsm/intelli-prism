@@ -31,6 +31,10 @@ configured, and read back over `GET /_ip/usage`.
 carried to every node, so each usage row carries what it cost as well as what it spent, and the
 summary totals a window beside the count of rows nothing priced. A model nobody has priced has
 no cost, which is not a cost of nothing.
+- **A record of who changed what.** Every management write records the account, the endpoint and
+what the thing was before and after, in the same transaction as the change itself, so neither can
+exist without the other. What a row carries is declared apart from how the thing is stored, which
+is why no passphrase hash or tenant key is in it. Read back over `GET /_ip/audit`.
 - **Dispatch across the endpoints behind a rule.** Round robin, least load or a share each, chosen
 per rule and per configured upstream; a rule can also race a request across two or three of them
 and take the first successful answer, when the body is one the gateway can send more than once. A
