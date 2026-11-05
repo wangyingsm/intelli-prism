@@ -1,3 +1,4 @@
+mod audit;
 mod grant;
 #[cfg(test)]
 pub(crate) mod harness;
@@ -63,6 +64,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/_ip/limits", limit::router())
         .nest("/_ip/prices", price::router())
         .nest("/_ip/usage", usage::router())
+        .nest("/_ip/audit", audit::router())
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))
