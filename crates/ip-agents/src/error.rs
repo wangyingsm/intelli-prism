@@ -84,6 +84,22 @@ pub enum AgentError {
         limit: u32,
     },
 
+    /// A path segment that names a place rather than a thing.
+    #[error("a path may not name {value:?}")]
+    ReservedSegment {
+        /// The segment that was not a name.
+        value: String,
+    },
+
+    /// A tree nesting deeper than its kind holds.
+    #[error("{kind} nests deeper than the limit of {max}")]
+    TooDeep {
+        /// What was being read.
+        kind: &'static str,
+        /// The deepest its kind holds.
+        max: usize,
+    },
+
     /// A strategy for a best-effort run the template does not ask for.
     #[error("a best effort strategy is set while best effort is off")]
     StrategyWithoutBestEffort,

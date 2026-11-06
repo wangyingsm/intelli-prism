@@ -1,9 +1,8 @@
 //! Agent templates.
 //!
 //! A template is what a system agent is before anything runs one: the [`AgentId`] an operator
-//! spells, the [`AgentConfig`] it would run under, and — as the rest of this crate lands — the
-//! sandbox it would see. A template is stored, served and edited; initializing one is somebody
-//! else's job.
+//! spells, the [`AgentConfig`] it would run under, and the [`Sandbox`] it would see. A template is
+//! stored, served and edited; initializing one is somebody else's job.
 //!
 //! Nothing here runs an agent, opens a sandbox, calls a tool or touches a network. That is the
 //! point of the crate being its own: an agent is not a gateway primitive, nothing on the request
@@ -17,6 +16,7 @@
 pub mod config;
 pub mod error;
 pub mod id;
+pub mod sandbox;
 
 pub use config::{
     AgentConfig, AgentConfigParts, AgentRole, BestEffortStrategy, MaxTurns, Prompt, ReqTimeout,
@@ -24,3 +24,4 @@ pub use config::{
 };
 pub use error::AgentError;
 pub use id::AgentId;
+pub use sandbox::{Entries, ObjectLocation, PathSegment, Sandbox, SandboxEntry};
