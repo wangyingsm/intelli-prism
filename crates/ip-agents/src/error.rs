@@ -84,6 +84,13 @@ pub enum AgentError {
         limit: u32,
     },
 
+    /// A value carrying whitespace at one of its edges.
+    #[error("{kind} has whitespace at its edge")]
+    Untrimmed {
+        /// What was being read.
+        kind: &'static str,
+    },
+
     /// A path segment that names a place rather than a thing.
     #[error("a path may not name {value:?}")]
     ReservedSegment {
