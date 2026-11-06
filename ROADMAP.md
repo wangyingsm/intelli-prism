@@ -665,6 +665,12 @@ operator who wants to know before the wall reads the summary.
 have neither, so the table only grows. That is the right default for a trail — a retention policy
 that quietly deletes evidence is worse than a large table — but it is the operator's to manage,
 and a deployment that needs rows dropped on a schedule has nothing here to do it with.
+- **A row is an ordinary row.** Nothing makes the trail tamper-evident: there is no hash chain,
+no signature and no append-only enforcement below the api, so anyone with write access to the
+database can edit a record or delete one. The trail answers what the gateway did, to a reader who
+trusts the database; it is not evidence against whoever holds it. Hash-chaining it is a different
+feature with a different threat model, and claiming that without building it would be worse than
+not having it.
 - **A trail records management writes, not traffic.** What a request did is the usage ledger's
 business; this table answers who changed the configuration. Neither is derivable from the other.
 - **What belongs to no tenant is the administrator's alone to read.** An account, a route and a
