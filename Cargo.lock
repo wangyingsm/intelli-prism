@@ -1615,6 +1615,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-agents"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "ip-auth"
 version = "0.1.0"
 dependencies = [
