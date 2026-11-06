@@ -1,8 +1,8 @@
 //! Agent templates.
 //!
 //! A template is what a system agent is before anything runs one: the [`AgentId`] an operator
-//! spells, and — as the rest of this crate lands — the sandbox it would see and the configuration
-//! it would run under. A template is stored, served and edited; initializing one is somebody
+//! spells, the [`AgentConfig`] it would run under, and — as the rest of this crate lands — the
+//! sandbox it would see. A template is stored, served and edited; initializing one is somebody
 //! else's job.
 //!
 //! Nothing here runs an agent, opens a sandbox, calls a tool or touches a network. That is the
@@ -14,8 +14,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod error;
 pub mod id;
 
+pub use config::{
+    AgentConfig, AgentConfigParts, AgentRole, BestEffortStrategy, MaxTurns, Prompt, ReqTimeout,
+    TimeLimit, ToolName, ToolSet,
+};
 pub use error::AgentError;
 pub use id::AgentId;
