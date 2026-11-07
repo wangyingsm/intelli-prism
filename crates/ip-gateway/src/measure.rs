@@ -30,23 +30,74 @@ pub struct Measuring {
     model: Option<ModelName>,
     input: Option<TokenCount>,
     output: Option<TokenCount>,
+    carry: Vec<u8>,
+    streaming: bool,
+    overrun: bool,
 }
 
+/// How much of an answer is held at once while the rest of it is still coming.
+///
+/// An answer is json only once all of it is here, so what has not parsed is kept; one longer
+/// than this is past measuring rather than worth holding in memory.
+const CARRY_LIMIT: usize = 1 << 20;
+
 impl Measuring {
-    /// Reads whatever passed: a json answer, or one or more events of a stream.
+    /// Reads whatever passed: a json answer whole or in pieces, or a stream event by event.
+    ///
+    /// **An upstream sends a whole answer in as many pieces as it likes**, and no piece of a
+    /// json document is one, so what has not parsed yet is held until the rest arrives. A
+    /// stream instead reports its totals inside one of its events, so events are folded and
+    /// dropped as they complete and nothing accumulates over the length of the answer.
     pub fn read(&mut self, bytes: &[u8]) {
-        if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-            self.fold(&value);
-            return;
-        }
+        // Whatever this piece carries whole, which for a stream is where its totals are.
         for line in bytes.split(|byte| *byte == b'\n') {
-            let Some(data) = strip_data(line) else {
-                continue;
-            };
-            if let Ok(value) = serde_json::from_slice::<Value>(data) {
-                self.fold(&value);
+            if let Some(data) = strip_data(line) {
+                self.streaming = true;
+                if let Ok(value) = serde_json::from_slice::<Value>(data) {
+                    self.fold(&value);
+                }
             }
         }
+        if self.overrun {
+            return;
+        }
+        if self.carry.len() + bytes.len() > CARRY_LIMIT {
+            self.overrun = true;
+            self.carry = Vec::new();
+            return;
+        }
+        let mut carry = std::mem::take(&mut self.carry);
+        carry.extend_from_slice(bytes);
+
+        // An event the pieces split in the middle of, joined up here. Folding one twice
+        // changes nothing, since a count only ever rises to the largest seen.
+        let mut complete = 0;
+        while let Some(at) = carry[complete..].iter().position(|byte| *byte == b'\n') {
+            let line = carry[complete..complete + at].to_vec();
+            complete += at + 1;
+            if let Some(data) = strip_data(&line) {
+                self.streaming = true;
+                if let Ok(value) = serde_json::from_slice::<Value>(data) {
+                    self.fold(&value);
+                }
+            }
+        }
+        if self.streaming {
+            carry.drain(..complete);
+            self.carry = carry;
+            return;
+        }
+        if let Ok(value) = serde_json::from_slice::<Value>(&carry) {
+            self.fold(&value);
+            carry.clear();
+        }
+        self.carry = carry;
+    }
+
+    /// How much of an answer is being held while the rest of it comes.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.carry.len()
     }
 
     /// What the answer said it cost, or nothing when it said neither count.
@@ -263,5 +314,106 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":30}}\n\
     fn a_model_name_the_answer_spoils_is_left_unnamed() {
         let body = br#"{"model":"a name with spaces","usage":{"input_tokens":1}}"#;
         assert_eq!(measure(body).unwrap().model, None);
+    }
+
+    /// What every test here used to assume and no upstream obliges: that a whole answer
+    /// arrives in one piece. A real provider sends it chunked, and no chunk of a json
+    /// document is a json document, so measuring a piece at a time measured nothing.
+    #[test]
+    fn a_whole_answer_split_across_pieces_is_measured() {
+        let body =
+            br#"{"model":"deepseek-chat","usage":{"prompt_tokens":9887,"completion_tokens":5356}}"#;
+
+        for at in 1..body.len() {
+            let mut measuring = Measuring::default();
+            let (first, rest) = body.split_at(at);
+            measuring.read(first);
+            measuring.read(rest);
+
+            let measured = measuring
+                .measured()
+                .unwrap_or_else(|| panic!("nothing measured when split at {at}"));
+            assert_eq!(measured.tokens.input.get(), 9887, "split at {at}");
+            assert_eq!(measured.tokens.output.get(), 5356, "split at {at}");
+        }
+    }
+
+    /// One byte at a time is the same answer, which is the strongest form of the above.
+    #[test]
+    fn a_whole_answer_arriving_a_byte_at_a_time_is_measured() {
+        let body = br#"{"usage":{"input_tokens":7,"output_tokens":3}}"#;
+        let mut measuring = Measuring::default();
+
+        for byte in body {
+            measuring.read(&[*byte]);
+        }
+
+        let measured = measuring.measured().unwrap();
+        assert_eq!(
+            (measured.tokens.input.get(), measured.tokens.output.get()),
+            (7, 3)
+        );
+    }
+
+    /// An answer whose json carries newlines is still one document, not a stream.
+    #[test]
+    fn a_pretty_printed_answer_is_not_mistaken_for_a_stream() {
+        let body = b"{\n  \"usage\": {\n    \"prompt_tokens\": 12\n  }\n}";
+        let mut measuring = Measuring::default();
+
+        measuring.read(&body[..20]);
+        measuring.read(&body[20..]);
+
+        assert_eq!(measuring.measured().unwrap().tokens.input.get(), 12);
+    }
+
+    #[test]
+    fn a_streamed_event_split_across_pieces_is_measured() {
+        let event = b"data: {\"model\":\"gpt-5\",\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n";
+        let mut measuring = Measuring::default();
+
+        measuring.read(&event[..30]);
+        measuring.read(&event[30..]);
+
+        let measured = measuring.measured().unwrap();
+        assert_eq!(
+            (measured.tokens.input.get(), measured.tokens.output.get()),
+            (9, 4)
+        );
+    }
+
+    /// A stream is folded and dropped event by event, so a long one is measured without
+    /// the whole of it ever being held — which is what the carry would otherwise do.
+    #[test]
+    fn a_long_stream_is_measured_without_being_held() {
+        let mut measuring = Measuring::default();
+        let filler = "x".repeat(4096);
+
+        for _ in 0..512 {
+            let event =
+                format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{filler}\"}}}}]}}\n");
+            measuring.read(event.as_bytes());
+        }
+        measuring.read(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n");
+
+        assert!(
+            measuring.held() < 2 * filler.len(),
+            "a stream held {} bytes, so it is accumulating the whole answer",
+            measuring.held()
+        );
+        assert!(!measuring.overrun, "a stream ran the carry out");
+        let measured = measuring.measured().expect("the totals were read");
+        assert_eq!(measured.tokens.input.get(), 5);
+    }
+
+    /// A whole answer past what is worth holding measures nothing rather than being kept.
+    #[test]
+    fn an_answer_too_long_to_hold_is_left_unmeasured() {
+        let mut measuring = Measuring::default();
+
+        measuring.read(&vec![b' '; CARRY_LIMIT + 1]);
+        measuring.read(br#"{"usage":{"input_tokens":1}}"#);
+
+        assert!(measuring.measured().is_none());
     }
 }
