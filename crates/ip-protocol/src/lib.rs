@@ -18,6 +18,7 @@ pub mod anchor;
 pub mod answer;
 pub mod anthropic;
 pub mod conversation;
+pub mod endpoint;
 pub mod error;
 pub mod gemini;
 pub mod openai;
@@ -28,5 +29,6 @@ pub use answer::{Event, Gathered, Stop};
 pub use conversation::{
     Block, Conversation, Dropped, Message, Role, Sampling, Tool, ToolCallId, ToolName,
 };
+pub use endpoint::under;
 pub use error::ProtocolError;
 pub use stream::{Reading, Writing};

@@ -121,7 +121,7 @@ pub async fn take(
     conversation: &Conversation,
 ) -> Result<Taken, RunError> {
     let (body, mut lost) = written(target.speaks, conversation);
-    let asking = asked(target, &body)?;
+    let asking = asked(target, conversation.model.as_ref(), &body)?;
     let trace = TraceId::generate().map_err(|error| RunError::TurnNotBuilt {
         detail: error.to_string(),
     })?;
@@ -168,6 +168,7 @@ pub async fn take(
 /// The request a caller would have sent to say this.
 fn asked(
     target: &Target,
+    model: Option<&ip_core::ModelName>,
     body: &serde_json::Value,
 ) -> Result<Request<ip_gateway::GatewayBody>, RunError> {
     let bytes = serde_json::to_vec(body).map_err(|error| RunError::TurnNotBuilt {
@@ -175,7 +176,11 @@ fn asked(
     })?;
     Request::builder()
         .method(Method::POST)
-        .uri(target.path.as_str())
+        .uri(format!(
+            "{}{}",
+            target.path.as_str().trim_end_matches('/'),
+            ip_protocol::under(target.speaks, model)
+        ))
         // The rule is keyed on where the gateway listens, so a turn has to say it arrived there.
         .header(HOST, target.listen.to_string())
         .header(CONTENT_TYPE, "application/json")
@@ -258,6 +263,60 @@ mod tests {
             listen: aimed.listen,
             protocol: aimed.protocol,
         }
+    }
+
+    /// The one a fake upstream cannot catch: a turn has to reach the path the provider
+    /// really serves, and the rule's own path is only the base of it. A run aimed by
+    /// `aimed` and sent by `take` must agree about where the family takes a conversation.
+    #[tokio::test]
+    async fn a_turn_reaches_the_path_its_family_serves_and_not_the_rules_bare_path() {
+        for (speaks, expected) in [
+            (Dialect::OpenAi, "/openai/chat/completions"),
+            (Dialect::Anthropic, "/anthropic/messages"),
+        ] {
+            let aimed = Target::aimed(
+                &[ruled("openai", "/openai", Some(Dialect::OpenAi))],
+                &Pinned::default(),
+                as_whom(),
+            )
+            .unwrap();
+            let aimed = Target {
+                path: AbsPath::new(if speaks == Dialect::OpenAi {
+                    "/openai"
+                } else {
+                    "/anthropic"
+                })
+                .unwrap(),
+                speaks,
+                ..aimed
+            };
+
+            let request = asked(&aimed, None, &serde_json::json!({})).unwrap();
+
+            assert_eq!(request.uri().to_string(), expected, "{speaks:?}");
+        }
+    }
+
+    /// Gemini names the model in the path, so a turn to it carries one.
+    #[tokio::test]
+    async fn a_turn_to_gemini_names_its_model_in_the_path() {
+        let aimed = Target {
+            path: AbsPath::new("/gemini").unwrap(),
+            speaks: Dialect::Gemini,
+            ..target(Dialect::Gemini)
+        };
+        let model = ip_core::ModelName::new("gemini-2.5-pro").unwrap();
+
+        let request = asked(&aimed, Some(&model), &serde_json::json!({})).unwrap();
+
+        assert!(
+            request
+                .uri()
+                .to_string()
+                .ends_with("/gemini/models/gemini-2.5-pro:generateContent"),
+            "{}",
+            request.uri()
+        );
     }
 
     #[test]

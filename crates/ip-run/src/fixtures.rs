@@ -202,7 +202,7 @@ pub(crate) fn target(speaks: Dialect) -> Target {
         .into_iter()
         .collect();
     Target {
-        path: AbsPath::new("/anthropic/messages").unwrap(),
+        path: AbsPath::new("/anthropic").unwrap(),
         speaks,
         authority: Authority::new(
             Identity {
