@@ -202,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn no_endpoint_taking_a_tenant_in_a_body_serves_another_tenants_member() {
         let theirs = theirs();
-        let cases: [(&str, String, Option<String>); 7] = [
+        let cases: [(&str, String, Option<String>); 9] = [
             ("GET", format!("/_ip/limits?tenant={theirs}"), None),
             (
                 "PUT",
@@ -215,6 +215,19 @@ mod tests {
             ("GET", format!("/_ip/usage/summary?tenant={theirs}"), None),
             ("GET", format!("/_ip/audit?tenant={theirs}"), None),
             ("GET", format!("/_ip/agents?tenant={theirs}"), None),
+            (
+                "PUT",
+                format!("/_ip/agents/theirs?tenant={theirs}"),
+                Some(
+                    r#"{"name":"Theirs","config":{"role":"system","prompt":"Be helpful.","max_turns":4,"time_limit":60,"req_timeout":10}}"#
+                        .to_owned(),
+                ),
+            ),
+            (
+                "DELETE",
+                format!("/_ip/agents/theirs?tenant={theirs}"),
+                None,
+            ),
             (
                 "POST",
                 "/_ip/keys/tenant".to_owned(),

@@ -1,13 +1,13 @@
 use axum::Json;
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use ip_agents::{AgentConfig, AgentId, Sandbox};
+use ip_agents::{AgentConfig, AgentId, AgentName, AgentTemplate, Sandbox};
 use ip_core::{Capability, CapabilityScope, TenantId, Timestamp};
-use ip_storage::{AgentOwner, StoredAgent};
+use ip_storage::{AgentOwner, By, NewAgent, StoredAgent};
 
 use super::{Paged, store_refusal};
 use crate::manage::Manager;
@@ -20,8 +20,11 @@ type Refusal = Box<Response<Body>>;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list))
-        .route("/{agent}", get(read))
+        .route("/{agent}", get(read).put(put).delete(remove))
 }
+
+/// What the audit trail records a template written or removed as having come through.
+const ENDPOINT: &str = "/_ip/agents";
 
 /// One agent template, as the api reports it.
 #[derive(Debug, serde::Serialize)]
@@ -52,6 +55,19 @@ impl From<StoredAgent> for AgentView {
             created_at: stored.created_at,
         }
     }
+}
+
+/// A template as the api takes it. Which one it is comes from the path, not from here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Written {
+    /// What it is called.
+    name: AgentName,
+    /// The file tree its agent would see; none at all when left out.
+    #[serde(default)]
+    sandbox: Sandbox,
+    /// What its agent would run under.
+    config: AgentConfig,
 }
 
 /// Whose templates a request is about.
@@ -96,6 +112,67 @@ async fn read(
     match state.store().agent(&owner, &id).await {
         Ok(Some(held)) => Json(AgentView::from(held)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => store_refusal(error),
+    }
+}
+
+/// Stores a template under the name the path gives it, replacing whatever was there.
+///
+/// Nothing is told to reload: a template is read when something runs one, and nothing does.
+async fn put(
+    State(state): State<AppState>,
+    manager: Manager,
+    Path(id): Path<String>,
+    Query(owned): Query<Owned>,
+    body: Bytes,
+) -> Response<Body> {
+    let id = match AgentId::new(&id) {
+        Ok(id) => id,
+        Err(error) => return *unprocessable(error),
+    };
+    let owner = match owner_of(&state, &manager, owned).await {
+        Ok(owner) => owner,
+        Err(refusal) => return *refusal,
+    };
+    let Json(written) = match Json::<Written>::from_bytes(&body) {
+        Ok(written) => written,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let writing = NewAgent {
+        owner,
+        template: AgentTemplate {
+            id,
+            name: written.name,
+            sandbox: written.sandbox,
+            config: written.config,
+        },
+    };
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match state.store().put_agent(writing, &by).await {
+        // The template as stored, so the caller learns when it was written without asking again.
+        Ok(stored) => (StatusCode::CREATED, Json(AgentView::from(stored))).into_response(),
+        Err(error) => store_refusal(error),
+    }
+}
+
+/// Removes a template, or reports that this owner stores none under the name.
+async fn remove(
+    State(state): State<AppState>,
+    manager: Manager,
+    Path(id): Path<String>,
+    Query(owned): Query<Owned>,
+) -> Response<Body> {
+    let id = match AgentId::new(&id) {
+        Ok(id) => id,
+        Err(error) => return *unprocessable(error),
+    };
+    let owner = match owner_of(&state, &manager, owned).await {
+        Ok(owner) => owner,
+        Err(refusal) => return *refusal,
+    };
+    let by = By::new(manager.user().clone(), ENDPOINT);
+    match state.store().remove_agent(&owner, &id, &by).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => store_refusal(error),
     }
 }
@@ -166,8 +243,8 @@ mod tests {
     };
     use ip_core::{Grant, TnKey, UserId};
     use ip_storage::{
-        AccountKind, AgentStore, By, GrantStore, Membership, MembershipStore, NewAgent, NewTenant,
-        NewUser, SqliteStore, Standing, TenantStore, UserStore,
+        AccountKind, AgentStore, AuditFilter, Entity, GrantStore, Membership, MembershipStore,
+        NewTenant, NewUser, Page, SqliteStore, Standing, TenantStore, UserStore,
     };
     use tower::ServiceExt;
 
@@ -306,6 +383,33 @@ mod tests {
             .into_iter()
             .map(|held| held["id"].as_str().unwrap().to_owned())
             .collect()
+    }
+
+    /// A template as a caller writes one, without the id the path carries.
+    fn written(name: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","sandbox":{{"python":"s3://mybucket/bin/python"}},"config":{{"role":"system","prompt":"Be helpful.","max_turns":4,"time_limit":60,"req_timeout":10}}}}"#
+        )
+    }
+
+    async fn send(
+        router: &Router,
+        state: &AppState,
+        method: &str,
+        caller: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> Response<Body> {
+        router
+            .clone()
+            .oneshot(request(
+                method,
+                uri,
+                &cookie_of(state, &user(caller)).await,
+                body,
+            ))
+            .await
+            .unwrap()
     }
 
     async fn fixture() -> (Router, AppState) {
@@ -468,5 +572,267 @@ mod tests {
 
         assert_eq!(listed.status(), StatusCode::NOT_FOUND);
         assert_eq!(one.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_written_template_is_read_back() {
+        let (router, state) = fixture().await;
+
+        let response = send(
+            &router,
+            &state,
+            "PUT",
+            "root",
+            "/_ip/agents/triage",
+            Some(&written("Triage")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let said: serde_json::Value = serde_json::from_str(&body_of(response).await).unwrap();
+        assert_eq!(said["id"], "triage");
+        assert_eq!(said["name"], "Triage");
+        assert!(
+            said["created_at"].as_i64().unwrap() > 0,
+            "the caller learns when it was written without asking again"
+        );
+        let held = read(&router, &state, "root", "/_ip/agents/triage").await;
+        assert_eq!(held.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn writing_a_template_again_replaces_it() {
+        let (router, state) = fixture().await;
+
+        for name in ["First", "Second"] {
+            let response = send(
+                &router,
+                &state,
+                "PUT",
+                "root",
+                "/_ip/agents/triage",
+                Some(&written(name)),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let listed = read(&router, &state, "root", "/_ip/agents").await;
+        assert_eq!(named(listed).await, ["triage", "deployment"]);
+        let one = read(&router, &state, "root", "/_ip/agents/triage").await;
+        let said: serde_json::Value = serde_json::from_str(&body_of(one).await).unwrap();
+        assert_eq!(said["name"], "Second");
+    }
+
+    #[tokio::test]
+    async fn an_owner_writes_and_removes_its_own_tenants() {
+        let (router, state) = fixture().await;
+
+        let written_at = send(
+            &router,
+            &state,
+            "PUT",
+            "alice",
+            "/_ip/agents/triage?tenant=acme",
+            Some(&written("Triage")),
+        )
+        .await;
+        assert_eq!(written_at.status(), StatusCode::CREATED);
+        let said: serde_json::Value = serde_json::from_str(&body_of(written_at).await).unwrap();
+        assert_eq!(said["tenant"], "acme");
+
+        let removed = send(
+            &router,
+            &state,
+            "DELETE",
+            "alice",
+            "/_ip/agents/triage?tenant=acme",
+            None,
+        )
+        .await;
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        let listed = read(&router, &state, "alice", "/_ip/agents?tenant=acme").await;
+        assert_eq!(named(listed).await, ["acme-triage"]);
+    }
+
+    /// Refused, and refused without writing: a 403 answered after the row landed would be a
+    /// report about the response rather than about the store.
+    #[tokio::test]
+    async fn a_member_holding_nothing_writes_nothing() {
+        let (router, state) = fixture().await;
+
+        let response = send(
+            &router,
+            &state,
+            "PUT",
+            "bob",
+            "/_ip/agents/triage?tenant=acme",
+            Some(&written("Triage")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let held = state
+            .store()
+            .agents(&AgentOwner::Tenant(tenant("acme")), Page::default())
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 1, "only what the fixture wrote is there");
+    }
+
+    #[tokio::test]
+    async fn nobody_but_the_administrator_writes_what_the_deployment_holds() {
+        let (router, state) = fixture().await;
+
+        let response = send(
+            &router,
+            &state,
+            "PUT",
+            "alice",
+            "/_ip/agents/triage",
+            Some(&written("Triage")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            state
+                .store()
+                .agent(&AgentOwner::Global, &AgentId::new("triage").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The whole point of the types: a template that cannot run is refused at the door rather
+    /// than stored and discovered later.
+    #[tokio::test]
+    async fn a_body_the_types_refuse_is_the_callers_own_mistake() {
+        let (router, state) = fixture().await;
+        let cases = [
+            (
+                r#"{"name":"Triage","config":{"role":"system","prompt":"Be helpful.","max_turns":4,"time_limit":10,"req_timeout":60}}"#,
+                "outlive",
+            ),
+            (
+                r#"{"name":" Triage","config":{"role":"system","prompt":"Be helpful.","max_turns":4,"time_limit":60,"req_timeout":10}}"#,
+                "whitespace",
+            ),
+            (
+                r#"{"name":"Triage","sandbox":{"..":"s3://b/x"},"config":{"role":"system","prompt":"Be helpful.","max_turns":4,"time_limit":60,"req_timeout":10}}"#,
+                r#"may not name "..""#,
+            ),
+            (
+                r#"{"name":"Triage","owner":"acme","config":{"role":"system","prompt":"Be helpful.","max_turns":4,"time_limit":60,"req_timeout":10}}"#,
+                "owner",
+            ),
+        ];
+
+        for (body, says) in cases {
+            let response = send(
+                &router,
+                &state,
+                "PUT",
+                "root",
+                "/_ip/agents/triage",
+                Some(body),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body}"
+            );
+            let said = body_of(response).await;
+            assert!(said.contains(says), "{says} is not in {said}");
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_a_template_that_is_absent_is_reported_missing() {
+        let (router, state) = fixture().await;
+
+        let absent = send(
+            &router,
+            &state,
+            "DELETE",
+            "root",
+            "/_ip/agents/nothing",
+            None,
+        )
+        .await;
+        let theirs = send(
+            &router,
+            &state,
+            "DELETE",
+            "root",
+            "/_ip/agents/acme-triage",
+            None,
+        )
+        .await;
+
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+        assert_eq!(theirs.status(), StatusCode::NOT_FOUND);
+        let held = read(&router, &state, "root", "/_ip/agents?tenant=acme").await;
+        assert_eq!(
+            named(held).await,
+            ["acme-triage"],
+            "another owner's template is untouched by a removal that named it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_in_the_path_that_is_not_one_is_refused_before_anything_is_written() {
+        let (router, state) = fixture().await;
+
+        for method in ["PUT", "DELETE"] {
+            let response = send(
+                &router,
+                &state,
+                method,
+                "root",
+                "/_ip/agents/not%20an%20id",
+                Some(&written("Triage")),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_is_recorded_against_the_endpoint_it_came_through() {
+        let (router, state) = fixture().await;
+        send(
+            &router,
+            &state,
+            "PUT",
+            "alice",
+            "/_ip/agents/triage?tenant=acme",
+            Some(&written("Triage")),
+        )
+        .await;
+
+        let trail = state
+            .store()
+            .audits(
+                &AuditFilter {
+                    tenant: Some(tenant("acme")),
+                    actor: Some(user("alice")),
+                    entity: Some(Entity::Agent),
+                },
+                Page::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].through, "/_ip/agents");
+        assert_eq!(trail[0].entity_id, "triage");
+        assert_eq!(trail[0].after.as_ref().unwrap()["name"], "Triage");
     }
 }
