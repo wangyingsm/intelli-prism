@@ -1,5 +1,6 @@
 //! Storage traits and the backends that satisfy them.
 
+pub mod agent;
 pub mod audit;
 #[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
 mod codec;
@@ -24,6 +25,7 @@ mod suite;
 pub mod transaction;
 pub mod usage;
 
+pub use agent::{AgentOwner, AgentStore, NewAgent, StoredAgent};
 pub use audit::{AuditFilter, AuditStore, Auditable, Audited, By, NewAudit};
 pub use error::{Entity, StorageError};
 #[cfg(feature = "testing")]

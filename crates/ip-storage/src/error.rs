@@ -103,6 +103,8 @@ pub enum Entity {
     Price,
     /// One recorded change.
     Audit,
+    /// What one agent would be before anything runs it.
+    Agent,
 }
 
 impl Entity {
@@ -125,6 +127,7 @@ impl Entity {
             Self::Limit => "limit",
             Self::Price => "price",
             Self::Audit => "audit",
+            Self::Agent => "agent",
         }
     }
 
@@ -143,6 +146,7 @@ impl Entity {
             "limit" => Ok(Self::Limit),
             "price" => Ok(Self::Price),
             "audit" => Ok(Self::Audit),
+            "agent" => Ok(Self::Agent),
             other => Err(StorageError::Malformed {
                 entity: Self::Audit,
                 detail: format!("unknown entity {other:?}"),
@@ -166,6 +170,7 @@ impl fmt::Display for Entity {
             Self::Limit => "limit",
             Self::Price => "price",
             Self::Audit => "audit",
+            Self::Agent => "agent template",
         })
     }
 }
@@ -189,8 +194,32 @@ mod tests {
             (Entity::RuleRevision, "rule revision"),
             (Entity::Usage, "usage"),
             (Entity::Limit, "limit"),
+            (Entity::Price, "price"),
+            (Entity::Audit, "audit"),
+            (Entity::Agent, "agent template"),
         ] {
             assert_eq!(entity.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn every_entity_reads_back_from_the_name_a_column_holds() {
+        for entity in [
+            Entity::Tenant,
+            Entity::User,
+            Entity::Membership,
+            Entity::Grant,
+            Entity::Route,
+            Entity::Plugin,
+            Entity::PluginRule,
+            Entity::RuleRevision,
+            Entity::Usage,
+            Entity::Limit,
+            Entity::Price,
+            Entity::Audit,
+            Entity::Agent,
+        ] {
+            assert_eq!(Entity::named(entity.name()).unwrap(), entity);
         }
     }
 

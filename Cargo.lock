@@ -1798,6 +1798,7 @@ name = "ip-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ip-agents",
  "ip-core",
  "serde",
  "serde_json",
