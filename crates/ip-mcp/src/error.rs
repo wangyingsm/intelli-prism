@@ -96,4 +96,18 @@ pub enum McpError {
         /// What is allowed.
         max: usize,
     },
+
+    /// Something a server offered as a tool that is not one.
+    #[error("the server offered something that is not a tool: {detail}")]
+    NotATool {
+        /// What was wrong with it.
+        detail: String,
+    },
+
+    /// A server handing a listing over in more pages than this will follow.
+    #[error("the server paged its answer past the {max} pages this will read")]
+    TooManyPages {
+        /// What is allowed.
+        max: usize,
+    },
 }

@@ -23,6 +23,7 @@ mod error;
 mod id;
 mod rpc;
 mod server;
+mod tool;
 
 pub use client::{
     McpClient, McpSettings, Offered, PROTOCOL_VERSION, ServerInfo, Told, ToolsOffered,
@@ -31,3 +32,4 @@ pub use error::McpError;
 pub use id::McpId;
 pub use rpc::{RpcFailure, RpcRequest, RpcResponse};
 pub use server::{McpAuth, McpEndpoint, McpName, McpServer, McpToken};
+pub use tool::{DroppedTool, McpTool, McpToolName, Offering};

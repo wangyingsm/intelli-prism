@@ -14,6 +14,7 @@ use hyper_util::rt::TokioExecutor;
 use crate::error::McpError;
 use crate::rpc::{RpcRequest, RpcResponse};
 use crate::server::{McpAuth, McpServer};
+use crate::tool::Offering;
 
 /// The version of the protocol this client asks for.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -33,6 +34,9 @@ const SESSION: &str = "mcp-session-id";
 
 /// The header that tells a server which version the calls after the handshake are in.
 const SPEAKING: &str = "mcp-protocol-version";
+
+/// How many pages of one listing this will follow before giving up on the server.
+const MAX_PAGES: usize = 32;
 
 /// The pooling http client this crate talks over.
 type Pooled = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
@@ -193,6 +197,45 @@ impl McpClient {
     /// Which server this is, as the deployment registered it.
     pub fn server(&self) -> &McpServer {
         &self.server
+    }
+
+    /// Every tool the server offers, and every one it offered that cannot be used.
+    ///
+    /// A server that declared no tools at all is not asked for any, which is what the protocol
+    /// says to do: asking anyway earns an error from a server behaving correctly.
+    ///
+    /// A server may hand its tools over a page at a time, so this follows the cursor until the
+    /// server names no further page — or until [`MAX_PAGES`], because a server this deployment
+    /// does not run can name one forever.
+    pub async fn tools(&self) -> Result<Offering, McpError> {
+        if self.told.capabilities.tools.is_none() {
+            return Ok(Offering::default());
+        }
+        let mut offering = Offering::default();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let params = match &cursor {
+                Some(cursor) => serde_json::json!({"cursor": cursor}),
+                None => serde_json::json!({}),
+            };
+            let page = self.call("tools/list", params).await?;
+            match page.get("tools").and_then(serde_json::Value::as_array) {
+                Some(listed) => offering.extend_from(listed),
+                None => {
+                    return Err(McpError::NotATool {
+                        detail: "a listing of tools held no tools".to_owned(),
+                    });
+                }
+            }
+            cursor = page
+                .get("nextCursor")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if cursor.is_none() {
+                return Ok(offering);
+            }
+        }
+        Err(McpError::TooManyPages { max: MAX_PAGES })
     }
 
     /// Asks the server for something, and reads what it answers.
@@ -416,19 +459,69 @@ mod tests {
         Status,
         /// With more than the caller will read.
         Long,
+        /// Saying it has no tools at all.
+        Toolless,
     }
 
-    fn handshake_result(version: &str) -> serde_json::Value {
+    /// What the stub offers when it is asked for its tools.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Listing {
+        /// Two tools a model can be told about.
+        Plain,
+        /// One good tool and three this gateway will not declare.
+        Unusable,
+        /// Two pages, the first naming the second.
+        Paged,
+        /// A page that always names another.
+        Forever,
+        /// An answer that holds no tools at all.
+        Empty,
+    }
+
+    fn handshake_result(version: &str, answers: Answers) -> serde_json::Value {
+        let capabilities = match answers {
+            Answers::Toolless => serde_json::json!({"resources": {}}),
+            _ => serde_json::json!({"tools": {"listChanged": true}}),
+        };
         serde_json::json!({
             "protocolVersion": version,
-            "capabilities": {"tools": {"listChanged": true}},
+            "capabilities": capabilities,
             "serverInfo": {"name": "Warehouse", "version": "1.2.3"},
         })
+    }
+
+    fn listed(listing: Listing, cursor: Option<&str>) -> serde_json::Value {
+        match listing {
+            Listing::Plain => serde_json::json!({"tools": [
+                {"name": "get_stock", "description": "What is in the warehouse",
+                 "inputSchema": {"type": "object", "properties": {"sku": {"type": "string"}}}},
+                {"name": "ping"},
+            ]}),
+            Listing::Unusable => serde_json::json!({"tools": [
+                {"name": "get_stock"},
+                {"name": "stock.get"},
+                {"name": ""},
+                {"description": "nameless"},
+            ]}),
+            Listing::Paged => match cursor {
+                None => serde_json::json!({
+                    "tools": [{"name": "get_stock"}],
+                    "nextCursor": "page-2",
+                }),
+                Some(_) => serde_json::json!({"tools": [{"name": "ping"}]}),
+            },
+            Listing::Forever => serde_json::json!({
+                "tools": [{"name": "ping"}],
+                "nextCursor": "and-another",
+            }),
+            Listing::Empty => serde_json::json!({"nothing": "here"}),
+        }
     }
 
     async fn answer(
         record: Record,
         answers: Answers,
+        listing: Listing,
         request: Request<hyper::body::Incoming>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         let (parts, body) = request.into_parts();
@@ -460,14 +553,21 @@ mod tests {
                 .body(Full::new(Bytes::new()))
                 .unwrap());
         };
-        let handshaking = body["method"] == "initialize";
-        let result = if handshaking {
-            handshake_result(match answers {
-                Answers::Version(version) => version,
-                _ => PROTOCOL_VERSION,
-            })
+        let result = if body["method"] == "initialize" {
+            handshake_result(
+                match answers {
+                    Answers::Version(version) => version,
+                    _ => PROTOCOL_VERSION,
+                },
+                answers,
+            )
         } else if matches!(answers, Answers::Long) {
             serde_json::json!({"padding": "x".repeat(4096)})
+        } else if body["method"] == "tools/list" {
+            listed(
+                listing,
+                body["params"].get("cursor").and_then(|it| it.as_str()),
+            )
         } else {
             serde_json::json!({"asked": body["method"].clone()})
         };
@@ -506,12 +606,14 @@ mod tests {
                 built,
                 &serde_json::json!({"jsonrpc": "2.0", "id": 99, "result": result}),
             ),
-            Answers::Plain | Answers::WithoutSession | Answers::Version(_) | Answers::Long => {
-                json_body(
-                    built,
-                    &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                )
-            }
+            Answers::Plain
+            | Answers::WithoutSession
+            | Answers::Version(_)
+            | Answers::Long
+            | Answers::Toolless => json_body(
+                built,
+                &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            ),
         })
     }
 
@@ -525,7 +627,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn stub(answers: Answers) -> (SocketAddr, Record) {
+    async fn stub(answers: Answers, listing: Listing) -> (SocketAddr, Record) {
         let record: Record = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -537,7 +639,9 @@ mod tests {
                     let _ = http1::Builder::new()
                         .serve_connection(
                             TokioIo::new(stream),
-                            service_fn(move |request| answer(Arc::clone(&kept), answers, request)),
+                            service_fn(move |request| {
+                                answer(Arc::clone(&kept), answers, listing, request)
+                            }),
                         )
                         .await;
                 });
@@ -577,9 +681,18 @@ mod tests {
     }
 
     async fn opened(answers: Answers) -> (Result<McpClient, McpError>, Record) {
-        let (address, record) = stub(answers).await;
+        let (address, record) = stub(answers, Listing::Plain).await;
         let client = McpClient::open(server(address, McpAuth::None), settings()).await;
         (client, record)
+    }
+
+    async fn offering(listing: Listing) -> (Result<Offering, McpError>, Record) {
+        let (address, record) = stub(Answers::Plain, listing).await;
+        let client = McpClient::open(server(address, McpAuth::None), settings())
+            .await
+            .unwrap();
+        let offered = client.tools().await;
+        (offered, record)
     }
 
     #[tokio::test]
@@ -661,7 +774,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_credential_is_presented_to_the_server_that_requires_one() {
-        let (address, record) = stub(Answers::Plain).await;
+        let (address, record) = stub(Answers::Plain, Listing::Plain).await;
         let auth = McpAuth::Bearer {
             token: McpToken::new(TOKEN).unwrap(),
         };
@@ -696,11 +809,8 @@ mod tests {
         let client = client.unwrap();
         assert_eq!(client.told().protocol_version, PROTOCOL_VERSION);
 
-        let answered = client
-            .call("tools/list", serde_json::json!({}))
-            .await
-            .unwrap();
-        assert_eq!(answered["asked"], "tools/list");
+        let answered = client.call("ping", serde_json::json!({})).await.unwrap();
+        assert_eq!(answered["asked"], "ping");
     }
 
     #[tokio::test]
@@ -792,7 +902,7 @@ mod tests {
     /// A server this deployment does not run may answer with as much as it likes.
     #[tokio::test]
     async fn an_answer_past_what_this_will_read_is_refused() {
-        let (address, _) = stub(Answers::Long).await;
+        let (address, _) = stub(Answers::Long, Listing::Plain).await;
         let client = McpClient::open(
             server(address, McpAuth::None),
             McpSettings {
@@ -806,6 +916,90 @@ mod tests {
         assert_eq!(
             client.call("tools/list", serde_json::json!({})).await,
             Err(McpError::AnswerTooLong { max: 512 })
+        );
+    }
+
+    #[tokio::test]
+    async fn every_tool_a_server_offers_is_read() {
+        let (offered, record) = offering(Listing::Plain).await;
+        let offered = offered.unwrap();
+
+        assert_eq!(offered.dropped, []);
+        let names: Vec<&str> = offered.tools.iter().map(|it| it.name.as_str()).collect();
+        assert_eq!(names, ["get_stock", "ping"]);
+        assert_eq!(
+            offered.tools[0].description.as_deref(),
+            Some("What is in the warehouse")
+        );
+        assert_eq!(
+            record.lock().unwrap()[2].method,
+            "tools/list",
+            "the listing is asked for by its own method"
+        );
+    }
+
+    /// One tool nobody can be told about does not take the listing down with it.
+    #[tokio::test]
+    async fn a_tool_this_cannot_declare_is_dropped_and_the_rest_is_offered() {
+        let (offered, _) = offering(Listing::Unusable).await;
+        let offered = offered.unwrap();
+
+        let names: Vec<&str> = offered.tools.iter().map(|it| it.name.as_str()).collect();
+        assert_eq!(names, ["get_stock"]);
+        assert_eq!(offered.dropped.len(), 3);
+        assert_eq!(offered.dropped[0].name, "stock.get");
+        assert_eq!(
+            offered.dropped[0].why,
+            McpError::IllegalChar {
+                kind: crate::McpToolName::KIND,
+                ch: '.',
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_handing_its_tools_over_a_page_at_a_time_is_read_to_the_end() {
+        let (offered, record) = offering(Listing::Paged).await;
+
+        let offered = offered.unwrap();
+        let names: Vec<&str> = offered.tools.iter().map(|it| it.name.as_str()).collect();
+        assert_eq!(names, ["get_stock", "ping"]);
+        assert_eq!(
+            record.lock().unwrap().len(),
+            4,
+            "two handshake messages and two pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_pages_forever_is_given_up_on() {
+        let (offered, record) = offering(Listing::Forever).await;
+
+        assert_eq!(offered, Err(McpError::TooManyPages { max: MAX_PAGES }));
+        assert_eq!(record.lock().unwrap().len(), 2 + MAX_PAGES);
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_lists_nothing_is_not_a_listing() {
+        let (offered, _) = offering(Listing::Empty).await;
+        assert!(
+            matches!(offered, Err(McpError::NotATool { .. })),
+            "{offered:?}"
+        );
+    }
+
+    /// The protocol says not to ask, and a server behaving correctly answers an error if asked.
+    #[tokio::test]
+    async fn a_server_that_declared_no_tools_is_not_asked_for_any() {
+        let (client, record) = opened(Answers::Toolless).await;
+        let client = client.unwrap();
+        assert_eq!(client.told().capabilities.tools, None);
+
+        assert_eq!(client.tools().await, Ok(Offering::default()));
+        assert_eq!(
+            record.lock().unwrap().len(),
+            2,
+            "the handshake and nothing else"
         );
     }
 
