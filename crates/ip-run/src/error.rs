@@ -39,6 +39,19 @@ pub enum RunError {
         server: String,
     },
 
+    /// A registered server that would not open, or would not say what it offers.
+    ///
+    /// A run is refused rather than started without it: the template asked for its tools, and
+    /// a run that silently has fewer than it was written for is worse than one that did not
+    /// start.
+    #[error("the server {server:?} could not be opened: {why}")]
+    ServerUnreachable {
+        /// Which server.
+        server: String,
+        /// What went wrong.
+        why: String,
+    },
+
     /// A tool the server it names does not offer.
     #[error("the server {server:?} offers no tool called {tool:?}")]
     NoSuchTool {

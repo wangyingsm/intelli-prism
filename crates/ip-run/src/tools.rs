@@ -1,6 +1,6 @@
 //! Which tools a run may call, and what the model is told they are called.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ip_agents::ToolSet;
 use ip_mcp::{McpId, McpToolName, Offering};
@@ -37,6 +37,17 @@ pub struct Addressed {
 pub struct Toolbox {
     by_wire: BTreeMap<String, Addressed>,
     declared: Vec<Tool>,
+}
+
+/// Every server a tool set names, each once however many of its tools are asked for.
+///
+/// Read before anything is opened, so a template naming a server this deployment does not
+/// have is refused without a connection being made.
+pub fn servers_named(set: &ToolSet) -> Result<BTreeSet<McpId>, RunError> {
+    set.tools()
+        .iter()
+        .map(|asked| addressed(asked.as_str()).map(|one| one.server))
+        .collect()
 }
 
 impl Toolbox {

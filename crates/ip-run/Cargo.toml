@@ -22,8 +22,16 @@ ip-protocol = { version = "0.1.0", path = "../ip-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing = "0.1.44"
 
 [dev-dependencies]
 async-trait = "0.1.92"
+hyper = { version = "1.11.1", features = ["server"] }
+hyper-util = { version = "0.1.19", features = ["tokio"] }
 ip-config = { version = "0.1.0", path = "../ip-config" }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+] }
