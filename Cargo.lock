@@ -1821,6 +1821,7 @@ dependencies = [
  "hex",
  "ip-agents",
  "ip-core",
+ "ip-mcp",
  "ip-protocol",
  "serde",
  "serde_json",
