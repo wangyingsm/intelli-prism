@@ -12,10 +12,14 @@
 
 #![forbid(unsafe_code)]
 
+mod choice;
+mod error;
 mod event;
 mod id;
 mod turn;
 
+pub use choice::{Pinned, Requested};
+pub use error::RunError;
 pub use event::RunEvent;
 pub use id::RunId;
 pub use turn::{Spend, Stopped, Turn, TurnNumber};
