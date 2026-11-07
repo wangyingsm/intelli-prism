@@ -9,12 +9,14 @@ use ip_core::{
     Checksum, Counted, Grant, Grants, LimitScope, ModelName, NewPluginRule, PassphraseHash, Period,
     PluginKind, PluginOrder, PluginRule, RouteKey, RouteRule, TenantId, Timestamp, UserId,
 };
+use ip_mcp::{McpId, McpServer};
 
 use crate::agent::{AgentOwner, AgentStore, NewAgent, StoredAgent};
 use crate::audit::{AuditFilter, AuditStore, Audited, By};
 use crate::error::{StorageError, ToldToFail};
 use crate::limit::{Limit, LimitStore, NewLimit};
 use crate::list::{ListStore, Listed, Page};
+use crate::mcp::{McpStore, StoredMcp};
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{NewPlugin, Plugin, PluginOwner, PluginRecord, PluginRuleStore, PluginStore};
 use crate::price::{NewPrice, PriceStore, Priced};
@@ -457,6 +459,29 @@ impl AgentStore for FailingStore {
     ) -> Result<Vec<StoredAgent>, StorageError> {
         self.answering()?;
         self.inner.agents(owner, page).await
+    }
+}
+
+#[async_trait]
+impl McpStore for FailingStore {
+    async fn put_mcp(&self, server: McpServer, by: &By) -> Result<StoredMcp, StorageError> {
+        self.answering()?;
+        self.inner.put_mcp(server, by).await
+    }
+
+    async fn remove_mcp(&self, id: &McpId, by: &By) -> Result<(), StorageError> {
+        self.answering()?;
+        self.inner.remove_mcp(id, by).await
+    }
+
+    async fn mcp(&self, id: &McpId) -> Result<Option<StoredMcp>, StorageError> {
+        self.answering()?;
+        self.inner.mcp(id).await
+    }
+
+    async fn mcps(&self, page: Page) -> Result<Vec<StoredMcp>, StorageError> {
+        self.answering()?;
+        self.inner.mcps(page).await
     }
 }
 

@@ -1079,3 +1079,60 @@ pub(crate) async fn a_template_that_was_refused_records_nothing(store: &impl Bac
         "a refused write recorded itself"
     );
 }
+
+/// The one record in this trail with a credential behind it, and it carries none of it.
+pub(crate) async fn registering_a_server_records_everything_but_its_token(store: &impl Backend) {
+    const TOKEN: &str = "wh-live-9f2c4a7b1e";
+    store
+        .put_mcp(
+            crate::suite::mcp::bearer("warehouse", "Warehouse tools", TOKEN),
+            &crate::suite::mcp::by(),
+        )
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Mcp).await;
+    assert_eq!(trail.len(), 1, "one change, one record");
+    let one = &trail[0];
+    assert_eq!(one.actor, UserId::new("alice").unwrap());
+    assert_eq!(one.entity_id, "warehouse");
+    assert_eq!(one.through, "/_ip/mcps");
+    assert_eq!(one.tenant, None, "a server belongs to nobody");
+    assert_eq!(one.before, None);
+    let after = one.after.as_ref().unwrap();
+    assert_eq!(after["name"], "Warehouse tools");
+    assert_eq!(after["endpoint"], "https://mcp.acme.test/sse");
+    assert_eq!(after["auth"], "bearer");
+
+    // Asked of the row as the database handed it back, rather than of the value that built it.
+    let whole = serde_json::to_string(one.after.as_ref().unwrap()).unwrap();
+    assert!(
+        !whole.contains(TOKEN),
+        "the trail carries a credential: {whole}"
+    );
+}
+
+pub(crate) async fn rewriting_and_removing_a_server_record_what_it_said(store: &impl Backend) {
+    let by = crate::suite::mcp::by();
+    store
+        .put_mcp(crate::suite::mcp::server("warehouse", "First"), &by)
+        .await
+        .unwrap();
+    store
+        .put_mcp(crate::suite::mcp::server("warehouse", "Second"), &by)
+        .await
+        .unwrap();
+    store
+        .remove_mcp(&ip_mcp::McpId::new("warehouse").unwrap(), &by)
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Mcp).await;
+    assert_eq!(trail.len(), 3);
+    let removal = &trail[0];
+    assert_eq!(removal.before.as_ref().unwrap()["name"], "Second");
+    assert_eq!(removal.after, None, "nothing is left to describe");
+    let rewrite = &trail[1];
+    assert_eq!(rewrite.before.as_ref().unwrap()["name"], "First");
+    assert_eq!(rewrite.after.as_ref().unwrap()["name"], "Second");
+}

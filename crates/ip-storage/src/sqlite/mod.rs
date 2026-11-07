@@ -3,6 +3,7 @@ mod audit;
 mod identity;
 mod limit;
 mod list;
+mod mcp;
 mod plugin;
 mod price;
 mod revision;

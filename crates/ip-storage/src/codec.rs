@@ -1,9 +1,10 @@
-//! How identity and plugin values are spelled in the columns every sql backend stores them in.
+//! How a value every sql backend shares is spelled in the columns that hold it.
 
 use ip_core::{
     ApiId, Capability, CapabilityScope, Decider, Dialect, Latency, Money, PluginOrder, PluginScope,
     Redacted, Served, TenantId, TnKey, TokenCount, UserId,
 };
+use ip_mcp::{McpAuth, McpError, McpToken};
 
 use crate::error::{Entity, StorageError};
 use crate::model::{AccountKind, Standing};
@@ -268,4 +269,30 @@ pub(crate) fn latency(millis: i64) -> Result<Latency, StorageError> {
         detail: format!("{millis} is not a span of milliseconds"),
     })?;
     Ok(Latency::from_millis(millis))
+}
+
+/// Rebuilds what an MCP server requires from the two columns that hold it.
+///
+/// The kind and the token are stored apart and no constraint pairs them, so a pair that
+/// disagrees is a row a database will hold and this is what refuses it.
+pub(crate) fn mcp_auth(kind: &str, token: Option<String>) -> Result<McpAuth, StorageError> {
+    match (kind, token) {
+        ("none", None) => Ok(McpAuth::None),
+        ("bearer", Some(token)) => Ok(McpAuth::Bearer {
+            token: McpToken::new(&token).map_err(mcp_refused)?,
+        }),
+        ("none" | "bearer", _) => Err(mcp_refused(McpError::TokenWithoutBearer)),
+        (other, _) => Err(StorageError::Malformed {
+            entity: Entity::Mcp,
+            detail: format!("unknown credential kind {other:?}"),
+        }),
+    }
+}
+
+/// A stored value an MCP server's own type refuses, reported against the server it was read for.
+pub(crate) fn mcp_refused(error: McpError) -> StorageError {
+    StorageError::Malformed {
+        entity: Entity::Mcp,
+        detail: error.to_string(),
+    }
 }

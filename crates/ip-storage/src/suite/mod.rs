@@ -6,6 +6,7 @@ pub(crate) mod identity;
 pub(crate) mod isolation;
 pub(crate) mod limit;
 pub(crate) mod list;
+pub(crate) mod mcp;
 pub(crate) mod member_add;
 pub(crate) mod member_remove;
 pub(crate) mod plugin;
@@ -232,6 +233,19 @@ macro_rules! backend_suite {
             deleting_a_tenant_takes_its_templates_with_it,
         ]);
     };
+    (mcp, $open:path) => {
+        $crate::suite::backend_suite!(@module mcp, $open, [
+            a_server_round_trips,
+            a_credential_survives_the_database,
+            registering_a_server_again_replaces_it,
+            a_server_that_stops_requiring_a_token_keeps_none,
+            rotating_a_credential_leaves_one_server_holding_the_new_one,
+            removing_a_server_leaves_the_others,
+            removing_a_server_that_is_absent_reports_it_missing,
+            servers_come_newest_first_a_page_at_a_time,
+            deleting_a_tenant_leaves_every_server_where_it_was,
+        ]);
+    };
     (audit, $open:path) => {
         $crate::suite::backend_suite!(@module audit, $open, [
             setting_a_limit_records_who_set_it,
@@ -247,6 +261,8 @@ macro_rules! backend_suite {
             writing_a_tenants_template_records_it_against_that_tenant,
             rewriting_and_removing_a_template_record_what_it_said,
             a_template_that_was_refused_records_nothing,
+            registering_a_server_records_everything_but_its_token,
+            rewriting_and_removing_a_server_record_what_it_said,
             routing_a_key_somewhere_else_records_both_targets,
             removing_a_route_records_where_it_pointed,
             whose_a_stored_plugin_is_comes_from_who_stored_it,
@@ -357,6 +373,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(audit, $open);
         $crate::suite::backend_suite!(price, $open);
         $crate::suite::backend_suite!(agent, $open);
+        $crate::suite::backend_suite!(mcp, $open);
         $crate::suite::backend_suite!(isolation, $open);
     };
 }

@@ -6,6 +6,7 @@ use crate::audit::{AuditStore, By};
 use crate::error::StorageError;
 use crate::limit::LimitStore;
 use crate::list::ListStore;
+use crate::mcp::McpStore;
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{PluginRuleStore, PluginStore};
 use crate::price::PriceStore;
@@ -137,6 +138,7 @@ impl<T> Storage for T where T: TenantStore + UserStore + MembershipStore + Grant
 pub trait Backend:
     Storage
     + AgentStore
+    + McpStore
     + RouteStore
     + PluginStore
     + PluginRuleStore
@@ -152,6 +154,7 @@ pub trait Backend:
 impl<T> Backend for T where
     T: Storage
         + AgentStore
+        + McpStore
         + RouteStore
         + PluginStore
         + PluginRuleStore
