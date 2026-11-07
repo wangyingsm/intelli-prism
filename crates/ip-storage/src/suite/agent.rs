@@ -1,7 +1,7 @@
 use ip_agents::{
     AgentConfig, AgentConfigParts, AgentId, AgentName, AgentRole, AgentTemplate,
-    BestEffortStrategy, Entries, MaxTurns, ObjectLocation, PathSegment, Prompt, ReqTimeout,
-    Sandbox, SandboxEntry, TimeLimit, ToolName, ToolSet,
+    BestEffortStrategy, ChosenApi, ChosenModel, Entries, MaxTurns, ObjectLocation, PathSegment,
+    Prompt, ReqTimeout, Sandbox, SandboxEntry, TimeLimit, ToolName, ToolSet,
 };
 use ip_core::TenantId;
 
@@ -42,6 +42,8 @@ fn config(prompt: &str, turns: u16) -> AgentConfig {
         req_timeout: ReqTimeout::new(10).unwrap(),
         use_best_effort: false,
         best_effort_strategy: None,
+        model: None,
+        api: None,
     })
     .unwrap()
 }
@@ -104,6 +106,8 @@ pub(crate) async fn every_part_of_a_template_survives_the_database(store: &impl 
             req_timeout: ReqTimeout::new(30).unwrap(),
             use_best_effort: true,
             best_effort_strategy: Some(BestEffortStrategy::Aggregate),
+            model: Some(ChosenModel::new("claude-sonnet-4-5").unwrap()),
+            api: Some(ChosenApi::Anthropic),
         })
         .unwrap(),
     };

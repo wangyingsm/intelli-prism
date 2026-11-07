@@ -149,6 +149,8 @@ mod tests {
                 req_timeout: ReqTimeout::new(10).unwrap(),
                 use_best_effort: false,
                 best_effort_strategy: None,
+                model: None,
+                api: None,
             })
             .unwrap(),
         }

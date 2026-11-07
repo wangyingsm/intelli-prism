@@ -21,8 +21,8 @@ pub mod sandbox;
 pub mod template;
 
 pub use config::{
-    AgentConfig, AgentConfigParts, AgentRole, BestEffortStrategy, MaxTurns, Prompt, ReqTimeout,
-    TimeLimit, ToolName, ToolSet,
+    AgentConfig, AgentConfigParts, AgentRole, BestEffortStrategy, ChosenApi, ChosenModel, MaxTurns,
+    Prompt, ReqTimeout, TimeLimit, ToolName, ToolSet,
 };
 pub use error::AgentError;
 pub use id::AgentId;

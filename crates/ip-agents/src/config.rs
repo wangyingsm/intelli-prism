@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::error::AgentError;
 
 /// The longest a prompt may be, in bytes: a template is a configuration, not a blob store.
@@ -10,6 +12,8 @@ const TIME_LIMIT_MAX_SECONDS: u32 = 86_400;
 const REQ_TIMEOUT_MAX_SECONDS: u32 = 3_600;
 /// The longest a tool name may be, in bytes: a 64-byte server id, a dot, and a 64-byte tool.
 const TOOL_NAME_MAX_BYTES: usize = 129;
+/// The longest a model name may be, in bytes, which is the widest any upstream is known to spell.
+const MODEL_NAME_MAX_BYTES: usize = 128;
 /// The most tools one template may name.
 const TOOL_SET_MAX: usize = 64;
 
@@ -380,6 +384,125 @@ impl From<BestEffortStrategy> for String {
     }
 }
 
+/// Which model a run puts its turns to.
+///
+/// Held as text rather than as the gateway's own model name, for the reason this crate holds no
+/// other crate's types: a template is configuration, and what a model is called is checked
+/// against what an endpoint actually offers when a run starts rather than when it is written.
+///
+/// A deployment that really runs a model called `auto` cannot pin it here, because the literal
+/// is read first. That is the price of spelling the choice in one field instead of two.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ChosenModel {
+    /// Whatever the deployment's own routing picks — the classified route, or the arbiter.
+    Auto,
+    /// This model and no other.
+    Named(Box<str>),
+}
+
+impl ChosenModel {
+    /// Name of this kind, as it appears in errors.
+    pub const KIND: &'static str = "chosen model";
+
+    /// How `auto` is spelled.
+    pub const ANY: &'static str = "auto";
+
+    /// Validates and wraps a choice.
+    pub fn new(raw: &str) -> Result<Self, AgentError> {
+        Self::try_from(raw.to_owned())
+    }
+
+    /// The choice as text, which is how it is stored and reported.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Auto => Self::ANY,
+            Self::Named(model) => model,
+        }
+    }
+
+    /// Whether this pins nothing.
+    #[must_use]
+    pub const fn is_any(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+impl TryFrom<String> for ChosenModel {
+    type Error = AgentError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        if raw == Self::ANY {
+            return Ok(Self::Auto);
+        }
+        if raw.is_empty() {
+            return Err(AgentError::Empty { kind: Self::KIND });
+        }
+        if raw.len() > MODEL_NAME_MAX_BYTES {
+            return Err(AgentError::TooLong {
+                kind: Self::KIND,
+                len: raw.len(),
+                max: MODEL_NAME_MAX_BYTES,
+            });
+        }
+        match raw.chars().find(|ch| ch.is_whitespace() || ch.is_control()) {
+            Some(ch) => Err(AgentError::IllegalChar {
+                kind: Self::KIND,
+                ch,
+            }),
+            None => Ok(Self::Named(raw.into_boxed_str())),
+        }
+    }
+}
+
+impl From<ChosenModel> for String {
+    fn from(model: ChosenModel) -> Self {
+        model.as_str().to_owned()
+    }
+}
+
+/// Which family of api a run's turns are written in.
+///
+/// Its own enum rather than the gateway's, for the reason [`ChosenModel`] is text: the mapping
+/// to what the gateway speaks is made where a run is resolved, by the one crate that holds both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChosenApi {
+    /// Whatever the deployment's own routing picks.
+    Auto,
+    /// Chat completions.
+    OpenAi,
+    /// Messages.
+    Anthropic,
+    /// Generate content.
+    Gemini,
+}
+
+impl ChosenApi {
+    /// The spelling this is stored and reported under.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// Whether this pins nothing.
+    #[must_use]
+    pub const fn is_any(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+impl fmt::Display for ChosenApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// The parts one agent configuration is built from.
 ///
 /// Its own shape is the stored shape, so the spellings here are what a column holds and what the
@@ -407,6 +530,12 @@ pub struct AgentConfigParts {
     /// How such a run picks its answer, and none where it is left to the deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub best_effort_strategy: Option<BestEffortStrategy>,
+    /// Which model its turns go to, and none where the template does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ChosenModel>,
+    /// Which family its turns are written in, and none where the template does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ChosenApi>,
 }
 
 /// What one agent would run under, with every part of it already refused or accepted.
@@ -470,6 +599,18 @@ impl AgentConfig {
     pub const fn best_effort_strategy(&self) -> Option<BestEffortStrategy> {
         self.0.best_effort_strategy
     }
+
+    /// Which model its turns go to, where the template says.
+    #[must_use]
+    pub const fn model(&self) -> Option<&ChosenModel> {
+        self.0.model.as_ref()
+    }
+
+    /// Which family its turns are written in, where the template says.
+    #[must_use]
+    pub const fn api(&self) -> Option<ChosenApi> {
+        self.0.api
+    }
 }
 
 impl TryFrom<AgentConfigParts> for AgentConfig {
@@ -513,7 +654,135 @@ mod tests {
             req_timeout: ReqTimeout::new(10).unwrap(),
             use_best_effort: false,
             best_effort_strategy: None,
+            model: None,
+            api: None,
         }
+    }
+
+    #[test]
+    fn a_chosen_model_is_either_one_model_or_none_in_particular() {
+        assert_eq!(ChosenModel::new("auto").unwrap(), ChosenModel::Auto);
+        assert!(ChosenModel::Auto.is_any());
+        assert_eq!(ChosenModel::Auto.as_str(), "auto");
+
+        let pinned = ChosenModel::new("gpt-4o-2024-08-06").unwrap();
+        assert_eq!(pinned.as_str(), "gpt-4o-2024-08-06");
+        assert!(!pinned.is_any());
+    }
+
+    #[test]
+    fn a_chosen_model_is_stored_as_the_text_it_was_written_as() {
+        for raw in ["auto", "claude-sonnet-4-5", "qwen3:30b"] {
+            let written = format!("\"{raw}\"");
+            let read: ChosenModel = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.as_str(), raw);
+            assert_eq!(serde_json::to_string(&read).unwrap(), written);
+        }
+    }
+
+    #[test]
+    fn a_chosen_model_is_refused_what_no_model_is_called() {
+        assert_eq!(
+            ChosenModel::new(""),
+            Err(AgentError::Empty {
+                kind: ChosenModel::KIND
+            })
+        );
+        assert_eq!(
+            ChosenModel::new("gpt 4o"),
+            Err(AgentError::IllegalChar {
+                kind: ChosenModel::KIND,
+                ch: ' ',
+            })
+        );
+        assert!(matches!(
+            ChosenModel::new(&"m".repeat(MODEL_NAME_MAX_BYTES + 1)),
+            Err(AgentError::TooLong { .. })
+        ));
+        assert!(ChosenModel::new(&"m".repeat(MODEL_NAME_MAX_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn a_chosen_api_survives_the_name_it_is_stored_under() {
+        for (api, name) in [
+            (ChosenApi::Auto, "auto"),
+            (ChosenApi::OpenAi, "openai"),
+            (ChosenApi::Anthropic, "anthropic"),
+            (ChosenApi::Gemini, "gemini"),
+        ] {
+            assert_eq!(api.name(), name);
+            assert_eq!(api.to_string(), name);
+            assert_eq!(serde_json::to_string(&api).unwrap(), format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<ChosenApi>(&format!("\"{name}\"")).unwrap(),
+                api
+            );
+        }
+        assert!(ChosenApi::Auto.is_any());
+        assert!(!ChosenApi::Gemini.is_any());
+    }
+
+    /// Both are optional, and a template written before either existed must still read back.
+    #[test]
+    fn a_configuration_written_before_a_model_could_be_named_still_reads_back() {
+        let stored = serde_json::json!({
+            "role": "system",
+            "prompt": "Be helpful.",
+            "tool_set": ["sql"],
+            "max_turns": 4,
+            "time_limit": 60,
+            "req_timeout": 10,
+        });
+
+        let config: AgentConfig = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(config.model(), None);
+        assert_eq!(config.api(), None);
+        let written = serde_json::to_value(&config).unwrap();
+        assert!(
+            written.get("model").is_none() && written.get("api").is_none(),
+            "a field nothing set was written back: {written}"
+        );
+    }
+
+    #[test]
+    fn a_configuration_that_names_a_model_and_a_family_carries_both() {
+        let config = AgentConfig::new(AgentConfigParts {
+            model: Some(ChosenModel::new("gpt-4o").unwrap()),
+            api: Some(ChosenApi::OpenAi),
+            ..parts()
+        })
+        .unwrap();
+
+        assert_eq!(config.model().unwrap().as_str(), "gpt-4o");
+        assert_eq!(config.api(), Some(ChosenApi::OpenAi));
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["model"],
+            serde_json::json!("gpt-4o")
+        );
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["api"],
+            serde_json::json!("openai")
+        );
+    }
+
+    /// A template that pins nothing on purpose reads differently from one that says nothing, and
+    /// both are kept: the first is an operator saying the deployment decides.
+    #[test]
+    fn a_template_may_pin_nothing_on_purpose() {
+        let config = AgentConfig::new(AgentConfigParts {
+            model: Some(ChosenModel::Auto),
+            api: Some(ChosenApi::Auto),
+            ..parts()
+        })
+        .unwrap();
+
+        assert!(config.model().unwrap().is_any());
+        assert!(config.api().unwrap().is_any());
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["model"],
+            serde_json::json!("auto")
+        );
     }
 
     #[test]
