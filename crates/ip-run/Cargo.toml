@@ -22,6 +22,7 @@ ip-protocol = { version = "0.1.0", path = "../ip-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tracing = "0.1.44"
 
 [dev-dependencies]

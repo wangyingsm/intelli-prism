@@ -43,6 +43,8 @@ pub struct Taken {
     pub gathered: Gathered,
     /// What the two translations could not carry, named so a run can say so.
     pub lost: Dropped,
+    /// What this turn was followed under, which is how it is joined to what it cost.
+    pub trace: TraceId,
 }
 
 /// Asks one turn and reads what the model answered.
@@ -57,13 +59,14 @@ pub async fn take(
 ) -> Result<Taken, RunError> {
     let (body, mut lost) = written(target.speaks, conversation);
     let asking = asked(target, &body)?;
+    let trace = TraceId::generate().map_err(|error| RunError::TurnNotBuilt {
+        detail: error.to_string(),
+    })?;
     let context = RequestContext {
         authority: target.authority.clone(),
         protocol: target.protocol,
         listen: target.listen,
-        trace: TraceId::generate().map_err(|error| RunError::TurnNotBuilt {
-            detail: error.to_string(),
-        })?,
+        trace,
         turn: None,
         presenting: Presenting::TheDeployments,
     };
@@ -95,6 +98,7 @@ pub async fn take(
     Ok(Taken {
         gathered: Gathered::of(&events),
         lost,
+        trace,
     })
 }
 
@@ -141,124 +145,10 @@ fn read(speaks: Dialect, body: &[u8]) -> Result<(Vec<ip_protocol::Event>, Droppe
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use ip_core::{ApiId, Capability, CapabilityScope, Grant, Grants, Role, TenantId, UserId};
-    use ip_gateway::{GatewayBody, ProcessorChain, RoutingTable, Upstream, UpstreamError};
     use ip_protocol::{Block, Message, Stop};
-    use std::sync::Arc;
 
     use super::*;
-
-    /// Records what it was sent and answers with what it was built with.
-    struct Fake {
-        seen: Mutex<Vec<(String, http::HeaderMap, bytes::Bytes)>>,
-        status: http::StatusCode,
-        answer: String,
-    }
-
-    impl Fake {
-        fn answering(answer: &str) -> Arc<Self> {
-            Arc::new(Self {
-                seen: Mutex::new(Vec::new()),
-                status: http::StatusCode::OK,
-                answer: answer.to_owned(),
-            })
-        }
-
-        fn refusing(status: http::StatusCode, answer: &str) -> Arc<Self> {
-            Arc::new(Self {
-                seen: Mutex::new(Vec::new()),
-                status,
-                answer: answer.to_owned(),
-            })
-        }
-
-        fn sent(&self) -> serde_json::Value {
-            let seen = self.seen.lock().unwrap();
-            let (_, _, body) = seen.last().expect("nothing was sent");
-            serde_json::from_slice(body).expect("what went out is json")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Upstream for Fake {
-        async fn send(
-            &self,
-            request: http::Request<GatewayBody>,
-        ) -> Result<http::Response<GatewayBody>, UpstreamError> {
-            let uri = request.uri().to_string();
-            let headers = request.headers().clone();
-            let body = request.into_body().collect().await.unwrap().to_bytes();
-            self.seen.lock().unwrap().push((uri, headers, body));
-            Ok(http::Response::builder()
-                .status(self.status)
-                .header(CONTENT_TYPE, "application/json")
-                .body(from_bytes(Bytes::from(self.answer.clone())))
-                .unwrap())
-        }
-    }
-
-    /// A deployment that routes `/anthropic` to one upstream and holds a credential for it,
-    /// which is what makes a turn the deployment's own request rather than a proxied one.
-    const CONFIG: &str = r#"
-[server]
-listen = "127.0.0.1:8080"
-
-[storage]
-backend = "sqlite"
-path = "./test.db"
-
-[cache]
-backend = "sled"
-path = "./test-cache"
-
-[auth.jwt]
-issuer = "intelli-prism"
-secret = "0123456789abcdef0123456789abcdef"
-
-[[upstream]]
-id = "anthropic"
-base_url = "https://api.example.com/v1"
-api_key = "sk-deployment"
-model = "claude-opus-5"
-"#;
-
-    fn gateway(upstream: Arc<Fake>) -> Gateway {
-        let config = ip_config::Config::parse(CONFIG).unwrap();
-        Gateway::new(
-            RoutingTable::build(&config, Vec::new()).unwrap(),
-            ProcessorChain::new(),
-            upstream,
-        )
-    }
-
-    fn target(speaks: Dialect) -> Target {
-        let user = UserId::new("alice").unwrap();
-        let tenant = TenantId::new("acme").unwrap();
-        let scope = CapabilityScope::Api {
-            user: user.clone(),
-            tenant: tenant.clone(),
-            api: ApiId::new("anthropic").unwrap(),
-        };
-        let grants: Grants = [Grant::new(Capability::ApiAccess, scope).unwrap()]
-            .into_iter()
-            .collect();
-        Target {
-            path: AbsPath::new("/anthropic/messages").unwrap(),
-            speaks,
-            authority: Authority::new(
-                ip_auth::Identity {
-                    user,
-                    tenant,
-                    role: Role::Member,
-                },
-                grants,
-            ),
-            listen: "127.0.0.1:8080".parse().unwrap(),
-            protocol: Protocol::Http,
-        }
-    }
+    use crate::fixtures::{Fake, gateway, said, target};
 
     fn asking() -> Conversation {
         Conversation {
@@ -271,20 +161,11 @@ model = "claude-opus-5"
         }
     }
 
-    const ANSWERED: &str = r#"{
-        "id": "msg_1",
-        "model": "claude-opus-5",
-        "role": "assistant",
-        "stop_reason": "end_turn",
-        "content": [{"type": "text", "text": "four"}],
-        "usage": {"input_tokens": 9, "output_tokens": 2}
-    }"#;
-
     /// A run has no caller to borrow a provider key from, so every turn says it presents the
     /// deployment's own and is aimed at the endpoint the matched rule names.
     #[tokio::test]
     async fn a_turn_goes_out_as_the_deployments_own_request() {
-        let upstream = Fake::answering(ANSWERED);
+        let upstream = Fake::answering(&said("four"));
 
         take(
             &gateway(upstream.clone()),
@@ -305,7 +186,7 @@ model = "claude-opus-5"
 
     #[tokio::test]
     async fn a_turn_is_written_in_the_family_the_target_speaks() {
-        let upstream = Fake::answering(ANSWERED);
+        let upstream = Fake::answering(&said("four"));
 
         take(
             &gateway(upstream.clone()),
@@ -351,7 +232,7 @@ model = "claude-opus-5"
 
     #[tokio::test]
     async fn what_the_model_answered_comes_back_gathered() {
-        let upstream = Fake::answering(ANSWERED);
+        let upstream = Fake::answering(&said("four"));
 
         let taken = take(&gateway(upstream), &target(Dialect::Anthropic), &asking())
             .await
@@ -404,7 +285,7 @@ model = "claude-opus-5"
     /// A tool result the loop appended is carried out as that family spells one.
     #[tokio::test]
     async fn a_tool_result_the_run_appended_goes_out_with_the_turn() {
-        let upstream = Fake::answering(ANSWERED);
+        let upstream = Fake::answering(&said("four"));
         let mut conversation = asking();
         conversation.messages.push(Message {
             role: ip_protocol::Role::User,
@@ -432,7 +313,7 @@ model = "claude-opus-5"
     /// would refuse an identical turn for too.
     #[tokio::test]
     async fn a_turn_the_gateway_will_not_carry_ends_the_run() {
-        let upstream = Fake::answering(ANSWERED);
+        let upstream = Fake::answering(&said("four"));
         let mut nowhere = target(Dialect::Anthropic);
         nowhere.path = AbsPath::new("/nothing/claims/this").unwrap();
 
@@ -450,7 +331,7 @@ model = "claude-opus-5"
     /// refusal reaches the run as the status it sent.
     #[tokio::test]
     async fn an_upstream_that_refuses_is_reported_with_its_own_status() {
-        let upstream = Fake::refusing(
+        let upstream = Fake::holding(
             http::StatusCode::TOO_MANY_REQUESTS,
             r#"{"error":{"message":"slow down"}}"#,
         );

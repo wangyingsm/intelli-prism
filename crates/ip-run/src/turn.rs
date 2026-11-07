@@ -108,8 +108,8 @@ impl Sum for Spend {
 pub struct Turn {
     /// Which turn this was.
     pub number: TurnNumber,
-    /// The model that answered it.
-    pub model: ModelName,
+    /// The model that answered it, where the family it answered in named one.
+    pub model: Option<ModelName>,
     /// What it answered with.
     pub blocks: Vec<Block>,
     /// What it spent.
@@ -209,7 +209,7 @@ mod tests {
     fn turn(blocks: Vec<Block>) -> Turn {
         Turn {
             number: TurnNumber::FIRST,
-            model: ModelName::new("gpt-4o").unwrap(),
+            model: Some(ModelName::new("gpt-4o").unwrap()),
             blocks,
             spend: Spend::NOTHING,
         }

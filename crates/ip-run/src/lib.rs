@@ -17,7 +17,11 @@ mod ask;
 mod choice;
 mod error;
 mod event;
+#[cfg(test)]
+mod fixtures;
 mod id;
+#[path = "loop_.rs"]
+mod running;
 mod shed;
 mod tools;
 mod turn;
@@ -27,6 +31,7 @@ pub use choice::{Pinned, Requested};
 pub use error::RunError;
 pub use event::RunEvent;
 pub use id::RunId;
+pub use running::{Ran, Running, run};
 pub use shed::Toolshed;
 pub use tools::{Addressed, Offered, Toolbox, servers_named};
 pub use turn::{Spend, Stopped, Turn, TurnNumber};

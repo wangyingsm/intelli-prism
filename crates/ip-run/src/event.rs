@@ -16,8 +16,8 @@ pub enum RunEvent {
     Turn {
         /// Which turn.
         number: TurnNumber,
-        /// The model it is being put to.
-        model: ModelName,
+        /// The model it is being put to, where one is known.
+        model: Option<ModelName>,
     },
     /// The model asked for a tool to be run.
     ToolCall {
@@ -75,7 +75,7 @@ impl RunEvent {
         match self {
             Self::Turn { number, model } => serde_json::json!({
                 "number": number.get(),
-                "model": model.as_str(),
+                "model": model.as_ref().map(ModelName::as_str),
             }),
             Self::ToolCall {
                 id,
@@ -120,7 +120,7 @@ mod tests {
     fn a_turn_says_which_one_it_is_and_what_is_answering_it() {
         let event = RunEvent::Turn {
             number: TurnNumber::FIRST.next(),
-            model: ModelName::new("gpt-4o").unwrap(),
+            model: Some(ModelName::new("gpt-4o").unwrap()),
         };
 
         assert_eq!(event.name(), "turn");
