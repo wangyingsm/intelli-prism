@@ -1817,15 +1817,23 @@ dependencies = [
 name = "ip-run"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "getrandom 0.4.3",
  "hex",
+ "http",
+ "http-body-util",
  "ip-agents",
+ "ip-auth",
+ "ip-config",
  "ip-core",
+ "ip-gateway",
  "ip-mcp",
  "ip-protocol",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

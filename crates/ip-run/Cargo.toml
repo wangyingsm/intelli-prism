@@ -8,12 +8,22 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+bytes = "1.12.1"
 getrandom.workspace = true
 hex.workspace = true
+http = "1.5.0"
+http-body-util = "0.1.5"
 ip-agents = { version = "0.1.0", path = "../ip-agents" }
+ip-auth = { version = "0.1.0", path = "../ip-auth" }
 ip-core = { version = "0.1.0", path = "../ip-core" }
+ip-gateway = { version = "0.1.0", path = "../ip-gateway" }
 ip-mcp = { version = "0.1.0", path = "../ip-mcp" }
 ip-protocol = { version = "0.1.0", path = "../ip-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+async-trait = "0.1.92"
+ip-config = { version = "0.1.0", path = "../ip-config" }
+tokio = { workspace = true, features = ["macros", "rt"] }

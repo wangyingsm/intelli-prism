@@ -1,0 +1,481 @@
+//! Asking the model one turn, through the gateway the deployment already runs.
+//!
+//! A turn is an ordinary request as far as the gateway is concerned: it is routed, limited,
+//! filtered, priced and recorded like any other. What makes it a run's turn is only that
+//! nothing arrived from outside to start it, so the runner builds what a caller would have
+//! sent and says whose credential it presents.
+
+use bytes::Bytes;
+use http::header::{CONTENT_TYPE, HOST};
+use http::{Method, Request};
+use http_body_util::BodyExt;
+use ip_auth::Authority;
+use ip_core::{AbsPath, Dialect, Protocol, TraceId};
+use ip_gateway::{Gateway, Presenting, RequestContext, from_bytes};
+use ip_protocol::{Conversation, Dropped, Gathered, anthropic, gemini, openai};
+use std::net::SocketAddr;
+
+use crate::error::RunError;
+
+/// Where a run's turns are sent, and as whom.
+///
+/// A run is started over the management api and has no uri of its own, so the path is a rule
+/// the deployment configured — the same one a caller proxying to that family would use. It is
+/// settled once for the run rather than per turn, so every turn of a run is routed alike.
+#[derive(Debug, Clone)]
+pub struct Target {
+    /// The path the turns are routed by.
+    pub path: AbsPath,
+    /// The family the body is written in, which is the one that path's callers speak.
+    pub speaks: Dialect,
+    /// The account the run was started by, whose quota and grants the turns answer to.
+    pub authority: Authority,
+    /// Where the gateway listens, which is what the rule is keyed on.
+    pub listen: SocketAddr,
+    /// The scheme the gateway serves.
+    pub protocol: Protocol,
+}
+
+/// What one turn came back with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Taken {
+    /// The answer, folded back into its parts.
+    pub gathered: Gathered,
+    /// What the two translations could not carry, named so a run can say so.
+    pub lost: Dropped,
+}
+
+/// Asks one turn and reads what the model answered.
+///
+/// The answer is asked for whole rather than streamed: a run reads the whole of a turn before
+/// it can decide whether to take another, so there is nothing to do with it as it arrives.
+/// Commit 13's event stream is of the run, not of any one turn.
+pub async fn take(
+    gateway: &Gateway,
+    target: &Target,
+    conversation: &Conversation,
+) -> Result<Taken, RunError> {
+    let (body, mut lost) = written(target.speaks, conversation);
+    let asking = asked(target, &body)?;
+    let context = RequestContext {
+        authority: target.authority.clone(),
+        protocol: target.protocol,
+        listen: target.listen,
+        trace: TraceId::generate().map_err(|error| RunError::TurnNotBuilt {
+            detail: error.to_string(),
+        })?,
+        turn: None,
+        presenting: Presenting::TheDeployments,
+    };
+    let answered =
+        gateway
+            .handle(context, asking)
+            .await
+            .map_err(|error| RunError::TurnRefused {
+                status: error.status().as_u16(),
+                detail: error.to_string(),
+            })?;
+    let status = answered.status();
+    let bytes = answered
+        .into_body()
+        .collect()
+        .await
+        .map_err(|error| RunError::NotAnAnswer {
+            detail: error.to_string(),
+        })?
+        .to_bytes();
+    if !status.is_success() {
+        return Err(RunError::TurnRefused {
+            status: status.as_u16(),
+            detail: String::from_utf8_lossy(&bytes).chars().take(256).collect(),
+        });
+    }
+    let (events, dropped) = read(target.speaks, &bytes)?;
+    lost.absorb(&dropped);
+    Ok(Taken {
+        gathered: Gathered::of(&events),
+        lost,
+    })
+}
+
+/// The request a caller would have sent to say this.
+fn asked(
+    target: &Target,
+    body: &serde_json::Value,
+) -> Result<Request<ip_gateway::GatewayBody>, RunError> {
+    let bytes = serde_json::to_vec(body).map_err(|error| RunError::TurnNotBuilt {
+        detail: error.to_string(),
+    })?;
+    Request::builder()
+        .method(Method::POST)
+        .uri(target.path.as_str())
+        // The rule is keyed on where the gateway listens, so a turn has to say it arrived there.
+        .header(HOST, target.listen.to_string())
+        .header(CONTENT_TYPE, "application/json")
+        .body(from_bytes(Bytes::from(bytes)))
+        .map_err(|error| RunError::TurnNotBuilt {
+            detail: error.to_string(),
+        })
+}
+
+/// The conversation as the family the turn is written in spells it.
+fn written(speaks: Dialect, conversation: &Conversation) -> (serde_json::Value, Dropped) {
+    match speaks {
+        Dialect::OpenAi => openai::write(conversation),
+        Dialect::Anthropic => anthropic::write(conversation),
+        Dialect::Gemini => gemini::write(conversation),
+    }
+}
+
+/// The answer as that family spelled it.
+fn read(speaks: Dialect, body: &[u8]) -> Result<(Vec<ip_protocol::Event>, Dropped), RunError> {
+    let read = match speaks {
+        Dialect::OpenAi => openai::read_answer(body),
+        Dialect::Anthropic => anthropic::read_answer(body),
+        Dialect::Gemini => gemini::read_answer(body),
+    };
+    read.map_err(|error| RunError::NotAnAnswer {
+        detail: error.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use ip_core::{ApiId, Capability, CapabilityScope, Grant, Grants, Role, TenantId, UserId};
+    use ip_gateway::{GatewayBody, ProcessorChain, RoutingTable, Upstream, UpstreamError};
+    use ip_protocol::{Block, Message, Stop};
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// Records what it was sent and answers with what it was built with.
+    struct Fake {
+        seen: Mutex<Vec<(String, http::HeaderMap, bytes::Bytes)>>,
+        status: http::StatusCode,
+        answer: String,
+    }
+
+    impl Fake {
+        fn answering(answer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                status: http::StatusCode::OK,
+                answer: answer.to_owned(),
+            })
+        }
+
+        fn refusing(status: http::StatusCode, answer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                status,
+                answer: answer.to_owned(),
+            })
+        }
+
+        fn sent(&self) -> serde_json::Value {
+            let seen = self.seen.lock().unwrap();
+            let (_, _, body) = seen.last().expect("nothing was sent");
+            serde_json::from_slice(body).expect("what went out is json")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for Fake {
+        async fn send(
+            &self,
+            request: http::Request<GatewayBody>,
+        ) -> Result<http::Response<GatewayBody>, UpstreamError> {
+            let uri = request.uri().to_string();
+            let headers = request.headers().clone();
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            self.seen.lock().unwrap().push((uri, headers, body));
+            Ok(http::Response::builder()
+                .status(self.status)
+                .header(CONTENT_TYPE, "application/json")
+                .body(from_bytes(Bytes::from(self.answer.clone())))
+                .unwrap())
+        }
+    }
+
+    /// A deployment that routes `/anthropic` to one upstream and holds a credential for it,
+    /// which is what makes a turn the deployment's own request rather than a proxied one.
+    const CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "./test.db"
+
+[cache]
+backend = "sled"
+path = "./test-cache"
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[[upstream]]
+id = "anthropic"
+base_url = "https://api.example.com/v1"
+api_key = "sk-deployment"
+model = "claude-opus-5"
+"#;
+
+    fn gateway(upstream: Arc<Fake>) -> Gateway {
+        let config = ip_config::Config::parse(CONFIG).unwrap();
+        Gateway::new(
+            RoutingTable::build(&config, Vec::new()).unwrap(),
+            ProcessorChain::new(),
+            upstream,
+        )
+    }
+
+    fn target(speaks: Dialect) -> Target {
+        let user = UserId::new("alice").unwrap();
+        let tenant = TenantId::new("acme").unwrap();
+        let scope = CapabilityScope::Api {
+            user: user.clone(),
+            tenant: tenant.clone(),
+            api: ApiId::new("anthropic").unwrap(),
+        };
+        let grants: Grants = [Grant::new(Capability::ApiAccess, scope).unwrap()]
+            .into_iter()
+            .collect();
+        Target {
+            path: AbsPath::new("/anthropic/messages").unwrap(),
+            speaks,
+            authority: Authority::new(
+                ip_auth::Identity {
+                    user,
+                    tenant,
+                    role: Role::Member,
+                },
+                grants,
+            ),
+            listen: "127.0.0.1:8080".parse().unwrap(),
+            protocol: Protocol::Http,
+        }
+    }
+
+    fn asking() -> Conversation {
+        Conversation {
+            model: None,
+            system: Some("Be brief.".to_owned()),
+            messages: vec![Message::text(ip_protocol::Role::User, "how many are left?")],
+            tools: Vec::new(),
+            sampling: ip_protocol::Sampling::default(),
+            stream: false,
+        }
+    }
+
+    const ANSWERED: &str = r#"{
+        "id": "msg_1",
+        "model": "claude-opus-5",
+        "role": "assistant",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "four"}],
+        "usage": {"input_tokens": 9, "output_tokens": 2}
+    }"#;
+
+    /// A run has no caller to borrow a provider key from, so every turn says it presents the
+    /// deployment's own and is aimed at the endpoint the matched rule names.
+    #[tokio::test]
+    async fn a_turn_goes_out_as_the_deployments_own_request() {
+        let upstream = Fake::answering(ANSWERED);
+
+        take(
+            &gateway(upstream.clone()),
+            &target(Dialect::Anthropic),
+            &asking(),
+        )
+        .await
+        .unwrap();
+
+        let seen = upstream.seen.lock().unwrap();
+        let (uri, headers, _) = seen.last().unwrap();
+        assert_eq!(uri, "https://api.example.com:443/v1/messages");
+        assert_eq!(
+            headers[http::header::AUTHORIZATION].to_str().unwrap(),
+            "Bearer sk-deployment"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_is_written_in_the_family_the_target_speaks() {
+        let upstream = Fake::answering(ANSWERED);
+
+        take(
+            &gateway(upstream.clone()),
+            &target(Dialect::Anthropic),
+            &asking(),
+        )
+        .await
+        .unwrap();
+
+        let sent = upstream.sent();
+        assert_eq!(
+            sent["system"], "Be brief.",
+            "anthropic carries it at the top"
+        );
+        assert_eq!(sent["messages"][0]["role"], "user");
+    }
+
+    /// The same conversation, spelled by whichever family the run was pinned to.
+    #[tokio::test]
+    async fn the_same_conversation_is_spelled_differently_for_another_family() {
+        let upstream = Fake::answering(
+            r#"{"choices":[{"message":{"role":"assistant","content":"four"},"finish_reason":"stop"}]}"#,
+        );
+
+        take(
+            &gateway(upstream.clone()),
+            &target(Dialect::OpenAi),
+            &asking(),
+        )
+        .await
+        .unwrap();
+
+        let sent = upstream.sent();
+        assert!(
+            sent.get("system").is_none(),
+            "openai has no top-level system"
+        );
+        assert_eq!(
+            sent["messages"][0]["role"], "system",
+            "it becomes the first message instead"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_the_model_answered_comes_back_gathered() {
+        let upstream = Fake::answering(ANSWERED);
+
+        let taken = take(&gateway(upstream), &target(Dialect::Anthropic), &asking())
+            .await
+            .unwrap();
+
+        assert_eq!(taken.gathered.text, "four");
+        assert_eq!(taken.gathered.stop, Some(Stop::End));
+        assert_eq!(taken.gathered.spent_or_zero().total(), 11);
+        assert!(taken.gathered.calls.is_empty());
+    }
+
+    /// The branch the loop turns on: a turn asking for a tool comes back with its calls.
+    #[tokio::test]
+    async fn a_turn_that_wants_a_tool_comes_back_with_the_call() {
+        let upstream = Fake::answering(
+            r#"{
+                "id": "msg_2",
+                "model": "claude-opus-5",
+                "role": "assistant",
+                "stop_reason": "tool_use",
+                "content": [
+                    {"type": "text", "text": "looking"},
+                    {"type": "tool_use", "id": "call_1", "name": "warehouse__sql",
+                     "input": {"query": "select 1"}}
+                ],
+                "usage": {"input_tokens": 9, "output_tokens": 7}
+            }"#,
+        );
+
+        let taken = take(&gateway(upstream), &target(Dialect::Anthropic), &asking())
+            .await
+            .unwrap();
+
+        assert_eq!(taken.gathered.stop, Some(Stop::ToolUse));
+        assert_eq!(taken.gathered.text, "looking");
+        assert_eq!(taken.gathered.calls.len(), 1);
+        assert!(
+            matches!(
+                &taken.gathered.calls[0],
+                ip_protocol::Event::ToolCall { id, name, arguments }
+                    if id.as_str() == "call_1"
+                        && name.as_str() == "warehouse__sql"
+                        && arguments["query"] == "select 1"
+            ),
+            "{:?}",
+            taken.gathered.calls[0]
+        );
+    }
+
+    /// A tool result the loop appended is carried out as that family spells one.
+    #[tokio::test]
+    async fn a_tool_result_the_run_appended_goes_out_with_the_turn() {
+        let upstream = Fake::answering(ANSWERED);
+        let mut conversation = asking();
+        conversation.messages.push(Message {
+            role: ip_protocol::Role::User,
+            blocks: vec![Block::ToolResult {
+                id: ip_protocol::ToolCallId::new("call_1").unwrap(),
+                content: "four".to_owned(),
+            }],
+        });
+
+        take(
+            &gateway(upstream.clone()),
+            &target(Dialect::Anthropic),
+            &conversation,
+        )
+        .await
+        .unwrap();
+
+        let sent = upstream.sent();
+        let last = sent["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["content"][0]["type"], "tool_result");
+        assert_eq!(last["content"][0]["tool_use_id"], "call_1");
+    }
+
+    /// The gateway refusing is the run ending, not a turn to try again: what it refuses it
+    /// would refuse an identical turn for too.
+    #[tokio::test]
+    async fn a_turn_the_gateway_will_not_carry_ends_the_run() {
+        let upstream = Fake::answering(ANSWERED);
+        let mut nowhere = target(Dialect::Anthropic);
+        nowhere.path = AbsPath::new("/nothing/claims/this").unwrap();
+
+        let refused = take(&gateway(upstream), &nowhere, &asking())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(refused, RunError::TurnRefused { status: 404, .. }),
+            "{refused:?}"
+        );
+    }
+
+    /// What the upstream answers is passed through by the gateway, so a provider's own
+    /// refusal reaches the run as the status it sent.
+    #[tokio::test]
+    async fn an_upstream_that_refuses_is_reported_with_its_own_status() {
+        let upstream = Fake::refusing(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"slow down"}}"#,
+        );
+
+        let refused = take(&gateway(upstream), &target(Dialect::Anthropic), &asking())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&refused, RunError::TurnRefused { status: 429, detail } if detail.contains("slow down")),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_one_is_refused_rather_than_read_as_empty() {
+        let upstream = Fake::answering("this is not json");
+
+        let refused = take(&gateway(upstream), &target(Dialect::Anthropic), &asking())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(refused, RunError::NotAnAnswer { .. }),
+            "{refused:?}"
+        );
+    }
+}

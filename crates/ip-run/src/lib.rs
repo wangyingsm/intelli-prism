@@ -6,12 +6,14 @@
 //! of: the id it is followed under, what one [`Turn`] did, what the whole of it [`Spend`]t, why
 //! it [`Stopped`], and the [`RunEvent`]s it says about itself on the way.
 //!
-//! It depends on the conversation and the model's own types, and on nothing of the gateway: the
-//! loop is driven from above rather than from here, so these types can be built and read in a
-//! test with no upstream, no store and no server.
+//! Its types depend on the conversation and the model's own and on nothing else, so they can be
+//! built and read in a test with no upstream, no store and no server. Taking a turn is the one
+//! part that cannot: [`take`] asks the deployment's own gateway, so a run is routed, limited,
+//! filtered, priced and recorded exactly as a proxied request is.
 
 #![forbid(unsafe_code)]
 
+mod ask;
 mod choice;
 mod error;
 mod event;
@@ -19,6 +21,7 @@ mod id;
 mod tools;
 mod turn;
 
+pub use ask::{Taken, Target, take};
 pub use choice::{Pinned, Requested};
 pub use error::RunError;
 pub use event::RunEvent;

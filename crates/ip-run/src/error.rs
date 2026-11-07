@@ -59,6 +59,32 @@ pub enum RunError {
         max: usize,
     },
 
+    /// A turn that could not be built into a request at all.
+    #[error("a turn could not be made into a request: {detail}")]
+    TurnNotBuilt {
+        /// What went wrong.
+        detail: String,
+    },
+
+    /// A turn the gateway would not carry: a limit, a filter, a route, an upstream.
+    ///
+    /// A run ends here rather than trying again. What the gateway refuses it refuses for a
+    /// reason that another identical turn would meet again.
+    #[error("a turn was refused with {status}: {detail}")]
+    TurnRefused {
+        /// What the gateway answered.
+        status: u16,
+        /// What it said.
+        detail: String,
+    },
+
+    /// A turn that came back as something this family does not read as an answer.
+    #[error("a turn came back as no answer: {detail}")]
+    NotAnAnswer {
+        /// Why it could not be read.
+        detail: String,
+    },
+
     /// Two tools a model could not tell apart once both are named for it.
     #[error("{first:?} and {second:?} are both declared as {wire:?}")]
     ToolNameCollides {

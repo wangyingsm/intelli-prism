@@ -24,7 +24,7 @@ pub mod turns;
 pub mod upstream;
 
 pub use arbiter::Arbiter;
-pub use body::{BoxError, GatewayBody};
+pub use body::{BoxError, GatewayBody, from_bytes};
 pub use cache::{CachedResponse, Freshness, ResponseCache, freshness, response_key};
 pub use classifier::{CLASSIFY_DEADLINE, Classifier};
 pub use dispatch::{Chosen, Dispatcher};
