@@ -521,6 +521,13 @@ no tokens. What the model is told is `server__tool`, because every provider's fu
 that started it: routing, dispatch, hedging, the filter, the semantic cache, metering, pricing,
 limits and the usage row all apply, because it is the same path a proxied call takes. A run is not a
 second way out of this process.
+- **Which model answers is settled in three steps**: what the request named, then what the template
+named, then the model the upstream was configured with — which is what `[[upstream]] model` has
+always meant. A template may therefore name no model and still run wherever it is deployed, and a
+request may name one to override it for that run alone. Nothing left to name one is the request's own
+omission and is answered 400, which a configured deployment cannot reach, since every upstream
+carries a model. Each turn's `turn` event reports the model that *answered*, which is not always the
+one asked for: a provider may route a request to a model of its own choosing and say so in its reply.
 - **The credential is attached by the flow, not by the runner.** A deployment run marks its request
 as presenting the deployment's own key, and the table hands dispatch the credential of the upstream
 the rule names. The runner never holds one, so a run cannot present one provider's key to another —
