@@ -35,6 +35,9 @@ no cost, which is not a cost of nothing.
 what the thing was before and after, in the same transaction as the change itself, so neither can
 exist without the other. What a row carries is declared apart from how the thing is stored, which
 is why no passphrase hash or tenant key is in it. Read back over `GET /_ip/audit`.
+- **Agent templates.** What a system agent would be — its prompt, its turn and time limits, the
+tools it may call and the file tree it would see — stored for the deployment or for one tenant and
+managed over `/_ip/agents`, with every part checked before it lands. Nothing runs one yet.
 - **Dispatch across the endpoints behind a rule.** Round robin, least load or a share each, chosen
 per rule and per configured upstream; a rule can also race a request across two or three of them
 and take the first successful answer, when the body is one the gateway can send more than once. A
@@ -84,9 +87,10 @@ does, and runs the `.hurl` files beside it in order.
 version 0.1.0, and nothing about it is stable — the configuration format, the storage schema, the
 wire headers and the plugin interface all still change without ceremony.
 
-Large parts of the design are unbuilt: there is no web ui, no system agents, no run graph, and no
-long term memory. The pieces that do exist are tested, but they have never run under real traffic,
-and no security review has been done. Read `ROADMAP.md` before assuming a feature is there.
+Large parts of the design are unbuilt: there is no web ui, nothing that runs a system agent, no
+run graph, and no long term memory. The pieces that do exist are tested, but they have never run
+under real traffic, and no security review has been done. Read `ROADMAP.md` before assuming a
+feature is there.
 
 ## License
 

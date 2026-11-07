@@ -475,8 +475,56 @@ answer which capability somebody left with, which is the question an incident ac
 system administrator reads every tenant; anyone else names the tenant it is asking about and must
 hold `Observer` inside it, which an owner does by standing.
 
+### What a system agent would be
+
+- **A template is one thing, checked whole.** The id, the name, the sandbox and the config are
+types that refuse what they cannot hold — a prompt past 32 KiB, more than 64 tools, the same tool
+twice, a request timeout outliving the run it is part of, a name padded with whitespace — so a
+template that reached the database is one every part of which was checked. Nothing is stored and
+found wrong later.
+- **The sandbox is a tree of names, not a list of paths.** A directory holds entries and a file
+names an object location, so `bin/python` is a file called `python` inside `bin` rather than a
+string with a slash in it: a segment may not contain `/` or `\`, and `.` and `..` are refused
+rather than normalised away. At most 4096 entries and 32 deep, counted by an iterative walk,
+because a tree deep enough to refuse is deep enough to exhaust the stack on the way to refusing
+it.
+- **A template belongs either to the deployment or to one tenant**, the way a plugin does: the
+owner is nullable on the row and one unique index spans it, so a single id names a different
+template under each owner without the two ever colliding. A read for a tenant nobody created
+reports it missing rather than answering with the deployment's own.
+- **Managed over `/_ip/agents`** — written with `PUT /_ip/agents/{agent}`, read one at a time or
+paged newest first, removed with `DELETE`. The system administrator manages the deployment's own
+and may name any tenant; anyone else names the tenant it is asking about and must hold `SysAgent`
+inside it, which an owner does by standing. **This is `SysAgent`'s first endpoint**: the
+capability has existed since the second milestone with nothing authorizing on it.
+- **Every write is in the audit trail, all of it.** A template holds no secret to leave out — a
+prompt, a tool name and an object location are what the operator wrote — so the row carries the
+whole of what it said before and after, unlike a key or a passphrase hash that is deliberately
+absent.
+- **The types live in their own crate.** `ip-agents` depends on no other crate in this workspace,
+including `ip-core`: an agent template is not a gateway concern, and the id rule is written again
+there rather than shared, so that `ip-core`'s error type is not part of how this crate fails.
+
 ## Shipped with a caveat
 
+- **Nothing runs an agent template.** One is stored, read, replaced and removed, and that is the
+whole of it: there is no runner, no sandbox mounted anywhere, no tool executed and no agent
+traffic through the gateway. A template is a description an operator can write down and read back,
+and nothing acts on it.
+- **`use_best_effort` and `best_effort_strategy` are carried and read by nothing.** They are
+stored, checked against each other — a strategy named without the flag is refused — and answered
+back unchanged, because the thing that would act on them does not exist. They are in the api now
+so that a template written today needs no rewriting when it does.
+- **A tool a template names is not checked against anything.** The preset tool set is not built
+and an MCP tool is a name this code cannot resolve, so `tool_set` is a list of names that may
+reach nothing at all. Whether a named tool can really be run is the runner's question.
+- **A sandbox path is not checked against object storage.** An object location is checked for
+shape and for nothing else: no bucket is contacted, no scheme is validated, and a template may
+name an object that does not exist or a store this deployment cannot reach. That check belongs to
+Ip-VFS, which is unbuilt.
+- **No node is told that a template changed.** Every other management write publishes a revision
+and each node rebuilds what it holds; a template write publishes nothing, because nothing holds a
+template in memory to rebuild. A runner will need that path and it is not there.
 - **`no-store` disables the response cache against upstreams that send it.** Correct HTTP, and
 several LLM APIs send it on completions, so the cache can be a no-op in production. Overriding it
 would mean deliberately ignoring what the upstream asked for; the call has not been made.
@@ -713,7 +761,8 @@ default and the wrong answer for a deployment whose routes differ in what a near
 
 ### System agents and run graph
 
-- Agent templates stored in the database, with sandbox, tools and prompts.
+- Something that runs a template: the sandbox mounted, the tool set resolved, the turns taken and
+the time limit enforced. The templates themselves are shipped, above.
 - Ip-VFS: a virtual file system over object storage that agents see as ordinary paths, with a new
 version per mutation and a CLI to sync up and down.
 - The preset tool set (core utilities, python, js/ts, bash) and optional MCP tools, all sandboxed.
