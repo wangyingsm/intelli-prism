@@ -1811,6 +1811,7 @@ dependencies = [
  "async-trait",
  "ip-agents",
  "ip-core",
+ "ip-mcp",
  "serde",
  "serde_json",
  "sqlx",

@@ -9,6 +9,7 @@ pub mod error;
 pub mod failing;
 pub mod limit;
 pub mod list;
+pub mod mcp;
 pub mod model;
 pub mod plugin;
 #[cfg(feature = "fast-storage")]
@@ -32,6 +33,7 @@ pub use error::{Entity, StorageError};
 pub use failing::FailingStore;
 pub use limit::{Limit, LimitStore, NewLimit};
 pub use list::{DEFAULT_PAGE_LIMIT, ListStore, Listed, MAX_PAGE_LIMIT, Page};
+pub use mcp::{McpStore, StoredMcp};
 pub use model::{
     AccountKind, MemberRemoved, Membership, NewTenant, NewUser, Standing, Tenant, TenantRowId,
     TenantWithOwner, User, UserRowId, UserWithMembership,
