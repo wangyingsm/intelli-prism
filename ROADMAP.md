@@ -505,19 +505,77 @@ absent.
 including `ip-core`: an agent template is not a gateway concern, and the id rule is written again
 there rather than shared, so that `ip-core`'s error type is not part of how this crate fails.
 
+### Running what an agent template describes
+
+- **An MCP server is registered, not configured.** `/_ip/mcps` holds the servers a template's tools
+may live on — an id, a name, an endpoint and what it requires — written by the system administrator
+alone, because a server is reached by the deployment itself and not on any one tenant's behalf. A
+token written is never read back, the way a tenant key and a passphrase are: what the api reports is
+whether a credential is required, never which one.
+- **A tool is addressed `server.tool`**, resolved against what the servers really offer rather than
+trusted. A template naming a bare tool, a server this deployment has not registered, a server that
+will not answer or a tool no server offers refuses the run — before its first turn, so a typo costs
+no tokens. What the model is told is `server__tool`, because every provider's function-name rule is
+`[a-zA-Z0-9_-]{1,64}` and a dot is not in it.
+- **A run's turns go through the gateway**, as requests the deployment makes on behalf of the account
+that started it: routing, dispatch, hedging, the filter, the semantic cache, metering, pricing,
+limits and the usage row all apply, because it is the same path a proxied call takes. A run is not a
+second way out of this process.
+- **The credential is attached by the flow, not by the runner.** A deployment run marks its request
+as presenting the deployment's own key, and the table hands dispatch the credential of the upstream
+the rule names. The runner never holds one, so a run cannot present one provider's key to another —
+which was possible for as long as the runner was the thing that chose.
+- **A run goes out as whoever started it** — their real standing inside the named tenant and their
+real grants. Nothing is synthesised and nothing is widened: an account that could not proxy to an
+api by hand cannot reach it through a template either, and the turns spend that tenant's quota.
+- **The loop ends on a limit, never on a tool.** A tool the model invented, a server that has gone
+away and a tool that failed are all answers the model is given and may act on, because a model told
+its tool failed often tries another. What ends a run is the turn ceiling, the time limit, a turn
+past its own timeout, or the gateway refusing — and it says which.
+- **It is streamed as it happens.** `POST /_ip/agents/{agent}/run` answers an event stream: `turn`,
+`text`, `tool_call`, `tool_result`, and a final `done` carrying the answer, why it stopped and what
+it spent. A call and its result are two events because the tool runs between them: a watcher told
+nothing until the result would learn what was asked for only once it no longer mattered. Everything
+that can refuse a run is settled before the stream opens, so a refusal is a status code rather than
+one event inside a 200.
+
 ## Shipped with a caveat
 
-- **Nothing runs an agent template.** One is stored, read, replaced and removed, and that is the
-whole of it: there is no runner, no sandbox mounted anywhere, no tool executed and no agent
-traffic through the gateway. A template is a description an operator can write down and read back,
-and nothing acts on it.
+- **Nothing in the sandbox runs.** A template's file tree is stored, checked and read back, and no
+part of it is mounted, fetched or executed: a run reaches its tools over MCP and nothing else. The
+sandbox remains a description waiting for Ip-VFS.
 - **`use_best_effort` and `best_effort_strategy` are carried and read by nothing.** They are
 stored, checked against each other — a strategy named without the flag is refused — and answered
-back unchanged, because the thing that would act on them does not exist. They are in the api now
-so that a template written today needs no rewriting when it does.
-- **A tool a template names is not checked against anything.** The preset tool set is not built
-and an MCP tool is a name this code cannot resolve, so `tool_set` is a list of names that may
-reach nothing at all. Whether a named tool can really be run is the runner's question.
+back unchanged, as at M23: the loop does not consult them. They are in the api now so that a
+template written today needs no rewriting when something does.
+- **An MCP token is unencrypted at rest.** It is stored as written and never reported back, but the
+column holds it in the clear, so the database is as sensitive as the tokens in it. Encrypting it
+needs a key the deployment manages, which is not built.
+- **A run is not resumable and nothing lists one.** It lives as long as its stream: a client that
+hangs up loses it, nothing records that it happened beyond the usage rows its turns wrote, and
+there is no handle to ask after one. The run id is generated, streamed, and stored nowhere.
+- **The run graph composes nothing.** One template, one loop, one model. An agent calling another
+agent, a template naming a sub-agent, a plan split across several — none of it exists.
+- **Nothing rate-limits a run as a run.** Each turn is counted and capped like any other request,
+so a run is limited turn by turn; the run itself is not. A template with a high turn ceiling is a
+loop that may make many requests before a per-request limit notices.
+- **A run reports no cost.** `done` carries a `cost_micros` and it is always zero: the gateway works
+out what a request cost when it writes the usage row and reports it on no response header, so the
+loop cannot see it. A run collects a trace id per turn, which is what the cost is recoverable by
+afterwards — through `/_ip/usage`, not through the stream.
+- **The administrator can start no run.** It manages every tenant's templates and holds a standing
+inside none, so it has nobody to charge and no role to run as, and is refused. Running a tenant's
+template for it means being a member of that tenant.
+- **A run that pinned no family is refused where several are served.** The gateway routes by path
+before anything chooses an endpoint, so `auto` picks among the endpoints behind one upstream and
+cannot pick across providers. A deployment serving one family runs an unpinned template; one serving
+several refuses it rather than sending it to whichever was configured first.
+- **A run does not keep one endpoint across its turns.** M11's turn affinity is driven by a field the
+runner does not set, so each turn is dispatched on its own and a multi-turn run may be spread across
+the endpoints behind its rule.
+- **A tool's arguments are passed as the model wrote them.** A call whose arguments are not an object
+is run with none rather than refused, and nothing checks them against the tool's schema before the
+server is asked: the server's own refusal is what catches it, and comes back as a failed result.
 - **A sandbox path is not checked against object storage.** An object location is checked for
 shape and for nothing else: no bucket is contacted, no scheme is validated, and a template may
 name an object that does not exist or a store this deployment cannot reach. That check belongs to

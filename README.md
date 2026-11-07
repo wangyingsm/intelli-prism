@@ -35,9 +35,17 @@ no cost, which is not a cost of nothing.
 what the thing was before and after, in the same transaction as the change itself, so neither can
 exist without the other. What a row carries is declared apart from how the thing is stored, which
 is why no passphrase hash or tenant key is in it. Read back over `GET /_ip/audit`.
-- **Agent templates.** What a system agent would be — its prompt, its turn and time limits, the
-tools it may call and the file tree it would see — stored for the deployment or for one tenant and
-managed over `/_ip/agents`, with every part checked before it lands. Nothing runs one yet.
+- **Agent templates, and runs of them.** What a system agent is — its prompt, its turn and time
+limits, the tools it may call and the file tree it would see — stored for the deployment or for one
+tenant and managed over `/_ip/agents`, with every part checked before it lands. `POST
+/_ip/agents/{agent}/run` runs one and streams what it does as it does it: each turn, the text, every
+tool call and its result, and a final event saying why it stopped and what it spent.
+- **Tools over MCP.** The servers a template's tools live on are registered over `/_ip/mcps`,
+addressed `server.tool`, and resolved against what each server really offers before a run's first
+turn — so a tool that cannot be reached refuses the run rather than failing partway through it. A
+token held for a server is written and never read back. A run's turns go through the gateway like
+any other request, under the authority of whoever started it, so they are routed, filtered, cached,
+metered, priced and limited the same way.
 - **Dispatch across the endpoints behind a rule.** Round robin, least load or a share each, chosen
 per rule and per configured upstream; a rule can also race a request across two or three of them
 and take the first successful answer, when the body is one the gateway can send more than once. A

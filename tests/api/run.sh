@@ -13,14 +13,18 @@ root="$(cd "$here/../.." && pwd)"
 port="${IP_PORT:-18080}"
 host="http://127.0.0.1:$port"
 passphrase="correct horse staple"
+upstream_port="${IP_UPSTREAM_PORT:-18081}"
 work="$(mktemp -d)"
 server=""
+upstream=""
 
 cleanup() {
-	if [ -n "$server" ] && kill -0 "$server" 2>/dev/null; then
-		kill "$server" 2>/dev/null || true
-		wait "$server" 2>/dev/null || true
-	fi
+	for pid in "$server" "$upstream"; do
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			kill "$pid" 2>/dev/null || true
+			wait "$pid" 2>/dev/null || true
+		fi
+	done
 	rm -rf "$work"
 }
 trap cleanup EXIT
@@ -49,7 +53,20 @@ nonce_ttl = 300
 issuer = "intelli-prism"
 secret = "0123456789abcdef0123456789abcdef"
 ttl = 3600
+
+# An agent run is the only thing here that reaches an upstream, and it has to have one
+# before a turn has anywhere to go.
+[[upstream]]
+id = "anthropic"
+base_url = "http://127.0.0.1:$upstream_port/v1"
+api_key = "sk-suite"
+model = "claude-opus-5"
+caller_speaks = "anthropic"
+upstream_speaks = "anthropic"
 TOML
+
+python3 "$here/stub_upstream.py" "$upstream_port" &
+upstream=$!
 
 binary="$root/target/debug/intelli-prism"
 printf '%s' "$passphrase" | "$binary" --config "$work/intelli-prism.toml" admin create root

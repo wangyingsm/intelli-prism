@@ -202,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn no_endpoint_taking_a_tenant_in_a_body_serves_another_tenants_member() {
         let theirs = theirs();
-        let cases: [(&str, String, Option<String>); 9] = [
+        let cases: [(&str, String, Option<String>); 10] = [
             ("GET", format!("/_ip/limits?tenant={theirs}"), None),
             (
                 "PUT",
@@ -227,6 +227,12 @@ mod tests {
                 "DELETE",
                 format!("/_ip/agents/theirs?tenant={theirs}"),
                 None,
+            ),
+            // A run reaches further than any other refusal here: it would spend their money.
+            (
+                "POST",
+                format!("/_ip/agents/theirs/run?tenant={theirs}"),
+                Some(r#"{"input":"how many?"}"#.to_owned()),
             ),
             (
                 "POST",

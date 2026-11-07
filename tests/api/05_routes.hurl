@@ -33,12 +33,13 @@ HTTP 422
 GET {{host}}/_ip/routes
 HTTP 200
 [Asserts]
-jsonpath "$" count == 1
-jsonpath "$[0].source" == "stored"
-jsonpath "$[0].shadowed" == false
-jsonpath "$[0].key.path" == "/v1"
-jsonpath "$[0].target[0].host" == "api.example.com"
-jsonpath "$[0].created_at" isInteger
+# The listing carries the deployment's configured upstreams alongside what is stored, so the
+# stored rule is picked out by its source rather than by where it happens to sit.
+jsonpath "$[?(@.source == 'stored')]" count == 1
+jsonpath "$[?(@.source == 'stored')].shadowed" nth 0 == false
+jsonpath "$[?(@.source == 'stored')].key.path" nth 0 == "/v1"
+jsonpath "$[?(@.source == 'stored')].target[0].host" nth 0 == "api.example.com"
+jsonpath "$[?(@.source == 'stored')].created_at" nth 0 isInteger
 
 DELETE {{host}}/_ip/routes
 x-ip-csrf: 1
