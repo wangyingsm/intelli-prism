@@ -39,6 +39,21 @@ use crate::upstream::Upstream;
 use ip_embed::Embedding;
 use ip_embed::Found;
 
+/// Whose credential a request presents to the upstream it reaches.
+///
+/// A proxied request presents its own caller's: the gateway rewrites the uri and the host and
+/// leaves `Authorization` alone, so a caller's provider key rides through. A request the
+/// deployment makes for itself has no caller to borrow one from, and presents the key the
+/// upstream it was routed to declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Presenting {
+    /// Whatever the caller sent, untouched.
+    #[default]
+    CallersOwn,
+    /// The deployment's own, read from the upstream the request is routed to.
+    TheDeployments,
+}
+
 /// What the dataflow needs about a request beyond the request itself.
 pub struct RequestContext {
     /// Who the caller is, with everything granted to it.
@@ -51,6 +66,8 @@ pub struct RequestContext {
     pub trace: TraceId,
     /// The chat turn it belongs to, when the caller marked one.
     pub turn: Option<TurnId>,
+    /// Whose credential it presents upstream.
+    pub presenting: Presenting,
 }
 
 /// The request dataflow: the stages of `DESIGN.md` run in order.

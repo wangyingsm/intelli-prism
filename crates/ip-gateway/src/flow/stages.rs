@@ -13,10 +13,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{Span, field};
 
-use super::RequestContext;
-use super::headers::{aim, authority_of, is_event_stream, rewrite, set_length, strip_hop_by_hop};
+use super::headers::{
+    aim, authority_of, is_event_stream, present, rewrite, set_length, strip_hop_by_hop,
+};
 use super::record::Recording;
 use super::run::{collect, run_body, run_headers};
+use super::{Presenting, RequestContext};
 use crate::arbiter::{ARBITRATING, Arbiter};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, Freshness, freshness, response_key};
@@ -500,6 +502,22 @@ impl Flow<BodyProcessed> {
             let (crossed, dropped) = crossed_out(crossing, request).await?;
             request = crossed;
             lost = dropped;
+        }
+        // Before the race splits the request, so every arm presents the same credential.
+        if self.context.presenting == Presenting::TheDeployments {
+            let api = resolution.rule().api.clone();
+            let credential = resolution
+                .credential()
+                .ok_or_else(|| GatewayErrorKind::NoCredential { api: api.clone() })
+                .map_err(|kind| GatewayError::new(Forwarded::NAME, kind))?;
+            present(request.headers_mut(), credential).map_err(|why| {
+                GatewayError::new(
+                    Forwarded::NAME,
+                    GatewayErrorKind::Malformed {
+                        detail: format!("the credential {api} declares {why}"),
+                    },
+                )
+            })?;
         }
         if raced == Hedge::NONE {
             let chosen = dispatcher.choose(&dispatching);
@@ -1952,5 +1970,183 @@ mod tests {
         gateway.handle(context(granted()), multipart).await.unwrap();
         let sent: usize = upstream.seen.lock().unwrap().len();
         assert_eq!(sent, 2, "a refused race went out more than once");
+    }
+
+    /// A deployment with one upstream that declares a credential.
+    const KEYED: &str = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "./test.db"
+
+[cache]
+backend = "sled"
+path = "./test-cache"
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[[upstream]]
+id = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-deployment"
+model = "claude-opus-5"
+"#;
+
+    /// A gateway routed by what a configuration declares, so the credential travels the way
+    /// it does in a deployment rather than through a fixture's back door.
+    fn configured_gateway(toml: &str, upstream: Arc<FakeUpstream>) -> Gateway {
+        let config = ip_config::Config::parse(toml).unwrap();
+        let table = RoutingTable::build(&config, Vec::new()).unwrap();
+        Gateway::new(table, ProcessorChain::new(), upstream)
+    }
+
+    /// Addressed to where that configuration listens, so its rule is the one that matches.
+    fn at_listen(path: &str, body: &str) -> Request<GatewayBody> {
+        Request::builder()
+            .uri(path)
+            .header(HOST, "127.0.0.1:8080")
+            .body(crate::body::from_bytes(Bytes::from(body.to_owned())))
+            .unwrap()
+    }
+
+    fn for_the_deployment(authority: ip_auth::Authority) -> RequestContext {
+        RequestContext {
+            presenting: Presenting::TheDeployments,
+            ..context(authority)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_deployment_makes_presents_the_upstreams_credential() {
+        let upstream = FakeUpstream::answering("{}");
+        let gateway = configured_gateway(KEYED, upstream.clone());
+
+        gateway
+            .handle(
+                for_the_deployment(granted()),
+                at_listen("/anthropic/messages", "{}"),
+            )
+            .await
+            .unwrap();
+
+        let sent = upstream.last();
+        assert_eq!(
+            sent.headers[http::header::AUTHORIZATION].to_str().unwrap(),
+            "Bearer sk-deployment"
+        );
+        assert_eq!(
+            sent.headers["x-api-key"].to_str().unwrap(),
+            "sk-deployment",
+            "spelled both ways, for either provider answers"
+        );
+    }
+
+    /// The property a proxied caller depends on: nothing about this reaches an ordinary
+    /// request, which still presents whatever its own caller sent.
+    #[tokio::test]
+    async fn a_proxied_request_still_presents_its_callers_own_credential() {
+        let upstream = FakeUpstream::answering("{}");
+        let gateway = configured_gateway(KEYED, upstream.clone());
+        let mut asking = at_listen("/anthropic/messages", "{}");
+        asking.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-the-callers-own"),
+        );
+
+        gateway.handle(context(granted()), asking).await.unwrap();
+
+        let sent = upstream.last();
+        assert_eq!(
+            sent.headers[http::header::AUTHORIZATION].to_str().unwrap(),
+            "Bearer sk-the-callers-own"
+        );
+        assert!(
+            !sent.headers.contains_key("x-api-key"),
+            "nothing is added to a request the gateway merely forwards"
+        );
+    }
+
+    /// What the caller sent is replaced rather than joined, so a run never presents two.
+    #[tokio::test]
+    async fn the_deployments_credential_replaces_one_the_request_arrived_with() {
+        let upstream = FakeUpstream::answering("{}");
+        let gateway = configured_gateway(KEYED, upstream.clone());
+        let mut asking = at_listen("/anthropic/messages", "{}");
+        asking.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-stale"),
+        );
+
+        gateway
+            .handle(for_the_deployment(granted()), asking)
+            .await
+            .unwrap();
+
+        let sent = upstream.last();
+        assert_eq!(
+            sent.headers
+                .get_all(http::header::AUTHORIZATION)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(
+            sent.headers[http::header::AUTHORIZATION].to_str().unwrap(),
+            "Bearer sk-deployment"
+        );
+    }
+
+    /// Refused here rather than at the provider, which would answer 401 to a blank header.
+    #[tokio::test]
+    async fn a_run_reaching_an_upstream_with_no_credential_is_refused_before_it_goes_out() {
+        let upstream = FakeUpstream::answering("{}");
+        let gateway = configured_gateway(
+            &KEYED.replace(r#"api_key = "sk-deployment""#, r#"api_key = """#),
+            upstream.clone(),
+        );
+
+        let refused = gateway
+            .handle(
+                for_the_deployment(granted()),
+                at_listen("/anthropic/messages", "{}"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(refused.kind(), GatewayErrorKind::NoCredential { api } if api.as_str() == "anthropic"),
+            "{refused:?}"
+        );
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            upstream.seen.lock().unwrap().is_empty(),
+            "nothing may go out without the credential it was told to present"
+        );
+    }
+
+    /// A stored rule carries no credential, so a run routed to one is refused the same way
+    /// rather than reaching a provider with nothing to present.
+    #[tokio::test]
+    async fn a_run_routed_by_a_stored_rule_is_refused_for_the_same_reason() {
+        let upstream = FakeUpstream::answering("{}");
+        let gateway = Gateway::new(table(), ProcessorChain::new(), upstream.clone());
+
+        let refused = gateway
+            .handle(
+                for_the_deployment(granted()),
+                request("/anthropic/messages", "{}"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(refused.kind(), GatewayErrorKind::NoCredential { .. }),
+            "{refused:?}"
+        );
+        assert!(upstream.seen.lock().unwrap().is_empty());
     }
 }

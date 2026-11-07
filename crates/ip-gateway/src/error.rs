@@ -1,7 +1,9 @@
 use http::StatusCode;
 use ip_cache::CacheError;
 use ip_config::ConfigError;
-use ip_core::{Allowance, Capability, CoreError, Counted, Period, Protocol, RouteKey, Timestamp};
+use ip_core::{
+    Allowance, ApiId, Capability, CoreError, Counted, Period, Protocol, RouteKey, Timestamp,
+};
 use ip_storage::StorageError;
 
 use crate::stage::StageName;
@@ -90,7 +92,9 @@ impl GatewayError {
             GatewayErrorKind::Upstream(_) => StatusCode::BAD_GATEWAY,
             GatewayErrorKind::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
             GatewayErrorKind::Spent { .. } => StatusCode::TOO_MANY_REQUESTS,
-            GatewayErrorKind::Unmeasured { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            GatewayErrorKind::Unmeasured { .. } | GatewayErrorKind::NoCredential { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -130,6 +134,16 @@ pub enum GatewayErrorKind {
     ProtocolNotServed {
         /// The protocol the rule names.
         protocol: Protocol,
+    },
+
+    /// A request the deployment makes for itself reached an upstream that declared no key.
+    ///
+    /// It is a deployment's own misconfiguration rather than anything a caller did, so it is
+    /// refused here instead of at the provider, which would answer 401 to an empty header.
+    #[error("the upstream {api} declares no credential for a request the deployment makes")]
+    NoCredential {
+        /// The upstream the request was routed to.
+        api: ApiId,
     },
 
     /// The request itself could not be read.

@@ -9,5 +9,5 @@ pub(crate) mod record;
 mod run;
 mod stages;
 
-pub use gateway::{Gateway, RequestContext};
+pub use gateway::{Gateway, Presenting, RequestContext};
 pub use stages::Flow;

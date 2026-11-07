@@ -1,11 +1,12 @@
 //! The header and uri surgery a proxy owes the next hop.
 
 use http::header::{
-    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, PROXY_AUTHENTICATE,
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, PROXY_AUTHENTICATE,
     PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use http::uri::{Authority as UriAuthority, Scheme};
 use http::{HeaderMap, HeaderValue, Request, Uri};
+use ip_config::Secret;
 use ip_core::Endpoint;
 use std::net::SocketAddr;
 
@@ -50,6 +51,23 @@ pub(super) fn aim(
     })?;
     parts.headers.insert(HOST, host);
     Ok(Request::from_parts(parts, body))
+}
+
+/// The header the second provider family spells its credential under.
+const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+
+/// Presents the deployment's own credential, replacing whatever the request carried.
+///
+/// Both spellings, as the arbiter's question does and for the same reason: one upstream has to
+/// answer either family, and neither rejects the other's header.
+pub(super) fn present(headers: &mut HeaderMap, secret: &Secret) -> Result<(), String> {
+    let key = HeaderValue::from_str(secret.expose())
+        .map_err(|_| "holds a byte no header will take".to_owned())?;
+    let bearer = HeaderValue::from_str(&format!("Bearer {}", secret.expose()))
+        .map_err(|_| "holds a byte no header will take".to_owned())?;
+    headers.insert(AUTHORIZATION, bearer);
+    headers.insert(X_API_KEY, key);
+    Ok(())
 }
 
 /// Headers that describe one connection, which a proxy must not pass on to the next.

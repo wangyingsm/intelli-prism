@@ -11,7 +11,7 @@ use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_core::RouteRule;
 use ip_gateway::{
     Configured, Dispatcher, Gateway, HyperUpstream, Limiter, Limits, Prices, ResponseCache,
-    RouteError, RoutingTable,
+    RoutingTable,
 };
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
@@ -135,7 +135,7 @@ impl AppState {
         // followed rather than missed.
         let started_at = ip_storage::RevisionStore::rule_revision(store.as_ref()).await?;
         let table = RoutingTable::load(config, store.as_ref()).await?;
-        let configured = Configured::of(config).map_err(RouteError::from)?;
+        let configured = Configured::of(config)?;
         let host = Arc::new(PluginHost::new(PluginLimits::default())?);
         let chains = PluginChains::load(Arc::clone(&host), store.as_ref(), store.as_ref()).await?;
         tracing::info!(rules = chains.len(), "plugin chains built");

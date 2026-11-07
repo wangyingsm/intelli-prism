@@ -13,7 +13,7 @@ use ip_core::{
 };
 use std::sync::{Arc, Mutex};
 
-use super::{Gateway, RequestContext};
+use super::{Gateway, Presenting, RequestContext};
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::ResponseCache;
 use crate::error::ProcessorError;
@@ -484,6 +484,7 @@ pub(super) fn context(authority: Authority) -> RequestContext {
         listen: "127.0.0.1:8080".parse().unwrap(),
         trace: TraceId::generate().unwrap(),
         turn: None,
+        presenting: Presenting::CallersOwn,
         // Unclassified until forward says otherwise, which is where the class is read from.
     }
 }

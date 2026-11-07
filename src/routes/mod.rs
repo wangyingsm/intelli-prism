@@ -30,7 +30,7 @@ use axum::{Json, Router};
 use http_body_util::BodyExt;
 use ip_auth::{Identity, Passphrase};
 use ip_core::{Capability, CapabilityScope, Protocol, Role, Timestamp, TraceId, TurnId};
-use ip_gateway::{GatewayBody, GatewayError, RequestContext};
+use ip_gateway::{GatewayBody, GatewayError, Presenting, RequestContext};
 use ip_storage::{DEFAULT_PAGE_LIMIT, Page, Standing, StorageError};
 use std::net::SocketAddr;
 use tracing::Instrument;
@@ -368,6 +368,8 @@ async fn proxy(
         listen: state.listen(),
         trace,
         turn: turn_of(&mut request),
+        // A proxied request presents the key its own caller sent.
+        presenting: Presenting::CallersOwn,
     };
     match state.gateway().handle(context, into_gateway(request)).await {
         Ok(response) => response.map(Body::new),
