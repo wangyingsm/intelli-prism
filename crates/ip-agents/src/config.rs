@@ -8,8 +8,8 @@ const MAX_TURNS_MAX: u16 = 1_000;
 const TIME_LIMIT_MAX_SECONDS: u32 = 86_400;
 /// The longest one upstream request may wait, in seconds.
 const REQ_TIMEOUT_MAX_SECONDS: u32 = 3_600;
-/// The longest a tool name may be, in bytes.
-const TOOL_NAME_MAX_BYTES: usize = 64;
+/// The longest a tool name may be, in bytes: a 64-byte server id, a dot, and a 64-byte tool.
+const TOOL_NAME_MAX_BYTES: usize = 129;
 /// The most tools one template may name.
 const TOOL_SET_MAX: usize = 64;
 
@@ -220,10 +220,15 @@ fn bounded(kind: &'static str, seconds: u32, max: u32) -> Result<u32, AgentError
     Ok(seconds)
 }
 
-/// One tool a template asks for.
+/// One tool a template asks for, either a system tool or an MCP server's as `server.tool`.
 ///
 /// The shape alone is checked, not the name: the preset of system tools does not exist yet, and a
 /// set to check against that is empty would refuse every tool there is.
+///
+/// **The dot is permitted and is not required.** A qualified name is what an MCP tool needs, and
+/// a bare one is what a system tool is and what templates written before MCP existed already
+/// hold; a type that required the dot would make a stored row unreadable. Which of the two a
+/// name is, and whether it resolves to anything, is the runner's to decide when a run starts.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct ToolName(Box<str>);
@@ -257,11 +262,11 @@ impl TryFrom<String> for ToolName {
                 max: TOOL_NAME_MAX_BYTES,
             });
         }
-        // Lower case only, unlike an id: a tool name is the name of something executable, and two
-        // tools differing in case alone would be one tool on a sandbox that folds it.
+        // Upper case is carried although a system tool has no use for it: half of what a name
+        // may now hold is a third-party MCP server's own spelling, which this does not choose.
         match raw
             .chars()
-            .find(|ch| !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')))
+            .find(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
         {
             Some(ch) => Err(AgentError::IllegalChar {
                 kind: Self::KIND,
@@ -628,7 +633,7 @@ mod tests {
                 kind: ToolName::KIND
             })
         );
-        for (raw, ch) in [("Python", 'P'), ("my tool", ' '), ("bin/bash", '/')] {
+        for (raw, ch) in [("my tool", ' '), ("bin/bash", '/'), ("库存", '库')] {
             assert_eq!(
                 ToolName::new(raw),
                 Err(AgentError::IllegalChar {
@@ -642,6 +647,42 @@ mod tests {
             ToolName::new(&"a".repeat(TOOL_NAME_MAX_BYTES + 1)),
             Err(AgentError::TooLong { .. })
         ));
+    }
+
+    /// A template naming an MCP tool says which server it means, so two servers may both offer
+    /// `sql`. Resolving it is the runner's, but holding it is this type's.
+    #[test]
+    fn a_tool_name_carries_the_server_that_offers_it() {
+        assert_eq!(tool("warehouse.get_stock").as_str(), "warehouse.get_stock");
+        assert_eq!(tool("wh.v2.search").as_str(), "wh.v2.search");
+    }
+
+    /// Half of a qualified name is a third-party server's own spelling, which this does not get
+    /// to choose; the other half may be a system tool, which has no use for it.
+    #[test]
+    fn a_tool_name_carries_the_case_the_server_spelled_it_in() {
+        assert_eq!(tool("warehouse.getStock").as_str(), "warehouse.getStock");
+        assert_eq!(tool("Python").as_str(), "Python");
+    }
+
+    /// The failure this guards against is a stored row no longer reading back, which is why the
+    /// dot is permitted rather than required.
+    #[test]
+    fn a_tool_named_before_any_server_existed_still_reads_back() {
+        let stored = r#"["sql","search"]"#;
+        let set: ToolSet = serde_json::from_str(stored).unwrap();
+
+        let named: Vec<&str> = set.tools().iter().map(ToolName::as_str).collect();
+        assert_eq!(named, ["sql", "search"]);
+        assert_eq!(serde_json::to_string(&set).unwrap(), stored);
+    }
+
+    /// A server id and a tool name are 64 bytes each, and a qualified name is both and a dot.
+    #[test]
+    fn a_name_long_enough_to_qualify_the_longest_tool_is_held() {
+        let qualified = format!("{}.{}", "s".repeat(64), "t".repeat(64));
+        assert_eq!(qualified.len(), TOOL_NAME_MAX_BYTES);
+        assert_eq!(tool(&qualified).as_str(), qualified);
     }
 
     #[test]
