@@ -7,6 +7,7 @@ pub(crate) mod harness;
 mod isolation;
 mod key;
 mod limit;
+mod mcp;
 mod member;
 mod plugin;
 mod price;
@@ -67,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/_ip/usage", usage::router())
         .nest("/_ip/audit", audit::router())
         .nest("/_ip/agents", agent::router())
+        .nest("/_ip/mcps", mcp::router())
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))

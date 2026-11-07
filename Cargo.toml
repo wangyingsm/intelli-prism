@@ -28,6 +28,7 @@ ip-config = { version = "0.1.0", path = "crates/ip-config" }
 ip-core = { version = "0.1.0", path = "crates/ip-core" }
 ip-filter = { version = "0.1.0", path = "crates/ip-filter" }
 ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
+ip-mcp = { version = "0.1.0", path = "crates/ip-mcp" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }
 opentelemetry = "0.33.0"
