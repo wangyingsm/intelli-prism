@@ -72,6 +72,24 @@ pub enum RunError {
         max: usize,
     },
 
+    /// A deployment with no upstream a run could be sent to.
+    #[error("no configured upstream serves {}", api.as_deref().unwrap_or("any family"))]
+    NowhereToRun {
+        /// The family that was asked for, where one was.
+        api: Option<String>,
+    },
+
+    /// A deployment serving several families, and a run that said nothing about which.
+    ///
+    /// Refused rather than guessed at: a body has to be written in one family, and sending a
+    /// run to whichever upstream was configured first is the kind of surprise a template
+    /// author cannot see coming.
+    #[error("this deployment serves {} — the run must name one", families.join(" and "))]
+    AmbiguousRun {
+        /// What it serves.
+        families: Vec<String>,
+    },
+
     /// A turn that could not be built into a request at all.
     #[error("a turn could not be made into a request: {detail}")]
     TurnNotBuilt {

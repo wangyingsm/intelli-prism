@@ -26,7 +26,7 @@ mod shed;
 mod tools;
 mod turn;
 
-pub use ask::{Taken, Target, take};
+pub use ask::{AsWhom, Taken, Target, take};
 pub use choice::{Pinned, Requested};
 pub use error::RunError;
 pub use event::RunEvent;

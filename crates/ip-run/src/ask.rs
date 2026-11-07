@@ -10,11 +10,12 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{Method, Request};
 use http_body_util::BodyExt;
 use ip_auth::Authority;
-use ip_core::{AbsPath, Dialect, Protocol, TraceId};
+use ip_core::{AbsPath, Dialect, Protocol, RouteRule, TraceId};
 use ip_gateway::{Gateway, Presenting, RequestContext, from_bytes};
 use ip_protocol::{Conversation, Dropped, Gathered, anthropic, gemini, openai};
 use std::net::SocketAddr;
 
+use crate::choice::Pinned;
 use crate::error::RunError;
 
 /// Where a run's turns are sent, and as whom.
@@ -34,6 +35,68 @@ pub struct Target {
     pub listen: SocketAddr,
     /// The scheme the gateway serves.
     pub protocol: Protocol,
+}
+
+impl Target {
+    /// Works out where a run's turns go from what the deployment configured.
+    ///
+    /// A run has no uri of its own, so the rule it is routed by is chosen here rather than
+    /// asked for. What settles it is the family: a body cannot be written without choosing
+    /// one, so a run that pinned no api in a deployment serving several families is refused
+    /// rather than sent to whichever upstream happened to be configured first. Several
+    /// upstreams of the *same* family are not ambiguous in that way, and the first is taken.
+    pub fn aimed(
+        configured: &[RouteRule],
+        pinned: &Pinned,
+        as_whom: AsWhom,
+    ) -> Result<Self, RunError> {
+        let candidates: Vec<(&RouteRule, Dialect)> = configured
+            .iter()
+            .map(|rule| (rule, family(rule)))
+            .filter(|(_, speaks)| pinned.api.is_none_or(|wanted| wanted == *speaks))
+            .collect();
+        let (first, speaks) = *candidates.first().ok_or_else(|| RunError::NowhereToRun {
+            api: pinned.api.map(|api| api.to_string()),
+        })?;
+        if candidates.iter().any(|(_, other)| *other != speaks) {
+            return Err(RunError::AmbiguousRun {
+                families: {
+                    let mut named: Vec<String> = candidates
+                        .iter()
+                        .map(|(_, speaks)| speaks.to_string())
+                        .collect();
+                    named.sort_unstable();
+                    named.dedup();
+                    named
+                },
+            });
+        }
+        Ok(Self {
+            path: first.key.endpoint().path.clone(),
+            speaks,
+            authority: as_whom.authority,
+            listen: as_whom.listen,
+            protocol: as_whom.protocol,
+        })
+    }
+}
+
+/// Who a run's turns are sent as, and from where.
+#[derive(Debug, Clone)]
+pub struct AsWhom {
+    /// The account the run was started by.
+    pub authority: Authority,
+    /// Where the gateway listens.
+    pub listen: SocketAddr,
+    /// The scheme it serves.
+    pub protocol: Protocol,
+}
+
+/// The family one rule's callers speak, which is what the gateway itself works out.
+fn family(rule: &RouteRule) -> Dialect {
+    rule.caller_speaks
+        .or(rule.upstream_speaks)
+        .unwrap_or(Dialect::OpenAi)
 }
 
 /// What one turn came back with.
@@ -147,6 +210,8 @@ fn read(speaks: Dialect, body: &[u8]) -> Result<(Vec<ip_protocol::Event>, Droppe
 mod tests {
     use ip_protocol::{Block, Message, Stop};
 
+    use ip_core::RouteRule;
+
     use super::*;
     use crate::fixtures::{Fake, gateway, said, target};
 
@@ -163,6 +228,143 @@ mod tests {
 
     /// A run has no caller to borrow a provider key from, so every turn says it presents the
     /// deployment's own and is aimed at the endpoint the matched rule names.
+    fn ruled(api: &str, path: &str, caller: Option<Dialect>) -> RouteRule {
+        RouteRule {
+            api: ip_core::ApiId::new(api).unwrap(),
+            key: ip_core::RouteKey::new(ip_core::Endpoint::new(
+                Protocol::Http,
+                ip_core::Host::new("127.0.0.1").unwrap(),
+                ip_core::Port::new(8080).unwrap(),
+                AbsPath::new(path).unwrap(),
+            )),
+            target: ip_core::RouteTarget::new(ip_core::Endpoint::new(
+                Protocol::Https,
+                ip_core::Host::new("api.example.com").unwrap(),
+                ip_core::Port::new(443).unwrap(),
+                AbsPath::new("/v1").unwrap(),
+            )),
+            strategy: ip_core::Strategy::default(),
+            hedge: ip_core::Hedge::default(),
+            hedge_delay: ip_core::HedgeDelay::default(),
+            caller_speaks: caller,
+            upstream_speaks: None,
+        }
+    }
+
+    fn as_whom() -> AsWhom {
+        let aimed = target(Dialect::Anthropic);
+        AsWhom {
+            authority: aimed.authority,
+            listen: aimed.listen,
+            protocol: aimed.protocol,
+        }
+    }
+
+    #[test]
+    fn one_upstream_is_where_a_run_that_pinned_nothing_goes() {
+        let aimed = Target::aimed(
+            &[ruled("anthropic", "/anthropic", Some(Dialect::Anthropic))],
+            &Pinned::default(),
+            as_whom(),
+        )
+        .unwrap();
+
+        assert_eq!(aimed.path.as_str(), "/anthropic");
+        assert_eq!(aimed.speaks, Dialect::Anthropic);
+    }
+
+    /// A rule that says nothing about families is what every rule written before M14 is.
+    #[test]
+    fn a_rule_naming_no_family_is_read_the_way_the_gateway_reads_it() {
+        let aimed = Target::aimed(
+            &[ruled("openai", "/v1", None)],
+            &Pinned::default(),
+            as_whom(),
+        )
+        .unwrap();
+
+        assert_eq!(aimed.speaks, Dialect::OpenAi);
+    }
+
+    #[test]
+    fn a_pinned_family_picks_the_upstream_that_speaks_it() {
+        let configured = [
+            ruled("openai", "/openai", Some(Dialect::OpenAi)),
+            ruled("anthropic", "/anthropic", Some(Dialect::Anthropic)),
+        ];
+
+        let aimed = Target::aimed(
+            &configured,
+            &Pinned {
+                model: None,
+                api: Some(Dialect::Anthropic),
+            },
+            as_whom(),
+        )
+        .unwrap();
+
+        assert_eq!(aimed.path.as_str(), "/anthropic");
+        assert_eq!(aimed.speaks, Dialect::Anthropic);
+    }
+
+    /// The decision this exists to make: a body has to be written in one family, so a run
+    /// that named none where several are served is refused rather than sent to the first.
+    #[test]
+    fn a_run_naming_no_family_where_several_are_served_is_refused() {
+        let configured = [
+            ruled("openai", "/openai", Some(Dialect::OpenAi)),
+            ruled("anthropic", "/anthropic", Some(Dialect::Anthropic)),
+        ];
+
+        let refused = Target::aimed(&configured, &Pinned::default(), as_whom()).unwrap_err();
+
+        assert!(
+            matches!(&refused, RunError::AmbiguousRun { families } if families == &["anthropic", "openai"]),
+            "{refused:?}"
+        );
+    }
+
+    /// Two upstreams of one family are not ambiguous in the way that matters.
+    #[test]
+    fn several_upstreams_of_one_family_are_not_ambiguous() {
+        let configured = [
+            ruled("anthropic-eu", "/eu", Some(Dialect::Anthropic)),
+            ruled("anthropic-us", "/us", Some(Dialect::Anthropic)),
+        ];
+
+        let aimed = Target::aimed(&configured, &Pinned::default(), as_whom()).unwrap();
+
+        assert_eq!(aimed.path.as_str(), "/eu", "the first the file declared");
+    }
+
+    #[test]
+    fn a_family_no_upstream_speaks_refuses_the_run() {
+        let refused = Target::aimed(
+            &[ruled("openai", "/openai", Some(Dialect::OpenAi))],
+            &Pinned {
+                model: None,
+                api: Some(Dialect::Gemini),
+            },
+            as_whom(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&refused, RunError::NowhereToRun { api } if api.as_deref() == Some("gemini")),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_no_upstreams_at_all_refuses_the_run() {
+        let refused = Target::aimed(&[], &Pinned::default(), as_whom()).unwrap_err();
+
+        assert!(
+            matches!(&refused, RunError::NowhereToRun { api: None }),
+            "{refused:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_turn_goes_out_as_the_deployments_own_request() {
         let upstream = Fake::answering(&said("four"));
