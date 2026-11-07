@@ -1580,6 +1580,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "ip-agents",
  "ip-auth",
  "ip-cache",
  "ip-classify",

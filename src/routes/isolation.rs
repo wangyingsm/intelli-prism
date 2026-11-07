@@ -73,6 +73,7 @@ mod tests {
         vec![
             at_tenant(Capability::UserMgr),
             at_tenant(Capability::Observer),
+            at_tenant(Capability::SysAgent),
             at_api(Capability::ApiAccess),
             at_api(Capability::LimitMgr),
         ]
@@ -201,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn no_endpoint_taking_a_tenant_in_a_body_serves_another_tenants_member() {
         let theirs = theirs();
-        let cases: [(&str, String, Option<String>); 6] = [
+        let cases: [(&str, String, Option<String>); 7] = [
             ("GET", format!("/_ip/limits?tenant={theirs}"), None),
             (
                 "PUT",
@@ -213,6 +214,7 @@ mod tests {
             ("GET", format!("/_ip/usage?tenant={theirs}"), None),
             ("GET", format!("/_ip/usage/summary?tenant={theirs}"), None),
             ("GET", format!("/_ip/audit?tenant={theirs}"), None),
+            ("GET", format!("/_ip/agents?tenant={theirs}"), None),
             (
                 "POST",
                 "/_ip/keys/tenant".to_owned(),
@@ -246,6 +248,7 @@ mod tests {
             "/_ip/usage",
             "/_ip/plugin-rules",
             "/_ip/audit",
+            "/_ip/agents",
         ] {
             let response = router
                 .clone()
@@ -280,11 +283,12 @@ mod tests {
     /// nothing about the boundary.
     #[tokio::test]
     async fn the_same_reads_against_her_own_tenant_are_served() {
-        let served: [String; 4] = [
+        let served: [String; 5] = [
             format!("/_ip/tenants/{}", mine()),
             format!("/_ip/tenants/{}/members", mine()),
             format!("/_ip/usage?tenant={}", mine()),
             format!("/_ip/audit?tenant={}", mine()),
+            format!("/_ip/agents?tenant={}", mine()),
         ];
         let (router, cookie) = fixture().await;
         for path in served {
@@ -319,7 +323,7 @@ mod tests {
             .collect();
         // Every prefix, and what this file does about it. A prefix that holds nothing
         // of any tenant's says so here rather than being quietly left out.
-        let audited: [(&str, &str); 13] = [
+        let audited: [(&str, &str); 14] = [
             ("/_ip/tenants", "asked for by path"),
             ("/_ip/tenants/{tenant}/members", "asked for by path"),
             (
@@ -339,6 +343,7 @@ mod tests {
             ),
             ("/_ip/usage", "asked for by query"),
             ("/_ip/audit", "asked for by query"),
+            ("/_ip/agents", "asked for by query"),
         ];
         for prefix in &nested {
             assert!(
