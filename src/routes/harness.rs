@@ -10,7 +10,7 @@ use ip_config::Config;
 use ip_core::{PassphraseHash, UserId};
 use ip_gateway::body::GatewayBody;
 use ip_gateway::upstream::Upstream;
-use ip_gateway::{Gateway, ProcessorChain, RoutingTable, UpstreamError};
+use ip_gateway::{Configured, Gateway, ProcessorChain, RoutingTable, UpstreamError};
 use ip_storage::SqliteStore;
 
 use crate::manage::CSRF_HEADER;
@@ -65,10 +65,24 @@ pub fn state_over(store: SqliteStore) -> AppState {
 
 /// The same, over a store the test keeps a handle on.
 pub fn state_over_shared(store: Arc<SqliteStore>) -> AppState {
+    serving(store, CONFIG, Arc::new(Unreachable))
+}
+
+/// The same, over a deployment that configured upstreams and an upstream that answers them.
+///
+/// What a run needs and the other fixtures do not: `state_over_shared` configures no upstream
+/// at all, so a run over it has nowhere to send a turn.
+pub fn serving(store: Arc<SqliteStore>, config: &str, upstream: Arc<dyn Upstream>) -> AppState {
+    let config = Config::parse(config).unwrap();
     let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-    let table = RoutingTable::build(&Config::parse(CONFIG).unwrap(), Vec::new()).unwrap();
-    let gateway = Gateway::new(table, ProcessorChain::new(), Arc::new(Unreachable));
-    AppState::with_parts(Stores::Sqlite(store), gateway, listen)
+    let table = RoutingTable::build(&config, Vec::new()).unwrap();
+    let gateway = Gateway::new(table, ProcessorChain::new(), upstream);
+    AppState::with_parts(
+        Stores::Sqlite(store),
+        gateway,
+        listen,
+        Configured::of(&config).unwrap(),
+    )
 }
 
 /// The cookie a real login hands back.

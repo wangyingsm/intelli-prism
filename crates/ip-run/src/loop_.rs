@@ -165,7 +165,7 @@ pub async fn run(running: &Running<'_>, input: &str) -> Ran {
 
     let ran = Ran {
         spend: turns.iter().map(|turn| turn.spend).sum(),
-        id: running.id.clone(),
+        id: running.id,
         turns,
         stopped,
         traces,

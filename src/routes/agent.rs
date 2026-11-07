@@ -4,10 +4,19 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use ip_agents::{AgentConfig, AgentId, AgentName, AgentTemplate, Sandbox};
 use ip_core::{Capability, CapabilityScope, TenantId, Timestamp};
 use ip_storage::{AgentOwner, By, NewAgent, StoredAgent};
+
+use axum::response::sse::{Event as SseEvent, Sse};
+use futures_util::StreamExt;
+use ip_core::Protocol;
+use ip_mcp::McpSettings;
+use ip_run::{AsWhom, Pinned, Requested, RunId, Running, Target, Toolshed};
+use ip_storage::Page;
+use std::time::Duration;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{Paged, store_refusal};
 use crate::manage::Manager;
@@ -21,6 +30,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list))
         .route("/{agent}", get(read).put(put).delete(remove))
+        .route("/{agent}/run", post(start))
 }
 
 /// What the audit trail records a template written or removed as having come through.
@@ -175,6 +185,134 @@ async fn remove(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => store_refusal(error),
     }
+}
+
+/// How long a run's tool calls wait on an MCP server.
+const MCP_SETTINGS: McpSettings = McpSettings {
+    connect_timeout: Duration::from_secs(10),
+    request_timeout: Duration::from_secs(30),
+    max_answer_bytes: 4 * 1024 * 1024,
+};
+
+/// How many registered servers a run may choose its tools from.
+const REGISTRY_LIMIT: u32 = 1_000;
+
+/// What starting a run is asked for.
+#[derive(Debug, serde::Deserialize)]
+struct Start {
+    /// What the agent is being asked to do.
+    input: String,
+    /// Which model, where the request names one rather than taking the template's.
+    #[serde(flatten)]
+    requested: Requested,
+}
+
+/// Runs a stored template, streaming what it does as it does it.
+///
+/// Everything that can refuse a run is settled before the stream opens, so a caller gets a
+/// status code rather than one event saying it went wrong: the template is read, the tools are
+/// resolved against the registry, the servers are opened and the target is worked out, all
+/// first. Once the stream is open the run has begun and every outcome, refusals included,
+/// arrives as a `done` event.
+async fn start(
+    State(state): State<AppState>,
+    manager: Manager,
+    Path(id): Path<String>,
+    Query(owned): Query<Owned>,
+    Json(asked): Json<Start>,
+) -> Response<Body> {
+    let id = match AgentId::new(&id) {
+        Ok(id) => id,
+        Err(error) => return *unprocessable(error),
+    };
+    // A run spends money, so it is charged to a tenant rather than to the deployment.
+    let Some(tenant) = owned.tenant.clone() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "name the tenant this run is charged to",
+        )
+            .into_response();
+    };
+    let tenant = match TenantId::new(&tenant) {
+        Ok(tenant) => tenant,
+        Err(error) => return *unprocessable(error),
+    };
+    let owner = match owner_of(&state, &manager, owned).await {
+        Ok(owner) => owner,
+        Err(refusal) => return *refusal,
+    };
+    let template = match state.store().agent(&owner, &id).await {
+        Ok(Some(held)) => held.template,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return store_refusal(error),
+    };
+    let authority = match manager.authority(state.store().as_ref(), &tenant).await {
+        Ok(Some(authority)) => authority,
+        Ok(None) => return StatusCode::FORBIDDEN.into_response(),
+        Err(error) => return store_refusal(error),
+    };
+
+    let config = template.config.clone();
+    let pinned = match Pinned::resolve(&asked.requested, &config) {
+        Ok(pinned) => pinned,
+        Err(error) => return *unprocessable(error),
+    };
+    let target = match Target::aimed(
+        state.configured(),
+        &pinned,
+        AsWhom {
+            authority,
+            listen: state.listen(),
+            protocol: Protocol::Http,
+        },
+    ) {
+        Ok(target) => target,
+        Err(error) => return *unprocessable(error),
+    };
+    let registry = match state.store().mcps(Page::new(REGISTRY_LIMIT, 0, None)).await {
+        Ok(held) => held
+            .into_iter()
+            .map(|stored| stored.server)
+            .collect::<Vec<_>>(),
+        Err(error) => return store_refusal(error),
+    };
+    let shed = match Toolshed::open(config.tool_set(), &registry, MCP_SETTINGS).await {
+        Ok(shed) => shed,
+        Err(error) => return *unprocessable(error),
+    };
+    let run_id = match RunId::generate() {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::error!(%error, "could not name a run");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = state.shared_gateway();
+    tokio::spawn(async move {
+        ip_run::run(
+            &Running {
+                id: run_id,
+                gateway: gateway.as_ref(),
+                target: &target,
+                shed: &shed,
+                config: &config,
+                pinned: &pinned,
+                reporting: &sender,
+            },
+            &asked.input,
+        )
+        .await;
+    });
+    Sse::new(UnboundedReceiverStream::new(receiver).map(|event| {
+        Ok::<_, std::convert::Infallible>(
+            SseEvent::default()
+                .event(event.name())
+                .data(event.body().to_string()),
+        )
+    }))
+    .into_response()
 }
 
 /// Whose templates this caller may manage, or what it is told when it may manage none.
@@ -836,5 +974,260 @@ mod tests {
         assert_eq!(trail[0].through, "/_ip/agents");
         assert_eq!(trail[0].entity_id, "triage");
         assert_eq!(trail[0].after.as_ref().unwrap()["name"], "Triage");
+    }
+
+    /// A deployment that actually has an upstream to send a run's turns to.
+    const SERVING: &str = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "./unopened.db"
+
+[cache]
+backend = "sled"
+path = "./unopened"
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[[upstream]]
+id = "anthropic"
+base_url = "https://api.example.com/v1"
+api_key = "sk-deployment"
+model = "claude-opus-5"
+caller_speaks = "anthropic"
+upstream_speaks = "anthropic"
+"#;
+
+    /// An upstream that answers every turn with the same finished message.
+    struct Answering;
+
+    #[async_trait::async_trait]
+    impl ip_gateway::upstream::Upstream for Answering {
+        async fn send(
+            &self,
+            _request: axum::http::Request<ip_gateway::body::GatewayBody>,
+        ) -> Result<axum::http::Response<ip_gateway::body::GatewayBody>, ip_gateway::UpstreamError>
+        {
+            let body = serde_json::json!({
+                "id": "msg_1",
+                "model": "claude-opus-5",
+                "role": "assistant",
+                "type": "message",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "four"}],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            })
+            .to_string();
+            Ok(axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(ip_gateway::from_bytes(body.into()))
+                .unwrap())
+        }
+    }
+
+    async fn running_fixture() -> (Router, AppState) {
+        let state = super::super::harness::serving(store().await, SERVING, Arc::new(Answering));
+        (super::super::router(state.clone()), state)
+    }
+
+    /// Stores a template under a tenant, overwriting whatever the fixture put there.
+    async fn template_asking(state: &AppState, tools: &[&str]) {
+        let mut stored = template("acme-triage", "Acme's");
+        stored.config = AgentConfig::new(AgentConfigParts {
+            role: AgentRole::System,
+            prompt: Prompt::new("Be helpful.").unwrap(),
+            tool_set: ToolSet::new(
+                tools
+                    .iter()
+                    .map(|one| ip_agents::ToolName::new(one).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+            max_turns: MaxTurns::new(2).unwrap(),
+            time_limit: TimeLimit::new(30).unwrap(),
+            req_timeout: ReqTimeout::new(10).unwrap(),
+            use_best_effort: false,
+            best_effort_strategy: None,
+            model: None,
+            api: None,
+        })
+        .unwrap();
+        state
+            .store()
+            .put_agent(
+                NewAgent {
+                    owner: AgentOwner::Tenant(tenant("acme")),
+                    template: stored,
+                },
+                &by("root", "/_ip/agents"),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn start_run(
+        router: &Router,
+        state: &AppState,
+        caller: &str,
+        uri: &str,
+    ) -> Response<Body> {
+        send(
+            router,
+            state,
+            "POST",
+            caller,
+            uri,
+            Some(r#"{"input":"how many?"}"#),
+        )
+        .await
+    }
+
+    /// Every `event:` line a stream carried, in the order it carried them.
+    async fn streamed(response: Response<Body>) -> Vec<String> {
+        body_of(response)
+            .await
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: ").map(str::to_owned))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_run_streams_what_it_did_and_ends_with_what_it_came_to() {
+        let (router, state) = running_fixture().await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/agents/acme-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.starts_with("text/event-stream")),
+            Some(true)
+        );
+        assert_eq!(streamed(response).await, ["turn", "text", "done"]);
+    }
+
+    /// The whole point of settling everything first: a refusal is a status code a client can
+    /// read, not one event inside a stream that says it went wrong.
+    #[tokio::test]
+    async fn a_template_naming_a_tool_no_server_offers_is_refused_before_the_stream_opens() {
+        let (router, state) = running_fixture().await;
+        template_asking(&state, &["nowhere.sql"]).await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/agents/acme-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_of(response).await.contains("nowhere"));
+    }
+
+    /// A run spends money, so it is charged to a tenant even when the caller could manage
+    /// the deployment's own templates without naming one.
+    #[tokio::test]
+    async fn a_run_that_names_no_tenant_is_refused() {
+        let (router, state) = running_fixture().await;
+
+        let response = start_run(&router, &state, "root", "/_ip/agents/deployment/run").await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_of(response).await.contains("charged"));
+    }
+
+    #[tokio::test]
+    async fn a_template_this_tenant_does_not_hold_is_not_found() {
+        let (router, state) = running_fixture().await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/agents/other-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_caller_outside_the_tenant_cannot_run_its_templates() {
+        let (router, state) = running_fixture().await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "carol",
+            "/_ip/agents/acme-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The administrator manages every tenant's templates but is a member of none, so it has
+    /// no standing inside one to run as.
+    #[tokio::test]
+    async fn the_administrator_has_no_authority_inside_a_tenant_to_run_as() {
+        let (router, state) = running_fixture().await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "root",
+            "/_ip/agents/acme-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A deployment that configured no upstream has nowhere to send a turn, and says so
+    /// rather than opening a stream that cannot carry one.
+    #[tokio::test]
+    async fn a_deployment_with_no_upstream_refuses_a_run() {
+        let (router, state) = fixture().await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/agents/acme-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body_of(response).await.contains("no configured upstream"));
+    }
+
+    #[tokio::test]
+    async fn a_template_name_that_is_not_one_is_the_callers_mistake() {
+        let (router, state) = running_fixture().await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/agents/NOT%20AN%20ID/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

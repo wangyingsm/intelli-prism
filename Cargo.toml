@@ -16,6 +16,7 @@ ip-embed = { version = "0.1.0", path = "crates/ip-embed", optional = true }
 ip-onnx = { version = "0.1.0", path = "crates/ip-onnx", optional = true }
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
+futures-util = { version = "0.3.34", default-features = false }
 getrandom.workspace = true
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
@@ -30,7 +31,9 @@ ip-filter = { version = "0.1.0", path = "crates/ip-filter" }
 ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
 ip-mcp = { version = "0.1.0", path = "crates/ip-mcp" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
+ip-run = { version = "0.1.0", path = "crates/ip-run" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }
+tokio-stream = "0.1.19"
 opentelemetry = "0.33.0"
 opentelemetry-appender-tracing = "0.33.1"
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "logs", "trace", "metrics"] }

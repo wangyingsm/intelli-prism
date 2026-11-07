@@ -295,7 +295,13 @@ impl AppState {
 
     /// Builds state over a store and gateway that are already built, on a cache of its own.
     #[cfg(test)]
-    pub fn with_parts(stores: Stores, gateway: Gateway, listen: SocketAddr) -> Self {
+    pub fn with_parts(
+        stores: Stores,
+        gateway: Gateway,
+        listen: SocketAddr,
+        configured: Configured,
+    ) -> Self {
+        let configured = Arc::new(configured);
         let failing_cache = Arc::new(ip_cache::FailingCache::new(Arc::new(
             ip_cache::SledCache::temporary().expect("a temporary cache"),
         )));
@@ -313,7 +319,7 @@ impl AppState {
             Arc::clone(&backend),
             host,
             Arc::clone(&gateway),
-            Arc::new(Configured::default()),
+            Arc::clone(&configured),
         ));
         let cache = published as Arc<dyn Cache>;
         let store = Arc::clone(&backend) as Arc<dyn Storage>;
@@ -331,7 +337,7 @@ impl AppState {
             session_seconds: 3600,
             gateway,
             listen,
-            configured: Arc::new(Configured::default()),
+            configured,
             feed,
             reloader,
             started_at: RuleRevision::new(0),
@@ -393,6 +399,11 @@ impl AppState {
     /// Carries proxied requests through the dataflow.
     pub fn gateway(&self) -> &Gateway {
         &self.gateway
+    }
+
+    /// The same gateway, held rather than borrowed, for work that outlives the request.
+    pub fn shared_gateway(&self) -> Arc<Gateway> {
+        Arc::clone(&self.gateway)
     }
 
     /// Where the gateway listens, supplying the port a `Host` header omits.

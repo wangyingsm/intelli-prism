@@ -628,7 +628,12 @@ secret = "0123456789abcdef0123456789abcdef"
 
     fn state_over(store: SqliteStore, gateway: Gateway) -> AppState {
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        AppState::with_parts(Stores::Sqlite(Arc::new(store)), gateway, listen)
+        AppState::with_parts(
+            Stores::Sqlite(Arc::new(store)),
+            gateway,
+            listen,
+            ip_gateway::Configured::default(),
+        )
     }
 
     fn signature(key: &TnKey) -> String {
@@ -1249,7 +1254,12 @@ secret = "0123456789abcdef0123456789abcdef"
         .limiting(Arc::new(limiter))
         .with_limits(limits);
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let state = AppState::with_parts(Stores::Sqlite(store), gateway, listen);
+        let state = AppState::with_parts(
+            Stores::Sqlite(store),
+            gateway,
+            listen,
+            ip_gateway::Configured::default(),
+        );
         let router = crate::routes::router(state);
 
         let answered = router
@@ -1294,7 +1304,12 @@ secret = "0123456789abcdef0123456789abcdef"
         )
         .recording(Arc::clone(&store) as Arc<dyn UsageStore>);
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let state = AppState::with_parts(Stores::Sqlite(Arc::clone(&store)), gateway, listen);
+        let state = AppState::with_parts(
+            Stores::Sqlite(Arc::clone(&store)),
+            gateway,
+            listen,
+            ip_gateway::Configured::default(),
+        );
         let router = router(state);
 
         let answered = router

@@ -1,7 +1,7 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{Method, StatusCode};
-use ip_auth::role_of;
+use ip_auth::{Authority, Identity, role_of};
 use ip_core::{Capability, CapabilityScope, Role, UserId};
 use ip_storage::{AccountKind, Storage, StorageError};
 
@@ -72,6 +72,33 @@ impl Manager {
         };
         let granted = store.grants_of(&self.user).await?;
         Ok(role.implies(capability, scope) || granted.holds(capability, scope))
+    }
+
+    /// This caller as the dataflow knows one, for a request the deployment makes on its behalf.
+    ///
+    /// An agent run is turns the deployment sends for somebody, so they go out as that
+    /// somebody: their own role inside the tenant and their own grants, which is what decides
+    /// whether the turns are allowed and whose quota they spend. Nothing is synthesised and
+    /// nothing is widened — a caller who could not proxy to an api by hand cannot reach it
+    /// through a run either.
+    pub async fn authority(
+        &self,
+        store: &dyn Storage,
+        tenant: &ip_core::TenantId,
+    ) -> Result<Option<Authority>, StorageError> {
+        let Some(membership) = store.membership(&self.user, tenant).await? else {
+            // Someone outside a tenant holds nothing inside it, whatever they were granted.
+            return Ok(None);
+        };
+        let role = role_of(self.kind, membership.standing, tenant.clone());
+        Ok(Some(Authority::new(
+            Identity {
+                user: self.user.clone(),
+                tenant: tenant.clone(),
+                role,
+            },
+            store.grants_of(&self.user).await?,
+        )))
     }
 }
 
@@ -285,7 +312,12 @@ secret = "0123456789abcdef0123456789abcdef"
 
         let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let gateway = Gateway::new(empty_table(), ProcessorChain::new(), Arc::new(Unreachable));
-        let state = AppState::with_parts(Stores::Sqlite(Arc::new(store)), gateway, listen);
+        let state = AppState::with_parts(
+            Stores::Sqlite(Arc::new(store)),
+            gateway,
+            listen,
+            ip_gateway::Configured::default(),
+        );
         let router = Router::new()
             .route("/who", get(who).post(who))
             .route("/may", get(may))
