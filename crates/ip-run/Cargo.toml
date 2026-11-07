@@ -1,0 +1,15 @@
+[package]
+name = "ip-run"
+description = "Running an agent template: what one run of the loop is made of"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+hex.workspace = true
+ip-core = { version = "0.1.0", path = "../ip-core" }
+ip-protocol = { version = "0.1.0", path = "../ip-protocol" }
+serde_json.workspace = true

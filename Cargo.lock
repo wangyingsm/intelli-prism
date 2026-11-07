@@ -1814,6 +1814,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-run"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hex",
+ "ip-core",
+ "ip-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "ip-storage"
 version = "0.1.0"
 dependencies = [
