@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use ip_config::Config;
+use ip_config::{Config, Secret};
 use ip_core::{AbsPath, Endpoint, Host, Port, Protocol, RouteKey, RouteRule, Weighted};
 use std::sync::Arc;
 
@@ -19,6 +19,7 @@ pub struct Resolution {
     rule: RouteRule,
     targets: Vec<Weighted>,
     plan: Arc<Plan>,
+    credential: Option<Arc<Secret>>,
 }
 
 impl Resolution {
@@ -42,6 +43,18 @@ impl Resolution {
     pub fn plan(&self) -> &Arc<Plan> {
         &self.plan
     }
+
+    /// The credential the deployment holds for this rule's upstream, where it configured one.
+    ///
+    /// Only a configured upstream has one: a stored rule is a route somebody added over the
+    /// api and names no credential, and nothing invents one for it.
+    ///
+    /// It is read by a request the deployment itself makes, such as an agent turn, which has no
+    /// caller to borrow a key from. A proxied request presents whatever its own caller sent and
+    /// this is not reached for it.
+    pub fn credential(&self) -> Option<&Secret> {
+        self.credential.as_deref()
+    }
 }
 
 /// Every routing rule in force, from the configuration file and from the database.
@@ -57,12 +70,67 @@ pub struct RoutingTable {
 struct Planned {
     rule: RouteRule,
     plan: Arc<Plan>,
+    credential: Option<Arc<Secret>>,
 }
 
 impl From<RouteRule> for Planned {
+    /// A rule carrying no credential, which is every rule that did not come from the file.
     fn from(rule: RouteRule) -> Self {
         let plan = Arc::new(Plan::of(rule.target.weighted()));
-        Self { rule, plan }
+        Self {
+            rule,
+            plan,
+            credential: None,
+        }
+    }
+}
+
+/// What the configuration file contributes to the table: its rules, and the credential each
+/// one's upstream presents.
+///
+/// The two travel together because a reload rebuilds the table from the configured rules it
+/// kept and the stored rules it just read. Keeping the credentials anywhere else means a
+/// reload that quietly drops them, and a run that worked until the first rule change.
+#[derive(Debug, Clone, Default)]
+pub struct Configured {
+    rules: Vec<RouteRule>,
+    credentials: HashMap<RouteKey, Arc<Secret>>,
+}
+
+impl Configured {
+    /// Reads the upstreams a configuration declares.
+    pub fn of(config: &Config) -> Result<Self, RouteError> {
+        let listen = config.server.listen;
+        let mut rules = Vec::with_capacity(config.upstreams.len());
+        let mut credentials = HashMap::new();
+        for upstream in &config.upstreams {
+            let rule = upstream.route_rule(listen)?;
+            if !upstream.api_key.is_empty() {
+                credentials.insert(rule.key.clone(), Arc::new(upstream.api_key.clone()));
+            }
+            rules.push(rule);
+        }
+        Ok(Self { rules, credentials })
+    }
+
+    /// The rules, as a table assembles them.
+    pub fn rules(&self) -> &[RouteRule] {
+        &self.rules
+    }
+
+    /// The credential the upstream behind one rule presents, where it declared one.
+    fn credential(&self, key: &RouteKey) -> Option<Arc<Secret>> {
+        self.credentials.get(key).map(Arc::clone)
+    }
+}
+
+impl From<Vec<RouteRule>> for Configured {
+    /// Rules with no credentials, which is what a test and an example contribute.
+    fn from(rules: Vec<RouteRule>) -> Self {
+        Self {
+            rules,
+            credentials: HashMap::new(),
+        }
     }
 }
 
@@ -70,20 +138,14 @@ impl RoutingTable {
     /// Builds the table from configured upstreams and stored rules. Config wins:
     /// a stored rule under a key an upstream already claims is ignored.
     pub fn build(config: &Config, dynamic: Vec<RouteRule>) -> Result<Self, RouteError> {
-        let listen = config.server.listen;
-        let configured = config
-            .upstreams
-            .iter()
-            .map(|upstream| upstream.route_rule(listen))
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::assemble(&configured, dynamic)
+        Self::assemble(&Configured::of(config)?, dynamic)
     }
 
     /// Builds the table from rules the configuration already contributed and stored ones, as
     /// a reload does when it has both in hand. Config wins, the same way.
-    pub fn assemble(configured: &[RouteRule], dynamic: Vec<RouteRule>) -> Result<Self, RouteError> {
-        let mut rules = Vec::with_capacity(configured.len() + dynamic.len());
-        rules.extend(configured.iter().cloned());
+    pub fn assemble(configured: &Configured, dynamic: Vec<RouteRule>) -> Result<Self, RouteError> {
+        let mut rules = Vec::with_capacity(configured.rules.len() + dynamic.len());
+        rules.extend(configured.rules.iter().cloned());
         for rule in dynamic {
             if !rules.iter().any(|configured| configured.key == rule.key) {
                 rules.push(rule);
@@ -95,7 +157,15 @@ impl RoutingTable {
                 return Err(RouteError::ReservedPath { path: path.clone() });
             }
         }
-        Ok(Self::from_rules(rules))
+        Ok(Self::from_planned(
+            rules
+                .into_iter()
+                .map(|rule| Planned {
+                    credential: configured.credential(&rule.key),
+                    ..Planned::from(rule)
+                })
+                .collect(),
+        ))
     }
 
     /// Reads the stored rules and builds the table around them.
@@ -103,13 +173,18 @@ impl RoutingTable {
         Self::build(config, store.routes().await?)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_rules(rules: Vec<RouteRule>) -> Self {
+        Self::from_planned(rules.into_iter().map(Planned::from).collect())
+    }
+
+    fn from_planned(planned: Vec<Planned>) -> Self {
         let mut by_authority: HashMap<Authority, Vec<Planned>> = HashMap::new();
-        for rule in rules {
+        for rule in planned {
             by_authority
-                .entry(authority(rule.key.endpoint()))
+                .entry(authority(rule.rule.key.endpoint()))
                 .or_default()
-                .push(Planned::from(rule));
+                .push(rule);
         }
         for group in by_authority.values_mut() {
             group.sort_by(|left, right| {
@@ -159,6 +234,7 @@ impl RoutingTable {
                 rule: rule.clone(),
                 targets,
                 plan: Arc::clone(&planned.plan),
+                credential: planned.credential.clone(),
             });
         }
         None
@@ -515,5 +591,139 @@ model = "claude-opus-5"
                 .get(),
             8080
         );
+    }
+
+    /// A configuration naming two providers, each with its own credential, which is the shape
+    /// the whole of this exists for.
+    const TWO: &str = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "./test.db"
+
+[cache]
+backend = "sled"
+path = "./test-cache"
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+[[upstream]]
+id = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-x"
+model = "claude-opus-5"
+
+[[upstream]]
+id = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-oai-y"
+model = "gpt-4o"
+"#;
+
+    fn exposed(table: &RoutingTable, path: &str) -> Option<String> {
+        table
+            .resolve(&key(path))
+            .unwrap()
+            .credential()
+            .map(|secret| secret.expose().to_owned())
+    }
+
+    #[test]
+    fn a_configured_upstreams_credential_reaches_the_rule_it_contributed() {
+        let config = Config::parse(CONFIG).unwrap();
+        let table = RoutingTable::build(&config, Vec::new()).unwrap();
+
+        assert_eq!(exposed(&table, "/anthropic"), Some("sk-x".to_owned()));
+    }
+
+    /// The path remainder is joined onto the target after the rule matched, so a deeper request
+    /// must still arrive with the credential of the rule that carried it.
+    #[test]
+    fn a_deeper_request_under_a_configured_rule_carries_the_credential_too() {
+        let config = Config::parse(CONFIG).unwrap();
+        let table = RoutingTable::build(&config, Vec::new()).unwrap();
+
+        assert_eq!(
+            exposed(&table, "/anthropic/messages"),
+            Some("sk-x".to_owned())
+        );
+    }
+
+    /// The property the whole commit exists for: a key belongs to one upstream and reaches no
+    /// other, so a turn dispatched to one provider can never present another's credential.
+    #[test]
+    fn each_upstream_keeps_its_own_credential_and_no_other() {
+        let config = Config::parse(TWO).unwrap();
+        let table = RoutingTable::build(&config, Vec::new()).unwrap();
+
+        assert_eq!(exposed(&table, "/anthropic"), Some("sk-ant-x".to_owned()));
+        assert_eq!(exposed(&table, "/openai"), Some("sk-oai-y".to_owned()));
+    }
+
+    /// A route somebody added over the api names no credential, and nothing invents one.
+    #[test]
+    fn a_stored_rule_carries_no_credential() {
+        let config = Config::parse(CONFIG).unwrap();
+        let table =
+            RoutingTable::build(&config, vec![rule("/internal", "llm.corp", "/v1")]).unwrap();
+
+        assert_eq!(exposed(&table, "/internal/chat"), None);
+        assert_eq!(exposed(&table, "/anthropic"), Some("sk-x".to_owned()));
+    }
+
+    /// Nothing is presented rather than an empty header, so the refusal is "this upstream holds
+    /// no credential" rather than a provider answering 401 to a blank one.
+    #[test]
+    fn an_upstream_declaring_an_empty_credential_carries_none() {
+        let config =
+            Config::parse(&CONFIG.replace(r#"api_key = "sk-x""#, r#"api_key = """#)).unwrap();
+        let table = RoutingTable::build(&config, Vec::new()).unwrap();
+
+        assert_eq!(exposed(&table, "/anthropic"), None);
+    }
+
+    /// A reload rebuilds the table from the configured rules it kept and the stored rules it
+    /// just read. The credentials travel with the first, so a rule change must not drop them.
+    #[test]
+    fn a_reload_keeps_what_the_configuration_contributed() {
+        let config = Config::parse(CONFIG).unwrap();
+        let configured = Configured::of(&config).unwrap();
+
+        let table = RoutingTable::assemble(&configured, vec![rule("/internal", "llm.corp", "/v1")])
+            .unwrap();
+
+        assert_eq!(exposed(&table, "/anthropic"), Some("sk-x".to_owned()));
+        assert_eq!(exposed(&table, "/internal"), None);
+    }
+
+    /// A stored rule cannot claim a configured key, and must not reach its credential by
+    /// claiming one either.
+    #[test]
+    fn a_stored_rule_claiming_a_configured_key_gets_neither_target_nor_credential() {
+        let config = Config::parse(CONFIG).unwrap();
+        let table =
+            RoutingTable::build(&config, vec![rule("/anthropic", "attacker.example", "/v1")])
+                .unwrap();
+        let resolved = table.resolve(&key("/anthropic")).unwrap();
+
+        assert_eq!(resolved.primary().host.as_str(), "api.anthropic.com");
+        assert_eq!(
+            resolved
+                .credential()
+                .map(|secret| secret.expose().to_owned()),
+            Some("sk-x".to_owned())
+        );
+    }
+
+    /// Rules a test or an example contributes have no configuration behind them.
+    #[test]
+    fn rules_with_no_configuration_behind_them_carry_no_credential() {
+        let table = table(vec![rule("/anthropic", "api.example.com", "/v1")]);
+
+        assert_eq!(exposed(&table, "/anthropic"), None);
     }
 }

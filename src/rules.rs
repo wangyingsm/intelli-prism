@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ip_gateway::{Gateway, Limits, Prices, RoutingTable};
+use ip_gateway::{Configured, Gateway, Limits, Prices, RoutingTable};
 use ip_plugin::{PluginChains, PluginHost};
 use tokio::sync::watch;
 
@@ -182,7 +182,7 @@ pub struct Reloader {
     store: Arc<dyn Backend>,
     host: Arc<PluginHost>,
     gateway: Arc<Gateway>,
-    configured: Arc<[RouteRule]>,
+    configured: Arc<Configured>,
 }
 
 impl Reloader {
@@ -192,7 +192,7 @@ impl Reloader {
         store: Arc<dyn Backend>,
         host: Arc<PluginHost>,
         gateway: Arc<Gateway>,
-        configured: Arc<[RouteRule]>,
+        configured: Arc<Configured>,
     ) -> Self {
         Self {
             feed,

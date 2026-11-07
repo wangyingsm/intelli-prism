@@ -43,6 +43,6 @@ pub use stage::{
     Authorized, BodyProcessed, Forwarded, HeadersProcessed, Received, ResponseBodyProcessed,
     ResponseHeadersProcessed, Routed, Stage, StageName,
 };
-pub use table::{Resolution, RoutingTable, request_key};
+pub use table::{Configured, Resolution, RoutingTable, request_key};
 pub use turns::{TurnAffinity, Verdict};
 pub use upstream::Upstream;

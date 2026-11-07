@@ -10,8 +10,8 @@ use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_core::RouteRule;
 use ip_gateway::{
-    Dispatcher, Gateway, HyperUpstream, Limiter, Limits, Prices, ResponseCache, RouteError,
-    RoutingTable,
+    Configured, Dispatcher, Gateway, HyperUpstream, Limiter, Limits, Prices, ResponseCache,
+    RouteError, RoutingTable,
 };
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
@@ -60,7 +60,7 @@ pub struct AppState {
     session_seconds: u64,
     gateway: Arc<Gateway>,
     listen: SocketAddr,
-    configured: Arc<[RouteRule]>,
+    configured: Arc<Configured>,
     feed: Arc<RuleFeed>,
     reloader: Arc<Reloader>,
     /// The store a test reads through, when the state was built for one, so the test can
@@ -135,12 +135,7 @@ impl AppState {
         // followed rather than missed.
         let started_at = ip_storage::RevisionStore::rule_revision(store.as_ref()).await?;
         let table = RoutingTable::load(config, store.as_ref()).await?;
-        let configured = config
-            .upstreams
-            .iter()
-            .map(|upstream| upstream.route_rule(config.server.listen))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(RouteError::from)?;
+        let configured = Configured::of(config).map_err(RouteError::from)?;
         let host = Arc::new(PluginHost::new(PluginLimits::default())?);
         let chains = PluginChains::load(Arc::clone(&host), store.as_ref(), store.as_ref()).await?;
         tracing::info!(rules = chains.len(), "plugin chains built");
@@ -271,7 +266,7 @@ impl AppState {
         );
         let logins = Logins::new(Arc::clone(&store), Arc::clone(&cache), tokens)?;
         let gateway = Arc::new(gateway);
-        let configured: Arc<[RouteRule]> = configured.into();
+        let configured = Arc::new(configured);
         let reloader = Arc::new(Reloader::new(
             Arc::clone(&feed),
             Arc::clone(&backend),
@@ -318,7 +313,7 @@ impl AppState {
             Arc::clone(&backend),
             host,
             Arc::clone(&gateway),
-            Arc::new([]),
+            Arc::new(Configured::default()),
         ));
         let cache = published as Arc<dyn Cache>;
         let store = Arc::clone(&backend) as Arc<dyn Storage>;
@@ -336,7 +331,7 @@ impl AppState {
             session_seconds: 3600,
             gateway,
             listen,
-            configured: Arc::new([]),
+            configured: Arc::new(Configured::default()),
             feed,
             reloader,
             started_at: RuleRevision::new(0),
@@ -364,7 +359,7 @@ impl AppState {
     /// The same state, as though the configuration file had contributed these rules.
     #[cfg(test)]
     pub fn configuring(mut self, rules: Vec<RouteRule>) -> Self {
-        self.configured = rules.into();
+        self.configured = Arc::new(Configured::from(rules));
         self
     }
 
@@ -424,7 +419,7 @@ impl AppState {
 
     /// The rules the configuration file contributes, which no stored rule can displace.
     pub fn configured(&self) -> &[RouteRule] {
-        &self.configured
+        self.configured.rules()
     }
 }
 
