@@ -18,8 +18,8 @@ use ip_agents::{
 };
 use ip_auth::{Authority, Identity};
 use ip_core::{
-    AbsPath, ApiId, Capability, CapabilityScope, Dialect, Grant, Grants, Protocol, Role, TenantId,
-    UserId,
+    AbsPath, ApiId, Capability, CapabilityScope, Dialect, Grant, Grants, ModelName, Protocol, Role,
+    TenantId, UserId,
 };
 use ip_gateway::{
     Gateway, GatewayBody, ProcessorChain, RoutingTable, Upstream, UpstreamError, from_bytes,
@@ -202,6 +202,7 @@ pub(crate) fn target(speaks: Dialect) -> Target {
         .into_iter()
         .collect();
     Target {
+        model: ModelName::new("claude-opus-5").unwrap(),
         path: AbsPath::new("/anthropic").unwrap(),
         speaks,
         authority: Authority::new(

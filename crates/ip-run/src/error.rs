@@ -72,6 +72,16 @@ pub enum RunError {
         max: usize,
     },
 
+    /// A run with no model to ask for, from the request, the template or the upstream.
+    ///
+    /// Reachable only where an upstream was contributed without the model it is configured
+    /// with, since a configured one always carries one.
+    #[error("name the model this run asks for: {api} supplied none")]
+    NoModelChosen {
+        /// The upstream the run would have gone to.
+        api: String,
+    },
+
     /// A deployment with no upstream a run could be sent to.
     #[error("no configured upstream serves {}", api.as_deref().unwrap_or("any family"))]
     NowhereToRun {

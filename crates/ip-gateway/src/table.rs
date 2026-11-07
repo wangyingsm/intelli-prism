@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use ip_config::{Config, Secret};
-use ip_core::{AbsPath, Endpoint, Host, Port, Protocol, RouteKey, RouteRule, Weighted};
+use ip_core::{AbsPath, Endpoint, Host, ModelName, Port, Protocol, RouteKey, RouteRule, Weighted};
 use std::sync::Arc;
 
 use crate::dispatch::Plan;
@@ -95,6 +95,7 @@ impl From<RouteRule> for Planned {
 pub struct Configured {
     rules: Vec<RouteRule>,
     credentials: HashMap<RouteKey, Arc<Secret>>,
+    models: HashMap<RouteKey, ModelName>,
 }
 
 impl Configured {
@@ -103,14 +104,20 @@ impl Configured {
         let listen = config.server.listen;
         let mut rules = Vec::with_capacity(config.upstreams.len());
         let mut credentials = HashMap::new();
+        let mut models = HashMap::new();
         for upstream in &config.upstreams {
             let rule = upstream.route_rule(listen)?;
+            models.insert(rule.key.clone(), upstream.model.clone());
             if !upstream.api_key.is_empty() {
                 credentials.insert(rule.key.clone(), Arc::new(upstream.api_key.clone()));
             }
             rules.push(rule);
         }
-        Ok(Self { rules, credentials })
+        Ok(Self {
+            rules,
+            credentials,
+            models,
+        })
     }
 
     /// The rules, as a table assembles them.
@@ -119,6 +126,12 @@ impl Configured {
     }
 
     /// The credential the upstream behind one rule presents, where it declared one.
+    /// The model this upstream was configured with, which a caller naming none is sent to.
+    #[must_use]
+    pub fn model(&self, key: &RouteKey) -> Option<&ModelName> {
+        self.models.get(key)
+    }
+
     fn credential(&self, key: &RouteKey) -> Option<Arc<Secret>> {
         self.credentials.get(key).map(Arc::clone)
     }
@@ -130,6 +143,7 @@ impl From<Vec<RouteRule>> for Configured {
         Self {
             rules,
             credentials: HashMap::new(),
+            models: HashMap::new(),
         }
     }
 }

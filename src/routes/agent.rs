@@ -13,7 +13,7 @@ use axum::response::sse::{Event as SseEvent, Sse};
 use futures_util::StreamExt;
 use ip_core::Protocol;
 use ip_mcp::McpSettings;
-use ip_run::{AsWhom, Pinned, Requested, RunId, Running, Target, Toolshed};
+use ip_run::{AsWhom, Pinned, Requested, RunError, RunId, Running, Target, Toolshed};
 use ip_storage::Page;
 use std::time::Duration;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -258,7 +258,7 @@ async fn start(
         Err(error) => return *unprocessable(error),
     };
     let target = match Target::aimed(
-        state.configured(),
+        state.upstreams(),
         &pinned,
         AsWhom {
             authority,
@@ -267,6 +267,11 @@ async fn start(
         },
     ) {
         Ok(target) => target,
+        // Nothing named a model, which is the request's own omission rather than the
+        // deployment's shape, so it is answered as the request's own mistake.
+        Err(error @ RunError::NoModelChosen { .. }) => {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
         Err(error) => return *unprocessable(error),
     };
     let registry = match state.store().mcps(Page::new(REGISTRY_LIMIT, 0, None)).await {
@@ -1214,6 +1219,48 @@ upstream_speaks = "anthropic"
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body_of(response).await.contains("no configured upstream"));
+    }
+
+    /// The fixture template names no model, so this proves the chain's last link: the
+    /// upstream's own configured model is what a run falls back to.
+    #[tokio::test]
+    async fn a_template_naming_no_model_runs_on_the_one_the_upstream_was_configured_with() {
+        let (router, state) = running_fixture().await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/agents/acme-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_of(response).await;
+        assert!(body.contains("claude-opus-5"), "{body}");
+    }
+
+    /// A run with nothing anywhere to name a model is the request's own omission, which is
+    /// what tells it apart from the refusals that are the deployment's shape.
+    #[tokio::test]
+    async fn a_run_with_no_model_anywhere_is_a_bad_request() {
+        let state = super::super::harness::serving_without_models(
+            store().await,
+            SERVING,
+            Arc::new(Answering),
+        );
+        let router = super::super::router(state.clone());
+
+        let response = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/agents/acme-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_of(response).await.contains("model"));
     }
 
     #[tokio::test]

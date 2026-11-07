@@ -186,7 +186,7 @@ fn seconds(count: u32) -> Duration {
 /// The conversation a run opens with.
 fn opening(running: &Running<'_>, input: &str) -> Conversation {
     Conversation {
-        model: running.pinned.model.clone(),
+        model: Some(running.target.model.clone()),
         system: Some(running.config.prompt().as_str().to_owned()),
         messages: vec![Message::text(Role::User, input)],
         tools: running.shed.declared().to_vec(),

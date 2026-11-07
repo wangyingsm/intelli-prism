@@ -85,6 +85,23 @@ pub fn serving(store: Arc<SqliteStore>, config: &str, upstream: Arc<dyn Upstream
     )
 }
 
+/// The same, over upstreams contributed without the models they are configured with.
+///
+/// A deployment cannot do this — every configured upstream carries a model — so it is how a
+/// test reaches the refusal a run gives when nothing anywhere names one.
+pub fn serving_without_models(
+    store: Arc<SqliteStore>,
+    config: &str,
+    upstream: Arc<dyn Upstream>,
+) -> AppState {
+    let config = Config::parse(config).unwrap();
+    let listen: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let table = RoutingTable::build(&config, Vec::new()).unwrap();
+    let gateway = Gateway::new(table, ProcessorChain::new(), upstream);
+    let bare: Configured = Configured::of(&config).unwrap().rules().to_vec().into();
+    AppState::with_parts(Stores::Sqlite(store), gateway, listen, bare)
+}
+
 /// The cookie a real login hands back.
 pub async fn cookie_of(state: &AppState, user: &UserId) -> String {
     let token = state

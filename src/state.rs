@@ -432,6 +432,11 @@ impl AppState {
     pub fn configured(&self) -> &[RouteRule] {
         self.configured.rules()
     }
+
+    /// The configured upstreams whole, which a run needs for the model and the credential.
+    pub fn upstreams(&self) -> &Configured {
+        &self.configured
+    }
 }
 
 pub(crate) async fn open_store(config: &StorageConfig) -> Result<Stores, StartupError> {

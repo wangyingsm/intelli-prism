@@ -10,8 +10,8 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{Method, Request};
 use http_body_util::BodyExt;
 use ip_auth::Authority;
-use ip_core::{AbsPath, Dialect, Protocol, RouteRule, TraceId};
-use ip_gateway::{Gateway, Presenting, RequestContext, from_bytes};
+use ip_core::{AbsPath, Dialect, ModelName, Protocol, RouteRule, TraceId};
+use ip_gateway::{Configured, Gateway, Presenting, RequestContext, from_bytes};
 use ip_protocol::{Conversation, Dropped, Gathered, anthropic, gemini, openai};
 use std::net::SocketAddr;
 
@@ -25,6 +25,9 @@ use crate::error::RunError;
 /// settled once for the run rather than per turn, so every turn of a run is routed alike.
 #[derive(Debug, Clone)]
 pub struct Target {
+    /// The model every turn asks for, once the request, the template and the upstream have
+    /// each had their say.
+    pub model: ModelName,
     /// The path the turns are routed by.
     pub path: AbsPath,
     /// The family the body is written in, which is the one that path's callers speak.
@@ -46,11 +49,12 @@ impl Target {
     /// rather than sent to whichever upstream happened to be configured first. Several
     /// upstreams of the *same* family are not ambiguous in that way, and the first is taken.
     pub fn aimed(
-        configured: &[RouteRule],
+        configured: &Configured,
         pinned: &Pinned,
         as_whom: AsWhom,
     ) -> Result<Self, RunError> {
         let candidates: Vec<(&RouteRule, Dialect)> = configured
+            .rules()
             .iter()
             .map(|rule| (rule, family(rule)))
             .filter(|(_, speaks)| pinned.api.is_none_or(|wanted| wanted == *speaks))
@@ -71,8 +75,17 @@ impl Target {
                 },
             });
         }
+        // The request, then the template, then what the upstream was configured with.
+        let model = pinned
+            .model
+            .clone()
+            .or_else(|| configured.model(&first.key).cloned())
+            .ok_or_else(|| RunError::NoModelChosen {
+                api: first.api.as_str().to_owned(),
+            })?;
         Ok(Self {
             path: first.key.endpoint().path.clone(),
+            model,
             speaks,
             authority: as_whom.authority,
             listen: as_whom.listen,
@@ -233,6 +246,43 @@ mod tests {
 
     /// A run has no caller to borrow a provider key from, so every turn says it presents the
     /// deployment's own and is aimed at the endpoint the matched rule names.
+    /// A deployment's configured upstreams, built the way a real one is: an upstream's key
+    /// path is derived from its id, and its model is what a run falls back to.
+    fn configured(upstreams: &[(&str, Option<Dialect>, &str)]) -> Configured {
+        let mut written = String::from(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "./unopened.db"
+
+[cache]
+backend = "sled"
+path = "./unopened"
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+"#,
+        );
+        for (id, speaks, model) in upstreams {
+            written.push_str(&format!(
+                "\n[[upstream]]\nid = \"{id}\"\nbase_url = \"https://api.example.com/v1\"\napi_key = \"sk-x\"\nmodel = \"{model}\"\n"
+            ));
+            if let Some(speaks) = speaks {
+                let named = match speaks {
+                    Dialect::OpenAi => "openai",
+                    Dialect::Anthropic => "anthropic",
+                    Dialect::Gemini => "gemini",
+                };
+                written.push_str(&format!("caller_speaks = \"{named}\"\n"));
+            }
+        }
+        Configured::of(&ip_config::Config::parse(&written).unwrap()).unwrap()
+    }
+
     fn ruled(api: &str, path: &str, caller: Option<Dialect>) -> RouteRule {
         RouteRule {
             api: ip_core::ApiId::new(api).unwrap(),
@@ -275,7 +325,7 @@ mod tests {
             (Dialect::Anthropic, "/anthropic/messages"),
         ] {
             let aimed = Target::aimed(
-                &[ruled("openai", "/openai", Some(Dialect::OpenAi))],
+                &configured(&[("openai", Some(Dialect::OpenAi), "gpt-4o")]),
                 &Pinned::default(),
                 as_whom(),
             )
@@ -322,7 +372,7 @@ mod tests {
     #[test]
     fn one_upstream_is_where_a_run_that_pinned_nothing_goes() {
         let aimed = Target::aimed(
-            &[ruled("anthropic", "/anthropic", Some(Dialect::Anthropic))],
+            &configured(&[("anthropic", Some(Dialect::Anthropic), "claude-opus-5")]),
             &Pinned::default(),
             as_whom(),
         )
@@ -336,7 +386,7 @@ mod tests {
     #[test]
     fn a_rule_naming_no_family_is_read_the_way_the_gateway_reads_it() {
         let aimed = Target::aimed(
-            &[ruled("openai", "/v1", None)],
+            &configured(&[("openai", None, "gpt-4o")]),
             &Pinned::default(),
             as_whom(),
         )
@@ -347,10 +397,10 @@ mod tests {
 
     #[test]
     fn a_pinned_family_picks_the_upstream_that_speaks_it() {
-        let configured = [
-            ruled("openai", "/openai", Some(Dialect::OpenAi)),
-            ruled("anthropic", "/anthropic", Some(Dialect::Anthropic)),
-        ];
+        let configured = configured(&[
+            ("openai", Some(Dialect::OpenAi), "gpt-4o"),
+            ("anthropic", Some(Dialect::Anthropic), "claude-opus-5"),
+        ]);
 
         let aimed = Target::aimed(
             &configured,
@@ -370,10 +420,10 @@ mod tests {
     /// that named none where several are served is refused rather than sent to the first.
     #[test]
     fn a_run_naming_no_family_where_several_are_served_is_refused() {
-        let configured = [
-            ruled("openai", "/openai", Some(Dialect::OpenAi)),
-            ruled("anthropic", "/anthropic", Some(Dialect::Anthropic)),
-        ];
+        let configured = configured(&[
+            ("openai", Some(Dialect::OpenAi), "gpt-4o"),
+            ("anthropic", Some(Dialect::Anthropic), "claude-opus-5"),
+        ]);
 
         let refused = Target::aimed(&configured, &Pinned::default(), as_whom()).unwrap_err();
 
@@ -386,20 +436,87 @@ mod tests {
     /// Two upstreams of one family are not ambiguous in the way that matters.
     #[test]
     fn several_upstreams_of_one_family_are_not_ambiguous() {
-        let configured = [
-            ruled("anthropic-eu", "/eu", Some(Dialect::Anthropic)),
-            ruled("anthropic-us", "/us", Some(Dialect::Anthropic)),
-        ];
+        let configured = configured(&[
+            ("anthropic-eu", Some(Dialect::Anthropic), "claude-opus-5"),
+            ("anthropic-us", Some(Dialect::Anthropic), "claude-opus-5"),
+        ]);
 
         let aimed = Target::aimed(&configured, &Pinned::default(), as_whom()).unwrap();
 
-        assert_eq!(aimed.path.as_str(), "/eu", "the first the file declared");
+        assert_eq!(
+            aimed.path.as_str(),
+            "/anthropic-eu",
+            "the first the file declared"
+        );
+    }
+
+    /// The chain (d): the request, then the template, then the upstream's own model.
+    #[test]
+    fn a_run_naming_no_model_asks_for_the_one_the_upstream_was_configured_with() {
+        let aimed = Target::aimed(
+            &configured(&[("anthropic", Some(Dialect::Anthropic), "claude-opus-5")]),
+            &Pinned::default(),
+            as_whom(),
+        )
+        .unwrap();
+
+        assert_eq!(aimed.model.as_str(), "claude-opus-5");
+    }
+
+    #[test]
+    fn a_model_the_run_named_itself_wins_over_the_upstreams() {
+        let aimed = Target::aimed(
+            &configured(&[("anthropic", Some(Dialect::Anthropic), "claude-opus-5")]),
+            &Pinned {
+                model: Some(ModelName::new("claude-haiku-5-5").unwrap()),
+                api: None,
+            },
+            as_whom(),
+        )
+        .unwrap();
+
+        assert_eq!(aimed.model.as_str(), "claude-haiku-5-5");
+    }
+
+    /// Each upstream's own model, not the first one the file happened to declare.
+    #[test]
+    fn the_model_comes_from_the_upstream_the_run_is_aimed_at() {
+        let configured = configured(&[
+            ("openai", Some(Dialect::OpenAi), "gpt-4o"),
+            ("anthropic", Some(Dialect::Anthropic), "claude-opus-5"),
+        ]);
+
+        let aimed = Target::aimed(
+            &configured,
+            &Pinned {
+                model: None,
+                api: Some(Dialect::Anthropic),
+            },
+            as_whom(),
+        )
+        .unwrap();
+
+        assert_eq!(aimed.model.as_str(), "claude-opus-5");
+    }
+
+    /// An upstream contributed without the model it would be configured with — which a
+    /// deployment cannot do, and a test and an example can.
+    #[test]
+    fn a_run_with_nothing_to_name_a_model_is_refused() {
+        let bare: Configured = vec![ruled("openai", "/openai", Some(Dialect::OpenAi))].into();
+
+        let refused = Target::aimed(&bare, &Pinned::default(), as_whom()).unwrap_err();
+
+        assert!(
+            matches!(&refused, RunError::NoModelChosen { api } if api == "openai"),
+            "{refused:?}"
+        );
     }
 
     #[test]
     fn a_family_no_upstream_speaks_refuses_the_run() {
         let refused = Target::aimed(
-            &[ruled("openai", "/openai", Some(Dialect::OpenAi))],
+            &configured(&[("openai", Some(Dialect::OpenAi), "gpt-4o")]),
             &Pinned {
                 model: None,
                 api: Some(Dialect::Gemini),
@@ -416,7 +533,7 @@ mod tests {
 
     #[test]
     fn a_deployment_with_no_upstreams_at_all_refuses_the_run() {
-        let refused = Target::aimed(&[], &Pinned::default(), as_whom()).unwrap_err();
+        let refused = Target::aimed(&configured(&[]), &Pinned::default(), as_whom()).unwrap_err();
 
         assert!(
             matches!(&refused, RunError::NowhereToRun { api: None }),
