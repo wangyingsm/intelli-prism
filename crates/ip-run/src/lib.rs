@@ -31,7 +31,7 @@ pub use choice::{Pinned, Requested};
 pub use error::RunError;
 pub use event::RunEvent;
 pub use id::RunId;
-pub use running::{Ran, Running, run};
+pub use running::{Ran, Reporting, Running, run};
 pub use shed::Toolshed;
 pub use tools::{Addressed, Offered, Toolbox, servers_named};
 pub use turn::{Spend, Stopped, Turn, TurnNumber};

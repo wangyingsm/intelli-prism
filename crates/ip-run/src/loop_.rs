@@ -9,9 +9,32 @@ use ip_protocol::{Block, Conversation, Message, Role, Sampling};
 
 use crate::ask::{Target, take};
 use crate::choice::Pinned;
+use crate::event::RunEvent;
 use crate::id::RunId;
 use crate::shed::Toolshed;
 use crate::turn::{Spend, Stopped, Turn, TurnNumber};
+
+/// Where a run says what it is doing while it does it.
+///
+/// Saying is never allowed to fail a run or to hold it up: a watcher that has hung up is not
+/// the run's problem, and a run that is already paying for turns must not also wait on whoever
+/// is reading about them.
+pub trait Reporting: Send + Sync {
+    /// Says one thing.
+    fn say(&self, event: RunEvent);
+}
+
+/// Says nothing, which is what a caller that only wants the answer needs.
+impl Reporting for () {
+    fn say(&self, _: RunEvent) {}
+}
+
+/// Says it down a channel, dropping it if nobody is listening any more.
+impl Reporting for tokio::sync::mpsc::UnboundedSender<RunEvent> {
+    fn say(&self, event: RunEvent) {
+        let _ = self.send(event);
+    }
+}
 
 /// Everything one run is driven with.
 pub struct Running<'a> {
@@ -27,6 +50,8 @@ pub struct Running<'a> {
     pub config: &'a AgentConfig,
     /// What it settled on for a model and a family.
     pub pinned: &'a Pinned,
+    /// Where it says what it is doing as it does it.
+    pub reporting: &'a dyn Reporting,
 }
 
 /// What a run came to.
@@ -112,6 +137,14 @@ pub async fn run(running: &Running<'_>, input: &str) -> Ran {
             blocks: answered(&taken.gathered),
             spend: Spend::new(taken.gathered.spent_or_zero(), ip_core::Money::ZERO),
         };
+        running.reporting.say(RunEvent::Turn {
+            number: turn.number,
+            model: turn.model.clone(),
+        });
+        let said = turn.text();
+        if !said.is_empty() {
+            running.reporting.say(RunEvent::Text { text: said });
+        }
         conversation.messages.push(Message {
             role: Role::Assistant,
             blocks: turn.blocks.clone(),
@@ -130,13 +163,19 @@ pub async fn run(running: &Running<'_>, input: &str) -> Ran {
         stopped = Stopped::OutOfTurns { after: number };
     }
 
-    Ran {
+    let ran = Ran {
         spend: turns.iter().map(|turn| turn.spend).sum(),
         id: running.id.clone(),
         turns,
         stopped,
         traces,
-    }
+    };
+    running.reporting.say(RunEvent::Done {
+        text: ran.text(),
+        stopped: ran.stopped.clone(),
+        spend: ran.spend,
+    });
+    ran
 }
 
 /// A duration of whole seconds, as the template's own types count them.
@@ -191,11 +230,21 @@ async fn produced(running: &Running<'_>, turn: &Turn) -> Vec<Block> {
         .collect();
     let mut results = Vec::with_capacity(asked.len());
     for (id, name, arguments) in asked {
+        running.reporting.say(RunEvent::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+        });
         let arguments = match arguments {
             serde_json::Value::Object(map) => map,
             _ => serde_json::Map::new(),
         };
         let produced = running.shed.run(&name, arguments).await;
+        running.reporting.say(RunEvent::ToolResult {
+            id: id.clone(),
+            text: produced.text.clone(),
+            failed: produced.failed,
+        });
         results.push(Block::ToolResult {
             id,
             content: produced.text,
@@ -216,7 +265,10 @@ mod tests {
     use crate::shed::Toolshed;
     use std::sync::Arc;
 
-    async fn shed_for(tools: &[&str], serving: Serving) -> (Toolshed, crate::fixtures::Called) {
+    pub(super) async fn shed_for(
+        tools: &[&str],
+        serving: Serving,
+    ) -> (Toolshed, crate::fixtures::Called) {
         let (address, called) = stub(serving).await;
         let shed = Toolshed::open(
             &crate::fixtures::asking(tools),
@@ -229,9 +281,19 @@ mod tests {
     }
 
     async fn ran(upstream: Arc<Fake>, shed: &Toolshed, config: &AgentConfig) -> Ran {
+        said_while(upstream, shed, config).await.0
+    }
+
+    /// Everything a run said, in the order it said it, alongside what it came to.
+    pub(super) async fn said_while(
+        upstream: Arc<Fake>,
+        shed: &Toolshed,
+        config: &AgentConfig,
+    ) -> (Ran, Vec<RunEvent>) {
         let gateway = gateway(upstream);
         let target = target(Dialect::Anthropic);
-        run(
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let ran = run(
             &Running {
                 id: RunId::generate().unwrap(),
                 gateway: &gateway,
@@ -239,10 +301,17 @@ mod tests {
                 shed,
                 config,
                 pinned: &Pinned::default(),
+                reporting: &sender,
             },
             "how many are left?",
         )
-        .await
+        .await;
+        drop(sender);
+        let mut said = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            said.push(event);
+        }
+        (ran, said)
     }
 
     #[tokio::test]
@@ -479,6 +548,180 @@ mod tests {
         let upstream = Fake::answering(&said("four"));
 
         let ran = ran(Arc::clone(&upstream), &shed, &template(&[], 4, 60, 10)).await;
+
+        assert_eq!(ran.stopped, Stopped::Answered);
+        assert_eq!(ran.text(), "four");
+    }
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use ip_core::Dialect;
+
+    use super::tests::*;
+    use super::*;
+    use crate::fixtures::{Fake, Serving, said, template, wants};
+    use std::sync::Arc;
+
+    /// What a watcher is told, and when: the call before the tool is run, not after.
+    #[tokio::test]
+    async fn a_run_says_each_thing_as_it_happens() {
+        let (shed, _) = shed_for(&["warehouse.sql"], Serving::Both).await;
+        let upstream = Fake::in_turn(&[
+            &wants("warehouse__sql", serde_json::json!({"query": "select 1"})),
+            &said("four"),
+        ]);
+
+        let (ran, events) = said_while(
+            Arc::clone(&upstream),
+            &shed,
+            &template(&["warehouse.sql"], 4, 60, 10),
+        )
+        .await;
+
+        let names: Vec<&str> = events.iter().map(RunEvent::name).collect();
+        assert_eq!(
+            names,
+            ["turn", "tool_call", "tool_result", "turn", "text", "done"],
+            "a turn that only asked for a tool says no text"
+        );
+        assert_eq!(ran.stopped, Stopped::Answered);
+    }
+
+    #[tokio::test]
+    async fn the_last_thing_a_run_says_is_what_it_came_to() {
+        let (shed, _) = shed_for(&["warehouse.sql"], Serving::Both).await;
+        let upstream = Fake::answering(&said("four"));
+
+        let (ran, events) =
+            said_while(upstream, &shed, &template(&["warehouse.sql"], 4, 60, 10)).await;
+
+        let last = events.last().expect("it said something");
+        assert_eq!(
+            last,
+            &RunEvent::Done {
+                text: "four".to_owned(),
+                stopped: Stopped::Answered,
+                spend: ran.spend,
+            }
+        );
+    }
+
+    /// A run that was refused still says so, so a watcher is never left waiting.
+    #[tokio::test]
+    async fn a_refused_run_still_says_it_is_done() {
+        let (shed, _) = shed_for(&["warehouse.sql"], Serving::Both).await;
+        let upstream = Fake::holding(
+            http::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":"slow down"}"#,
+        );
+
+        let (_, events) =
+            said_while(upstream, &shed, &template(&["warehouse.sql"], 4, 60, 10)).await;
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                &events[0],
+                RunEvent::Done { stopped: Stopped::Refused { why }, .. } if why.contains("429")
+            ),
+            "{:?}",
+            events[0]
+        );
+    }
+
+    /// A failing tool is said to be one, so a watcher sees what the model saw.
+    #[tokio::test]
+    async fn a_tool_that_failed_is_said_to_have_failed() {
+        let (shed, _) = shed_for(&["warehouse.sql"], Serving::RefusesCalls).await;
+        let upstream = Fake::in_turn(&[
+            &wants("warehouse__sql", serde_json::json!({})),
+            &said("I could not look it up"),
+        ]);
+
+        let (_, events) =
+            said_while(upstream, &shed, &template(&["warehouse.sql"], 4, 60, 10)).await;
+
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                RunEvent::ToolResult { failed, text, .. } => Some((*failed, text.clone())),
+                _ => None,
+            })
+            .expect("the tool answered");
+        assert!(result.0, "{result:?}");
+        assert!(result.1.contains("failed"));
+    }
+
+    /// Why a call and its result are two events: the call is said before the tool is run,
+    /// so a watcher knows what was asked for while it is still being answered.
+    #[tokio::test]
+    async fn a_call_is_said_before_the_tool_it_names_is_run() {
+        /// Remembers when each thing was said, not only what.
+        struct Timed(std::sync::Mutex<Vec<(&'static str, Instant)>>);
+        impl Reporting for Timed {
+            fn say(&self, event: RunEvent) {
+                self.0.lock().unwrap().push((event.name(), Instant::now()));
+            }
+        }
+
+        let (shed, _) = shed_for(&["warehouse.sql"], Serving::SlowCalls).await;
+        let gateway = crate::fixtures::gateway(Fake::in_turn(&[
+            &wants("warehouse__sql", serde_json::json!({})),
+            &said("four"),
+        ]));
+        let target = crate::fixtures::target(Dialect::Anthropic);
+        let timed = Timed(std::sync::Mutex::new(Vec::new()));
+
+        run(
+            &Running {
+                id: RunId::generate().unwrap(),
+                gateway: &gateway,
+                target: &target,
+                shed: &shed,
+                config: &template(&["warehouse.sql"], 4, 60, 10),
+                pinned: &Pinned::default(),
+                reporting: &timed,
+            },
+            "how many are left?",
+        )
+        .await;
+
+        let said = timed.0.lock().unwrap();
+        let at = |name: &str| {
+            said.iter()
+                .find(|(what, _)| *what == name)
+                .unwrap_or_else(|| panic!("{name} was never said"))
+                .1
+        };
+        assert!(
+            at("tool_result").duration_since(at("tool_call")) >= crate::fixtures::SLOW,
+            "the call must be said before the tool runs, not after it answers: {said:?}"
+        );
+    }
+
+    /// Nobody listening is not the run's problem.
+    #[tokio::test]
+    async fn a_run_nobody_is_listening_to_still_finishes() {
+        let (shed, _) = shed_for(&["warehouse.sql"], Serving::Both).await;
+        let gateway = crate::fixtures::gateway(Fake::answering(&said("four")));
+        let target = crate::fixtures::target(Dialect::Anthropic);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+
+        let ran = run(
+            &Running {
+                id: RunId::generate().unwrap(),
+                gateway: &gateway,
+                target: &target,
+                shed: &shed,
+                config: &template(&["warehouse.sql"], 4, 60, 10),
+                pinned: &Pinned::default(),
+                reporting: &sender,
+            },
+            "how many are left?",
+        )
+        .await;
 
         assert_eq!(ran.stopped, Stopped::Answered);
         assert_eq!(ran.text(), "four");

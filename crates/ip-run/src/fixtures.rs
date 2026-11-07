@@ -254,7 +254,12 @@ pub(crate) enum Serving {
     SqlOnly,
     /// Handshakes, then refuses every call.
     RefusesCalls,
+    /// Offers `sql`, and takes [`SLOW`] over every call.
+    SlowCalls,
 }
+
+/// How long [`Serving::SlowCalls`] takes over one call.
+pub(crate) const SLOW: Duration = Duration::from_millis(200);
 
 /// Every json-rpc message a stub server was sent.
 pub(crate) type Called = Arc<Mutex<Vec<serde_json::Value>>>;
@@ -294,6 +299,9 @@ async fn answer(
             serde_json::json!({ "tools": tools })
         }
         "tools/call" => {
+            if matches!(serving, Serving::SlowCalls) {
+                tokio::time::sleep(SLOW).await;
+            }
             if matches!(serving, Serving::RefusesCalls) {
                 let refused = serde_json::json!({
                     "jsonrpc": "2.0", "id": id,
