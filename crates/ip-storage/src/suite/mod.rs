@@ -1,5 +1,6 @@
 //! Tests every storage backend must pass, written once and run against each backend.
 
+pub(crate) mod agent;
 pub(crate) mod audit;
 pub(crate) mod identity;
 pub(crate) mod isolation;
@@ -215,6 +216,22 @@ macro_rules! backend_suite {
             a_list_holds_only_the_tenant_it_names,
         ]);
     };
+    (agent, $open:path) => {
+        $crate::suite::backend_suite!(@module agent, $open, [
+            a_template_round_trips,
+            every_part_of_a_template_survives_the_database,
+            one_id_names_a_different_template_under_each_owner,
+            writing_a_template_again_replaces_it,
+            removing_a_template_leaves_the_others,
+            removing_a_template_that_is_absent_reports_it_missing,
+            removing_one_owners_template_leaves_the_other_owners,
+            a_template_for_a_tenant_that_is_not_there_is_refused,
+            a_read_for_a_tenant_that_is_not_there_answers_with_nothing_of_the_deployments,
+            templates_come_newest_first_a_page_at_a_time,
+            a_list_holds_only_the_owner_it_names,
+            deleting_a_tenant_takes_its_templates_with_it,
+        ]);
+    };
     (audit, $open:path) => {
         $crate::suite::backend_suite!(@module audit, $open, [
             setting_a_limit_records_who_set_it,
@@ -226,6 +243,10 @@ macro_rules! backend_suite {
             pricing_a_model_records_that_it_belongs_to_nobody,
             repricing_and_unpricing_a_model_record_what_it_cost,
             a_tenant_sees_none_of_what_belongs_to_the_deployment,
+            writing_a_template_records_who_wrote_it,
+            writing_a_tenants_template_records_it_against_that_tenant,
+            rewriting_and_removing_a_template_record_what_it_said,
+            a_template_that_was_refused_records_nothing,
             routing_a_key_somewhere_else_records_both_targets,
             removing_a_route_records_where_it_pointed,
             whose_a_stored_plugin_is_comes_from_who_stored_it,
@@ -335,6 +356,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(limit, $open);
         $crate::suite::backend_suite!(audit, $open);
         $crate::suite::backend_suite!(price, $open);
+        $crate::suite::backend_suite!(agent, $open);
         $crate::suite::backend_suite!(isolation, $open);
     };
 }

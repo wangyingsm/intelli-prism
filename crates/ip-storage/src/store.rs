@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use ip_core::{Grant, Grants, PassphraseHash, TenantId, UserId};
 
+use crate::agent::AgentStore;
 use crate::audit::{AuditStore, By};
 use crate::error::StorageError;
 use crate::limit::LimitStore;
@@ -135,6 +136,7 @@ impl<T> Storage for T where T: TenantStore + UserStore + MembershipStore + Grant
 /// Everything a storage backend provides, behind one object.
 pub trait Backend:
     Storage
+    + AgentStore
     + RouteStore
     + PluginStore
     + PluginRuleStore
@@ -149,6 +151,7 @@ pub trait Backend:
 
 impl<T> Backend for T where
     T: Storage
+        + AgentStore
         + RouteStore
         + PluginStore
         + PluginRuleStore

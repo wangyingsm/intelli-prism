@@ -1,4 +1,7 @@
-use ip_core::{Allowance, Counted, LimitScope, Period, PluginKind, UserId};
+use ip_agents::AgentId;
+use ip_core::{Allowance, Counted, LimitScope, Period, PluginKind, TenantId, UserId};
+
+use crate::agent::AgentOwner;
 
 use crate::audit::{AuditFilter, By};
 use crate::error::Entity;
@@ -980,4 +983,99 @@ fn api_access() -> ip_core::Grant {
         },
     )
     .unwrap()
+}
+
+/// A template of the deployment's own belongs to no tenant, as a price does.
+pub(crate) async fn writing_a_template_records_who_wrote_it(store: &impl Backend) {
+    store
+        .put_agent(
+            crate::suite::agent::written_by(AgentOwner::Global, "triage", "Support triage"),
+            &crate::suite::agent::by(),
+        )
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Agent).await;
+    assert_eq!(trail.len(), 1, "one change, one record");
+    let one = &trail[0];
+    assert_eq!(one.actor, UserId::new("alice").unwrap());
+    assert_eq!(one.entity_id, "triage");
+    assert_eq!(one.through, "/_ip/agents");
+    assert_eq!(one.tenant, None, "the deployment's own belongs to nobody");
+    assert_eq!(one.before, None);
+    let after = one.after.as_ref().unwrap();
+    assert_eq!(after["name"], "Support triage");
+    assert_eq!(after["owner"], "global");
+    assert_eq!(after["config"]["prompt"], "Be helpful.");
+}
+
+/// A tenant's template is recorded against that tenant, so its own trail holds it.
+pub(crate) async fn writing_a_tenants_template_records_it_against_that_tenant(
+    store: &impl Backend,
+) {
+    tenant_with_user(store).await;
+    store
+        .put_agent(
+            crate::suite::agent::written_by(
+                AgentOwner::Tenant(tenant_id()),
+                "triage",
+                "The tenant's",
+            ),
+            &crate::suite::agent::by(),
+        )
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Agent).await;
+    assert_eq!(trail.len(), 1);
+    assert_eq!(trail[0].tenant, Some(tenant_id()));
+    assert_eq!(trail[0].after.as_ref().unwrap()["owner"], "acme");
+}
+
+pub(crate) async fn rewriting_and_removing_a_template_record_what_it_said(store: &impl Backend) {
+    let by = crate::suite::agent::by();
+    store
+        .put_agent(
+            crate::suite::agent::written_by(AgentOwner::Global, "triage", "First"),
+            &by,
+        )
+        .await
+        .unwrap();
+    store
+        .put_agent(
+            crate::suite::agent::written_by(AgentOwner::Global, "triage", "Second"),
+            &by,
+        )
+        .await
+        .unwrap();
+    store
+        .remove_agent(&AgentOwner::Global, &AgentId::new("triage").unwrap(), &by)
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Agent).await;
+    assert_eq!(trail.len(), 3);
+    let removal = &trail[0];
+    assert_eq!(removal.before.as_ref().unwrap()["name"], "Second");
+    assert_eq!(removal.after, None, "nothing is left to describe");
+    let rewrite = &trail[1];
+    assert_eq!(rewrite.before.as_ref().unwrap()["name"], "First");
+    assert_eq!(rewrite.after.as_ref().unwrap()["name"], "Second");
+}
+
+/// A write the store refused leaves nothing behind, template or record.
+pub(crate) async fn a_template_that_was_refused_records_nothing(store: &impl Backend) {
+    let absent = TenantId::new("nobody").unwrap();
+    store
+        .put_agent(
+            crate::suite::agent::written_by(AgentOwner::Tenant(absent), "triage", "Triage"),
+            &crate::suite::agent::by(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        trail_of(store, Entity::Agent).await.is_empty(),
+        "a refused write recorded itself"
+    );
 }

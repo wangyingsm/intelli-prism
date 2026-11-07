@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use ip_agents::AgentId;
 use ip_core::{
     Checksum, Counted, Grant, Grants, LimitScope, ModelName, NewPluginRule, PassphraseHash, Period,
     PluginKind, PluginOrder, PluginRule, RouteKey, RouteRule, TenantId, Timestamp, UserId,
 };
 
+use crate::agent::{AgentOwner, AgentStore, NewAgent, StoredAgent};
 use crate::audit::{AuditFilter, AuditStore, Audited, By};
 use crate::error::{StorageError, ToldToFail};
 use crate::limit::{Limit, LimitStore, NewLimit};
@@ -419,6 +421,42 @@ impl PriceStore for FailingStore {
     async fn prices(&self) -> Result<Vec<Priced>, StorageError> {
         self.answering()?;
         self.inner.prices().await
+    }
+}
+
+#[async_trait]
+impl AgentStore for FailingStore {
+    async fn put_agent(&self, agent: NewAgent, by: &By) -> Result<StoredAgent, StorageError> {
+        self.answering()?;
+        self.inner.put_agent(agent, by).await
+    }
+
+    async fn remove_agent(
+        &self,
+        owner: &AgentOwner,
+        id: &AgentId,
+        by: &By,
+    ) -> Result<(), StorageError> {
+        self.answering()?;
+        self.inner.remove_agent(owner, id, by).await
+    }
+
+    async fn agent(
+        &self,
+        owner: &AgentOwner,
+        id: &AgentId,
+    ) -> Result<Option<StoredAgent>, StorageError> {
+        self.answering()?;
+        self.inner.agent(owner, id).await
+    }
+
+    async fn agents(
+        &self,
+        owner: &AgentOwner,
+        page: Page,
+    ) -> Result<Vec<StoredAgent>, StorageError> {
+        self.answering()?;
+        self.inner.agents(owner, page).await
     }
 }
 
