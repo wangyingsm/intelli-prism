@@ -46,4 +46,54 @@ pub enum McpError {
     /// A bearer kind declaring a token, or one declaring none and carrying one.
     #[error("a bearer credential needs a token, and no other kind may carry one")]
     TokenWithoutBearer,
+
+    /// A server that could not be reached, answered too slowly, or dropped the connection.
+    #[error("the server could not be reached: {detail}")]
+    Unreachable {
+        /// What went wrong on the way.
+        detail: String,
+    },
+
+    /// A server that answered with a status rather than with a message.
+    #[error("the server answered {status}")]
+    Refused {
+        /// The http status it answered with.
+        status: u16,
+    },
+
+    /// An answer that is not a JSON-RPC message, whatever else it may be.
+    #[error("the server did not answer in json-rpc: {detail}")]
+    NotJsonRpc {
+        /// What was wrong with it.
+        detail: String,
+    },
+
+    /// An answer to some other call, which is not an answer to this one.
+    #[error("the server answered a call that was not the one made")]
+    AnsweredSomethingElse,
+
+    /// A server reporting, in json-rpc, that it would not do what was asked.
+    #[error("the server refused: {message} ({code})")]
+    ServerRefused {
+        /// The code the server chose.
+        code: i64,
+        /// What it said about it.
+        message: String,
+    },
+
+    /// A server speaking a version of the protocol this code does not.
+    #[error("the server speaks {theirs:?} and this speaks {ours:?}")]
+    UnsupportedProtocol {
+        /// What the server answered the handshake with.
+        theirs: String,
+        /// What was asked for.
+        ours: &'static str,
+    },
+
+    /// An answer longer than this will read from a server it does not run.
+    #[error("the server answered with more than the {max} bytes this will read")]
+    AnswerTooLong {
+        /// What is allowed.
+        max: usize,
+    },
 }

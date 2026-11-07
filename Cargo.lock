@@ -1759,9 +1759,17 @@ dependencies = [
 name = "ip-mcp"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "zeroize",
 ]
 
