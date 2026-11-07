@@ -134,6 +134,89 @@ fn tool(listed: &serde_json::Value) -> Result<McpTool, (String, McpError)> {
     })
 }
 
+/// What a tool produced when it was run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Produced {
+    /// What it returned, as the text a model is given.
+    pub text: String,
+    /// Whether the tool itself called this a failure.
+    ///
+    /// A tool reports its own failure *in a result* rather than as a protocol error, because
+    /// the model is what must read it and may try something else; a protocol error means the
+    /// call itself was wrong, which is this gateway's problem and not the model's. The two are
+    /// kept apart for that reason: this is a field, and the other is an error.
+    pub failed: bool,
+}
+
+/// Reads a `tools/call` answer into the text a model can be given.
+///
+/// A model is handed one string, so every block a server sent is rendered into it in order —
+/// including the ones that are not text, which are named rather than dropped. A tool that
+/// answered with a picture answered with something, and a model told nothing at all would read
+/// that as a tool that did nothing.
+pub(crate) fn produced(result: &serde_json::Value) -> Result<Produced, McpError> {
+    let failed = result
+        .get("isError")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    match result.get("content").and_then(serde_json::Value::as_array) {
+        Some(blocks) => Ok(Produced {
+            text: blocks
+                .iter()
+                .map(rendered)
+                .collect::<Vec<String>>()
+                .join("\n"),
+            failed,
+        }),
+        // A revision of the protocol added a structured answer beside the content, and a server
+        // speaking it may send that alone.
+        None => match result.get("structuredContent") {
+            Some(structured) => Ok(Produced {
+                text: structured.to_string(),
+                failed,
+            }),
+            None => Err(McpError::NotAResult {
+                detail: "neither content nor a structured answer".to_owned(),
+            }),
+        },
+    }
+}
+
+/// One content block as the text a model is given for it.
+fn rendered(block: &serde_json::Value) -> String {
+    let text = |key: &str| {
+        block
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    match block.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => text("text"),
+        Some("resource_link") => format!("[resource {}]", text("uri")),
+        Some("resource") => match block.get("resource") {
+            Some(held) => match held.get("text").and_then(serde_json::Value::as_str) {
+                Some(held) => held.to_owned(),
+                None => format!("[resource {}]", rendered_uri(held)),
+            },
+            None => "[resource]".to_owned(),
+        },
+        Some(kind) => match text("mimeType") {
+            mime if mime.is_empty() => format!("[{kind} omitted]"),
+            mime => format!("[{kind} {mime} omitted]"),
+        },
+        None => "[omitted]".to_owned(),
+    }
+}
+
+/// What a resource says it is, where it says.
+fn rendered_uri(resource: &serde_json::Value) -> &str {
+    resource
+        .get("uri")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("of no uri")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +300,145 @@ mod tests {
         assert_eq!(
             offering.tools[0].schema,
             serde_json::json!({"type": "object", "properties": {}})
+        );
+    }
+
+    fn ran(result: serde_json::Value) -> Produced {
+        produced(&result).unwrap()
+    }
+
+    #[test]
+    fn what_a_tool_said_is_what_the_model_is_given() {
+        assert_eq!(
+            ran(serde_json::json!({"content": [{"type": "text", "text": "41 crates in bay 3"}]})),
+            Produced {
+                text: "41 crates in bay 3".to_owned(),
+                failed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn every_block_a_tool_answered_with_is_read_in_order() {
+        assert_eq!(
+            ran(serde_json::json!({"content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"},
+            ]}))
+            .text,
+            "first\nsecond"
+        );
+    }
+
+    /// A tool that failed still answered, and the model is what reads it.
+    #[test]
+    fn a_tool_that_calls_itself_failed_says_so_and_is_still_read() {
+        assert_eq!(
+            ran(serde_json::json!({
+                "content": [{"type": "text", "text": "no such sku"}],
+                "isError": true,
+            })),
+            Produced {
+                text: "no such sku".to_owned(),
+                failed: true,
+            }
+        );
+    }
+
+    /// Named, not dropped: a tool that answered with a picture answered with something, and a
+    /// model given nothing would read that as a tool that did nothing.
+    #[test]
+    fn what_a_model_cannot_be_given_is_named_in_its_place() {
+        for (block, rendered) in [
+            (
+                serde_json::json!({"type": "image", "mimeType": "image/png", "data": "iVBOR"}),
+                "[image image/png omitted]",
+            ),
+            (
+                serde_json::json!({"type": "audio", "mimeType": "audio/wav"}),
+                "[audio audio/wav omitted]",
+            ),
+            (serde_json::json!({"type": "image"}), "[image omitted]"),
+            (
+                serde_json::json!({"type": "resource_link", "uri": "file:///stock.csv"}),
+                "[resource file:///stock.csv]",
+            ),
+            (
+                serde_json::json!({"nothing": "of the protocol"}),
+                "[omitted]",
+            ),
+        ] {
+            assert_eq!(
+                ran(serde_json::json!({"content": [block.clone()]})).text,
+                rendered,
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embedded_resource_is_read_as_its_text_where_it_carries_one() {
+        assert_eq!(
+            ran(serde_json::json!({"content": [{
+                "type": "resource",
+                "resource": {"uri": "file:///stock.csv", "text": "sku,count"},
+            }]}))
+            .text,
+            "sku,count"
+        );
+        assert_eq!(
+            ran(serde_json::json!({"content": [{
+                "type": "resource",
+                "resource": {"uri": "file:///stock.png", "blob": "iVBOR"},
+            }]}))
+            .text,
+            "[resource file:///stock.png]"
+        );
+        assert_eq!(
+            ran(serde_json::json!({"content": [{"type": "resource"}]})).text,
+            "[resource]"
+        );
+        assert_eq!(
+            ran(serde_json::json!({"content": [{"type": "resource", "resource": {}}]})).text,
+            "[resource of no uri]"
+        );
+    }
+
+    /// A later revision of the protocol lets a server answer with this and no content at all.
+    #[test]
+    fn a_structured_answer_is_read_where_there_is_no_content() {
+        assert_eq!(
+            ran(serde_json::json!({"structuredContent": {"count": 41}, "isError": false})),
+            Produced {
+                text: r#"{"count":41}"#.to_owned(),
+                failed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_answer_holding_nothing_a_model_can_read_is_refused() {
+        for result in [
+            serde_json::json!({}),
+            serde_json::json!({"content": "not a list"}),
+            serde_json::json!({"isError": true}),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                matches!(produced(&result), Err(McpError::NotAResult { .. })),
+                "{result} was taken for a result"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_that_answered_with_nothing_answered_with_nothing() {
+        assert_eq!(
+            ran(serde_json::json!({"content": []})),
+            Produced {
+                text: String::new(),
+                failed: false,
+            }
         );
     }
 

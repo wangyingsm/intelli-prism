@@ -110,4 +110,11 @@ pub enum McpError {
         /// What is allowed.
         max: usize,
     },
+
+    /// An answer to a tool call that holds nothing a model could be given.
+    #[error("the server answered a tool call with nothing a model can read: {detail}")]
+    NotAResult {
+        /// What was wrong with it.
+        detail: String,
+    },
 }

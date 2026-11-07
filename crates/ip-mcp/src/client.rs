@@ -14,7 +14,7 @@ use hyper_util::rt::TokioExecutor;
 use crate::error::McpError;
 use crate::rpc::{RpcRequest, RpcResponse};
 use crate::server::{McpAuth, McpServer};
-use crate::tool::Offering;
+use crate::tool::{McpToolName, Offering, Produced, produced};
 
 /// The version of the protocol this client asks for.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -236,6 +236,24 @@ impl McpClient {
             }
         }
         Err(McpError::TooManyPages { max: MAX_PAGES })
+    }
+
+    /// Runs one of the server's tools and reads what it produced.
+    ///
+    /// The arguments are a json object because that is the only shape a tool takes them in, so
+    /// nothing else can be offered here and no error is needed for it.
+    pub async fn run(
+        &self,
+        name: &McpToolName,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Produced, McpError> {
+        let answered = self
+            .call(
+                "tools/call",
+                serde_json::json!({"name": name.as_str(), "arguments": arguments}),
+            )
+            .await?;
+        produced(&answered)
     }
 
     /// Asks the server for something, and reads what it answers.
@@ -461,6 +479,10 @@ mod tests {
         Long,
         /// Saying it has no tools at all.
         Toolless,
+        /// With the call itself, so a test can see what crossed the wire.
+        Echo,
+        /// Properly to the handshake, and with a json-rpc error to everything after it.
+        RefusesCalls,
     }
 
     /// What the stub offers when it is asked for its tools.
@@ -568,6 +590,15 @@ mod tests {
                 listing,
                 body["params"].get("cursor").and_then(|it| it.as_str()),
             )
+        } else if body["method"] == "tools/call" {
+            match answers {
+                Answers::Echo => serde_json::json!({
+                    "content": [{"type": "text", "text": body.to_string()}],
+                }),
+                // Answers with whatever the caller asked it to produce, so one stub covers
+                // every shape a tool can answer in.
+                _ => body["params"]["arguments"]["produce"].clone(),
+            }
         } else {
             serde_json::json!({"asked": body["method"].clone()})
         };
@@ -602,6 +633,14 @@ mod tests {
                     "error": {"code": -32000, "message": "the warehouse is closed"},
                 }),
             ),
+            Answers::RefusesCalls if body["method"] != "initialize" => json_body(
+                built,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": "no tool named absent"},
+                }),
+            ),
             Answers::WrongId => json_body(
                 built,
                 &serde_json::json!({"jsonrpc": "2.0", "id": 99, "result": result}),
@@ -610,7 +649,9 @@ mod tests {
             | Answers::WithoutSession
             | Answers::Version(_)
             | Answers::Long
-            | Answers::Toolless => json_body(
+            | Answers::Toolless
+            | Answers::Echo
+            | Answers::RefusesCalls => json_body(
                 built,
                 &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
             ),
@@ -1000,6 +1041,94 @@ mod tests {
             record.lock().unwrap().len(),
             2,
             "the handshake and nothing else"
+        );
+    }
+
+    /// What the server is asked, as the server sees it.
+    #[tokio::test]
+    async fn a_tool_is_run_by_name_with_the_arguments_it_was_given() {
+        let (address, _) = stub(Answers::Echo, Listing::Plain).await;
+        let client = McpClient::open(server(address, McpAuth::None), settings())
+            .await
+            .unwrap();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("sku".to_owned(), serde_json::json!("A-1"));
+
+        let asked = client
+            .run(&crate::McpToolName::new("get_stock").unwrap(), arguments)
+            .await
+            .unwrap();
+
+        let asked: serde_json::Value = serde_json::from_str(&asked.text).unwrap();
+        assert_eq!(asked["method"], "tools/call");
+        assert_eq!(asked["params"]["name"], "get_stock");
+        assert_eq!(
+            asked["params"]["arguments"],
+            serde_json::json!({"sku": "A-1"})
+        );
+    }
+
+    #[tokio::test]
+    async fn what_a_tool_produced_comes_back_from_the_server() {
+        let (client, _) = opened(Answers::Plain).await;
+        let client = client.unwrap();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "produce".to_owned(),
+            serde_json::json!({
+                "content": [{"type": "text", "text": "41 crates in bay 3"}],
+                "isError": true,
+            }),
+        );
+
+        assert_eq!(
+            client
+                .run(&crate::McpToolName::new("get_stock").unwrap(), arguments)
+                .await,
+            Ok(Produced {
+                text: "41 crates in bay 3".to_owned(),
+                failed: true,
+            })
+        );
+    }
+
+    /// A server refusing the call is not a tool reporting its own failure, and the two must not
+    /// arrive as the same thing: one is the model's to read, the other is this gateway's.
+    #[tokio::test]
+    async fn a_server_that_will_not_run_the_tool_at_all_is_an_error_and_not_a_result() {
+        let (client, _) = opened(Answers::RefusesCalls).await;
+        let client = client.unwrap();
+
+        assert_eq!(
+            client
+                .run(
+                    &crate::McpToolName::new("absent").unwrap(),
+                    serde_json::Map::new()
+                )
+                .await,
+            Err(McpError::ServerRefused {
+                code: -32602,
+                message: "no tool named absent".to_owned(),
+            })
+        );
+    }
+
+    /// An answer that is not a result is this gateway's problem, not something to hand a model.
+    #[tokio::test]
+    async fn a_server_answering_a_call_with_nothing_usable_is_refused() {
+        let (client, _) = opened(Answers::Plain).await;
+        let client = client.unwrap();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("produce".to_owned(), serde_json::json!({"isError": false}));
+
+        assert!(
+            matches!(
+                client
+                    .run(&crate::McpToolName::new("get_stock").unwrap(), arguments)
+                    .await,
+                Err(McpError::NotAResult { .. })
+            ),
+            "an answer holding no content at all was taken for a result"
         );
     }
 

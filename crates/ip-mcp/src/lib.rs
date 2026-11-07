@@ -32,4 +32,4 @@ pub use error::McpError;
 pub use id::McpId;
 pub use rpc::{RpcFailure, RpcRequest, RpcResponse};
 pub use server::{McpAuth, McpEndpoint, McpName, McpServer, McpToken};
-pub use tool::{DroppedTool, McpTool, McpToolName, Offering};
+pub use tool::{DroppedTool, McpTool, McpToolName, Offering, Produced};
