@@ -6,6 +6,7 @@ use ip_agents::AgentConfig;
 use ip_core::TraceId;
 use ip_gateway::Gateway;
 use ip_protocol::{Block, Conversation, Message, Role, Sampling};
+use tokio::sync::watch;
 
 use crate::ask::{Target, take};
 use crate::choice::Pinned;
@@ -36,6 +37,37 @@ impl Reporting for tokio::sync::mpsc::UnboundedSender<RunEvent> {
     }
 }
 
+/// What whoever started a run can say to it while it runs.
+///
+/// A channel rather than a flag a reader shares, because the run being spoken to is not always in
+/// the same process: a graph whose generations are spread over several nodes has to *address* a
+/// run, and a `watch` is the smallest thing that stays correct either way. What flips it is
+/// replaceable — locally the caller holds the sender; across a cluster a local task holds it and
+/// flips it when a message for that [`RunId`](crate::RunId) arrives off whatever bus carries it.
+/// The run itself never learns which, so this signature does not change when that lands.
+///
+/// It is read between turns and never mid-turn. A turn already asked for is paid for whether its
+/// answer is waited for or not, so cutting one off would lose the tokens *and* the record of them;
+/// stopping before the next one costs at most one turn and abandons nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunSignal {
+    /// Nothing has been said, which is every run that is simply running.
+    Carry,
+    /// Stop after the turn being taken, without starting another.
+    Stop,
+}
+
+impl RunSignal {
+    /// A signal nobody holds the other end of, for a run with nothing to stop it.
+    ///
+    /// The sender is dropped immediately, which a `watch` receiver does not mind: it keeps
+    /// answering with the last value sent.
+    #[must_use]
+    pub fn never() -> watch::Receiver<Self> {
+        watch::channel(Self::Carry).1
+    }
+}
+
 /// Everything one run is driven with.
 pub struct Running<'a> {
     /// What the run is followed under.
@@ -52,6 +84,8 @@ pub struct Running<'a> {
     pub pinned: &'a Pinned,
     /// Where it says what it is doing as it does it.
     pub reporting: &'a dyn Reporting,
+    /// What whoever started it can say to it while it runs.
+    pub signals: &'a watch::Receiver<RunSignal>,
 }
 
 /// What a run came to.
@@ -108,6 +142,10 @@ pub async fn run(running: &Running<'_>, input: &str) -> Ran {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             stopped = Stopped::OutOfTime;
+            break;
+        }
+        if *running.signals.borrow() == RunSignal::Stop {
+            stopped = Stopped::CutShort;
             break;
         }
         let asked = take(running.gateway, running.target, &conversation);
@@ -306,6 +344,7 @@ mod tests {
                 config,
                 pinned: &Pinned::default(),
                 reporting: &sender,
+                signals: &RunSignal::never(),
             },
             "how many are left?",
         )
@@ -378,6 +417,88 @@ mod tests {
                 .contains("select count(*)"),
             "the stub echoes the arguments, so the result carries them"
         );
+    }
+
+    /// The other half of a graph's stop: a run reads the word between turns and takes no more.
+    #[tokio::test]
+    async fn a_run_told_to_stop_takes_no_further_turn() {
+        let (shed, _) = shed_for(&["warehouse.sql"], Serving::Both).await;
+        let upstream = Fake::answering(&wants("warehouse__sql", serde_json::json!({})));
+        let gateway = crate::fixtures::gateway(Arc::clone(&upstream));
+        let target = crate::fixtures::target(Dialect::Anthropic);
+        let (stop, signals) = tokio::sync::watch::channel(RunSignal::Carry);
+        stop.send(RunSignal::Stop)
+            .expect("the run holds the other end");
+
+        let ran = run(
+            &Running {
+                id: RunId::generate().unwrap(),
+                gateway: &gateway,
+                target: &target,
+                shed: &shed,
+                config: &template(&["warehouse.sql"], 8, 60, 10),
+                pinned: &Pinned::default(),
+                reporting: &(),
+                signals: &signals,
+            },
+            "how many are left?",
+        )
+        .await;
+
+        assert_eq!(ran.stopped, Stopped::CutShort);
+        assert_eq!(
+            upstream.asked(),
+            0,
+            "a run already told to stop still asked the model"
+        );
+        assert_eq!(ran.spend, Spend::NOTHING);
+    }
+
+    /// Between turns and not mid-turn: the turn in flight is finished, recorded and paid for.
+    #[tokio::test]
+    async fn a_run_told_to_stop_keeps_the_turn_it_was_taking() {
+        // A slow tool is what gives the word somewhere to land: with an instant one the whole
+        // template is over in less time than any flip can be scheduled.
+        let (shed, _) = shed_for(&["warehouse.sql"], Serving::SlowCalls).await;
+        let upstream = Fake::answering(&wants("warehouse__sql", serde_json::json!({})));
+        let gateway = crate::fixtures::gateway(Arc::clone(&upstream));
+        let target = crate::fixtures::target(Dialect::Anthropic);
+        let (stop, signals) = tokio::sync::watch::channel(RunSignal::Carry);
+        let config = template(&["warehouse.sql"], 8, 60, 10);
+        let pinned = Pinned::default();
+        let nobody = ();
+        let running = Running {
+            id: RunId::generate().unwrap(),
+            gateway: &gateway,
+            target: &target,
+            shed: &shed,
+            config: &config,
+            pinned: &pinned,
+            reporting: &nobody,
+            signals: &signals,
+        };
+        let said = run(&running, "how many are left?");
+
+        // Said once the first turn is under way, which is where a graph says it.
+        let flip = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            stop.send(RunSignal::Stop)
+                .expect("the run holds the other end");
+        };
+        let (ran, ()) = tokio::join!(said, flip);
+
+        assert_eq!(ran.stopped, Stopped::CutShort);
+        assert_eq!(
+            ran.turns.len(),
+            1,
+            "the turn in flight was lost rather than kept"
+        );
+        assert_eq!(
+            upstream.asked(),
+            1,
+            "a template allowing eight turns took more than the one it was on"
+        );
+        assert_eq!(ran.traces.len(), 1, "the kept turn went unrecorded");
     }
 
     /// A model that never stops asking is stopped by the template, not by the upstream.
@@ -686,6 +807,7 @@ mod reporting_tests {
                 config: &template(&["warehouse.sql"], 4, 60, 10),
                 pinned: &Pinned::default(),
                 reporting: &timed,
+                signals: &RunSignal::never(),
             },
             "how many are left?",
         )
@@ -722,6 +844,7 @@ mod reporting_tests {
                 config: &template(&["warehouse.sql"], 4, 60, 10),
                 pinned: &Pinned::default(),
                 reporting: &sender,
+                signals: &RunSignal::never(),
             },
             "how many are left?",
         )

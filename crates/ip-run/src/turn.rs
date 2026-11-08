@@ -169,6 +169,12 @@ pub enum Stopped {
         /// What refused it, and why.
         why: String,
     },
+    /// Whoever started it said stop, and it stopped before taking another turn.
+    ///
+    /// Its own: a run cut short was going fine, and reporting it as [`Stopped::Refused`] would
+    /// read as a run that failed. In a graph that is the difference between the node that broke
+    /// and the siblings that were stopped because it did.
+    CutShort,
 }
 
 impl Stopped {
@@ -180,6 +186,7 @@ impl Stopped {
             Self::OutOfTurns { .. } => "out_of_turns",
             Self::OutOfTime => "out_of_time",
             Self::Refused { .. } => "refused",
+            Self::CutShort => "cut_short",
         }
     }
 }
@@ -191,6 +198,7 @@ impl fmt::Display for Stopped {
             Self::OutOfTurns { after } => write!(f, "still asking for tools after {after} turns"),
             Self::OutOfTime => f.write_str("the run ran out of time"),
             Self::Refused { why } => write!(f, "the run was refused: {why}"),
+            Self::CutShort => f.write_str("the run was stopped before its next turn"),
         }
     }
 }
@@ -306,6 +314,11 @@ mod tests {
                 },
                 "refused",
                 "the run was refused: the warehouse is closed",
+            ),
+            (
+                Stopped::CutShort,
+                "cut_short",
+                "the run was stopped before its next turn",
             ),
         ] {
             assert_eq!(stopped.name(), name);

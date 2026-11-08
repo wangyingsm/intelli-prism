@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ip_core::TraceId;
-use ip_run::{Spend, Stopped};
+use ip_run::{RunSignal, Spend, Stopped};
 use serde_json::{Map, Value, json};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::graph::{GraphNode, RunGraph};
@@ -48,7 +49,16 @@ pub trait RunsNode: Send + Sync {
     ///
     /// Answers with what the run came to, never with an error: a node that was refused partway is
     /// a node that ran, and whether that stops the graph is [`run`]'s to decide.
-    async fn run(&self, node: GraphNode, input: String) -> NodeRan;
+    ///
+    /// The signal is the graph's word to a node that is already running, which an implementation
+    /// hands to `ip_run::run` and does not read itself. It is what keeps a sibling of a node that
+    /// broke from going on taking turns nobody will read.
+    async fn run(
+        &self,
+        node: GraphNode,
+        input: String,
+        signals: watch::Receiver<RunSignal>,
+    ) -> NodeRan;
 }
 
 /// A graph, the order it runs in, and whatever runs one node of it.
@@ -120,17 +130,24 @@ fn answer_of(graph: &RunGraph, answered: &BTreeMap<NodeName, NodeRan>) -> Value 
 
 /// Runs the graph, a generation at a time, until it is through or a node stops it.
 ///
-/// A node that does not end [`Stopped::Answered`] stops the graph: nothing further is started, and
-/// what is already running is awaited rather than abandoned, because its tokens are paid for
-/// either way. The result says which node stopped it and carries everything spent up to that
-/// point — the shape `ip_run::Ran` has for the same reason, that a run refused partway is still a
-/// run.
+/// A node that does not end [`Stopped::Answered`] stops the graph: nothing further is started, its
+/// siblings are told to stop, and what is already running is awaited rather than abandoned. The
+/// three are one decision. Abandoning a sibling mid-turn would lose the tokens it had already
+/// asked for *and* the record of them, so it is awaited; but letting it run its template out would
+/// pay for turns nobody will read, so it is told. Between turns is where those two meet, and
+/// [`RunSignal`] is what carries it.
+///
+/// A sibling stopped that way comes back [`Stopped::CutShort`] and is never named as the cause:
+/// [`GraphRan::stopped_at`] is the node that broke, not the ones that were stopped because it did.
+/// The result carries everything spent up to that point — the shape `ip_run::Ran` has for the same
+/// reason, that a run refused partway is still a run.
 pub async fn run(graphing: &Graphing) -> GraphRan {
     let mut answered: BTreeMap<NodeName, NodeRan> = BTreeMap::new();
     let mut done: BTreeSet<NodeName> = BTreeSet::new();
     let mut traces: Vec<TraceId> = Vec::new();
     let mut spend = Spend::NOTHING;
     let mut stopped_at = None;
+    let (stop, listen) = watch::channel(RunSignal::Carry);
 
     while stopped_at.is_none() {
         let ready: Vec<NodeName> = graphing
@@ -157,7 +174,8 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
             };
             let input = input_for(graphing, &name, &answered);
             let runner = Arc::clone(&graphing.runner);
-            running.spawn(async move { (name, runner.run(node, input).await) });
+            let listen = listen.clone();
+            running.spawn(async move { (name, runner.run(node, input, listen).await) });
         }
 
         // Every one of them is awaited, the stop included: a node already running is paid for.
@@ -167,8 +185,12 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
             };
             spend = spend + ran.spend;
             traces.extend(ran.traces.iter().cloned());
-            if ran.stopped != Stopped::Answered && stopped_at.is_none() {
+            if !matches!(ran.stopped, Stopped::Answered | Stopped::CutShort) && stopped_at.is_none()
+            {
                 stopped_at = Some(name.clone());
+                // Said while the rest of the generation is still running, which is the only
+                // moment it can save a turn.
+                let _ = stop.send(RunSignal::Stop);
             }
             done.insert(name.clone());
             answered.insert(name, ran);
@@ -209,8 +231,10 @@ mod tests {
     ///
     /// It records when each node started and finished, which is what the concurrency case reads.
     struct Echo {
-        /// How long each node takes.
+        /// How long each turn takes.
         takes: Duration,
+        /// How many turns a node takes before it answers.
+        turns: u32,
         /// Nodes that stop the graph rather than answering, and why.
         refuses: BTreeSet<String>,
         /// What ran, and when, in the order it finished.
@@ -220,9 +244,10 @@ mod tests {
     }
 
     impl Echo {
-        fn new(takes: Duration, refuses: &[&str]) -> Arc<Self> {
+        fn new(takes: Duration, turns: u32, refuses: &[&str]) -> Arc<Self> {
             Arc::new(Self {
                 takes,
+                turns,
                 refuses: refuses.iter().map(|name| (*name).to_owned()).collect(),
                 seen: Mutex::new(Vec::new()),
                 opened: Instant::now(),
@@ -248,9 +273,31 @@ mod tests {
 
     #[async_trait]
     impl RunsNode for Echo {
-        async fn run(&self, node: GraphNode, input: String) -> NodeRan {
+        /// Takes its turns one sleep at a time, reading the signal before each one as
+        /// `ip_run::run` does, so that a node told to stop reports [`Stopped::CutShort`] having
+        /// taken the turns before the word reached it and no more.
+        ///
+        /// A node that refuses does so on its first turn, before a sibling has reached its
+        /// second: otherwise which of the two gets there first is a race, and a test of the
+        /// signal would pass or fail on the scheduler.
+        async fn run(
+            &self,
+            node: GraphNode,
+            input: String,
+            signals: watch::Receiver<RunSignal>,
+        ) -> NodeRan {
             let from = Instant::now();
-            tokio::time::sleep(self.takes).await;
+            let refused = self.refuses.contains(node.name.as_str());
+            let mut cut = false;
+            if !refused {
+                for turn in 0..self.turns {
+                    if turn > 0 && *signals.borrow() == RunSignal::Stop {
+                        cut = true;
+                        break;
+                    }
+                    tokio::time::sleep(self.takes).await;
+                }
+            }
             let to = Instant::now();
             self.seen.lock().expect("the record is not poisoned").push((
                 node.name.to_string(),
@@ -259,10 +306,12 @@ mod tests {
             ));
             NodeRan {
                 answer: format!("{} saw {input}", node.name),
-                stopped: if self.refuses.contains(node.name.as_str()) {
+                stopped: if refused {
                     Stopped::Refused {
                         why: "the fixture refuses this node".to_owned(),
                     }
+                } else if cut {
+                    Stopped::CutShort
                 } else {
                     Stopped::Answered
                 },
@@ -329,7 +378,7 @@ mod tests {
         let ran = run(&graphing(
             graph(&["intake", "reply"], &[("intake", "reply")]),
             order(&[("intake", 0), ("reply", 1)]),
-            Echo::new(Duration::ZERO, &[]),
+            Echo::new(Duration::ZERO, 1, &[]),
         ))
         .await;
         assert_eq!(
@@ -355,7 +404,7 @@ mod tests {
                 &[("left", "merge"), ("right", "merge")],
             ),
             order(&[("left", 0), ("right", 0), ("merge", 1)]),
-            Echo::new(Duration::ZERO, &[]),
+            Echo::new(Duration::ZERO, 1, &[]),
         ))
         .await;
         let saw = &ran.nodes[&name("merge")].answer;
@@ -367,7 +416,7 @@ mod tests {
     /// whether two nodes overlapped.
     #[tokio::test]
     async fn the_middle_of_a_diamond_runs_at_once_rather_than_in_turn() {
-        let runner = Echo::new(SLOW, &[]);
+        let runner = Echo::new(SLOW, 1, &[]);
         let whole = Instant::now();
         run(&graphing(
             graph(
@@ -403,7 +452,7 @@ mod tests {
     /// Ruling 3: nothing further starts, and what is running is awaited rather than abandoned.
     #[tokio::test]
     async fn a_refused_node_stops_the_graph_and_its_sibling_still_finishes() {
-        let runner = Echo::new(SLOW, &["left"]);
+        let runner = Echo::new(SLOW, 2, &["left"]);
         let ran = run(&graphing(
             graph(
                 &["left", "right", "merge"],
@@ -427,6 +476,40 @@ mod tests {
             2,
             "a node was started after the graph had stopped"
         );
+        assert_eq!(
+            ran.nodes[&name("right")].stopped,
+            Stopped::CutShort,
+            "the sibling was left to run its template out"
+        );
+        assert_eq!(
+            ran.stopped_at,
+            Some(name("left")),
+            "the sibling that was cut short was named as the cause"
+        );
+    }
+
+    /// The whole point of the signal: a sibling of a node that broke takes no further turn.
+    #[tokio::test]
+    async fn a_sibling_of_a_node_that_broke_stops_before_its_next_turn() {
+        let runner = Echo::new(SLOW, 2, &["left"]);
+        run(&graphing(
+            graph(
+                &["left", "right", "merge"],
+                &[("left", "merge"), ("right", "merge")],
+            ),
+            order(&[("left", 0), ("right", 0), ("merge", 1)]),
+            Arc::clone(&runner),
+        ))
+        .await;
+        let spans = runner.spans();
+        let right = spans
+            .iter()
+            .find(|(name, _, _)| name == "right")
+            .expect("the sibling ran");
+        assert!(
+            right.2 - right.1 < SLOW * 2,
+            "the sibling took both of its turns: {right:?}"
+        );
     }
 
     #[tokio::test]
@@ -437,7 +520,7 @@ mod tests {
                 &[("intake", "left"), ("intake", "right")],
             ),
             order(&[("intake", 0), ("left", 1), ("right", 1)]),
-            Echo::new(Duration::ZERO, &[]),
+            Echo::new(Duration::ZERO, 1, &[]),
         ))
         .await;
         assert_eq!(
@@ -455,7 +538,7 @@ mod tests {
         let ran = run(&graphing(
             graph(&["intake", "reply"], &[("intake", "reply")]),
             order(&[("intake", 0), ("reply", 1)]),
-            Echo::new(Duration::ZERO, &["intake"]),
+            Echo::new(Duration::ZERO, 1, &["intake"]),
         ))
         .await;
         assert_eq!(ran.stopped_at, Some(name("intake")));
@@ -469,7 +552,12 @@ mod tests {
 
         #[async_trait]
         impl RunsNode for Costs {
-            async fn run(&self, _node: GraphNode, _input: String) -> NodeRan {
+            async fn run(
+                &self,
+                _node: GraphNode,
+                _input: String,
+                _signals: watch::Receiver<RunSignal>,
+            ) -> NodeRan {
                 NodeRan {
                     answer: String::new(),
                     stopped: Stopped::Answered,

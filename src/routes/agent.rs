@@ -13,7 +13,7 @@ use axum::response::sse::{Event as SseEvent, Sse};
 use futures_util::StreamExt;
 use ip_core::Protocol;
 use ip_mcp::McpSettings;
-use ip_run::{AsWhom, Pinned, Requested, RunError, RunId, Running, Target, Toolshed};
+use ip_run::{AsWhom, Pinned, Requested, RunError, RunId, RunSignal, Running, Target, Toolshed};
 use ip_storage::Page;
 use std::time::Duration;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -305,6 +305,7 @@ async fn start(
                 config: &config,
                 pinned: &pinned,
                 reporting: &sender,
+                signals: &RunSignal::never(),
             },
             &asked.input,
         )
