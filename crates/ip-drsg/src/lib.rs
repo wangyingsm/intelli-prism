@@ -20,8 +20,12 @@ mod client;
 mod error;
 mod plane;
 mod rpc;
+#[cfg(any(feature = "testing", test))]
+pub mod testing;
 
 pub use client::{DrsgClient, DrsgSettings};
 pub use error::DrsgError;
 pub use plane::{DrsgEndpoint, PlaneName};
 pub use rpc::{RpcFailure, RpcRequest, RpcResponse, VERSION};
+#[cfg(any(feature = "testing", test))]
+pub use testing::{Replies, Seen, SilentPlane, StubPlane};

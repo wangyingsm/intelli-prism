@@ -250,200 +250,19 @@ fn install_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
-    use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
-
-    use http::Response;
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
-    use tokio::net::TcpListener;
-
     use super::*;
+    use crate::testing::{
+        Replies as Answers, STUB_TOKEN as TOKEN, Seen, SilentPlane, StubPlane, stub_settings,
+    };
 
-    /// The credential the stub below requires, and the thing no message may ever carry.
-    const TOKEN: &str = "drsg-live-4f91ca7b22e8";
-
-    /// What the stub saw of one call.
-    #[derive(Debug, Clone)]
-    struct Seen {
-        /// The method that was asked for.
-        method: String,
-        /// What it was asked with.
-        params: serde_json::Value,
-        /// What was presented, if anything.
-        authorization: Option<String>,
+    /// Kept as a pair, so each test below reads as it did when the stub lived in this file.
+    async fn client(answers: Answers) -> (DrsgClient, StubPlane) {
+        let stub = StubPlane::start(answers).await;
+        (stub.client(), stub)
     }
 
-    /// Everything the stub saw, in the order it saw it.
-    type Record = Arc<Mutex<Vec<Seen>>>;
-
-    /// How the stub answers. Every one of these is a store somebody really runs.
-    #[derive(Debug, Clone, Copy)]
-    enum Answers {
-        /// With the call itself, so a test can see what crossed the wire.
-        Echo,
-        /// With a JSON-RPC error object.
-        Failure,
-        /// With a 401, as a store with a different token does.
-        Unauthorized,
-        /// With a body that is not JSON-RPC at all.
-        Garbage,
-        /// With an answer to a call nobody made.
-        WrongId,
-        /// With a 502, as a proxy in front of a store that is down does.
-        Gateway,
-        /// Saying a node was deleted.
-        Deleted,
-        /// Saying nothing was there to delete.
-        Absent,
-    }
-
-    async fn answer(
-        record: Record,
-        answers: Answers,
-        request: Request<hyper::body::Incoming>,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
-        let authorization = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = request
-            .into_body()
-            .collect()
-            .await
-            .map(|collected| collected.to_bytes())
-            .unwrap_or_default();
-        let call: serde_json::Value =
-            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-        let id = call["id"].as_u64().unwrap_or(0);
-        record
-            .lock()
-            .expect("the record is not poisoned")
-            .push(Seen {
-                method: call["method"].as_str().unwrap_or_default().to_owned(),
-                params: call["params"].clone(),
-                authorization,
-            });
-
-        let built = Response::builder();
-        Ok(match answers {
-            Answers::Echo => json_body(
-                built,
-                &serde_json::json!({
-                    "jsonrpc": "2.0", "id": id, "result": {"echoed": call["params"].clone()},
-                }),
-            ),
-            Answers::Failure => json_body(
-                built,
-                &serde_json::json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32602, "message": "no plane named graphs"},
-                }),
-            ),
-            Answers::Unauthorized => built
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Full::new(Bytes::new()))
-                .expect("the fixture's own response builds"),
-            Answers::Garbage => json_body(built, &serde_json::json!({"ok": true})),
-            Answers::WrongId => json_body(
-                built,
-                &serde_json::json!({
-                    "jsonrpc": "2.0", "id": id + 100, "result": {},
-                }),
-            ),
-            Answers::Gateway => built
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Full::new(Bytes::new()))
-                .expect("the fixture's own response builds"),
-            Answers::Deleted => json_body(
-                built,
-                &serde_json::json!({
-                    "jsonrpc": "2.0", "id": id, "result": {"deleted": true, "id": 42},
-                }),
-            ),
-            Answers::Absent => json_body(
-                built,
-                &serde_json::json!({
-                    "jsonrpc": "2.0", "id": id, "result": {"deleted": false},
-                }),
-            ),
-        })
-    }
-
-    fn json_body(
-        built: http::response::Builder,
-        payload: &serde_json::Value,
-    ) -> Response<Full<Bytes>> {
-        built
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(payload.to_string())))
-            .expect("the fixture's own response builds")
-    }
-
-    async fn stub(answers: Answers) -> (SocketAddr, Record) {
-        let record: Record = Arc::new(Mutex::new(Vec::new()));
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("the fixture's own socket binds");
-        let address = listener
-            .local_addr()
-            .expect("a bound socket has an address");
-        let kept = Arc::clone(&record);
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let kept = Arc::clone(&kept);
-                tokio::spawn(async move {
-                    let _ = http1::Builder::new()
-                        .serve_connection(
-                            TokioIo::new(stream),
-                            service_fn(move |request| answer(Arc::clone(&kept), answers, request)),
-                        )
-                        .await;
-                });
-            }
-        });
-        (address, record)
-    }
-
-    /// Accepts the connection and answers nothing, so the client's own clock is what ends it.
-    async fn silent() -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("the fixture's own socket binds");
-        let address = listener
-            .local_addr()
-            .expect("a bound socket has an address");
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                held.push(stream);
-            }
-        });
-        address
-    }
-
-    fn settings(address: SocketAddr) -> DrsgSettings {
-        DrsgSettings {
-            endpoint: DrsgEndpoint::new(&format!("http://{address}/rpc"))
-                .expect("the fixture's own endpoint is one"),
-            token: Secret::from(TOKEN),
-            plane: PlaneName::new("graphs").expect("the fixture's own plane name is one"),
-            timeout: Duration::from_millis(300),
-        }
-    }
-
-    async fn client(answers: Answers) -> (DrsgClient, Record) {
-        let (address, record) = stub(answers).await;
-        (DrsgClient::new(settings(address)), record)
-    }
-
-    fn only(record: &Record) -> Seen {
-        let seen = record.lock().expect("the record is not poisoned");
-        assert_eq!(seen.len(), 1, "one call was expected");
-        seen[0].clone()
+    fn only(stub: &StubPlane) -> Seen {
+        stub.only()
     }
 
     #[tokio::test]
@@ -592,11 +411,45 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_that_never_answers_is_given_up_on() {
-        let client = DrsgClient::new(settings(silent().await));
+        let client = SilentPlane::start().await.client();
         assert!(matches!(
             client.query(serde_json::json!({})).await,
             Err(DrsgError::Unreachable { .. })
         ));
+    }
+
+    /// What a graph's own tests will drive the stub with: one prepared answer per method, so a
+    /// sequence of calls can be exercised without a stub per step.
+    #[tokio::test]
+    async fn a_scripted_store_answers_each_method_with_what_was_prepared_for_it() {
+        let stub = StubPlane::start(Answers::scripted([
+            ("plane.query", serde_json::json!([{"id": 1}])),
+            ("node.delete", serde_json::json!({"deleted": true})),
+        ]))
+        .await;
+        let client = stub.client();
+        assert_eq!(
+            client
+                .query(serde_json::json!({"source": "ScanAll"}))
+                .await
+                .expect("the script answers a read"),
+            serde_json::json!([{"id": 1}])
+        );
+        assert!(
+            client
+                .node_delete("a-key")
+                .await
+                .expect("the script answers a delete")
+        );
+        assert!(
+            !client
+                .edge_delete(7)
+                .await
+                .expect("a method nothing prepared still answers"),
+            "an unscripted method answered as though it had done something"
+        );
+        assert_eq!(stub.calls("plane.query").len(), 1);
+        assert_eq!(stub.calls("node.create").len(), 0);
     }
 
     /// Two calls in flight must not read each other's answer, which is what the id is for.
@@ -605,7 +458,7 @@ mod tests {
         let (client, record) = client(Answers::Echo).await;
         client.query(serde_json::json!({})).await.unwrap();
         client.query(serde_json::json!({})).await.unwrap();
-        assert_eq!(record.lock().expect("the record is not poisoned").len(), 2);
+        assert_eq!(record.seen().len(), 2);
     }
 
     /// The `Secret` contract, asserted here because this is the crate that presents it.
@@ -626,7 +479,7 @@ mod tests {
             "a message carried the token"
         );
 
-        let settings = format!("{:?}", settings("127.0.0.1:1".parse().unwrap()));
+        let settings = format!("{:?}", stub_settings("127.0.0.1:1".parse().unwrap()));
         assert!(!settings.contains(TOKEN), "the settings printed the token");
     }
 }

@@ -10,6 +10,12 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The stub plane in `testing`, which answers real JSON-RPC over a loopback socket. Behind a
+# feature rather than `#[cfg(test)]` because `ip-graph`'s tests assert the bodies this crate
+# sends, and a double of the client would be a double of the thing under test.
+testing = ["hyper/server"]
+
 [dependencies]
 bytes = "1.12.1"
 http = "1.5.0"
