@@ -305,43 +305,40 @@ mod tests {
         ("gate.json", b"{}"),
     ];
 
-    /// The bug this crate exists to make impossible.
+    /// The bug this crate exists to make impossible, and the whole story of the choice.
     ///
     /// `ort` holds the library in a process-global cell and silently ignores a second
     /// load naming another path, so a configuration could ask for two and be told
-    /// nothing. Each of these runs in a process of its own, which is what lets a
-    /// global be tested at all.
+    /// nothing.
+    ///
+    /// **It is one test because the choice is one global.** Split across two, each
+    /// asserts what is only true of a process that has not loaded yet, which holds under
+    /// a runner giving every test its own process and fails under one that does not —
+    /// and the gate and the coverage run use one of each.
     #[test]
-    fn asking_for_a_second_runtime_is_refused_rather_than_ignored() {
+    fn the_runtime_is_chosen_once_and_a_second_choice_is_refused() {
+        let missing = PathBuf::from("/nonexistent/libonnxruntime.so");
+
+        // A load that failed settles nothing: the next caller, perhaps naming a library
+        // that does exist, must still be able to try. This is why the choice is held in a
+        // `Mutex` and not a `OnceLock`.
+        assert!(
+            matches!(load(Some(&missing)), Err(OnnxError::RuntimeMissing(_))),
+            "a library that will not load must leave the choice open"
+        );
+
         let Some(library) = library_from_env() else {
             eprintln!("ORT_DYLIB_PATH unset: nothing to load a first time");
             return;
         };
-        load(Some(&library)).expect("the library loads");
+        load(Some(&library)).expect("a failed load must not have settled the choice");
         load(Some(&library)).expect("the same library again costs nothing");
-        let other = PathBuf::from("/nonexistent/libonnxruntime.so");
-        let Err(OnnxError::RuntimeDisagrees { loaded, asked }) = load(Some(&other)) else {
+
+        let Err(OnnxError::RuntimeDisagrees { loaded, asked }) = load(Some(&missing)) else {
             panic!("a second, different library must be refused and not ignored");
         };
         assert_eq!(loaded, library, "what is loaded is what loaded first");
-        assert_eq!(asked, other);
-    }
-
-    /// And a load that failed settles nothing: the next caller, perhaps naming a
-    /// library that does exist, must still be able to try. This is why the choice is
-    /// held in a `Mutex` and not a `OnceLock`.
-    #[test]
-    fn a_library_that_will_not_load_leaves_the_choice_open() {
-        let missing = PathBuf::from("/nonexistent/libonnxruntime.so");
-        assert!(matches!(
-            load(Some(&missing)),
-            Err(OnnxError::RuntimeMissing(_))
-        ));
-        let Some(library) = library_from_env() else {
-            eprintln!("ORT_DYLIB_PATH unset: no good library to try afterwards");
-            return;
-        };
-        load(Some(&library)).expect("a failed load must not have settled the choice");
+        assert_eq!(asked, missing);
     }
 
     #[test]
