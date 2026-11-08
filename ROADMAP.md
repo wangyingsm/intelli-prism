@@ -833,7 +833,25 @@ version per mutation and a CLI to sync up and down.
 - The preset tool set (core utilities, python, js/ts, bash) and optional MCP tools, all sandboxed.
 - Agent traffic routed through the gateway itself, so it is authenticated, authorized and processed
 like any other request.
-- Run graph: a `dr-strange` plane of agents in a DAG, run from `POST /_ip/graph_run/{id}`.
+- Run graph: a `dr-strange` plane of agents in a DAG, run from `POST /_ip/graph_run/{id}`. A node
+with several parents receives their answers as a json object keyed by parent, a node that does not
+answer stops the graph, and the graph's only ceiling of its own is a node count — money and time
+stay with the per-turn and per-tenant limits rather than being counted a second time. The order to
+walk the nodes in, and the check that the graph is acyclic, are asked of the plane rather than
+written here: `plane.algo` answers `toposort` and `cycles`, each over one named edge type, from
+[#98](https://github.com/wangyingsm/dr-strange/issues/98) and
+[#99](https://github.com/wangyingsm/dr-strange/issues/99). The order comes back with a generation
+per node, so a generation is what may run at once.
+- A capped loop-back in a run graph, which is the one cycle worth permitting. A node unsatisfied
+with what a predecessor gave it answers something like `{"loop_back": "survey"}`, the flow reruns
+that node with the extra context, and a predefined loop count stops it. The loop target is
+*declared*, as an edge of its own kind, so a graph that names a node it has not got is refused when
+it is written rather than when it is run, and a person reading the graph can see where it may
+double back; whether the loop is taken is still the answering node's decision, and only up to the
+cap. Two things follow for the ordinary edges: they are labelled `FEEDS` from the first version, so
+a later loop-back label is a new label and not a migration of every plane, and both the run order
+and the acyclicity check are asked for over `FEEDS` alone — a graph is a DAG in its feeding edges
+while its loop-back edges are expected to close cycles.
 
 ### Persistence beyond configuration
 
