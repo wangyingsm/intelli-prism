@@ -18,6 +18,7 @@ pub enum StartupError {
     },
 
     /// The classifier's artefact could not be got, or is not the one it claims.
+    #[cfg(feature = "classifier")]
     #[error("{detail}")]
     Artefact {
         /// What was wrong with it.
@@ -61,6 +62,11 @@ pub enum StartupError {
     Feed(#[from] FeedError),
 
     /// The configured backend is not compiled into this build.
+    #[allow(
+        dead_code,
+        reason = "every construction site is behind a `cfg(not(feature))`, so a build \
+                  carrying every backend constructs it nowhere"
+    )]
     #[error("this build has no {backend} backend; rebuild with the `{feature}` feature")]
     UnsupportedBackend {
         /// The backend the configuration asked for.
