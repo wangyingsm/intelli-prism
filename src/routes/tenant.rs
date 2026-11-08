@@ -610,17 +610,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
     }
 
+    /// Every store call a request makes carries its own "the store could not answer" arm,
+    /// and a database that works reaches none of them. Failing each in turn reaches them all.
+    ///
+    /// The sweep starts at the first call of the whole request — the extractor's own read of
+    /// the caller's standing, where there is one — and the count is asserted, so a handler
+    /// that gains or loses a store call fails here rather than quietly leaving a new arm
+    /// untested. Each refused request changes nothing, which is what lets one fixture serve
+    /// a whole sweep.
     #[tokio::test]
     async fn a_store_that_cannot_answer_is_the_server_s_own_failure() {
-        let (router, state) = fixture().await;
-        let cookie = cookie_of(&state, &admin_id()).await;
-        // The extractor reads the account; the handler's own read is the one that fails.
-        state.store_failure().answer_only(1);
+        let making = creating("globex", "hank", PASSPHRASE);
+        for (method, uri, body, calls) in [
+            ("POST", "/_ip/tenants", Some(making.as_str()), 1),
+            ("GET", "/_ip/tenants/acme", None, 2),
+            ("DELETE", "/_ip/tenants/acme", None, 2),
+        ] {
+            let (router, state) = fixture().await;
+            let cookie = cookie_of(&state, &admin_id()).await;
+            let mut refused = 0;
 
-        let response = router
-            .oneshot(request("GET", "/_ip/tenants/acme", &cookie, None))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            loop {
+                state.store_failure().answer_only(refused);
+                let response = router
+                    .clone()
+                    .oneshot(request(method, uri, &cookie, body))
+                    .await
+                    .unwrap();
+                state.store_failure().answer_again();
+                if response.status() != StatusCode::INTERNAL_SERVER_ERROR {
+                    break;
+                }
+                refused += 1;
+                assert!(refused <= 9, "{method} {uri} refuses whatever it is given");
+            }
+
+            assert_eq!(refused, calls, "{method} {uri}");
+        }
     }
 }

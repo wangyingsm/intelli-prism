@@ -542,6 +542,7 @@ mod tests {
     }
 
     const BOB: &str = "/_ip/tenants/acme/members/bob/grants";
+    const ACCOUNT: &str = "/_ip/users/carol/grants";
 
     #[tokio::test]
     async fn an_owner_grants_a_member_a_capability_once_however_often_it_asks() {
@@ -830,24 +831,98 @@ mod tests {
         );
     }
 
+    /// Every store call a request makes carries its own "the store could not answer" arm,
+    /// and a database that works reaches none of them. Failing each in turn reaches them all.
+    ///
+    /// The sweep starts at the first call of the whole request — the extractor's own read of
+    /// the caller's standing, where there is one — and the count is asserted, so a handler
+    /// that gains or loses a store call fails here rather than quietly leaving a new arm
+    /// untested. Each refused request changes nothing, which is what lets one fixture serve
+    /// a whole sweep.
     #[tokio::test]
     async fn a_store_that_cannot_answer_is_the_server_s_own_failure() {
+        for (caller, method, uri, calls) in [
+            ("alice", "GET", BOB.to_owned(), 2),
+            ("alice", "PUT", format!("{BOB}/observer"), 5),
+            ("alice", "DELETE", format!("{BOB}/observer"), 5),
+            ("alice", "PUT", format!("{BOB}/api_access/openai"), 5),
+            ("alice", "DELETE", format!("{BOB}/api_access/openai"), 5),
+            // A sysadmin is authorized by what it carries, so nothing reads a standing for it
+            // and the first call of the request is the handler's own.
+            ("root", "GET", ACCOUNT.to_owned(), 1),
+            ("root", "PUT", format!("{ACCOUNT}/tenant_mgr"), 3),
+            ("root", "DELETE", format!("{ACCOUNT}/tenant_mgr"), 3),
+        ] {
+            let (router, state) = fixture().await;
+            let cookie = cookie_of(&state, &id(caller)).await;
+            let mut refused = 0;
+
+            loop {
+                state.store_failure().answer_only(refused);
+                let response = router
+                    .clone()
+                    .oneshot(request(method, &uri, &cookie, None))
+                    .await
+                    .unwrap();
+                state.store_failure().answer_again();
+                if response.status() != StatusCode::INTERNAL_SERVER_ERROR {
+                    break;
+                }
+                refused += 1;
+                assert!(refused <= 9, "{method} {uri} refuses whatever it is given");
+            }
+
+            assert_eq!(refused, calls, "{method} {uri}");
+        }
+    }
+
+    /// A path whose parts do not name a grant is a grant nobody holds, on every handler that
+    /// reads one — including the two scoped to an api, which nothing else here calls.
+    #[tokio::test]
+    async fn a_path_that_names_no_grant_is_not_there() {
         let (router, state) = fixture().await;
-        let cookie = cookie_of(&state, &id("alice")).await;
-        state.store_failure().answer_only(1);
 
-        let response = router
-            .clone()
-            .oneshot(request("GET", BOB, &cookie, None))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        for (method, uri) in [
+            ("PUT", format!("{BOB}/not_a_capability")),
+            ("DELETE", format!("{BOB}/not_a_capability")),
+            ("PUT", format!("{BOB}/api_access/not%20an%20api")),
+            ("DELETE", format!("{BOB}/api_access/not%20an%20api")),
+            (
+                "PUT",
+                "/_ip/tenants/acme/members/not%20a%20user/grants/observer".to_owned(),
+            ),
+            (
+                "DELETE",
+                "/_ip/tenants/acme/members/not%20a%20user/grants/observer".to_owned(),
+            ),
+        ] {
+            let response = call(&router, &state, "alice", method, &uri).await;
 
-        state.store_failure().answer_only(1);
-        let refused = router
-            .oneshot(request("PUT", &format!("{BOB}/observer"), &cookie, None))
-            .await
-            .unwrap();
-        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    /// A capability of the wrong shape for the scope the path puts it at: `observer` is held
+    /// across a whole tenant and cannot be held against one api.
+    #[tokio::test]
+    async fn a_capability_that_does_not_fit_the_scope_is_refused() {
+        let (router, state) = fixture().await;
+
+        for method in ["PUT", "DELETE"] {
+            let response = call(
+                &router,
+                &state,
+                "alice",
+                method,
+                &format!("{BOB}/observer/openai"),
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{method}"
+            );
+        }
     }
 }

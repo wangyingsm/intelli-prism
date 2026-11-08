@@ -295,4 +295,49 @@ mod tests {
             );
         }
     }
+
+    /// Every store call a request makes carries its own "the store could not answer" arm,
+    /// and a database that works reaches none of them. Failing each in turn reaches them all.
+    ///
+    /// The sweep starts at the first call of the whole request — the extractor's own read of
+    /// the caller's standing, where there is one — and the count is asserted, so a handler
+    /// that gains or loses a store call fails here rather than quietly leaving a new arm
+    /// untested. Each refused request changes nothing, which is what lets one fixture serve
+    /// a whole sweep.
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_is_the_server_s_own_failure() {
+        for (caller, method, uri, body, calls) in [
+            ("root", "GET", "/_ip/prices", None, 2),
+            ("root", "PUT", "/_ip/prices", Some(OPUS), 2),
+            (
+                "root",
+                "DELETE",
+                "/_ip/prices",
+                Some(r#"{"model": "claude-opus-5"}"#),
+                2,
+            ),
+        ] {
+            let state = state_over(store().await);
+            let router = crate::routes::router(state.clone());
+            let cookie = cookie_of(&state, &id(caller)).await;
+            let mut refused = 0;
+
+            loop {
+                state.store_failure().answer_only(refused);
+                let response = router
+                    .clone()
+                    .oneshot(request(method, uri, &cookie, body))
+                    .await
+                    .unwrap();
+                state.store_failure().answer_again();
+                if response.status() != StatusCode::INTERNAL_SERVER_ERROR {
+                    break;
+                }
+                refused += 1;
+                assert!(refused <= 9, "{method} {uri} refuses whatever it is given");
+            }
+
+            assert_eq!(refused, calls, "{method} {uri}");
+        }
+    }
 }

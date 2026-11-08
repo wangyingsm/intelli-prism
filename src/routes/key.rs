@@ -444,4 +444,41 @@ mod tests {
         let response = reveal(&router, &cookie, "user", &asking(Some("acme"), PASSPHRASE)).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    /// Every store call a request makes carries its own "the store could not answer" arm,
+    /// and a database that works reaches none of them. Failing each in turn reaches them all.
+    ///
+    /// The sweep starts at the first call of the whole request — the extractor's own read of
+    /// the caller's standing, where there is one — and the count is asserted, so a handler
+    /// that gains or loses a store call fails here rather than quietly leaving a new arm
+    /// untested. Each refused request changes nothing, which is what lets one fixture serve
+    /// a whole sweep.
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_is_the_server_s_own_failure() {
+        for (which, body, calls) in [
+            ("user", asking(Some("acme"), PASSPHRASE), 4),
+            ("tenant", asking(Some("acme"), PASSPHRASE), 4),
+        ] {
+            let (router, state, acme_key) = fixture().await;
+            let cookie = cookie_of(&state, &id("alice")).await;
+            let mut refused = 0;
+
+            loop {
+                state.store_failure().answer_only(refused);
+                let response = reveal(&router, &cookie, which, &body).await;
+                state.store_failure().answer_again();
+                if response.status() != StatusCode::INTERNAL_SERVER_ERROR {
+                    break;
+                }
+                assert!(
+                    !body_of(response).await.contains(&acme_key.to_hex()),
+                    "a refusal shows no key"
+                );
+                refused += 1;
+                assert!(refused <= 9, "{which} refuses whatever it is given");
+            }
+
+            assert_eq!(refused, calls, "{which}");
+        }
+    }
 }
