@@ -96,6 +96,7 @@ fn_params_excessive_bools = "warn"  # prefer an enum over a bool parameter
 missing_panics_doc = "warn"         # say when a caller's own mistake will panic
 ref_option = "warn"                 # `Option<&T>` over `&Option<T>`
 string_add_assign = "warn"          # prefer `format!`/`write!` over `+`
+too_many_lines = "warn"             # threshold in clippy.toml beside this
 trivially_copy_pass_by_ref = "warn" # a reference to something smaller than a reference
 undocumented_unsafe_blocks = "warn" # the guide's `SAFETY:` rule
 unwrap_used = "warn"                # `expect` states why, `unwrap` states nothing

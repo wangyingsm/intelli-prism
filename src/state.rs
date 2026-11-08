@@ -77,6 +77,11 @@ pub struct AppState {
 impl AppState {
     /// Opens the configured backend, then builds the routing table, the plugin chains and the
     /// upstream client.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup is one sequence: each backend opened and wired in the one order \
+                  that works, where a half-built state is the thing to avoid"
+    )]
     pub async fn open(config: &Config) -> Result<Self, StartupError> {
         // The judge first, before any backend is touched: a config that asks through a
         // build without the feature, or for an artefact that is not one, is refused at

@@ -540,6 +540,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a mock server answering the whole protocol in one match"
+    )]
     async fn answer(
         record: Record,
         answers: Answers,

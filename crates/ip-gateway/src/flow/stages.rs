@@ -371,6 +371,11 @@ impl Flow<BodyProcessed> {
     /// is, so a marked request never waits on its body; recognising one asks the body, and a
     /// body that may not be held is not read at all — such a request streams through exactly
     /// as it did before any of this, and is simply not sticky.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one stage of the dataflow, whose steps mean what they mean only in this \
+                  order and are each reached once"
+    )]
     pub async fn forward(self, egress: Egress<'_>) -> Result<Flow<Forwarded>, GatewayError> {
         let Egress {
             upstream,
@@ -1220,6 +1225,10 @@ async fn send_arm(
 /// one only when that wait has run out with nothing acceptable answered — or at once,
 /// without waiting out its remainder, once an arm has been lost. An arm the wait never
 /// released is abandoned like a losing one, which is right for an arm that never went out.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one race, whose arms and the waits that release them cannot be read apart"
+)]
 async fn race(
     context: RequestContext,
     upstream: &dyn Upstream,

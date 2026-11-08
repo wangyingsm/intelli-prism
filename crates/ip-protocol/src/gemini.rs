@@ -37,6 +37,10 @@ fn synthesised(name: &str, nth: usize) -> Result<ToolCallId, ProtocolError> {
 /// # Errors
 ///
 /// Refuses a body that is not json, and one that carries no `contents`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass over a wire format, an arm per shape this family can send"
+)]
 pub fn read(body: &[u8]) -> Result<(Conversation, Dropped), ProtocolError> {
     let value: Value =
         serde_json::from_slice(body).map_err(|error| ProtocolError::NotJson(error.to_string()))?;

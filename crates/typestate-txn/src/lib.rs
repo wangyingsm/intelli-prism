@@ -325,6 +325,11 @@ pub fn transaction(input: TokenStream) -> TokenStream {
     expand(&workflow).into()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one expansion emitted as one template, which is read against the code it \
+              produces rather than in pieces"
+)]
 fn expand(workflow: &Workflow) -> proc_macro2::TokenStream {
     let Workflow {
         name,

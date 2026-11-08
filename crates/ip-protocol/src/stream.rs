@@ -384,6 +384,10 @@ impl Writing {
         format!("data: {chunk}\n\n")
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match over the event kinds, an arm per kind this family spells"
+    )]
     fn anthropic(&mut self, event: &Event) -> String {
         match event {
             Event::Started { model } => {

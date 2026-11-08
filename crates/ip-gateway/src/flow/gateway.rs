@@ -318,6 +318,11 @@ impl Gateway {
     ///
     /// Each stage runs in a span of its own, all under the trace the request arrived with, so
     /// what a request did is read back from one place.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the pipeline itself, where splitting the stages into helpers called once \
+                  each would hide the order this doc comment exists to state"
+    )]
     pub async fn handle(
         &self,
         context: RequestContext,
