@@ -154,6 +154,32 @@ impl DrsgClient {
         Ok(answer["deleted"].as_bool().unwrap_or(false))
     }
 
+    /// Runs one graph algorithm over the nodes carrying a label, and the edges of one type among
+    /// them.
+    ///
+    /// Both arguments are required rather than optional, although the store defaults each: the
+    /// label is what narrows an algorithm to one graph, since a plane holds every deployment's,
+    /// and an unnamed edge type means *every* type, which an edge that is not a dependency turns
+    /// into a cycle that is not one.
+    pub async fn algo(
+        &self,
+        algo: &str,
+        label: &str,
+        edge_type: &str,
+        extra: serde_json::Value,
+    ) -> Result<serde_json::Value, DrsgError> {
+        let mut params = serde_json::json!({
+            "plane": self.settings.plane.as_str(),
+            "algo": algo,
+            "label": label,
+            "edge_type": edge_type,
+        });
+        if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            params.extend(extra.clone());
+        }
+        self.call("plane.algo", params).await
+    }
+
     /// Runs a read plan against the plane and answers what it returned.
     ///
     /// The plan is passed through rather than built here: this crate is the transport, and what a
@@ -416,6 +442,46 @@ mod tests {
             client.query(serde_json::json!({})).await,
             Err(DrsgError::Unreachable { .. })
         ));
+    }
+
+    /// The two things an algorithm must always be told, since the store's own defaults for them
+    /// are the whole plane and every edge type.
+    #[tokio::test]
+    async fn an_algorithm_names_the_label_it_runs_over_and_the_edge_it_follows() {
+        let (client, record) = client(Answers::Echo).await;
+        client
+            .algo(
+                "toposort",
+                "Graph/acme/triage",
+                "FEEDS",
+                serde_json::json!({}),
+            )
+            .await
+            .expect("the stub answers");
+        let seen = only(&record);
+        assert_eq!(seen.method, "plane.algo");
+        assert_eq!(seen.params["algo"], "toposort");
+        assert_eq!(seen.params["label"], "Graph/acme/triage");
+        assert_eq!(seen.params["edge_type"], "FEEDS");
+        assert_eq!(seen.params["plane"], "graphs");
+    }
+
+    #[tokio::test]
+    async fn what_one_algorithm_needs_and_another_does_not_rides_beside_the_rest() {
+        let (client, record) = client(Answers::Echo).await;
+        client
+            .algo(
+                "cycles",
+                "Graph/acme/triage",
+                "FEEDS",
+                serde_json::json!({"limit": 1, "dir": "out"}),
+            )
+            .await
+            .expect("the stub answers");
+        let seen = only(&record);
+        assert_eq!(seen.params["limit"], 1);
+        assert_eq!(seen.params["dir"], "out");
+        assert_eq!(seen.params["algo"], "cycles", "the extra overwrote a name");
     }
 
     /// What a graph's own tests will drive the stub with: one prepared answer per method, so a

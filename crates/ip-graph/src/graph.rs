@@ -9,7 +9,7 @@ use crate::error::GraphError;
 use crate::id::{GraphId, GraphName, NodeName};
 
 /// The most nodes a graph's own ceiling may allow.
-const NODES_MOST: u32 = 256;
+const NODES_MOST: u32 = MaxNodes::MOST;
 
 /// Whose a graph is: the deployment's, or one tenant's.
 ///
@@ -56,6 +56,12 @@ impl GraphOwner {
 pub struct MaxNodes(u32);
 
 impl MaxNodes {
+    /// The most any graph's ceiling may be, whatever a graph asks for.
+    ///
+    /// Public because it is also what a read of the order must ask the store for: the store caps
+    /// its own answer, so a question asked for fewer than this could come back truncated.
+    pub const MOST: u32 = 256;
+
     /// A ceiling, if it is one a graph can be run under.
     pub fn new(value: u32) -> Result<Self, GraphError> {
         if value == 0 || value > NODES_MOST {

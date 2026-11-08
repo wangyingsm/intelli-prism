@@ -109,6 +109,34 @@ pub enum GraphError {
         property: &'static str,
     },
 
+    /// A graph that feeds itself, which has no order to run it in.
+    ///
+    /// Found by the store rather than here, and only once the rows exist, so the graph is taken
+    /// back out before this is reported: a refused write leaves the graph absent, not as it was.
+    #[error("a graph cannot feed itself: {cycle}")]
+    Cyclic {
+        /// The nodes closing the loop, in the order they close it.
+        cycle: String,
+    },
+
+    /// The store answered with fewer places in the order than it said the graph has.
+    ///
+    /// Its own answers are capped, and a truncated order reads exactly like a complete one, so it
+    /// is refused: half an order would run half a graph and call it finished.
+    #[error("the graph store ordered {answered} of {held} nodes")]
+    Truncated {
+        /// How many it said there were.
+        held: u64,
+        /// How many it placed.
+        answered: usize,
+    },
+
+    /// The order places a node the graph does not hold, so nothing can be run for it.
+    ///
+    /// Reachable where a graph changed between the sort and the read of its nodes.
+    #[error("the order places a node this graph does not hold")]
+    Unplaced,
+
     /// The plane answered with a row belonging to another graph, or to another owner.
     ///
     /// Reachable only where the filter in the read plan did not hold, which is why it is reported

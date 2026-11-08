@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use crate::error::GraphError;
 use crate::graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
 use crate::id::{GraphId, GraphName, NodeName};
+use crate::order::{Generation, Placed, RunOrder};
 
 /// The label on the one node that holds what a graph says about itself.
 pub const GRAPH_LABEL: &str = "RunGraph";
@@ -162,6 +163,12 @@ fn edge_properties(graph: &RunGraph) -> Value {
     })
 }
 
+/// How many cycles a write asks about.
+///
+/// One is enough to refuse the write, and the node it names is enough to say where. A graph of 256
+/// nodes could hold many, and reporting the rest would be a longer answer to the same question.
+const CYCLES_ASKED: u64 = 1;
+
 /// One row's text property, or why it is not one.
 fn text<'row>(row: &'row Value, property: &'static str) -> Result<&'row str, GraphError> {
     match &row["properties"][property] {
@@ -268,10 +275,7 @@ impl GraphPlane {
     /// Deleting a node takes its edges with it, so the `FEEDS` edges need no pass of their own.
     pub async fn put(&self, graph: &RunGraph) -> Result<(), GraphError> {
         let (owner, id) = (graph.owner(), graph.id());
-        for key in self.held(owner, id).await? {
-            self.drsg.node_delete(&key).await?;
-        }
-        self.drsg.node_delete(&graph_key(owner, id)).await?;
+        self.clear(owner, id).await?;
 
         self.drsg
             .node_create(
@@ -281,14 +285,17 @@ impl GraphPlane {
             )
             .await?;
         let scope = scope_label(owner, id);
+        let mut written = Vec::with_capacity(graph.nodes().len());
         for node in graph.nodes() {
-            self.drsg
+            let stored = self
+                .drsg
                 .node_create(
                     &node_key(owner, id, &node.name),
                     &[NODE_LABEL, &scope],
                     node_properties(graph, node),
                 )
                 .await?;
+            written.push((stored["id"].as_u64(), node.name.clone()));
         }
         for edge in graph.edges() {
             self.drsg
@@ -300,6 +307,155 @@ impl GraphPlane {
                 )
                 .await?;
         }
+        if let Some(cycle) = self.cycle(&scope, &written).await? {
+            self.clear(owner, id).await?;
+            return Err(GraphError::Cyclic { cycle });
+        }
+        Ok(())
+    }
+
+    /// The order one owner's graph runs in, as the store's own topological sort answers it.
+    ///
+    /// Scoped to the graph's own label, so one deployment's graphs are sorted one at a time: over
+    /// the label every graph shares, a cycle in any of them would be an error on all of their
+    /// reads, since a cyclic scope has no order to return.
+    pub async fn order(&self, owner: &GraphOwner, id: &GraphId) -> Result<RunOrder, GraphError> {
+        let scope = scope_label(owner, id);
+        let answered = self.sorted(&scope).await?;
+        let placed = answered
+            .iter()
+            .map(|row| {
+                let id = row["id"].as_u64().ok_or_else(|| GraphError::Unreadable {
+                    detail: "an order placing a node it did not name".to_owned(),
+                })?;
+                let generation = row["generation"]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| GraphError::Unreadable {
+                        detail: "an order with no generation to run a node in".to_owned(),
+                    })?;
+                Ok((id, Generation::new(generation)))
+            })
+            .collect::<Result<Vec<_>, GraphError>>()?;
+        self.named(owner, id, placed).await
+    }
+
+    /// The rows the store's topological sort answered with, all of them.
+    ///
+    /// `dir` is `out` because this store counts a node's *incoming* edges to find the roots, so
+    /// over `parent FEEDS child` the parents come back first and a generation is a set with no
+    /// edge inside it.
+    ///
+    /// The count is checked against the rows: the store truncates its answer to `limit` while
+    /// reporting the true total, and a truncated order reads exactly like a complete one.
+    async fn sorted(&self, scope: &str) -> Result<Vec<Value>, GraphError> {
+        let answered = self
+            .drsg
+            .algo(
+                "toposort",
+                scope,
+                FEEDS,
+                json!({ "dir": "out", "limit": MaxNodes::MOST }),
+            )
+            .await?;
+        let rows = answered["results"]
+            .as_array()
+            .ok_or_else(|| GraphError::Unreadable {
+                detail: "a topological sort that ordered nothing".to_owned(),
+            })?;
+        let counted = answered["count"]
+            .as_u64()
+            .ok_or_else(|| GraphError::Unreadable {
+                detail: "a topological sort that counted nothing".to_owned(),
+            })?;
+        if counted != rows.len() as u64 {
+            return Err(GraphError::Truncated {
+                held: counted,
+                answered: rows.len(),
+            });
+        }
+        Ok(rows.clone())
+    }
+
+    /// An order over node ids, as an order over the names a graph calls them by.
+    ///
+    /// The sort answers in the store's own ids, which mean nothing to a caller and nothing to the
+    /// graph, so the nodes are read to name them.
+    async fn named(
+        &self,
+        owner: &GraphOwner,
+        id: &GraphId,
+        placed: Vec<(u64, Generation)>,
+    ) -> Result<RunOrder, GraphError> {
+        let rows = self.drsg.query(nodes_plan(owner, id)).await?;
+        let rows = rows.as_array().ok_or_else(|| GraphError::Unreadable {
+            detail: "a node read answered with something that is not rows".to_owned(),
+        })?;
+        let mut named = Vec::with_capacity(placed.len());
+        for (stored, generation) in placed {
+            let row = rows
+                .iter()
+                .find(|row| row["id"].as_u64() == Some(stored))
+                .ok_or(GraphError::Unplaced)?;
+            ours(row, owner, id)?;
+            named.push(Placed {
+                name: NodeName::new(text(row, NAME)?)?,
+                generation,
+            });
+        }
+        RunOrder::checked(named)
+    }
+
+    /// The first cycle the store finds among a graph's nodes, named, or nothing where it is a DAG.
+    ///
+    /// Asked of the store rather than answered here, for the reason [`RunGraph::checked`] does not
+    /// look for one: a cycle witness and a topological order are what a graph database is for, and
+    /// a second implementation in a consumer is one that can disagree with the order a run is
+    /// driven by.
+    async fn cycle(
+        &self,
+        scope: &str,
+        written: &[(Option<u64>, NodeName)],
+    ) -> Result<Option<String>, GraphError> {
+        let answered = self
+            .drsg
+            .algo("cycles", scope, FEEDS, json!({ "limit": CYCLES_ASKED }))
+            .await?;
+        let found = answered["count"]
+            .as_u64()
+            .ok_or_else(|| GraphError::Unreadable {
+                detail: "a cycle check that counted nothing, not even none".to_owned(),
+            })?;
+        if found == 0 {
+            return Ok(None);
+        }
+        let name = |stored: &Value| match stored.as_u64() {
+            Some(stored) => written
+                .iter()
+                .find(|(written, _)| *written == Some(stored))
+                .map_or_else(|| stored.to_string(), |(_, name)| name.to_string()),
+            None => "?".to_owned(),
+        };
+        Ok(Some(
+            answered["results"][0]["cycle"].as_array().map_or_else(
+                || "nodes the store did not name".to_owned(),
+                |cycle| cycle.iter().map(name).collect::<Vec<_>>().join(" → "),
+            ),
+        ))
+    }
+
+    /// Takes a graph out of the plane, rows and edges alike.
+    ///
+    /// Both halves of a write start here: what a write replaces, and what a refused write leaves
+    /// behind. A cycle can only be looked for once the rows exist, so a cyclic graph is written
+    /// and then removed, which leaves it **absent rather than as it was** — the delete-then-
+    /// rewrite decision showing through, and the reason a refused write is reported and never
+    /// retried.
+    async fn clear(&self, owner: &GraphOwner, id: &GraphId) -> Result<(), GraphError> {
+        for key in self.held(owner, id).await? {
+            self.drsg.node_delete(&key).await?;
+        }
+        self.drsg.node_delete(&graph_key(owner, id)).await?;
         Ok(())
     }
 
@@ -446,12 +602,13 @@ mod tests {
         })
     }
 
-    /// Every read a graph store sends, answered as a plane holding that graph would answer it.
-    ///
-    /// One script cannot answer three different `plane.query` calls differently, so each read is
-    /// driven by its own stub; what this gives is the write path with reads that find nothing.
+    /// A plane holding nothing, which takes a write and finds no cycle in it.
     async fn empty_plane() -> StubPlane {
-        StubPlane::start(Replies::scripted([("plane.query", json!([]))])).await
+        StubPlane::start(Replies::scripted([
+            ("plane.query", json!([])),
+            ("plane.algo", json!({"count": 0, "results": []})),
+        ]))
+        .await
     }
 
     #[test]
@@ -567,8 +724,150 @@ mod tests {
                 "node.create",
                 "node.create",
                 "edge.create",
+                "plane.algo",
             ],
-            "the write did not read, then delete, then write"
+            "the write did not read, then delete, then write, then check"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_asks_whether_the_graph_it_just_wrote_feeds_itself() {
+        let stub = empty_plane().await;
+        GraphPlane::new(stub.client())
+            .put(&graph())
+            .await
+            .expect("a graph with no cycle in it is taken");
+        let asked = stub.calls("plane.algo");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0]["algo"], "cycles");
+        assert_eq!(
+            asked[0]["label"], "Graph/acme/triage",
+            "the check ran over more than this graph"
+        );
+        assert_eq!(
+            asked[0]["edge_type"], FEEDS,
+            "the check followed every kind of edge, not just the ones that feed"
+        );
+        assert_eq!(asked[0]["limit"], 1);
+    }
+
+    /// A cycle cannot be looked for until the rows exist, so the rows go in and come back out.
+    #[tokio::test]
+    async fn a_graph_that_feeds_itself_is_refused_and_taken_back_out() {
+        let stub = StubPlane::start(Replies::scripted([
+            ("plane.query", json!([])),
+            ("node.create", json!({"id": 7})),
+            (
+                "plane.algo",
+                json!({"count": 1, "results": [{"cycle": [7, 7]}]}),
+            ),
+        ]))
+        .await;
+        let refusal = GraphPlane::new(stub.client()).put(&graph()).await;
+        let Err(GraphError::Cyclic { cycle }) = refusal else {
+            panic!("{refusal:?} was taken as a graph");
+        };
+        assert_eq!(
+            cycle, "intake → intake",
+            "the cycle was reported in the store's own ids"
+        );
+        assert_eq!(
+            stub.calls("node.delete").len(),
+            2,
+            "the rows a refused write left behind were not taken back out"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_order_comes_back_named_and_in_generations() {
+        let stored = graph();
+        let stub = StubPlane::start(Replies::scripted([
+            (
+                "plane.algo",
+                json!({"count": 2, "results": [
+                    {"id": 2, "order": 0, "generation": 0},
+                    {"id": 1, "order": 1, "generation": 1},
+                ]}),
+            ),
+            ("plane.query", node_rows(&stored)),
+        ]))
+        .await;
+        let order = GraphPlane::new(stub.client())
+            .order(&tenant(), &id())
+            .await
+            .expect("a sorted graph has an order");
+        assert_eq!(
+            order.placed(),
+            [
+                Placed {
+                    name: name("reply"),
+                    generation: Generation::new(0),
+                },
+                Placed {
+                    name: name("intake"),
+                    generation: Generation::new(1),
+                },
+            ],
+            "the store's ids were not read back as the graph's own names"
+        );
+    }
+
+    /// The store caps its own answer, and a truncated order reads exactly like a complete one.
+    #[tokio::test]
+    async fn an_order_shorter_than_the_graph_is_refused_rather_than_run() {
+        let stub = StubPlane::start(Replies::scripted([(
+            "plane.algo",
+            json!({"count": 120, "results": [{"id": 1, "order": 0, "generation": 0}]}),
+        )]))
+        .await;
+        assert_eq!(
+            GraphPlane::new(stub.client()).order(&tenant(), &id()).await,
+            Err(GraphError::Truncated {
+                held: 120,
+                answered: 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sort_asks_for_every_node_a_graph_may_hold_and_for_parents_first() {
+        let stub = StubPlane::start(Replies::scripted([
+            ("plane.algo", json!({"count": 0, "results": []})),
+            ("plane.query", json!([])),
+        ]))
+        .await;
+        GraphPlane::new(stub.client())
+            .order(&tenant(), &id())
+            .await
+            .expect("an empty order is still an order");
+        let asked = stub.calls("plane.algo");
+        assert_eq!(asked[0]["algo"], "toposort");
+        assert_eq!(asked[0]["label"], "Graph/acme/triage");
+        assert_eq!(asked[0]["edge_type"], FEEDS);
+        assert_eq!(
+            asked[0]["dir"], "out",
+            "the order was asked for children first"
+        );
+        assert_eq!(
+            asked[0]["limit"],
+            MaxNodes::MOST,
+            "the order was asked for fewer nodes than a graph may hold"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_placing_a_node_the_graph_does_not_hold_is_refused() {
+        let stub = StubPlane::start(Replies::scripted([
+            (
+                "plane.algo",
+                json!({"count": 1, "results": [{"id": 99, "order": 0, "generation": 0}]}),
+            ),
+            ("plane.query", node_rows(&graph())),
+        ]))
+        .await;
+        assert_eq!(
+            GraphPlane::new(stub.client()).order(&tenant(), &id()).await,
+            Err(GraphError::Unplaced)
         );
     }
 
