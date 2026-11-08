@@ -2,7 +2,12 @@
 
 pub mod agent;
 pub mod audit;
-#[cfg(any(feature = "standalone-storage", feature = "fast-storage"))]
+// Ungated because `model.rs` and `store.rs` name stored values whatever backend is compiled.
+// The reading half is the backends' own, so a build with none of them uses less than all of it.
+#[cfg_attr(
+    not(any(feature = "standalone-storage", feature = "fast-storage")),
+    allow(dead_code)
+)]
 mod codec;
 pub mod error;
 #[cfg(feature = "testing")]
