@@ -122,7 +122,7 @@ impl<'a> Trickle<'a> {
         if boundary == 0 {
             return String::new();
         }
-        let carry = std::mem::take(&mut self.carry);
+        let mut carry = std::mem::take(&mut self.carry);
         let mut built = String::with_capacity(boundary);
         let mut from = 0;
         for finding in findings.iter().filter(|one| one.at().end <= boundary) {
@@ -132,7 +132,8 @@ impl<'a> Trickle<'a> {
             from = finding.at().end;
         }
         built.push_str(&carry[from..boundary]);
-        self.carry = carry[boundary..].to_owned();
+        carry.drain(..boundary);
+        self.carry = carry;
         built
     }
 }

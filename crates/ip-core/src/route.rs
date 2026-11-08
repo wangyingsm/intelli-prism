@@ -643,6 +643,10 @@ impl HedgeDelay {
     }
 
     /// Whether the arms go out together.
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's `skip_serializing_if` names this by path and calls it with a reference"
+    )]
     pub const fn is_none(&self) -> bool {
         self.0 == 0
     }

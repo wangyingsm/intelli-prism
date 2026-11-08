@@ -82,6 +82,10 @@ pub struct PassphraseHasher {
 
 impl PassphraseHasher {
     /// A hasher at the default cost.
+    ///
+    /// # Panics
+    ///
+    /// Never: the default cost is a constant argon2 accepts.
     pub fn new() -> Self {
         Self::with_cost(HashingCost::default())
             .expect("the default hashing cost is accepted by argon2")

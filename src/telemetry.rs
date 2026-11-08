@@ -120,14 +120,14 @@ pub fn install(config: &TelemetryConfig) -> Telemetry {
         .as_ref()
         .map(|endpoint| exporting(endpoint, config.sample_ratio));
     let shipped = config.otlp_endpoint.as_ref().map(shipping);
-    let written = worked(&rolled).map(|rolled| {
+    let written = worked(rolled.as_ref()).map(|rolled| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(rolled.writer.clone())
     });
-    let traces = worked(&traced)
+    let traces = worked(traced.as_ref())
         .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer(SERVICE)));
-    let lines = worked(&shipped)
+    let lines = worked(shipped.as_ref())
         .map(|provider| OpenTelemetryTracingBridge::new(provider).with_filter(ours()));
     tracing_subscriber::registry()
         .with(LevelFilter::from(config.log_level))
@@ -192,8 +192,8 @@ pub fn install(config: &TelemetryConfig) -> Telemetry {
 
 /// What an attempt that was made and worked produced, and nothing for one that was not
 /// made or did not.
-fn worked<T, E>(outcome: &Option<Result<T, E>>) -> Option<&T> {
-    outcome.as_ref().and_then(|outcome| outcome.as_ref().ok())
+fn worked<T, E>(outcome: Option<&Result<T, E>>) -> Option<&T> {
+    outcome.and_then(|outcome| outcome.as_ref().ok())
 }
 
 /// The file the lines are also written to, and the guard that keeps the thread writing

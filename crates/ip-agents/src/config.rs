@@ -481,7 +481,7 @@ pub enum ChosenApi {
 impl ChosenApi {
     /// The spelling this is stored and reported under.
     #[must_use]
-    pub const fn name(&self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::OpenAi => "openai",
@@ -492,7 +492,7 @@ impl ChosenApi {
 
     /// Whether this pins nothing.
     #[must_use]
-    pub const fn is_any(&self) -> bool {
+    pub const fn is_any(self) -> bool {
         matches!(self, Self::Auto)
     }
 }

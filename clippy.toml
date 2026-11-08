@@ -15,6 +15,12 @@ allow-unwrap-in-tests = true
 # so code relying on it changes meaning under a profile this workspace may set later.
 disallowed-methods = ["std::panic::catch_unwind"]
 
+# `doc_markdown` reads an inner capital as an identifier somebody forgot to mark up, and the
+# three provider families are named in prose throughout. `OpenAI` is the company, not a type,
+# so it belongs on this list rather than in backticks. `..` keeps clippy's own defaults, which
+# already carry `OpenAL`, `OpenGL` and `OpenTelemetry` but not this one.
+doc-valid-idents = ["OpenAI", ".."]
+
 # NOT set here yet. `avoid-breaking-exported-api` defaults to true, which makes a dozen lints
 # skip every `pub` item — `wrong_self_convention`, `vec_box`, `box_collection`,
 # `option_option`, `trivially_copy_pass_by_ref`, `ref_option` and more, several of them

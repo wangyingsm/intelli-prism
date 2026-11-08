@@ -85,6 +85,10 @@ impl Ran {
 }
 
 /// Runs the template until the model answers, the turns run out, or the time does.
+///
+/// # Panics
+///
+/// Never: the turn whose results are read back was pushed in the same iteration.
 pub async fn run(running: &Running<'_>, input: &str) -> Ran {
     let config = running.config;
     let deadline = Instant::now() + seconds(config.time_limit().seconds());

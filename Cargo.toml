@@ -89,9 +89,14 @@ unsafe_code = "deny"
 # can quietly drop. The guide's `ptr_arg`, `borrowed_box`, `new_without_default`,
 # `should_implement_trait`, `len_without_is_empty` and `wrong_self_convention` are absent
 # deliberately — clippy warns on them by default.
+assigning_clones = "warn"           # overwrite in place rather than drop and allocate
 disallowed_methods = "warn"         # the `catch_unwind` ban in clippy.toml
+doc_markdown = "warn"               # a name in prose is in backticks or it is not a name
 fn_params_excessive_bools = "warn"  # prefer an enum over a bool parameter
+missing_panics_doc = "warn"         # say when a caller's own mistake will panic
+ref_option = "warn"                 # `Option<&T>` over `&Option<T>`
 string_add_assign = "warn"          # prefer `format!`/`write!` over `+`
+trivially_copy_pass_by_ref = "warn" # a reference to something smaller than a reference
 undocumented_unsafe_blocks = "warn" # the guide's `SAFETY:` rule
 unwrap_used = "warn"                # `expect` states why, `unwrap` states nothing
 wildcard_imports = "warn"           # name what a module takes, `super` and preludes excepted
