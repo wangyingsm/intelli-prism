@@ -5,31 +5,59 @@ use crate::capability::{Capability, ScopeKind};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 /// Every way a core value can fail to be built.
 pub enum CoreError {
+    /// A value that may not be empty is.
     #[error("{kind} is empty")]
-    Empty { kind: &'static str },
+    Empty {
+        /// What was being read.
+        kind: &'static str,
+    },
 
+    /// A value longer than its own type allows.
     #[error("{kind} is {len} bytes, over the {max} byte limit")]
     TooLong {
+        /// What was being read.
         kind: &'static str,
+        /// How long it was.
         len: usize,
+        /// The most it may be.
         max: usize,
     },
 
+    /// A value shorter than its own type allows.
     #[error("{kind} is {len} bytes, under the {min} byte minimum")]
     TooShort {
+        /// What was being read.
         kind: &'static str,
+        /// How long it was.
         len: usize,
+        /// The least it may be.
         min: usize,
     },
 
+    /// A value holding a character its own type refuses.
     #[error("{kind} contains the illegal character {ch:?}")]
-    IllegalChar { kind: &'static str, ch: char },
+    IllegalChar {
+        /// What was being read.
+        kind: &'static str,
+        /// The character it may not hold.
+        ch: char,
+    },
 
+    /// A hex value of the wrong width.
     #[error("{kind} is not {expected} hex characters")]
-    HexLength { kind: &'static str, expected: usize },
+    HexLength {
+        /// What was being read.
+        kind: &'static str,
+        /// How many characters it must be.
+        expected: usize,
+    },
 
+    /// A value that is not hex at all.
     #[error("{kind} is not valid hex")]
-    HexDigit { kind: &'static str },
+    HexDigit {
+        /// What was being read.
+        kind: &'static str,
+    },
 
     /// A value that must open with a particular character does not.
     #[error("{kind} must start with {expected:?}")]
@@ -127,10 +155,14 @@ pub enum CoreError {
         seconds: i64,
     },
 
+    /// A grant whose scope is not the shape its capability is granted at.
     #[error("{capability:?} is scoped to {expected:?}, not {actual:?}")]
     ScopeMismatch {
+        /// The capability that was granted.
         capability: Capability,
+        /// The shape it must be scoped at.
         expected: ScopeKind,
+        /// The shape it was scoped at.
         actual: ScopeKind,
     },
 

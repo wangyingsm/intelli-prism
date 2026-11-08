@@ -1,3 +1,5 @@
+//! The proxy itself: the server, its management api and the command line that starts them.
+
 mod admin;
 mod auth;
 mod classify;

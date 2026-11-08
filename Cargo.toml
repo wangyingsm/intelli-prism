@@ -79,6 +79,11 @@ zeroize = "1.9.0"
 # with findings still open turns a green gate red. Thresholds live in `clippy.toml` beside this.
 
 [workspace.lints.rust]
+# This project's own rule, in its CLAUDE.md, is that every public item carries a doc comment.
+# Until this line that was a rule written down rather than a rule checked, and the gap was 112:
+# 54 modules, 57 enum variants and their fields, and the binary's own crate doc.
+missing_docs = "warn"
+
 # Measured at zero over every feature combination this workspace builds, so `deny` rather than
 # `warn`: there is nothing here to grandfather.
 unsafe_code = "deny"

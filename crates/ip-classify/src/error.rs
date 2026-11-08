@@ -1,5 +1,6 @@
 //! Every way the arithmetic can refuse.
 
+/// Every way reading a distribution can fail.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ClassifyError {
     /// Probabilities are read as a distribution over a vector that holds another count.

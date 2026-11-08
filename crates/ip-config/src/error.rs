@@ -11,7 +11,9 @@ pub enum ConfigError {
     /// The configuration file could not be read.
     #[error("cannot read {path:?}")]
     Read {
+        /// The file that could not be read.
         path: PathBuf,
+        /// Why it could not be.
         #[source]
         source: io::Error,
     },
@@ -26,7 +28,10 @@ pub enum ConfigError {
 
     /// Two upstreams claim the same id, so a routing rule could not name one of them.
     #[error("upstream {id} is declared more than once")]
-    DuplicateUpstream { id: ApiId },
+    DuplicateUpstream {
+        /// The id that was declared twice.
+        id: ApiId,
+    },
 
     /// The filter names a secret this build does not ship.
     #[error("no secret ships under the name {value}; this build carries {carried}")]
@@ -44,20 +49,36 @@ pub enum ConfigError {
     /// The arbiter's timeout is outside the range in which waiting on it is a delay and
     /// not a dependency.
     #[error("the arbiter's timeout of {value} seconds is outside 1 to {limit}")]
-    ArbiterTimeout { value: u64, limit: u64 },
+    ArbiterTimeout {
+        /// What the file asked for.
+        value: u64,
+        /// The most it may ask for.
+        limit: u64,
+    },
 
     /// The arbiter's credential names an upstream this configuration never declared.
     #[error("the arbiter names upstream {id}, which this configuration does not declare")]
-    ArbiterUpstream { id: ApiId },
+    ArbiterUpstream {
+        /// The upstream the arbiter names.
+        id: ApiId,
+    },
 
     /// The upstream the arbiter names carries no credential: every question would go
     /// out with nothing to present.
     #[error("the arbiter names upstream {id}, whose api_key is empty")]
-    ArbiterKey { id: ApiId },
+    ArbiterKey {
+        /// The upstream whose credential is empty.
+        id: ApiId,
+    },
 
     /// The jwt secret is too short to sign tokens safely.
     #[error("the jwt secret is {len} bytes, under the {min} byte minimum")]
-    WeakJwtSecret { len: usize, min: usize },
+    WeakJwtSecret {
+        /// How long the secret is.
+        len: usize,
+        /// The least it may be.
+        min: usize,
+    },
 
     /// The upstream's base url names no host to send to.
     #[error("upstream {id} has no host in its base url")]
@@ -75,7 +96,14 @@ pub enum ConfigError {
 
     /// A temperature outside the range every upstream accepts.
     #[error("temperature {value} is outside {min} to {max}")]
-    Temperature { value: f64, min: f32, max: f32 },
+    Temperature {
+        /// What the file asked for.
+        value: f64,
+        /// The least an upstream accepts.
+        min: f32,
+        /// The most an upstream accepts.
+        max: f32,
+    },
 
     /// A difficulty confidence that is not a margin.
     #[error("difficulty confidence {value} is not between 0 and 1")]

@@ -10,20 +10,30 @@ use crate::id::{ApiId, TenantId, UserId};
 )]
 /// A capability a subject may hold.
 pub enum Capability {
+    /// Create and manage tenants.
     TenantMgr,
+    /// Manage the users of one tenant, and what they hold inside it.
     UserMgr,
+    /// Send requests through one api.
     ApiAccess,
+    /// Place plugins on one api.
     ApiAdvMgr,
+    /// Set the limits of one api.
     LimitMgr,
+    /// Manage the system agents of one tenant.
     SysAgent,
+    /// Read what one tenant spent, and the trail of what it did.
     Observer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 /// The tuple shape a capability is scoped by.
 pub enum ScopeKind {
+    /// Against the holder itself, in no tenant.
     User,
+    /// Against one tenant.
     Tenant,
+    /// Against one api of one tenant.
     Api,
 }
 
@@ -49,16 +59,25 @@ impl Capability {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 /// The subject and range one grant applies to.
 pub enum CapabilityScope {
+    /// Against the holder itself.
     User {
+        /// Who holds it.
         user: UserId,
     },
+    /// Against one tenant.
     Tenant {
+        /// Who holds it.
         user: UserId,
+        /// The tenant it is held in.
         tenant: TenantId,
     },
+    /// Against one api of one tenant.
     Api {
+        /// Who holds it.
         user: UserId,
+        /// The tenant the api belongs to.
         tenant: TenantId,
+        /// The api it is held against.
         api: ApiId,
     },
 }
@@ -194,8 +213,11 @@ impl FromIterator<Grant> for Grants {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// The standing a subject has before any explicit grant.
 pub enum Role {
+    /// Reaches every capability, in every tenant.
     SysAdmin,
+    /// Owns one tenant and reaches everything inside it, tenant management excepted.
     TenantAdmin(TenantId),
+    /// Holds nothing but what it was granted.
     Member,
 }
 
