@@ -26,7 +26,7 @@ impl RunId {
     }
 
     /// The hex form, which is what an event and a log carry.
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
 }

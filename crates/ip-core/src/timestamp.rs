@@ -53,7 +53,7 @@ impl Timestamp {
     }
 
     /// The moment in rfc 3339 form, for logs and audit records.
-    pub fn to_rfc3339(&self) -> String {
+    pub fn to_rfc3339(self) -> String {
         self.0.to_rfc3339()
     }
 }
