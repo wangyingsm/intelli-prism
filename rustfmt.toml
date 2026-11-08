@@ -1,0 +1,10 @@
+# Google's Rust style guide names four rustfmt settings. Only two are reachable on a stable
+# toolchain, and one of those is already the default:
+#
+#   max_width = 100        already rustfmt's default, so setting it would be a no-op
+#   hex_literal_case       stable, below
+#   format_macro_matchers  nightly only
+#   imports_granularity    nightly only — so the guide's "import from one module per `use`
+#                          statement" rule cannot be enforced here at all, and stays a thing
+#                          review looks for rather than a thing the gate decides
+hex_literal_case = "Lower"
