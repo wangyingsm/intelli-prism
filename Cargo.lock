@@ -1777,6 +1777,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-graph"
+version = "0.1.0"
+dependencies = [
+ "ip-agents",
+ "ip-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "ip-mcp"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,21 @@
+[package]
+name = "ip-graph"
+description = "Run graphs: what a DAG of agent templates is before anything runs one"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ip-agents = { version = "0.1.0", path = "../ip-agents" }
+ip-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1.12.0"
+serde_json.workspace = true
