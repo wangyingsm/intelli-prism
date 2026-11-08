@@ -1701,6 +1701,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-drsg"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "ip-config",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "ip-embed"
 version = "0.1.0"
 dependencies = [
