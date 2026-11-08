@@ -90,4 +90,39 @@ pub enum GraphError {
         /// The name placed twice.
         name: NodeName,
     },
+
+    /// The plane the graphs are kept in could not be reached, or would not answer.
+    #[error(transparent)]
+    Plane(#[from] ip_drsg::DrsgError),
+
+    /// A stored row carries nothing under a property a graph is rebuilt from.
+    #[error("a stored row carries no {property}")]
+    PropertyMissing {
+        /// What was being read.
+        property: &'static str,
+    },
+
+    /// A stored row carries something under a property that is not what it must be.
+    #[error("a stored row's {property} is not a value a graph can be rebuilt from")]
+    PropertyKind {
+        /// What was being read.
+        property: &'static str,
+    },
+
+    /// The plane answered with a row belonging to another graph, or to another owner.
+    ///
+    /// Reachable only where the filter in the read plan did not hold, which is why it is reported
+    /// rather than skipped: rows that should not have arrived mean the read asked wrongly.
+    #[error("the graph store answered with a row of another {property}")]
+    Foreign {
+        /// Which of the two did not match: the graph, or its owner.
+        property: &'static str,
+    },
+
+    /// The plane answered with a shape this cannot read as a graph.
+    #[error("the graph store answered with {detail}")]
+    Unreadable {
+        /// What was wrong with it.
+        detail: String,
+    },
 }

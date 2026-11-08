@@ -68,6 +68,12 @@ pub enum Replies {
     /// A method nothing was prepared for is answered with an empty object rather than an error, so
     /// a test scripts only the answers it reads and the writes it ignores still succeed.
     Scripted(BTreeMap<String, serde_json::Value>),
+    /// With a prepared result per *call*, in the order the calls arrive.
+    ///
+    /// What [`Replies::Scripted`] cannot do: a read made of several queries asks one method three
+    /// times and needs three different answers. A call past the end is answered with an empty
+    /// object, so a test prepares only the calls it is about.
+    InTurn(Arc<Mutex<std::collections::VecDeque<serde_json::Value>>>),
 }
 
 impl Replies {
@@ -83,6 +89,14 @@ impl Replies {
                 .map(|(method, result)| (method.into(), result))
                 .collect(),
         )
+    }
+
+    /// One result per call, in the order the calls arrive.
+    pub fn in_turn<I>(answers: I) -> Self
+    where
+        I: IntoIterator<Item = serde_json::Value>,
+    {
+        Self::InTurn(Arc::new(Mutex::new(answers.into_iter().collect())))
     }
 }
 
@@ -300,6 +314,17 @@ async fn answer(
                 "result": answers.get(&method).cloned().unwrap_or_else(|| serde_json::json!({})),
             }),
         ),
+        Replies::InTurn(answers) => {
+            let next = answers
+                .lock()
+                .expect("the script is not poisoned")
+                .pop_front()
+                .unwrap_or_else(|| serde_json::json!({}));
+            json_body(
+                built,
+                &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": next}),
+            )
+        }
     })
 }
 

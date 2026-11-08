@@ -1782,10 +1782,12 @@ version = "0.1.0"
 dependencies = [
  "ip-agents",
  "ip-core",
+ "ip-drsg",
  "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
