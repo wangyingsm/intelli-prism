@@ -52,7 +52,48 @@ pub struct Config {
     /// level holds nothing and no request is ever embedded.
     #[serde(default)]
     pub semantic: Option<SemanticConfig>,
+    /// Where the run graphs are kept. Absent, a deployment has no graph routes at all:
+    /// a graph lives in a store outside this process, and one that was never configured
+    /// is not a degraded graph but no graph feature.
+    #[serde(default)]
+    pub graph_store: Option<GraphStoreConfig>,
 }
+
+/// The dr-strange plane the run graphs are kept in.
+///
+/// The one part of this system whose state lives outside its own database, which is why
+/// the whole block is optional: a deployment that configures none simply has no graph
+/// routes, rather than routes that answer 503 for the life of the process.
+///
+/// The plane is made on first use rather than at startup, so a store that comes up after
+/// the proxy is not a startup failure.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphStoreConfig {
+    /// Where the store answers JSON-RPC, which is its `/rpc` path.
+    pub url: Url,
+    /// The bearer token every call presents. The store gates every write on this one
+    /// shared credential, so an empty one is arbitration silently off — refused below.
+    pub token: Secret,
+    /// The plane the graphs live in. One plane per deployment, named here and never by a
+    /// caller, so no request can be made to read another deployment's graphs.
+    pub plane: String,
+    /// How long one call may take before the store is given up on. Ten seconds is the
+    /// default: a graph write is a handful of small calls, and a store that is slower
+    /// than this is one a management request should stop waiting for.
+    #[serde(default = "default_graph_store_timeout")]
+    pub timeout: Seconds,
+}
+
+fn default_graph_store_timeout() -> Seconds {
+    Seconds::new(10)
+}
+
+/// The most a graph store call may be given, past which it is a dependency and not a wait.
+const GRAPH_STORE_TIMEOUT_MAX_SECONDS: u64 = 60;
+
+/// The most characters a plane's name may be, matching what the client will take.
+const GRAPH_STORE_PLANE_MAX_BYTES: usize = 128;
 
 /// The third cache level: the model that recognises a question, and how near two of
 /// them must be before one may answer for the other.
@@ -370,6 +411,40 @@ impl Config {
                     });
                 }
                 Some(_) => {}
+            }
+        }
+        // Everything the graph client would refuse, refused here instead, so an operator
+        // learns at startup rather than on the first graph run. `ip-config` cannot use
+        // `ip-drsg`'s own newtypes to say it — that crate depends on this one — so the two
+        // sets of rules are written twice and must agree; a divergence shows up as a
+        // startup conversion that fails on a config this said was good.
+        if let Some(graph_store) = &self.graph_store {
+            match graph_store.url.scheme() {
+                "http" | "https" => {}
+                other => {
+                    return Err(ConfigError::GraphStoreScheme {
+                        scheme: other.to_owned(),
+                    });
+                }
+            }
+            if graph_store.token.is_empty() {
+                return Err(ConfigError::GraphStoreToken);
+            }
+            let plane = graph_store.plane.as_str();
+            if plane.is_empty()
+                || plane.len() > GRAPH_STORE_PLANE_MAX_BYTES
+                || plane.chars().any(char::is_whitespace)
+            {
+                return Err(ConfigError::GraphStorePlane {
+                    value: plane.to_owned(),
+                });
+            }
+            let secs = graph_store.timeout.get();
+            if !(1..=GRAPH_STORE_TIMEOUT_MAX_SECONDS).contains(&secs) {
+                return Err(ConfigError::GraphStoreTimeout {
+                    value: secs,
+                    limit: GRAPH_STORE_TIMEOUT_MAX_SECONDS,
+                });
             }
         }
         for (index, upstream) in self.upstreams.iter().enumerate() {
@@ -823,6 +898,149 @@ url = "redis://:pw@cache:6379"
 issuer = "intelli-prism"
 secret = "0123456789abcdef0123456789abcdef"
 "#;
+
+    /// `MINIMAL` with a `[graph_store]` block whose fields are whatever a test overrides.
+    fn with_graph_store(block: &str) -> Result<Config, ConfigError> {
+        Config::parse(&format!("{MINIMAL}\n[graph_store]\n{block}"))
+    }
+
+    #[test]
+    fn a_deployment_that_configures_no_graph_store_has_none() {
+        let config = Config::parse(MINIMAL).unwrap();
+        assert!(
+            config.graph_store.is_none(),
+            "a graph store appeared from nowhere"
+        );
+    }
+
+    #[test]
+    fn a_graph_store_is_read_with_the_timeout_defaulted() {
+        let config = with_graph_store(
+            r#"
+url = "http://127.0.0.1:7777/rpc"
+token = "drsg-live-4f91ca7b22e8"
+plane = "intelli-prism_graphs"
+"#,
+        )
+        .unwrap();
+        let graphs = config.graph_store.expect("the block was configured");
+        assert_eq!(graphs.url.as_str(), "http://127.0.0.1:7777/rpc");
+        assert_eq!(graphs.token.expose(), "drsg-live-4f91ca7b22e8");
+        assert_eq!(graphs.plane, "intelli-prism_graphs");
+        assert_eq!(graphs.timeout, Seconds::new(10));
+    }
+
+    #[test]
+    fn a_graph_store_timeout_is_taken_when_it_is_given() {
+        let config = with_graph_store(
+            r#"
+url = "https://graphs.internal/rpc"
+token = "t"
+plane = "graphs"
+timeout = 30
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .graph_store
+                .expect("the block was configured")
+                .timeout,
+            Seconds::new(30)
+        );
+    }
+
+    #[test]
+    fn a_url_that_is_not_one_is_refused() {
+        let refusal = with_graph_store(
+            r#"
+url = "127.0.0.1:7777/rpc"
+token = "t"
+plane = "graphs"
+"#,
+        );
+        assert!(
+            matches!(refusal, Err(ConfigError::Parse(_))),
+            "{refusal:?} was taken"
+        );
+    }
+
+    /// A url `Url` will take but this proxy cannot post JSON-RPC over, which is a
+    /// different mistake from a url that is not one and gets its own refusal.
+    #[test]
+    fn a_scheme_this_proxy_cannot_speak_is_refused_by_name() {
+        let refusal = with_graph_store(
+            r#"
+url = "ws://127.0.0.1:7777/ws"
+token = "t"
+plane = "graphs"
+"#,
+        );
+        match refusal {
+            Err(ConfigError::GraphStoreScheme { scheme }) => assert_eq!(scheme, "ws"),
+            other => panic!("{other:?} was taken"),
+        }
+    }
+
+    #[test]
+    fn an_empty_token_is_refused_rather_than_presented() {
+        let refusal = with_graph_store(
+            r#"
+url = "http://127.0.0.1:7777/rpc"
+token = ""
+plane = "graphs"
+"#,
+        );
+        assert!(
+            matches!(refusal, Err(ConfigError::GraphStoreToken)),
+            "{refusal:?} was taken"
+        );
+    }
+
+    #[test]
+    fn a_plane_name_no_store_will_take_is_refused() {
+        for plane in ["", "two words", " graphs"] {
+            let refusal = with_graph_store(&format!(
+                "url = \"http://127.0.0.1:7777/rpc\"\ntoken = \"t\"\nplane = \"{plane}\"\n"
+            ));
+            match refusal {
+                Err(ConfigError::GraphStorePlane { value }) => assert_eq!(value, plane),
+                other => panic!("the plane {plane:?} was taken as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_timeout_that_is_a_dependency_rather_than_a_wait_is_refused() {
+        for (timeout, value) in [(0, 0), (61, 61)] {
+            let refusal = with_graph_store(&format!(
+                "url = \"http://127.0.0.1:7777/rpc\"\ntoken = \"t\"\nplane = \"g\"\ntimeout = {timeout}\n"
+            ));
+            match refusal {
+                Err(ConfigError::GraphStoreTimeout { value: got, limit }) => {
+                    assert_eq!(got, value);
+                    assert_eq!(limit, 60);
+                }
+                other => panic!("a timeout of {timeout} was taken as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_graph_store_field_nobody_declared_is_refused() {
+        let refusal = with_graph_store(
+            r#"
+url = "http://127.0.0.1:7777/rpc"
+token = "t"
+plane = "graphs"
+planes = "graphs"
+"#,
+        );
+        assert!(
+            matches!(refusal, Err(ConfigError::Parse(_))),
+            "{refusal:?} was taken"
+        );
+    }
 
     #[test]
     fn parses_a_full_configuration() {

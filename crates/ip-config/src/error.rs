@@ -158,4 +158,32 @@ pub enum ConfigError {
         /// The most that will be kept.
         limit: u16,
     },
+
+    /// The graph store's url names a scheme this proxy cannot post JSON-RPC over.
+    #[error("the graph store speaks {scheme:?}, which this proxy does not")]
+    GraphStoreScheme {
+        /// The scheme the url named.
+        scheme: String,
+    },
+
+    /// The graph store carries no credential, so every call would present an empty one.
+    #[error("the graph store's token is empty")]
+    GraphStoreToken,
+
+    /// The graph store names no plane, or one no store will take.
+    #[error("the graph store's plane {value:?} is not a name a plane can have")]
+    GraphStorePlane {
+        /// What the file asked for.
+        value: String,
+    },
+
+    /// The graph store's timeout is outside the range in which waiting on it is a delay
+    /// and not a dependency.
+    #[error("the graph store's timeout of {value} seconds is outside 1 to {limit}")]
+    GraphStoreTimeout {
+        /// What the file asked for.
+        value: u64,
+        /// The most it may ask for.
+        limit: u64,
+    },
 }
