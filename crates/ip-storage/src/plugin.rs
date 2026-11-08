@@ -1,3 +1,5 @@
+//! Stored plugins, and the rules that place them.
+
 use async_trait::async_trait;
 use ip_core::{
     Checksum, NewPluginRule, PluginKind, PluginOrder, PluginRule, PluginScope, TenantId, Timestamp,

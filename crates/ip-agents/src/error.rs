@@ -1,3 +1,5 @@
+//! Every way a template can be refused.
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 /// Every way a value in this crate can fail to be built.
 pub enum AgentError {

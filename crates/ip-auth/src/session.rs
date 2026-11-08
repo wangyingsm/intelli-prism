@@ -1,3 +1,5 @@
+//! Web sessions: the token a browser carries, and what it stands for.
+
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

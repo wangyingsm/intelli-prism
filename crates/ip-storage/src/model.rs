@@ -1,3 +1,5 @@
+//! The records storage reads and writes: tenants, users, and their membership.
+
 use ip_core::{Grant, PassphraseHash, TenantId, Timestamp, TnKey, UserId};
 
 /// Surrogate primary key of a stored tenant row.

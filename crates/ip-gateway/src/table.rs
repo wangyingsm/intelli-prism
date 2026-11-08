@@ -1,3 +1,5 @@
+//! The routing table: the rules in force, and what a request resolves to.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 

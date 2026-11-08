@@ -1,3 +1,5 @@
+//! Every way the gateway can fail, and the status each failure answers with.
+
 use http::StatusCode;
 use ip_cache::CacheError;
 use ip_config::ConfigError;

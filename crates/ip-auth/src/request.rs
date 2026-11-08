@@ -1,3 +1,5 @@
+//! Signed requests: who is asking, and whether the signature says so.
+
 use std::net::IpAddr;
 use std::sync::Arc;
 

@@ -1,3 +1,5 @@
+//! The sled backend, for a cache one node keeps to itself.
+
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 

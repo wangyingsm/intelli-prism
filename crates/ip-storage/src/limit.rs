@@ -1,3 +1,5 @@
+//! The stored limits a tenant, a user or an api is held to.
+
 use async_trait::async_trait;
 use ip_core::{Allowance, Counted, LimitScope, Period, Timestamp};
 

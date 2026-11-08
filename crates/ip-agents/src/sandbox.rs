@@ -1,3 +1,5 @@
+//! The object tree a run may see, and nothing outside it.
+
 use std::collections::BTreeMap;
 use std::fmt;
 

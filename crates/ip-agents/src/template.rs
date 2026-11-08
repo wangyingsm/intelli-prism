@@ -1,3 +1,5 @@
+//! A template: its name, the configuration it would run under and the sandbox it would see.
+
 use std::fmt;
 
 use crate::config::AgentConfig;

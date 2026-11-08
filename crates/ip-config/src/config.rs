@@ -1,3 +1,5 @@
+//! The configuration file the proxy is started from.
+
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

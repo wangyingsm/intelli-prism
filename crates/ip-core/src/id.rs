@@ -1,3 +1,5 @@
+//! The identifiers every layer names a tenant, a user, an api and a turn by.
+
 use std::fmt;
 use std::str::FromStr;
 

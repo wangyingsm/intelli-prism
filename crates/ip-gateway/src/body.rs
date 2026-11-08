@@ -1,3 +1,5 @@
+//! The body type every stage of the dataflow carries.
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 

@@ -1,3 +1,5 @@
+//! Headers encoded for a plugin to read, and decoded from what it wrote.
+
 use http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::error::HeaderBlockError;

@@ -1,3 +1,5 @@
+//! The response cache: what may be kept, and whether what was kept is still good.
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 

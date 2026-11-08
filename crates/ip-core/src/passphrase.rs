@@ -1,3 +1,5 @@
+//! A stored passphrase hash.
+
 use std::fmt;
 
 use crate::error::CoreError;

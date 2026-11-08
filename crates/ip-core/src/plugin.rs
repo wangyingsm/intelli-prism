@@ -1,3 +1,5 @@
+//! A plugin rule: what runs, where it runs, and in what order.
+
 use std::fmt;
 use std::str::FromStr;
 

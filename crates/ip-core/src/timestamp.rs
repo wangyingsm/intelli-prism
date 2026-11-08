@@ -1,3 +1,5 @@
+//! The moment every record is stamped with.
+
 use std::fmt;
 
 use chrono::{DateTime, Datelike, SubsecRound, TimeZone, Utc};

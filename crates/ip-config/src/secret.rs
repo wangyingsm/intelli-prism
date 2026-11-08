@@ -1,3 +1,5 @@
+//! A configured value that must not be printed.
+
 use std::fmt;
 
 use subtle::ConstantTimeEq;

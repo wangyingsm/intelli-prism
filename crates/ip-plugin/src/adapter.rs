@@ -1,3 +1,5 @@
+//! The processors that run a wasm plugin over headers and over a body.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -1,3 +1,5 @@
+//! What one plugin call may spend.
+
 use std::time::Duration;
 
 /// What one plugin call may spend before it is stopped.

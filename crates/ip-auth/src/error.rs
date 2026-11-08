@@ -1,3 +1,5 @@
+//! Every way authentication can be refused.
+
 use ip_cache::CacheError;
 use ip_core::{CoreError, Nonce, TenantId, UserId};
 use ip_storage::StorageError;

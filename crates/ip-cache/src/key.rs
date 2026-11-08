@@ -1,3 +1,5 @@
+//! A cache key, and the level it belongs to.
+
 use std::fmt;
 
 use crate::error::CacheError;

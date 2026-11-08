@@ -1,3 +1,5 @@
+//! The identifier an operator spells a template by.
+
 use std::fmt;
 
 use crate::error::AgentError;

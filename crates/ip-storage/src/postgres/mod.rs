@@ -1,3 +1,5 @@
+//! The postgres backend.
+
 mod agent;
 mod audit;
 mod identity;

@@ -1,3 +1,5 @@
+//! How much each level may hold.
+
 use crate::error::CacheError;
 use crate::key::CacheLevel;
 

@@ -1,3 +1,5 @@
+//! Every way a plugin, or the chain it sits in, can fail.
+
 use ip_core::Checksum;
 use ip_storage::StorageError;
 use wasmtime::Trap;

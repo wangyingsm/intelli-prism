@@ -1,3 +1,5 @@
+//! The sqlite backend.
+
 mod agent;
 mod audit;
 mod identity;

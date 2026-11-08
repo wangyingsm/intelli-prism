@@ -1,3 +1,5 @@
+//! What each model costs, as stored.
+
 use async_trait::async_trait;
 use ip_core::{ModelName, Price, Timestamp};
 

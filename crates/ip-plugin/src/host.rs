@@ -1,3 +1,5 @@
+//! The wasm host: compiles a plugin once, and runs each call inside its limits.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};

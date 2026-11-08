@@ -1,3 +1,5 @@
+//! The trait an upstream satisfies.
+
 use async_trait::async_trait;
 use http::{Request, Response};
 

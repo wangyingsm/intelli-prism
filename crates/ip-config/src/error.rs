@@ -1,3 +1,5 @@
+//! Every way a configuration can be refused.
+
 use std::io;
 use std::path::PathBuf;
 

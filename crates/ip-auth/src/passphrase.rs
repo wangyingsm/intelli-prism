@@ -1,3 +1,5 @@
+//! Hashing and verifying passphrases with argon2id.
+
 use std::fmt;
 
 use argon2::password_hash::Error as HashError;

@@ -1,3 +1,5 @@
+//! The plugin chains in force, built from the stored rules.
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 

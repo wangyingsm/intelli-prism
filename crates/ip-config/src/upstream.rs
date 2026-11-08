@@ -1,3 +1,5 @@
+//! An upstream the proxy forwards to, and what a route may override on it.
+
 use std::net::SocketAddr;
 
 use ip_core::{

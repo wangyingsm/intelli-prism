@@ -1,3 +1,5 @@
+//! What a template would run under: its role, its model, its tool set and its ceilings.
+
 use std::fmt;
 
 use crate::error::AgentError;

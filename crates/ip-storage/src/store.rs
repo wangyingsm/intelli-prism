@@ -1,3 +1,5 @@
+//! The traits every storage backend satisfies.
+
 use async_trait::async_trait;
 use ip_core::{Grant, Grants, PassphraseHash, TenantId, UserId};
 

@@ -1,3 +1,5 @@
+//! The stored routing rules.
+
 use async_trait::async_trait;
 use ip_core::{RouteKey, RouteRule};
 

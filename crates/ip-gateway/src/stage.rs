@@ -1,3 +1,5 @@
+//! The stages a request passes through, as the types that fix their order.
+
 use std::fmt;
 
 use http::{Request, Response};

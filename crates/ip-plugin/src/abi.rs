@@ -1,3 +1,5 @@
+//! The calling convention between the host and a plugin.
+
 use ip_core::Checksum;
 use wasmtime::{ExternType, Module, ValType};
 

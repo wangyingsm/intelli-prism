@@ -1,3 +1,5 @@
+//! A routing rule: what arrives, where it goes, and how it is dispatched.
+
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;

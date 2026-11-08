@@ -1,3 +1,5 @@
+//! How long an entry stays good for.
+
 use std::time::Duration;
 
 use crate::error::CacheError;

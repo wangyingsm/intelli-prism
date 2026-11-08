@@ -1,3 +1,5 @@
+//! Every way a core type can refuse the value it was given.
+
 use crate::capability::{Capability, ScopeKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

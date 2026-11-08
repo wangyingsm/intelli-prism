@@ -1,3 +1,5 @@
+//! Every way storage can fail, and the entity it failed about.
+
 use std::error::Error;
 use std::fmt;
 

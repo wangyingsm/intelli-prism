@@ -1,3 +1,5 @@
+//! The redis backend, for a cache every node shares.
+
 use async_trait::async_trait;
 use std::time::Duration;
 

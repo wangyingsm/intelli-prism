@@ -1,3 +1,5 @@
+//! The chains a request's headers and body are passed through.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

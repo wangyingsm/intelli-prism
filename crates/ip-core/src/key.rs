@@ -1,3 +1,5 @@
+//! The keys a request is signed with, and the signature itself.
+
 use std::fmt;
 
 use sha2::{Digest, Sha256};

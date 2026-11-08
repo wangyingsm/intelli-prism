@@ -1,3 +1,5 @@
+//! What an identity is allowed, and the scope it is allowed it in.
+
 use std::collections::HashSet;
 
 use crate::error::CoreError;

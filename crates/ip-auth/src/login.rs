@@ -1,3 +1,5 @@
+//! Passphrase attempts, counted so that guessing is slowed down.
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

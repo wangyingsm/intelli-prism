@@ -1,3 +1,5 @@
+//! What each request spent, as stored.
+
 use async_trait::async_trait;
 use ip_core::{
     ApiId, Counted, Decider, Difficulty, Hedge, Latency, ModelName, Money, Redacted, Replica,

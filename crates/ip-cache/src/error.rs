@@ -1,3 +1,5 @@
+//! Every way a cache can fail.
+
 use std::error::Error;
 
 /// Every way a cache call can fail.

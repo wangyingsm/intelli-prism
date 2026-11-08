@@ -1,3 +1,5 @@
+//! The trait every cache backend satisfies.
+
 use async_trait::async_trait;
 
 use crate::error::CacheError;
