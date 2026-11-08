@@ -227,6 +227,17 @@ impl RunGraph {
     pub fn max_nodes(&self) -> MaxNodes {
         self.max_nodes
     }
+
+    /// The nodes whose answers feed one node, which are the keys its input arrives under.
+    pub fn parents_of<'graph>(
+        &'graph self,
+        name: &'graph NodeName,
+    ) -> impl Iterator<Item = &'graph NodeName> {
+        self.edges
+            .iter()
+            .filter(move |edge| &edge.to == name)
+            .map(|edge| &edge.from)
+    }
 }
 
 #[cfg(test)]

@@ -20,9 +20,11 @@ mod graph;
 mod id;
 mod order;
 mod plane;
+mod run;
 
 pub use error::GraphError;
 pub use graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
 pub use id::{GraphId, GraphName, NodeName};
 pub use order::{Generation, Placed, RunOrder};
 pub use plane::{FEEDS, GRAPH_LABEL, GraphPlane, NODE_LABEL};
+pub use run::{GraphRan, Graphing, NodeRan, RunsNode, run};

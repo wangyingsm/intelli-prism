@@ -1780,9 +1780,11 @@ dependencies = [
 name = "ip-graph"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ip-agents",
  "ip-core",
  "ip-drsg",
+ "ip-run",
  "proptest",
  "serde",
  "serde_json",
