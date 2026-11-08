@@ -74,6 +74,27 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 zeroize = "1.9.0"
 
+# The lintable part of Google's Rust style guide. Every member needs `[lints] workspace = true`
+# or this applies to nothing, and a lint arrives in the same commit as its fixes — one enabled
+# with findings still open turns a green gate red. Thresholds live in `clippy.toml` beside this.
+
+[workspace.lints.rust]
+# Measured at zero over every feature combination this workspace builds, so `deny` rather than
+# `warn`: there is nothing here to grandfather.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# These cost nothing in a tree that already complies. They are here to keep it that way: a lint
+# at zero is a decision that holds, where a convention only written down is one the next commit
+# can quietly drop. The guide's `ptr_arg`, `borrowed_box`, `new_without_default`,
+# `should_implement_trait`, `len_without_is_empty` and `wrong_self_convention` are absent
+# deliberately — clippy warns on them by default.
+disallowed_methods = "warn"         # the `catch_unwind` ban in clippy.toml
+fn_params_excessive_bools = "warn"  # prefer an enum over a bool parameter
+string_add_assign = "warn"          # prefer `format!`/`write!` over `+`
+undocumented_unsafe_blocks = "warn" # the guide's `SAFETY:` rule
+wildcard_imports = "warn"           # name what a module takes, `super` and preludes excepted
+
 [dev-dependencies]
 async-trait = "0.1.92"
 hex.workspace = true
@@ -87,6 +108,9 @@ serde_json.workspace = true
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
 tower = "0.5.3"
 wat = "1.259.0"
+
+[lints]
+workspace = true
 
 [features]
 default = ["fast-storage", "cluster-cache"]

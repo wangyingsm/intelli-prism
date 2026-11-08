@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 hex.workspace = true
 # Pinned, and pinned in one place now: two crates loading two different `ort` versions

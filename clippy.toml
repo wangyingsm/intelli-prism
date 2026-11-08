@@ -1,0 +1,22 @@
+# Clippy cannot carry a lint's configuration in the manifest, so a threshold and the lint
+# enforcing it are written in two files; changing one without the other is the mistake to
+# watch for. The lints themselves are `[workspace.lints]` in the root `Cargo.toml`.
+too-many-lines-threshold = 100
+
+# `catch_unwind` is prohibited outright by Google's Rust style guide. Named rather than left
+# to habit: unwinding across it is only defined when the binary is built `panic = "unwind"`,
+# so code relying on it changes meaning under a profile this workspace may set later.
+disallowed-methods = ["std::panic::catch_unwind"]
+
+# NOT set here yet. `avoid-breaking-exported-api` defaults to true, which makes a dozen lints
+# skip every `pub` item — `wrong_self_convention`, `vec_box`, `box_collection`,
+# `option_option`, `trivially_copy_pass_by_ref`, `ref_option` and more, several of them
+# warn-by-default. So this tree can pass a `-D warnings` gate while its public api violates
+# the rule those lints encode, and the public api is where the guide says they bind.
+# Measured here at four findings, all of them `to_*(&self)` on a `Copy` type:
+#
+#   avoid-breaking-exported-api = false
+#
+# `warn-on-all-wildcard-imports` is also left at its default, which exempts `use super::*`
+# and preludes. That exemption is the guide's own, and it is what `wildcard_imports` leaves
+# standing in the inline test modules.

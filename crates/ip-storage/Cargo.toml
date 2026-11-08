@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait = "0.1.92"
 ip-agents = { version = "0.1.0", path = "../ip-agents" }
