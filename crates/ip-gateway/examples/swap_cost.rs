@@ -11,6 +11,11 @@
 //!
 //! `cargo run --release -p ip-gateway --example swap_cost`
 
+#![allow(
+    clippy::unwrap_used,
+    reason = "a measurement that stops at the first thing it cannot set up"
+)]
+
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

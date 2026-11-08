@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 const WIDE: usize = 4096;
 
 fn detectors() -> Detectors {
-    Detectors::defaults().unwrap()
+    Detectors::defaults().expect("the shipped detectors build")
 }
 
 /// Text that cannot accidentally be, or run into, one of the secrets below.
@@ -28,7 +28,8 @@ fn detectors() -> Detectors {
 /// not mean to plant, and one free to emit digits beside a card number would change
 /// whether that number passes Luhn — both would fail the property for the wrong reason.
 fn around() -> impl Strategy<Value = String> {
-    proptest::string::string_regex("[a-z ,.!?\u{4e00}-\u{9fa5}]{0,80}").unwrap()
+    proptest::string::string_regex("[a-z ,.!?\u{4e00}-\u{9fa5}]{0,80}")
+        .expect("the generator's own pattern is a regex")
 }
 
 /// One of each kind of secret this build ships, written as a model or a caller would.

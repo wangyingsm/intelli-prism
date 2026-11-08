@@ -417,9 +417,9 @@ mod tests {
         // Per-process and per-test: parallel tests must not delete each other's
         // fixtures, and every one of them reads its library from the environment.
         let dir = std::env::temp_dir().join(format!("ip-classify-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("the fixture's own directory can be made");
         for (name, bytes) in files {
-            std::fs::write(dir.join(name), bytes).unwrap();
+            std::fs::write(dir.join(name), bytes).expect("the fixture's own file can be written");
         }
         dir
     }

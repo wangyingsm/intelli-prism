@@ -133,11 +133,13 @@ mod tests {
     use super::*;
 
     fn failing() -> FailingCache {
-        FailingCache::new(Arc::new(SledCache::temporary().unwrap()))
+        FailingCache::new(Arc::new(
+            SledCache::temporary().expect("a temporary cache opens"),
+        ))
     }
 
     fn key() -> CacheKey {
-        CacheKey::new(CacheLevel::System, "told-to-fail").unwrap()
+        CacheKey::new(CacheLevel::System, "told-to-fail").expect("the fixture's own key is one")
     }
 
     fn told_to_fail(error: &CacheError) -> bool {

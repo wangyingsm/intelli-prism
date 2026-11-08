@@ -1347,7 +1347,7 @@ async fn race(
             .unwrap_or(HEDGE_MOST)
             .clamp(1, HEDGE_MOST),
     )
-    .unwrap();
+    .expect("the count is clamped into the range a hedge accepts");
     let mut response = response;
     strip_hop_by_hop(response.headers_mut());
     Ok(Flow {

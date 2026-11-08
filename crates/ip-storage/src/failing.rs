@@ -492,7 +492,9 @@ mod tests {
     use super::*;
 
     async fn failing() -> FailingStore {
-        let store = SqliteStore::in_memory().await.unwrap();
+        let store = SqliteStore::in_memory()
+            .await
+            .expect("an in-memory store opens");
         FailingStore::new(Arc::new(store))
     }
 

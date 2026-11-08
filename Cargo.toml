@@ -93,6 +93,7 @@ disallowed_methods = "warn"         # the `catch_unwind` ban in clippy.toml
 fn_params_excessive_bools = "warn"  # prefer an enum over a bool parameter
 string_add_assign = "warn"          # prefer `format!`/`write!` over `+`
 undocumented_unsafe_blocks = "warn" # the guide's `SAFETY:` rule
+unwrap_used = "warn"                # `expect` states why, `unwrap` states nothing
 wildcard_imports = "warn"           # name what a module takes, `super` and preludes excepted
 
 [dev-dependencies]

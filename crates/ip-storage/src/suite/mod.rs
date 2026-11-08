@@ -1,5 +1,13 @@
 //! Tests every storage backend must pass, written once and run against each backend.
 
+// This is a test suite, but it lives behind the `testing` feature rather than under
+// `cfg(test)` so that every backend's own tests can run it, which puts it outside what
+// `allow-unwrap-in-tests` can see.
+#![allow(
+    clippy::unwrap_used,
+    reason = "a suite of tests, compiled as a library"
+)]
+
 pub(crate) mod agent;
 pub(crate) mod audit;
 pub(crate) mod identity;

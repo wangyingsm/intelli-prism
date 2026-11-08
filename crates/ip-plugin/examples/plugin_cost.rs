@@ -5,6 +5,11 @@
 //! one being measured. Each is reported as its fastest, middle and slowest round, since a
 //! single figure invites a conclusion the spread does not support.
 
+#![allow(
+    clippy::unwrap_used,
+    reason = "a measurement that stops at the first thing it cannot set up"
+)]
+
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

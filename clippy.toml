@@ -3,6 +3,13 @@
 # watch for. The lints themselves are `[workspace.lints]` in the root `Cargo.toml`.
 too-many-lines-threshold = 100
 
+# A test that unwraps states its own precondition, and a panic there is the failure being
+# reported rather than a fault escaping into a caller. Without this the lint answers 3738
+# findings here, 2839 of them in `#[test]` functions; with it, 899, of which exactly one was
+# in code that ships. It exempts a `#[test]` function and nothing else, so a helper beside
+# one is still linted — which is why the shared suites carry an `allow` of their own.
+allow-unwrap-in-tests = true
+
 # `catch_unwind` is prohibited outright by Google's Rust style guide. Named rather than left
 # to habit: unwinding across it is only defined when the binary is built `panic = "unwind"`,
 # so code relying on it changes meaning under a profile this workspace may set later.
