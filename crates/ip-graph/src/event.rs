@@ -3,7 +3,39 @@
 use ip_run::{RunEvent, Spend, Stopped};
 use serde_json::{Value, json};
 
-use crate::id::NodeName;
+use crate::id::{GraphRunId, NodeName};
+
+/// One thing a graph run said, and which run said it.
+///
+/// The run id sits here rather than in every variant of [`GraphEvent`] because it is the one
+/// thing every event carries: a stream is about one graph run, and an event lifted out of that
+/// stream — written to a log, kept beside a persisted answer, matched against a dispatch that
+/// was retried — still says which run it belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphSaid {
+    /// Which graph run said it.
+    pub run: GraphRunId,
+    /// What it said.
+    pub event: GraphEvent,
+}
+
+impl GraphSaid {
+    /// The name this is streamed under.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        self.event.name()
+    }
+
+    /// What it carries, as the json one event holds, the run it belongs to included.
+    #[must_use]
+    pub fn body(&self) -> Value {
+        let mut body = self.event.body();
+        if let Some(body) = body.as_object_mut() {
+            body.insert("run".to_owned(), Value::String(self.run.to_hex()));
+        }
+        body
+    }
+}
 
 /// One thing a graph run says.
 ///
@@ -123,18 +155,18 @@ fn tokens(spend: Spend) -> Value {
 /// [`RunsNode`]: crate::RunsNode
 pub trait GraphReporting: Send + Sync {
     /// Says one thing.
-    fn say(&self, event: GraphEvent);
+    fn say(&self, said: GraphSaid);
 }
 
 /// Says nothing, which is what a caller that only wants the answer needs.
 impl GraphReporting for () {
-    fn say(&self, _: GraphEvent) {}
+    fn say(&self, _: GraphSaid) {}
 }
 
 /// Says it down a channel, dropping it if nobody is listening any more.
-impl GraphReporting for tokio::sync::mpsc::UnboundedSender<GraphEvent> {
-    fn say(&self, event: GraphEvent) {
-        let _ = self.send(event);
+impl GraphReporting for tokio::sync::mpsc::UnboundedSender<GraphSaid> {
+    fn say(&self, said: GraphSaid) {
+        let _ = self.send(said);
     }
 }
 
@@ -225,15 +257,22 @@ mod tests {
         assert_eq!(stopped.body()["cost_micros"], 330);
     }
 
+    fn said(event: GraphEvent) -> GraphSaid {
+        GraphSaid {
+            run: GraphRunId::generate().expect("a graph run id"),
+            event,
+        }
+    }
+
     #[test]
     fn saying_nothing_is_what_a_caller_that_only_wants_the_answer_does() {
         GraphReporting::say(
             &(),
-            GraphEvent::Done {
+            said(GraphEvent::Done {
                 answer: json!({}),
                 stopped_at: None,
                 spend: Spend::NOTHING,
-            },
+            }),
         );
     }
 
@@ -241,9 +280,57 @@ mod tests {
     fn a_watcher_that_has_hung_up_is_not_the_graphs_problem() {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         drop(receiver);
-        sender.say(GraphEvent::Node {
+        sender.say(said(GraphEvent::Node {
             name: name("intake"),
             input: String::new(),
-        });
+        }));
+    }
+
+    /// Every event of a stream says which run it is from, whatever kind of event it is.
+    #[test]
+    fn every_event_carries_the_run_it_belongs_to() {
+        let run = GraphRunId::generate().expect("a graph run id");
+        for event in [
+            GraphEvent::Node {
+                name: name("intake"),
+                input: String::new(),
+            },
+            GraphEvent::NodeDone {
+                name: name("intake"),
+                answer: String::new(),
+                stopped: Stopped::Answered,
+                spend: Spend::NOTHING,
+            },
+            GraphEvent::Turn {
+                node: name("intake"),
+                event: RunEvent::Text {
+                    text: "four".to_owned(),
+                },
+            },
+            GraphEvent::Done {
+                answer: json!({}),
+                stopped_at: None,
+                spend: Spend::NOTHING,
+            },
+        ] {
+            let said = GraphSaid { run, event };
+            assert_eq!(
+                said.body()["run"],
+                run.to_hex(),
+                "{} carried no run",
+                said.name()
+            );
+        }
+    }
+
+    /// Hex, 32 characters of it, and never two the same.
+    #[test]
+    fn a_graph_run_is_named_by_something_nothing_else_will_be() {
+        let one = GraphRunId::generate().expect("a graph run id");
+        let two = GraphRunId::generate().expect("another");
+        assert_ne!(one, two);
+        assert_eq!(one.to_hex().len(), 32);
+        assert_eq!(one.to_string(), one.to_hex());
+        assert!(one.to_hex().chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 }

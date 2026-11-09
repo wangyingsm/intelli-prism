@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+getrandom.workspace = true
+hex.workspace = true
 ip-agents = { version = "0.1.0", path = "../ip-agents" }
 ip-core.workspace = true
 ip-drsg = { version = "0.1.0", path = "../ip-drsg" }

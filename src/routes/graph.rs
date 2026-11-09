@@ -16,16 +16,16 @@ use ip_auth::Authority;
 use ip_core::{Capability, CapabilityScope, Protocol, TenantId};
 use ip_gateway::Gateway;
 use ip_graph::{
-    GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner, GraphSummary,
-    Graphing, Listing, MaxNodes, NodeName, NodeRan, RunGraph, RunGraphParts, RunsNode,
+    GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner, GraphRunId,
+    GraphSaid, GraphSummary, Graphing, Listing, MaxNodes, NodeName, NodeRan, RunGraph,
+    RunGraphParts, RunningNode, RunsNode,
 };
 use ip_mcp::{McpServer, McpSettings};
 use ip_run::{
-    AsWhom, Pinned, Reporting, Requested, RunError, RunEvent, RunId, RunSignal, Running, Spend,
-    Stopped, Target, Toolshed,
+    AsWhom, Pinned, Reporting, Requested, RunError, RunEvent, RunId, Running, Spend, Stopped,
+    Target, Toolshed,
 };
 use ip_storage::{AgentOwner, Page};
-use tokio::sync::watch;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{Paged, store_refusal};
@@ -394,15 +394,17 @@ struct Nodes {
     /// What each node of this graph needs, by name.
     prepared: BTreeMap<NodeName, Prepared>,
     /// Where the graph's stream is written.
-    say: tokio::sync::mpsc::UnboundedSender<GraphEvent>,
+    say: tokio::sync::mpsc::UnboundedSender<GraphSaid>,
 }
 
 /// One node's turns, said into the graph's own stream under that node's name.
 struct Saying {
+    /// Which graph run the node belongs to.
+    run: GraphRunId,
     /// Which node is saying it.
     node: NodeName,
     /// Where the graph's stream is written.
-    say: tokio::sync::mpsc::UnboundedSender<GraphEvent>,
+    say: tokio::sync::mpsc::UnboundedSender<GraphSaid>,
 }
 
 impl Reporting for Saying {
@@ -414,21 +416,25 @@ impl Reporting for Saying {
         if matches!(event, RunEvent::Done { .. }) {
             return;
         }
-        let _ = self.say.send(GraphEvent::Turn {
-            node: self.node.clone(),
-            event,
+        let _ = self.say.send(GraphSaid {
+            run: self.run,
+            event: GraphEvent::Turn {
+                node: self.node.clone(),
+                event,
+            },
         });
     }
 }
 
 #[async_trait::async_trait]
 impl RunsNode for Nodes {
-    async fn run(
-        &self,
-        node: GraphNode,
-        input: String,
-        signals: watch::Receiver<RunSignal>,
-    ) -> NodeRan {
+    async fn run(&self, running: RunningNode) -> NodeRan {
+        let RunningNode {
+            run,
+            node,
+            input,
+            signals,
+        } = running;
         let refused = |why: String| NodeRan {
             answer: String::new(),
             stopped: Stopped::Refused { why },
@@ -458,6 +464,7 @@ impl RunsNode for Nodes {
                 config: &prepared.config,
                 pinned: &prepared.pinned,
                 reporting: &Saying {
+                    run,
                     node: node.name.clone(),
                     say: self.say.clone(),
                 },
@@ -649,8 +656,19 @@ async fn start(
         Err(refusal) => return *refusal,
     };
 
+    let run = match GraphRunId::generate() {
+        Ok(run) => run,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("this run could not be named: {error}"),
+            )
+                .into_response();
+        }
+    };
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let graphing = Graphing {
+        id: run,
         graph,
         order,
         runner: Arc::new(Nodes {
@@ -664,11 +682,11 @@ async fn start(
     tokio::spawn(async move {
         ip_graph::run(&graphing).await;
     });
-    Sse::new(UnboundedReceiverStream::new(receiver).map(|event| {
+    Sse::new(UnboundedReceiverStream::new(receiver).map(|said| {
         Ok::<_, std::convert::Infallible>(
             SseEvent::default()
-                .event(event.name())
-                .data(event.body().to_string()),
+                .event(said.name())
+                .data(said.body().to_string()),
         )
     }))
     .into_response()
@@ -1435,6 +1453,64 @@ upstream_speaks = "anthropic"
             done["tokens"]["input"], 20,
             "the graph's spend is not both nodes': {done}"
         );
+    }
+
+    /// Every event of one stream names one run, which is what ties a graph's nodes together.
+    #[tokio::test]
+    async fn every_event_of_a_run_names_the_same_run() {
+        let (router, state, _plane) = running(
+            &["intake-agent", "reply-agent"],
+            chain_of_two(sorted_chain()),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let runs: std::collections::BTreeSet<&str> = said
+            .iter()
+            .map(|(name, body)| {
+                body["run"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name} carried no run: {body}"))
+            })
+            .collect();
+        assert_eq!(runs.len(), 1, "one run said more than one run id: {runs:?}");
+        let run = runs.iter().next().expect("a run id");
+        assert_eq!(run.len(), 32, "a run id that is not one: {run}");
+    }
+
+    /// Two runs of the same graph are told apart, which a retried dispatch will depend on.
+    #[tokio::test]
+    async fn two_runs_of_one_graph_are_named_apart() {
+        let mut named = Vec::new();
+        for _ in 0..2 {
+            let (router, state, _plane) = running(
+                &["intake-agent", "reply-agent"],
+                chain_of_two(sorted_chain()),
+            )
+            .await;
+            let said = streamed(
+                start_run(
+                    &router,
+                    &state,
+                    "alice",
+                    "/_ip/graph_run/triage?tenant=acme",
+                )
+                .await,
+            )
+            .await;
+            named.push(said[0].1["run"].as_str().expect("a run id").to_owned());
+        }
+        assert_ne!(named[0], named[1]);
     }
 
     /// Ruling 2 over the wire: the second node is given the first's answer under its name.

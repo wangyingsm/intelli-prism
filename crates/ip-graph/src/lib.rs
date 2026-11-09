@@ -24,9 +24,9 @@ mod plane;
 mod run;
 
 pub use error::GraphError;
-pub use event::{GraphEvent, GraphReporting};
+pub use event::{GraphEvent, GraphReporting, GraphSaid};
 pub use graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
-pub use id::{GraphId, GraphName, NodeName};
+pub use id::{GraphId, GraphName, GraphRunId, NodeName};
 pub use order::{Generation, Placed, RunOrder};
 pub use plane::{FEEDS, GRAPH_LABEL, GraphPlane, GraphSummary, Listing, NODE_LABEL};
-pub use run::{GraphRan, Graphing, NodeRan, RunsNode, run};
+pub use run::{GraphRan, Graphing, NodeRan, RunningNode, RunsNode, run};

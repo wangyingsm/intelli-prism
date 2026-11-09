@@ -178,6 +178,45 @@ impl TryFrom<String> for GraphName {
     }
 }
 
+/// How many bytes a graph run is named with.
+const GRAPH_RUN_BYTES: usize = 16;
+
+/// What one run of one graph is followed under.
+///
+/// Drawn rather than counted, for the reason `ip_run::RunId` is: no two nodes of a cluster can
+/// agree a counter without asking each other.
+///
+/// It names the *graph* run, and each node of it still mints an `ip_run::RunId` of its own, so a
+/// node's turns are a run's turns as they have always been. This is what ties those runs together:
+/// what a stream is about, what a persisted answer would be keyed by, and what tells a dispatch
+/// that was retried from one that is new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GraphRunId([u8; GRAPH_RUN_BYTES]);
+
+impl GraphRunId {
+    /// Name of this kind, as it appears in errors.
+    pub const KIND: &'static str = "graph run id";
+
+    /// Draws a new graph run id from the operating system entropy source.
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0u8; GRAPH_RUN_BYTES];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+
+    /// The hex form, which is what an event and a log carry.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+impl fmt::Display for GraphRunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

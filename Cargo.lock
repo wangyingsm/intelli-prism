@@ -1783,6 +1783,8 @@ name = "ip-graph"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "getrandom 0.4.3",
+ "hex",
  "ip-agents",
  "ip-core",
  "ip-drsg",

@@ -15,9 +15,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::event::{GraphEvent, GraphReporting};
+use crate::event::{GraphEvent, GraphReporting, GraphSaid};
 use crate::graph::{GraphNode, RunGraph};
-use crate::id::NodeName;
+use crate::id::{GraphRunId, NodeName};
 use crate::order::RunOrder;
 
 /// What one node's run came to.
@@ -37,6 +37,23 @@ pub struct NodeRan {
     pub traces: Vec<TraceId>,
 }
 
+/// One node's work, as whatever runs it is handed it.
+///
+/// A struct rather than four arguments because it is also the shape a dispatch takes: everything
+/// a node needs to run travels *to* the work and its answer comes back, so a machine running a
+/// node of somebody else's graph needs no access to that graph, its order, or what its siblings
+/// answered. Only the coordinator holds those.
+pub struct RunningNode {
+    /// Which graph run this node belongs to.
+    pub run: GraphRunId,
+    /// The node to run.
+    pub node: GraphNode,
+    /// What the graph built for it: its parents' answers, keyed by name.
+    pub input: String,
+    /// What the graph can say to it while it runs.
+    pub signals: watch::Receiver<RunSignal>,
+}
+
 /// Whatever runs one node of a graph.
 ///
 /// A seam rather than a direct call to `ip_run::run`, because running a node needs the
@@ -51,19 +68,16 @@ pub trait RunsNode: Send + Sync {
     /// Answers with what the run came to, never with an error: a node that was refused partway is
     /// a node that ran, and whether that stops the graph is [`run`]'s to decide.
     ///
-    /// The signal is the graph's word to a node that is already running, which an implementation
-    /// hands to `ip_run::run` and does not read itself. It is what keeps a sibling of a node that
-    /// broke from going on taking turns nobody will read.
-    async fn run(
-        &self,
-        node: GraphNode,
-        input: String,
-        signals: watch::Receiver<RunSignal>,
-    ) -> NodeRan;
+    /// The signal in [`RunningNode`] is the graph's word to a node that is already running, which
+    /// an implementation hands to `ip_run::run` and does not read itself. It is what keeps a
+    /// sibling of a node that broke from going on taking turns nobody will read.
+    async fn run(&self, running: RunningNode) -> NodeRan;
 }
 
 /// A graph, the order it runs in, and whatever runs one node of it.
 pub struct Graphing {
+    /// What this run is followed under.
+    pub id: GraphRunId,
     /// The graph to run.
     pub graph: RunGraph,
     /// The order its nodes run in, as the plane answered it.
@@ -151,6 +165,12 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
     let mut spend = Spend::NOTHING;
     let mut stopped_at = None;
     let (stop, listen) = watch::channel(RunSignal::Carry);
+    let say = |event| {
+        graphing.reporting.say(GraphSaid {
+            run: graphing.id,
+            event,
+        });
+    };
 
     while stopped_at.is_none() {
         let ready: Vec<NodeName> = graphing
@@ -176,13 +196,18 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
                 continue;
             };
             let input = input_for(graphing, &name, &answered);
-            graphing.reporting.say(GraphEvent::Node {
+            say(GraphEvent::Node {
                 name: name.clone(),
                 input: input.clone(),
             });
             let runner = Arc::clone(&graphing.runner);
-            let listen = listen.clone();
-            running.spawn(async move { (name, runner.run(node, input, listen).await) });
+            let running_node = RunningNode {
+                run: graphing.id,
+                node,
+                input,
+                signals: listen.clone(),
+            };
+            running.spawn(async move { (name, runner.run(running_node).await) });
         }
 
         // Every one of them is awaited, the stop included: a node already running is paid for.
@@ -192,7 +217,7 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
             };
             spend = spend + ran.spend;
             traces.extend(ran.traces.iter().cloned());
-            graphing.reporting.say(GraphEvent::NodeDone {
+            say(GraphEvent::NodeDone {
                 name: name.clone(),
                 answer: ran.answer.clone(),
                 stopped: ran.stopped.clone(),
@@ -220,7 +245,7 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
         spend,
         traces,
     };
-    graphing.reporting.say(GraphEvent::Done {
+    say(GraphEvent::Done {
         answer: ran.answer.clone(),
         stopped_at: ran.stopped_at.clone(),
         spend: ran.spend,
@@ -299,12 +324,13 @@ mod tests {
         /// A node that refuses does so on its first turn, before a sibling has reached its
         /// second: otherwise which of the two gets there first is a race, and a test of the
         /// signal would pass or fail on the scheduler.
-        async fn run(
-            &self,
-            node: GraphNode,
-            input: String,
-            signals: watch::Receiver<RunSignal>,
-        ) -> NodeRan {
+        async fn run(&self, running: RunningNode) -> NodeRan {
+            let RunningNode {
+                node,
+                input,
+                signals,
+                ..
+            } = running;
             let from = Instant::now();
             let refused = self.refuses.contains(node.name.as_str());
             let mut cut = false;
@@ -385,6 +411,7 @@ mod tests {
 
     fn graphing(graph: RunGraph, order: RunOrder, runner: Arc<Echo>) -> Graphing {
         Graphing {
+            id: GraphRunId::generate().expect("a graph run id"),
             graph,
             order,
             runner,
@@ -398,10 +425,11 @@ mod tests {
         graph: RunGraph,
         order: RunOrder,
         runner: Arc<Echo>,
-    ) -> (Graphing, tokio::sync::mpsc::UnboundedReceiver<GraphEvent>) {
+    ) -> (Graphing, tokio::sync::mpsc::UnboundedReceiver<GraphSaid>) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         (
             Graphing {
+                id: GraphRunId::generate().expect("a graph run id"),
                 graph,
                 order,
                 runner,
@@ -413,7 +441,7 @@ mod tests {
     }
 
     /// Every event a run said, by name, in the order it said them.
-    fn said(mut receiver: tokio::sync::mpsc::UnboundedReceiver<GraphEvent>) -> Vec<GraphEvent> {
+    fn said(mut receiver: tokio::sync::mpsc::UnboundedReceiver<GraphSaid>) -> Vec<GraphSaid> {
         let mut said = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             said.push(event);
@@ -603,7 +631,7 @@ mod tests {
         let ran = run(&graphing).await;
         let events = said(watcher);
 
-        let names: Vec<&str> = events.iter().map(GraphEvent::name).collect();
+        let names: Vec<&str> = events.iter().map(GraphSaid::name).collect();
         assert_eq!(
             names,
             ["node", "node_done", "node", "node_done", "done"],
@@ -611,14 +639,14 @@ mod tests {
         );
         // The input a node was given is said as it is given, which is what makes a stream
         // readable: ruling 2's keying is visible rather than inferred from the answer.
-        match &events[2] {
+        match &events[2].event {
             GraphEvent::Node { name, input } => {
                 assert_eq!(name.as_str(), "reply");
                 assert_eq!(input, r#"{"intake":"intake saw a ticket"}"#);
             }
             other => panic!("{other:?}"),
         }
-        match events.last().expect("a graph says it is over") {
+        match &events.last().expect("a graph says it is over").event {
             GraphEvent::Done {
                 answer,
                 stopped_at,
@@ -643,11 +671,11 @@ mod tests {
         let events = said(watcher);
 
         assert_eq!(
-            events.iter().map(GraphEvent::name).collect::<Vec<&str>>(),
+            events.iter().map(GraphSaid::name).collect::<Vec<&str>>(),
             ["node", "node_done", "done"],
             "the graph went on past the node that stopped it"
         );
-        match events.last().expect("a graph says it is over") {
+        match &events.last().expect("a graph says it is over").event {
             GraphEvent::Done { stopped_at, .. } => {
                 assert_eq!(stopped_at.as_ref().map(NodeName::as_str), Some("intake"));
             }
@@ -668,7 +696,7 @@ mod tests {
         );
         run(&graphing).await;
 
-        let names: Vec<&str> = said(watcher).iter().map(GraphEvent::name).collect();
+        let names: Vec<&str> = said(watcher).iter().map(GraphSaid::name).collect();
         assert_eq!(
             names,
             [
@@ -691,12 +719,7 @@ mod tests {
 
         #[async_trait]
         impl RunsNode for Costs {
-            async fn run(
-                &self,
-                _node: GraphNode,
-                _input: String,
-                _signals: watch::Receiver<RunSignal>,
-            ) -> NodeRan {
+            async fn run(&self, _running: RunningNode) -> NodeRan {
                 NodeRan {
                     answer: String::new(),
                     stopped: Stopped::Answered,
@@ -710,6 +733,7 @@ mod tests {
         }
 
         let ran = run(&Graphing {
+            id: GraphRunId::generate().expect("a graph run id"),
             graph: graph(&["a", "b", "c"], &[("a", "b"), ("b", "c")]),
             order: order(&[("a", 0), ("b", 1), ("c", 2)]),
             runner: Arc::new(Costs),
