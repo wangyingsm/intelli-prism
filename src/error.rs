@@ -61,6 +61,14 @@ pub enum StartupError {
     #[error(transparent)]
     Feed(#[from] FeedError),
 
+    /// The configured graph store could not be named, although the configuration took it.
+    ///
+    /// A startup failure rather than a graph refusal: `ip-config` and `ip-drsg` apply the same
+    /// rules to the same three values, written out twice because the config crate cannot depend
+    /// on the client's newtypes, and this is where the two disagreeing shows up.
+    #[error(transparent)]
+    GraphStore(#[from] ip_drsg::DrsgError),
+
     /// The configured backend is not compiled into this build.
     #[allow(
         dead_code,

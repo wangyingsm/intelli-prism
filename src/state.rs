@@ -9,10 +9,12 @@ use ip_cache::{Cache, CacheBackend, Counters, Ttl};
 use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_core::RouteRule;
+use ip_drsg::{DrsgClient, DrsgEndpoint, DrsgSettings, PlaneName};
 use ip_gateway::{
     Configured, Dispatcher, Gateway, HyperUpstream, Limiter, Limits, Prices, ResponseCache,
     RoutingTable,
 };
+use ip_graph::GraphPlane;
 use ip_plugin::{PluginChains, PluginHost, PluginLimits};
 #[cfg(feature = "fast-storage")]
 use ip_storage::PostgresStore;
@@ -63,6 +65,9 @@ pub struct AppState {
     configured: Arc<Configured>,
     feed: Arc<RuleFeed>,
     reloader: Arc<Reloader>,
+    /// Where the run graphs are kept, where a deployment keeps any. Absent is not a degraded
+    /// graph store but a deployment with no graph feature, and the routes answer accordingly.
+    graphs: Option<Arc<GraphPlane>>,
     /// The store a test reads through, when the state was built for one, so the test can
     /// make it fail where it means to.
     #[cfg(test)]
@@ -125,6 +130,7 @@ impl AppState {
                 feature: "semantic",
             });
         }
+        let graphs = open_graphs(config)?;
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
         let backend: Arc<dyn Backend> = Arc::clone(&store);
@@ -291,6 +297,7 @@ impl AppState {
             feed,
             reloader,
             started_at,
+            graphs,
             #[cfg(test)]
             failing_store: None,
             #[cfg(test)]
@@ -346,9 +353,17 @@ impl AppState {
             feed,
             reloader,
             started_at: RuleRevision::new(0),
+            graphs: None,
             failing_store: Some(failing_store),
             failing_cache: Some(failing_cache),
         }
+    }
+
+    /// The same state over a graph store, for a test that works on one.
+    #[cfg(test)]
+    pub fn with_graphs(mut self, graphs: Arc<GraphPlane>) -> Self {
+        self.graphs = Some(graphs);
+        self
     }
 
     /// The store every read goes through, which a test can tell to fail.
@@ -389,6 +404,11 @@ impl AppState {
     /// identity half is wanted, it is the same handle read as `&dyn Storage`.
     pub fn store(&self) -> &Arc<dyn Backend> {
         &self.store
+    }
+
+    /// Where the run graphs are kept, where this deployment keeps any.
+    pub fn graphs(&self) -> Option<&Arc<GraphPlane>> {
+        self.graphs.as_ref()
     }
 
     /// Opens and ends the sessions the web carries.
@@ -502,6 +522,26 @@ async fn open_cache(config: &CacheConfig) -> Result<Arc<dyn CacheBackend>, Start
             feature: "cluster-cache",
         }),
     }
+}
+
+/// The graph store, where one is configured.
+///
+/// No connection is made here: a client is a pool and a plane is made on first write, so a graph
+/// store that is not up yet is not a startup failure. What `ip-config` already refused is the
+/// shape of the url, the token and the plane name; this only rebuilds them as the client's own
+/// types, which is why its errors are a startup failure rather than a graph refusal.
+fn open_graphs(config: &Config) -> Result<Option<Arc<GraphPlane>>, StartupError> {
+    let Some(graph_store) = config.graph_store.as_ref() else {
+        return Ok(None);
+    };
+    let settings = DrsgSettings {
+        endpoint: DrsgEndpoint::new(graph_store.url.as_str())?,
+        token: graph_store.token.clone(),
+        plane: PlaneName::new(&graph_store.plane)?,
+        timeout: std::time::Duration::from_secs(graph_store.timeout.get()),
+    };
+    tracing::info!(plane = %settings.plane, "run graphs kept in a plane");
+    Ok(Some(Arc::new(GraphPlane::new(DrsgClient::new(settings)))))
 }
 
 #[cfg(test)]

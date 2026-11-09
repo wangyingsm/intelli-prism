@@ -88,6 +88,54 @@ fn owned_by(owner: &GraphOwner, id: &GraphId) -> Value {
     })
 }
 
+/// How much of one owner's listing to answer with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listing {
+    /// The most graphs to answer with.
+    pub limit: u32,
+    /// How many to pass over first.
+    pub offset: u32,
+}
+
+/// One graph as a listing reports it: what it says about itself, without its nodes.
+///
+/// A graph's nodes and edges are two further reads each, so a listing of fifty graphs would be a
+/// hundred and fifty round trips to answer a question nobody asked. [`GraphPlane::get`] is what
+/// answers with a whole graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphSummary {
+    /// What the graph is spelled by.
+    pub id: GraphId,
+    /// What it is called.
+    pub name: GraphName,
+    /// The most nodes it may hold.
+    pub max_nodes: MaxNodes,
+}
+
+/// The plan that lists one owner's graphs, as a table of what each says about itself.
+///
+/// A projection rather than node rows for two reasons: a listing wants three properties of each
+/// graph and not every property of each, and the projection is the only place a plan can *skip*
+/// rows, which is what paging is. The owner is projected alongside them so the rows can be checked
+/// the way [`ours`] checks a single read's.
+fn graphs_plan(owner: &GraphOwner, listing: Listing) -> Value {
+    let column =
+        |property: &str| json!({"name": property, "expr": {"Value": {"Property": property}}});
+    json!({
+        "source": {"ScanLabel": GRAPH_LABEL},
+        "steps": [{"Filter": eq(OWNER, owner.written())}],
+        "project": {
+            "items": [column(GRAPH), column(NAME), column(MAX_NODES), column(OWNER)],
+            "distinct": false,
+            // By the id, so two pages of one listing cannot answer with one graph twice and
+            // leave another out.
+            "order_by": [{"column": 0, "descending": false}],
+            "skip": listing.offset,
+            "limit": listing.limit,
+        },
+    })
+}
+
 /// The plan that reads one graph's own row.
 fn graph_plan(owner: &GraphOwner, id: &GraphId) -> Value {
     json!({
@@ -246,6 +294,46 @@ fn edges_from(table: &Value) -> Result<Vec<GraphEdge>, GraphError> {
             Ok(GraphEdge {
                 from: name(&pair[0])?,
                 to: name(&pair[1])?,
+            })
+        })
+        .collect()
+}
+
+/// The table of a listing, as what each graph says about itself.
+fn summaries_from(table: &Value, owner: &GraphOwner) -> Result<Vec<GraphSummary>, GraphError> {
+    let rows = table["rows"]
+        .as_array()
+        .ok_or_else(|| GraphError::Unreadable {
+            detail: "a listing answered with something that is not a table".to_owned(),
+        })?;
+    rows.iter()
+        .map(|row| {
+            let cells = row
+                .as_array()
+                .filter(|cells| cells.len() == 4)
+                .ok_or_else(|| GraphError::Unreadable {
+                    detail: "a listed row is not the four columns it was asked for".to_owned(),
+                })?;
+            fn said<'cell>(
+                cell: &'cell Value,
+                property: &'static str,
+            ) -> Result<&'cell str, GraphError> {
+                cell.as_str().ok_or(GraphError::PropertyKind { property })
+            }
+            if said(&cells[3], OWNER)? != owner.written() {
+                return Err(GraphError::Foreign { property: OWNER });
+            }
+            let ceiling = cells[2].as_u64().ok_or(GraphError::PropertyKind {
+                property: MAX_NODES,
+            })?;
+            Ok(GraphSummary {
+                id: GraphId::new(said(&cells[0], GRAPH)?)?,
+                name: GraphName::new(said(&cells[1], NAME)?)?,
+                max_nodes: MaxNodes::new(u32::try_from(ceiling).map_err(|_| {
+                    GraphError::PropertyKind {
+                        property: MAX_NODES,
+                    }
+                })?)?,
             })
         })
         .collect()
@@ -507,6 +595,38 @@ impl GraphPlane {
         .map(Some)
     }
 
+    /// One owner's graphs, by id, as each says about itself.
+    ///
+    /// One read however many graphs it answers with, and the rows are checked against the owner
+    /// that asked for the same reason [`ours`] checks a single read's: the filter in the plan is
+    /// the lock, and this is the second one on the same door.
+    pub async fn graphs(
+        &self,
+        owner: &GraphOwner,
+        listing: Listing,
+    ) -> Result<Vec<GraphSummary>, GraphError> {
+        let answered = self.drsg.query(graphs_plan(owner, listing)).await?;
+        summaries_from(&answered, owner)
+    }
+
+    /// Takes one owner's graph out of the plane, saying whether it held one.
+    ///
+    /// Presence is the graph's own row and not whether the whole graph can be rebuilt: a graph
+    /// whose stored rows no longer make a valid graph is exactly one an operator must be able to
+    /// delete, so this does not go through [`GraphPlane::get`].
+    pub async fn remove(&self, owner: &GraphOwner, id: &GraphId) -> Result<bool, GraphError> {
+        let answered = self.drsg.query(graph_plan(owner, id)).await?;
+        let rows = answered.as_array().ok_or_else(|| GraphError::Unreadable {
+            detail: "a graph read answered with something that is not rows".to_owned(),
+        })?;
+        let Some(row) = rows.first() else {
+            return Ok(false);
+        };
+        ours(row, owner, id)?;
+        self.clear(owner, id).await?;
+        Ok(true)
+    }
+
     /// The keys of the nodes this owner's graph holds now, which is what a write deletes first.
     async fn held(&self, owner: &GraphOwner, id: &GraphId) -> Result<Vec<String>, GraphError> {
         let answered = self.drsg.query(nodes_plan(owner, id)).await?;
@@ -609,6 +729,164 @@ mod tests {
             ("plane.algo", json!({"count": 0, "results": []})),
         ]))
         .await
+    }
+
+    #[tokio::test]
+    async fn a_listing_filters_on_the_owner_and_pages_in_the_plan_itself() {
+        let stub = StubPlane::start(Replies::scripted([(
+            "plane.query",
+            json!({
+                "columns": [GRAPH, NAME, MAX_NODES, OWNER],
+                "rows": [["triage", "Support triage", 8, "acme"]],
+            }),
+        )]))
+        .await;
+
+        let listed = GraphPlane::new(stub.client())
+            .graphs(
+                &tenant(),
+                Listing {
+                    limit: 5,
+                    offset: 10,
+                },
+            )
+            .await
+            .expect("a listing");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id.as_str(), "triage");
+        assert_eq!(listed[0].name.as_str(), "Support triage");
+        assert_eq!(listed[0].max_nodes.get(), 8);
+        let plan = &stub.only().params["plan"];
+        assert_eq!(plan["source"]["ScanLabel"], GRAPH_LABEL);
+        assert_eq!(plan["project"]["skip"], 10);
+        assert_eq!(plan["project"]["limit"], 5);
+        assert_eq!(
+            plan["steps"][0]["Filter"]["Compare"]["rhs"]["Literal"]["Str"], "acme",
+            "a listing did not filter on the owner: {plan}"
+        );
+    }
+
+    /// The projection carries the owner so the rows can be checked the way a single read's are.
+    #[tokio::test]
+    async fn a_listed_row_of_another_owner_is_refused() {
+        let stub = StubPlane::start(Replies::scripted([(
+            "plane.query",
+            json!({
+                "columns": [GRAPH, NAME, MAX_NODES, OWNER],
+                "rows": [["triage", "Support triage", 8, "other"]],
+            }),
+        )]))
+        .await;
+
+        assert_eq!(
+            GraphPlane::new(stub.client())
+                .graphs(
+                    &tenant(),
+                    Listing {
+                        limit: 5,
+                        offset: 0
+                    }
+                )
+                .await,
+            Err(GraphError::Foreign { property: OWNER })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_answering_with_anything_but_a_table_is_refused() {
+        for answered in [
+            json!([]),
+            json!({"rows": [["triage"]]}),
+            json!({"rows": "no"}),
+        ] {
+            let stub =
+                StubPlane::start(Replies::scripted([("plane.query", answered.clone())])).await;
+            assert!(
+                GraphPlane::new(stub.client())
+                    .graphs(
+                        &tenant(),
+                        Listing {
+                            limit: 5,
+                            offset: 0
+                        }
+                    )
+                    .await
+                    .is_err(),
+                "a listing took {answered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_a_graph_takes_its_own_row_and_every_node_with_it() {
+        let graph = graph();
+        let stub = StubPlane::start(Replies::in_turn([
+            graph_rows(&graph),
+            node_rows(&graph),
+            json!({"deleted": true}),
+            json!({"deleted": true}),
+            json!({"deleted": true}),
+        ]))
+        .await;
+
+        assert!(
+            GraphPlane::new(stub.client())
+                .remove(&tenant(), &id())
+                .await
+                .expect("the graph was there"),
+        );
+        let deleted: Vec<String> = stub
+            .calls("node.delete")
+            .into_iter()
+            .map(|params| params["key"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert!(
+            deleted.contains(&format!("{GRAPH_LABEL}/acme/triage")),
+            "the graph's own row was left behind: {deleted:?}"
+        );
+        assert_eq!(deleted.len(), 3, "{deleted:?}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_graph_that_is_not_there_says_so_and_deletes_nothing() {
+        let stub = StubPlane::start(Replies::scripted([("plane.query", json!([]))])).await;
+
+        assert!(
+            !GraphPlane::new(stub.client())
+                .remove(&tenant(), &id())
+                .await
+                .expect("a read that found nothing is not a failure")
+        );
+        assert!(stub.calls("node.delete").is_empty());
+    }
+
+    /// A delete is the one place a foreign row must stop the call rather than be read past.
+    #[tokio::test]
+    async fn removing_a_graph_the_store_says_is_another_owners_is_refused() {
+        let stub = StubPlane::start(Replies::scripted([(
+            "plane.query",
+            json!([{
+                "id": 1,
+                "external_key": format!("{GRAPH_LABEL}/other/triage"),
+                "labels": [GRAPH_LABEL],
+                "properties": {
+                    GRAPH: "triage", OWNER: "other", NAME: "Support triage", MAX_NODES: 8,
+                },
+            }]),
+        )]))
+        .await;
+
+        assert_eq!(
+            GraphPlane::new(stub.client())
+                .remove(&tenant(), &id())
+                .await,
+            Err(GraphError::Foreign { property: OWNER })
+        );
+        assert!(
+            stub.calls("node.delete").is_empty(),
+            "a row the store should never have answered with was deleted anyway"
+        );
     }
 
     #[test]

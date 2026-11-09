@@ -27,8 +27,10 @@ ip-auth = { version = "0.1.0", path = "crates/ip-auth" }
 ip-cache = { version = "0.1.0", path = "crates/ip-cache", default-features = false }
 ip-config = { version = "0.1.0", path = "crates/ip-config" }
 ip-core = { version = "0.1.0", path = "crates/ip-core" }
+ip-drsg = { version = "0.1.0", path = "crates/ip-drsg" }
 ip-filter = { version = "0.1.0", path = "crates/ip-filter" }
 ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
+ip-graph = { version = "0.1.0", path = "crates/ip-graph" }
 ip-mcp = { version = "0.1.0", path = "crates/ip-mcp" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
 ip-run = { version = "0.1.0", path = "crates/ip-run" }
@@ -110,6 +112,7 @@ wildcard_imports = "warn"           # name what a module takes, `super` and prel
 [dev-dependencies]
 async-trait = "0.1.92"
 hex.workspace = true
+ip-drsg = { version = "0.1.0", path = "crates/ip-drsg", features = ["testing"] }
 sha2.workspace = true
 bytes = "1.12.1"
 http-body-util = "0.1.5"
