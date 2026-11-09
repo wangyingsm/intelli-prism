@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use crate::event::{GraphEvent, GraphReporting};
 use crate::graph::{GraphNode, RunGraph};
 use crate::id::NodeName;
 use crate::order::RunOrder;
@@ -71,6 +72,8 @@ pub struct Graphing {
     pub runner: Arc<dyn RunsNode>,
     /// What the graph as a whole was asked.
     pub input: String,
+    /// Where it says what it is doing as it does it.
+    pub reporting: Arc<dyn GraphReporting>,
 }
 
 /// What running a whole graph came to.
@@ -173,6 +176,10 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
                 continue;
             };
             let input = input_for(graphing, &name, &answered);
+            graphing.reporting.say(GraphEvent::Node {
+                name: name.clone(),
+                input: input.clone(),
+            });
             let runner = Arc::clone(&graphing.runner);
             let listen = listen.clone();
             running.spawn(async move { (name, runner.run(node, input, listen).await) });
@@ -185,6 +192,12 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
             };
             spend = spend + ran.spend;
             traces.extend(ran.traces.iter().cloned());
+            graphing.reporting.say(GraphEvent::NodeDone {
+                name: name.clone(),
+                answer: ran.answer.clone(),
+                stopped: ran.stopped.clone(),
+                spend: ran.spend,
+            });
             if !matches!(ran.stopped, Stopped::Answered | Stopped::CutShort) && stopped_at.is_none()
             {
                 stopped_at = Some(name.clone());
@@ -197,7 +210,7 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
         }
     }
 
-    GraphRan {
+    let ran = GraphRan {
         answer: match stopped_at {
             Some(_) => json!({}),
             None => answer_of(&graphing.graph, &answered),
@@ -206,7 +219,13 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
         stopped_at,
         spend,
         traces,
-    }
+    };
+    graphing.reporting.say(GraphEvent::Done {
+        answer: ran.answer.clone(),
+        stopped_at: ran.stopped_at.clone(),
+        spend: ran.spend,
+    });
+    ran
 }
 
 #[cfg(test)]
@@ -370,7 +389,36 @@ mod tests {
             order,
             runner,
             input: "a ticket".to_owned(),
+            reporting: Arc::new(()),
         }
+    }
+
+    /// The same, over a sink a test can read back in the order it was said.
+    fn watched(
+        graph: RunGraph,
+        order: RunOrder,
+        runner: Arc<Echo>,
+    ) -> (Graphing, tokio::sync::mpsc::UnboundedReceiver<GraphEvent>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Graphing {
+                graph,
+                order,
+                runner,
+                input: "a ticket".to_owned(),
+                reporting: Arc::new(sender),
+            },
+            receiver,
+        )
+    }
+
+    /// Every event a run said, by name, in the order it said them.
+    fn said(mut receiver: tokio::sync::mpsc::UnboundedReceiver<GraphEvent>) -> Vec<GraphEvent> {
+        let mut said = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            said.push(event);
+        }
+        said
     }
 
     #[tokio::test]
@@ -546,6 +594,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_says_each_node_beginning_and_ending_and_then_the_graph() {
+        let (graphing, watcher) = watched(
+            graph(&["intake", "reply"], &[("intake", "reply")]),
+            order(&[("intake", 0), ("reply", 1)]),
+            Echo::new(Duration::ZERO, 1, &[]),
+        );
+        let ran = run(&graphing).await;
+        let events = said(watcher);
+
+        let names: Vec<&str> = events.iter().map(GraphEvent::name).collect();
+        assert_eq!(
+            names,
+            ["node", "node_done", "node", "node_done", "done"],
+            "a node ended after the next had begun, or the graph spoke out of turn"
+        );
+        // The input a node was given is said as it is given, which is what makes a stream
+        // readable: ruling 2's keying is visible rather than inferred from the answer.
+        match &events[2] {
+            GraphEvent::Node { name, input } => {
+                assert_eq!(name.as_str(), "reply");
+                assert_eq!(input, r#"{"intake":"intake saw a ticket"}"#);
+            }
+            other => panic!("{other:?}"),
+        }
+        match events.last().expect("a graph says it is over") {
+            GraphEvent::Done {
+                answer,
+                stopped_at,
+                spend,
+            } => {
+                assert_eq!(answer, &ran.answer, "the stream and the result disagree");
+                assert_eq!(stopped_at, &None);
+                assert_eq!(spend, &ran.spend);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_graph_that_was_stopped_says_so_in_the_event_that_ends_it() {
+        let (graphing, watcher) = watched(
+            graph(&["intake", "reply"], &[("intake", "reply")]),
+            order(&[("intake", 0), ("reply", 1)]),
+            Echo::new(Duration::ZERO, 1, &["intake"]),
+        );
+        run(&graphing).await;
+        let events = said(watcher);
+
+        assert_eq!(
+            events.iter().map(GraphEvent::name).collect::<Vec<&str>>(),
+            ["node", "node_done", "done"],
+            "the graph went on past the node that stopped it"
+        );
+        match events.last().expect("a graph says it is over") {
+            GraphEvent::Done { stopped_at, .. } => {
+                assert_eq!(stopped_at.as_ref().map(NodeName::as_str), Some("intake"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A generation says every node of it before any of them is done.
+    #[tokio::test]
+    async fn a_generation_announces_all_of_itself_before_any_of_it_finishes() {
+        let (graphing, watcher) = watched(
+            graph(
+                &["left", "right", "merge"],
+                &[("left", "merge"), ("right", "merge")],
+            ),
+            order(&[("left", 0), ("right", 0), ("merge", 1)]),
+            Echo::new(Duration::ZERO, 1, &[]),
+        );
+        run(&graphing).await;
+
+        let names: Vec<&str> = said(watcher).iter().map(GraphEvent::name).collect();
+        assert_eq!(
+            names,
+            [
+                "node",
+                "node",
+                "node_done",
+                "node_done",
+                "node",
+                "node_done",
+                "done"
+            ],
+            "the pair of a generation was not both begun before either ended"
+        );
+    }
+
+    #[tokio::test]
     async fn what_a_graph_spent_is_every_node_of_it_summed() {
         /// A runner that spends one token of each kind per node.
         struct Costs;
@@ -575,6 +714,7 @@ mod tests {
             order: order(&[("a", 0), ("b", 1), ("c", 2)]),
             runner: Arc::new(Costs),
             input: "a ticket".to_owned(),
+            reporting: Arc::new(()),
         })
         .await;
         assert_eq!(ran.spend.tokens.input.get(), 6);

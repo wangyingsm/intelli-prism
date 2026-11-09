@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod event;
 mod graph;
 mod id;
 mod order;
@@ -23,6 +24,7 @@ mod plane;
 mod run;
 
 pub use error::GraphError;
+pub use event::{GraphEvent, GraphReporting};
 pub use graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
 pub use id::{GraphId, GraphName, NodeName};
 pub use order::{Generation, Placed, RunOrder};
