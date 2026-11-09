@@ -14,6 +14,7 @@ categories = ["network-programming", "web-programming::http-server"]
 ip-classify = { path = "crates/ip-classify", optional = true }
 ip-embed = { version = "0.1.0", path = "crates/ip-embed", optional = true }
 ip-onnx = { version = "0.1.0", path = "crates/ip-onnx", optional = true }
+async-trait = "0.1.92"
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = { version = "0.3.34", default-features = false }
@@ -110,7 +111,6 @@ unwrap_used = "warn"                # `expect` states why, `unwrap` states nothi
 wildcard_imports = "warn"           # name what a module takes, `super` and preludes excepted
 
 [dev-dependencies]
-async-trait = "0.1.92"
 hex.workspace = true
 ip-drsg = { version = "0.1.0", path = "crates/ip-drsg", features = ["testing"] }
 sha2.workspace = true

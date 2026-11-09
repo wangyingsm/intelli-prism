@@ -202,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn no_endpoint_taking_a_tenant_in_a_body_serves_another_tenants_member() {
         let theirs = theirs();
-        let cases: [(&str, String, Option<String>); 10] = [
+        let cases: [(&str, String, Option<String>); 15] = [
             ("GET", format!("/_ip/limits?tenant={theirs}"), None),
             (
                 "PUT",
@@ -214,6 +214,30 @@ mod tests {
             ("GET", format!("/_ip/usage?tenant={theirs}"), None),
             ("GET", format!("/_ip/usage/summary?tenant={theirs}"), None),
             ("GET", format!("/_ip/audit?tenant={theirs}"), None),
+            ("GET", format!("/_ip/graphs?tenant={theirs}"), None),
+            (
+                "GET",
+                format!("/_ip/graphs/theirs?tenant={theirs}"),
+                None,
+            ),
+            (
+                "PUT",
+                format!("/_ip/graphs/theirs?tenant={theirs}"),
+                Some(
+                    r#"{"name":"Theirs","nodes":[{"name":"a","agent":"x"}],"max_nodes":8}"#
+                        .to_owned(),
+                ),
+            ),
+            (
+                "DELETE",
+                format!("/_ip/graphs/theirs?tenant={theirs}"),
+                None,
+            ),
+            (
+                "POST",
+                format!("/_ip/graph_run/theirs?tenant={theirs}"),
+                Some(r#"{"input":"how many?"}"#.to_owned()),
+            ),
             ("GET", format!("/_ip/agents?tenant={theirs}"), None),
             (
                 "PUT",
@@ -268,6 +292,7 @@ mod tests {
             "/_ip/plugin-rules",
             "/_ip/audit",
             "/_ip/agents",
+            "/_ip/graphs",
         ] {
             let response = router
                 .clone()
@@ -342,7 +367,7 @@ mod tests {
             .collect();
         // Every prefix, and what this file does about it. A prefix that holds nothing
         // of any tenant's says so here rather than being quietly left out.
-        let audited: [(&str, &str); 15] = [
+        let audited: [(&str, &str); 17] = [
             ("/_ip/tenants", "asked for by path"),
             ("/_ip/tenants/{tenant}/members", "asked for by path"),
             (
@@ -363,6 +388,8 @@ mod tests {
             ("/_ip/usage", "asked for by query"),
             ("/_ip/audit", "asked for by query"),
             ("/_ip/agents", "asked for by query"),
+            ("/_ip/graphs", "asked for by query"),
+            ("/_ip/graph_run", "asked for by query"),
             (
                 "/_ip/mcps",
                 "a server the deployment reaches tools over, belonging to no tenant",

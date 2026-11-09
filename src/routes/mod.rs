@@ -70,6 +70,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/_ip/audit", audit::router())
         .nest("/_ip/agents", agent::router())
         .nest("/_ip/graphs", graph::router())
+        .nest("/_ip/graph_run", graph::run_router())
         .nest("/_ip/mcps", mcp::router())
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
