@@ -132,10 +132,54 @@ async fn serve(config: &Path) -> Result<(), StartupError> {
 /// How long a shutdown waits for the records of the requests it has just answered.
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Returns when the kernel asks this process to stop, by either signal that means it.
+///
+/// Both, not only an interrupt: a container runtime stops a process with `SIGTERM`, and a server
+/// that listens for `SIGINT` alone shuts down gracefully at a terminal and is killed outright
+/// everywhere it is actually deployed — losing the records of requests it has already answered,
+/// and leaving its own row in the cluster behind.
 async fn shutdown() {
-    if tokio::signal::ctrl_c().await.is_ok() {
-        tracing::info!("shutting down");
+    let why = tokio::select! {
+        () = interrupted() => "interrupted",
+        () = terminated() => "terminated",
+    };
+    tracing::info!(why, "shutting down");
+}
+
+/// Returns on `SIGINT`, which is what a terminal sends.
+async fn interrupted() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        waits_forever().await;
     }
+}
+
+/// Returns on `SIGTERM`, which is what a container runtime sends.
+#[cfg(unix)]
+async fn terminated() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut termination) => {
+            termination.recv().await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot listen for a termination signal");
+            waits_forever().await;
+        }
+    }
+}
+
+/// Nothing to listen to off unix, where the interrupt is the whole of it.
+#[cfg(not(unix))]
+async fn terminated() {
+    waits_forever().await;
+}
+
+/// A signal that will not arrive, so the other one decides.
+///
+/// Never returning is the point: a handler that could not be installed must not look like the
+/// signal it was waiting for, which would shut the server down the moment it started.
+async fn waits_forever() {
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]
