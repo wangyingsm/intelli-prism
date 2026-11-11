@@ -199,4 +199,11 @@ pub enum CoreError {
         /// The most it may be.
         most: u64,
     },
+
+    /// An address written as neither `host:port` nor `[v6]:port`.
+    #[error("{value:?} is not a host and a port")]
+    NotAnAddress {
+        /// What was written.
+        value: String,
+    },
 }

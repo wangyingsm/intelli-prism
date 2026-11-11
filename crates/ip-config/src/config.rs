@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use ip_core::route::ClusterAddress;
 use ip_embed::MOST_HELD;
 use serde::Deserialize;
 use url::Url;
@@ -57,6 +58,9 @@ pub struct Config {
     /// is not a degraded graph but no graph feature.
     #[serde(default)]
     pub graph_store: Option<GraphStoreConfig>,
+    /// How the other members of this cluster reach this deployment.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 /// The dr-strange plane the run graphs are kept in.
@@ -467,6 +471,31 @@ impl Config {
 pub struct ServerConfig {
     /// Address the downstream listener binds to.
     pub listen: SocketAddr,
+}
+
+/// How the other members of this cluster reach this deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// Where to tell the rest of the cluster this deployment answers. Unset, the address
+    /// the listener binds is used, which is right for a deployment bound to one interface
+    /// and says nothing for one bound to all of them.
+    #[serde(default)]
+    pub advertise: Option<ClusterAddress>,
+}
+
+impl ClusterConfig {
+    /// Where this deployment is reachable, given what its listener bound.
+    ///
+    /// Nothing, when neither an advertisement nor the bound address names an interface: a
+    /// deployment on `0.0.0.0` that advertises nothing has not said where it is, and the
+    /// alternative to answering nothing is publishing an address nobody can dial.
+    pub fn address(&self, bound: SocketAddr) -> Result<Option<ClusterAddress>, ConfigError> {
+        match &self.advertise {
+            Some(advertised) => Ok(Some(advertised.clone())),
+            None => Ok(ClusterAddress::of(bound)?),
+        }
+    }
 }
 
 /// Which storage backend holds tenants, users and grants.
@@ -1759,5 +1788,69 @@ model = "claude-sonnet-5"
             .map(ip_core::TenantId::as_str)
             .collect();
         assert_eq!(named, vec!["acme", "quiet"]);
+    }
+
+    #[test]
+    fn a_deployment_advertises_the_address_the_listener_bound() {
+        let config = Config::parse(FULL).unwrap();
+        assert_eq!(config.cluster.advertise, None, "nothing is advertised");
+
+        let address = config
+            .cluster
+            .address(config.server.listen)
+            .unwrap()
+            .expect("a listener bound to one interface says where it is");
+
+        assert_eq!(address.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn a_deployment_bound_to_every_interface_says_where_it_is_or_nowhere() {
+        let config = Config::parse(MINIMAL).unwrap();
+        assert_eq!(config.server.listen.to_string(), "0.0.0.0:443");
+
+        assert_eq!(
+            config.cluster.address(config.server.listen).unwrap(),
+            None,
+            "a wildcard with no advertisement is not an address"
+        );
+
+        let advertised = Config::parse(&format!(
+            "{MINIMAL}\n[cluster]\nadvertise = \"10.0.0.2:8443\"\n"
+        ))
+        .unwrap();
+
+        let address = advertised
+            .cluster
+            .address(advertised.server.listen)
+            .unwrap()
+            .expect("what was advertised");
+
+        assert_eq!(address.to_string(), "10.0.0.2:8443");
+    }
+
+    #[test]
+    fn an_advertisement_is_taken_over_what_was_bound() {
+        let written = format!("{FULL}\n[cluster]\nadvertise = \"node-3.cluster.local:9000\"\n");
+        let config = Config::parse(&written).unwrap();
+
+        let address = config
+            .cluster
+            .address(config.server.listen)
+            .unwrap()
+            .expect("what was advertised");
+
+        assert_eq!(address.to_string(), "node-3.cluster.local:9000");
+    }
+
+    #[test]
+    fn an_advertisement_that_is_not_an_address_is_refused_at_the_door() {
+        for written in ["10.0.0.2", "10.0.0.2:0", "10.0.0.2:70000", ""] {
+            let refused = Config::parse(&format!(
+                "{MINIMAL}\n[cluster]\nadvertise = \"{written}\"\n"
+            ));
+
+            assert!(refused.is_err(), "{written:?} was taken as an address");
+        }
     }
 }

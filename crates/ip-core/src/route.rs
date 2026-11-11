@@ -1,7 +1,7 @@
 //! A routing rule: what arrives, where it goes, and how it is dispatched.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use crate::error::CoreError;
@@ -380,6 +380,94 @@ impl Replica {
 impl fmt::Display for Replica {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+/// Where this deployment answers the other members of its own cluster.
+///
+/// Deliberately not a [`Replica`], which names an upstream endpoint that answered a request: this
+/// names us. Its parts are private because not every pair of them is an address worth publishing —
+/// an address is built by [`ClusterAddress::of`], which refuses the wildcard a listener binds when
+/// it means "every interface" and names none.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct ClusterAddress {
+    host: Host,
+    port: Port,
+}
+
+impl ClusterAddress {
+    /// Name of this kind, as it appears in errors.
+    pub const KIND: &'static str = "cluster address";
+
+    /// Pairs a host with the port this deployment answers on.
+    pub fn new(host: Host, port: Port) -> Self {
+        Self { host, port }
+    }
+
+    /// The address a bound socket names, or nothing when it names every interface and so none.
+    ///
+    /// A deployment that binds `0.0.0.0` has not said where it is, and an address nobody can
+    /// reach is worse than no address: it would be published and dialled.
+    pub fn of(bound: SocketAddr) -> Result<Option<Self>, CoreError> {
+        if bound.ip().is_unspecified() {
+            return Ok(None);
+        }
+        Ok(Some(Self::new(
+            Host::new(&bound.ip().to_string())?,
+            Port::new(bound.port())?,
+        )))
+    }
+
+    /// Where it is.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// The port it answers on.
+    pub fn port(&self) -> Port {
+        self.port
+    }
+}
+
+impl FromStr for ClusterAddress {
+    type Err = CoreError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (host, port) = match raw.strip_prefix('[') {
+            Some(rest) => rest
+                .split_once("]:")
+                .ok_or_else(|| CoreError::NotAnAddress {
+                    value: raw.to_owned(),
+                })?,
+            None => raw
+                .rsplit_once(':')
+                .ok_or_else(|| CoreError::NotAnAddress {
+                    value: raw.to_owned(),
+                })?,
+        };
+        let port = port.parse::<u16>().map_err(|_| CoreError::NotAnAddress {
+            value: raw.to_owned(),
+        })?;
+        Ok(Self::new(Host::new(host)?, Port::new(port)?))
+    }
+}
+
+impl TryFrom<String> for ClusterAddress {
+    type Error = CoreError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        raw.parse()
+    }
+}
+
+/// Written the way it is dialled, so an ipv6 address carries its brackets.
+impl fmt::Display for ClusterAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.host.as_ip() {
+            Some(IpAddr::V6(ip)) => write!(f, "[{ip}]:{}", self.port),
+            _ => write!(f, "{}:{}", self.host, self.port),
+        }
     }
 }
 
@@ -1595,5 +1683,69 @@ mod tests {
         assert_eq!(replica.port, endpoint.port);
         let written = serde_json::to_string(&replica).unwrap();
         assert_eq!(serde_json::from_str::<Replica>(&written).unwrap(), replica);
+    }
+
+    #[test]
+    fn a_cluster_address_is_taken_from_what_the_listener_bound() {
+        let bound = ClusterAddress::of("10.0.0.2:8080".parse().unwrap())
+            .expect("an address")
+            .expect("a bound interface names one");
+
+        assert_eq!(bound.host().as_str(), "10.0.0.2");
+        assert_eq!(bound.port().get(), 8080);
+        assert_eq!(bound.to_string(), "10.0.0.2:8080");
+    }
+
+    #[test]
+    fn a_listener_bound_to_every_interface_names_none() {
+        for wildcard in ["0.0.0.0:8080", "[::]:8080"] {
+            let taken = ClusterAddress::of(wildcard.parse().unwrap()).expect("an address");
+
+            assert_eq!(taken, None, "{wildcard} says where this deployment is");
+        }
+    }
+
+    #[test]
+    fn an_address_is_written_the_way_it_is_dialled() {
+        let six = ClusterAddress::of("[::1]:8080".parse().unwrap())
+            .expect("an address")
+            .expect("the loopback is an interface");
+
+        assert_eq!(six.to_string(), "[::1]:8080");
+    }
+
+    #[test]
+    fn an_advertised_address_may_name_a_host_as_well_as_an_ip() {
+        for (written, printed) in [
+            ("10.0.0.2:8080", "10.0.0.2:8080"),
+            ("[::1]:8080", "[::1]:8080"),
+            ("node-3.cluster.local:8080", "node-3.cluster.local:8080"),
+            ("NODE-3.Cluster.Local:8080", "node-3.cluster.local:8080"),
+            // An ipv6 address written without its brackets: the port is the last colon's.
+            ("::1:8080", "[::1]:8080"),
+        ] {
+            let parsed: ClusterAddress = written.parse().expect(written);
+
+            assert_eq!(parsed.to_string(), printed);
+        }
+    }
+
+    #[test]
+    fn an_address_that_is_not_a_host_and_a_port_is_refused() {
+        for written in [
+            "10.0.0.2",
+            "",
+            ":8080",
+            "10.0.0.2:",
+            "10.0.0.2:0",
+            "10.0.0.2:70000",
+            "10.0.0.2:eight",
+            "[::1]8080",
+        ] {
+            assert!(
+                written.parse::<ClusterAddress>().is_err(),
+                "{written:?} was taken as an address"
+            );
+        }
     }
 }
