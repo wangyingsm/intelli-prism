@@ -15,11 +15,14 @@ host="http://127.0.0.1:$port"
 passphrase="correct horse staple"
 upstream_port="${IP_UPSTREAM_PORT:-18081}"
 work="$(mktemp -d)"
+drsg_port="${IP_DRSG_PORT:-18082}"
+drsg_token="drsg-$$"
 server=""
 upstream=""
+store=""
 
 cleanup() {
-	for pid in "$server" "$upstream"; do
+	for pid in "$server" "$upstream" "$store"; do
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
 			kill "$pid" 2>/dev/null || true
 			wait "$pid" 2>/dev/null || true
@@ -65,6 +68,37 @@ caller_speaks = "anthropic"
 upstream_speaks = "anthropic"
 TOML
 
+# The run graphs live in a dr-strange plane rather than in our own tables, so the files that
+# exercise them need one running. Without `drsg` on the path there is nothing to keep a graph
+# in, and those files are left out rather than failed: every other endpoint is unaffected.
+graphs="no"
+if command -v drsg >/dev/null 2>&1; then
+	DRSG_TOKEN="$drsg_token" drsg serve --addr "127.0.0.1:$drsg_port" -d "$work/graphs.drsg" \
+		>"$work/drsg.log" 2>&1 &
+	store=$!
+	rpc() {
+		curl -s -m 10 -H "Authorization: Bearer $drsg_token" -H 'content-type: application/json' \
+			-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" \
+			"http://127.0.0.1:$drsg_port/rpc"
+	}
+	for _ in $(seq 1 100); do
+		rpc plane.list '{}' >/dev/null 2>&1 && break
+		kill -0 "$store" 2>/dev/null || break
+		sleep 0.1
+	done
+	if rpc plane.create '{"name":"ip_graphs"}' >/dev/null 2>&1; then
+		graphs="yes"
+		cat >>"$work/intelli-prism.toml" <<TOML
+
+[graph_store]
+url = "http://127.0.0.1:$drsg_port/rpc"
+token = "$drsg_token"
+plane = "ip_graphs"
+TOML
+	fi
+fi
+[ "$graphs" = yes ] || echo "no drsg on the path: the run graph files are left out"
+
 python3 "$here/stub_upstream.py" "$upstream_port" &
 upstream=$!
 
@@ -88,7 +122,11 @@ done
 
 files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
-	mapfile -t files < <(find "$here" -name '*.hurl' | sort)
+	if [ "$graphs" = yes ]; then
+		mapfile -t files < <(find "$here" -name '*.hurl' | sort)
+	else
+		mapfile -t files < <(find "$here" -name '*.hurl' -not -name '1[56]_graph*' | sort)
+	fi
 fi
 
 # The files run one after another, against one server, so each builds on what the last left.
