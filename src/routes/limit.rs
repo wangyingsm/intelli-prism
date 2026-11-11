@@ -341,6 +341,10 @@ mod tests {
         Arc::new(store)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a test fixture: one request, whose six parts a composite would only move"
+    )]
     async fn call(
         router: &Router,
         state: &AppState,

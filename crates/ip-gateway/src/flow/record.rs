@@ -219,15 +219,14 @@ impl Recording {
     }
 
     /// Measures an answer as it goes out, recording what it cost once the last of it has.
-    pub(super) fn measuring(
-        self,
-        body: GatewayBody,
-        served_by: Replica,
-        raced: Hedge,
-        dispatched: Dispatched,
-        filtered: Filtered,
-        reported: Option<Reported>,
-    ) -> GatewayBody {
+    pub(super) fn measuring(self, body: GatewayBody, attributed: Attributed) -> GatewayBody {
+        let Attributed {
+            served_by,
+            raced,
+            dispatched,
+            filtered,
+            reported,
+        } = attributed;
         Measured {
             inner: body,
             measuring: Measuring::default(),
@@ -252,14 +251,14 @@ impl Recording {
     /// caller's limiting, so its tokens count against the caller's token limits —
     /// the caller caused the spend and pays for it as they would have paid for it
     /// had they asked the model directly.
-    pub(super) fn arbitrated(
-        mut self,
-        api: ApiId,
-        endpoint: &ip_core::Endpoint,
-        began: Instant,
-        asked: ip_core::ModelName,
-        bytes: &[u8],
-    ) {
+    pub(super) fn arbitrated(mut self, call: Arbitrated<'_>) {
+        let Arbitrated {
+            api,
+            endpoint,
+            began,
+            asked,
+            bytes,
+        } = call;
         let mut measuring = Measuring::default();
         measuring.read(bytes);
         let measured = measuring.measured();
@@ -374,6 +373,37 @@ impl Recording {
 fn priced(price: Price, tokens: Tokens, arms: Hedge) -> Money {
     let lost = u32::from(arms.get().saturating_sub(1));
     price.of(tokens) + price.input.of(tokens.input).times(lost)
+}
+
+/// What an answer is attributed to, as the measurement is handed it.
+///
+/// A struct rather than five arguments: both functions that take them take all five, in the same
+/// order, and nothing reads one of them apart from the rest.
+pub(super) struct Attributed {
+    /// Which endpoint answered.
+    pub(super) served_by: Replica,
+    /// How many endpoints it was raced across.
+    pub(super) raced: Hedge,
+    /// What class it was dispatched at, and which level named it.
+    pub(super) dispatched: Dispatched,
+    /// What the filter took out of the request and the answer together.
+    pub(super) filtered: Filtered,
+    /// What the filter reported, when anything counts it.
+    pub(super) reported: Option<Reported>,
+}
+
+/// The arbiter's own call, as the recorder is told of it.
+pub(super) struct Arbitrated<'a> {
+    /// Whose route it travelled.
+    pub(super) api: ApiId,
+    /// Which endpoint it reached.
+    pub(super) endpoint: &'a ip_core::Endpoint,
+    /// When it began.
+    pub(super) began: Instant,
+    /// What it asked for, unless the answer echoed a model of its own.
+    pub(super) asked: ip_core::ModelName,
+    /// The answer, measured rather than parsed.
+    pub(super) bytes: &'a [u8],
 }
 
 /// How the request was served, which together is what a row keeps of it past its request.

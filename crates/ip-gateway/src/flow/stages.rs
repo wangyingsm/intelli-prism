@@ -16,7 +16,7 @@ use tracing::{Span, field};
 use super::headers::{
     aim, authority_of, is_event_stream, present, rewrite, set_length, strip_hop_by_hop,
 };
-use super::record::Recording;
+use super::record::{Arbitrated, Recording};
 use super::run::{collect, run_body, run_headers};
 use super::{Presenting, RequestContext};
 use crate::arbiter::{ARBITRATING, Arbiter};
@@ -553,12 +553,14 @@ impl Flow<BodyProcessed> {
             });
         }
         let mut outcome = race(
-            self.context,
-            upstream,
-            dispatcher,
+            Racing {
+                context: self.context,
+                upstream,
+                dispatcher,
+                dispatched,
+            },
             request,
             &dispatching,
-            dispatched,
         )
         .await?;
         if let Some(crossing) = crossing {
@@ -861,13 +863,13 @@ async fn arbitrate(how: Arbitrating<'_>, text: &str) -> Option<Difficulty> {
             // a call was made, and someone is paying for it. Recording and parsing sit
             // outside the deadline — they touch no network.
             if let Some(recording) = how.recording {
-                recording.arbitrated(
-                    resolution.rule().api.clone(),
-                    chosen.endpoint(),
+                recording.arbitrated(Arbitrated {
+                    api: resolution.rule().api.clone(),
+                    endpoint: chosen.endpoint(),
                     began,
-                    how.arbiter.model().clone(),
-                    &bytes,
-                );
+                    asked: how.arbiter.model().clone(),
+                    bytes: &bytes,
+                });
             }
             named_ruling(&bytes)
         }
@@ -1225,18 +1227,36 @@ async fn send_arm(
 /// one only when that wait has run out with nothing acceptable answered — or at once,
 /// without waiting out its remainder, once an arm has been lost. An arm the wait never
 /// released is abandoned like a losing one, which is right for an arm that never went out.
+/// What a race takes, besides the request itself and the rule it is dispatched by.
+///
+/// A struct rather than four more arguments: the caller holds all four and the race needs all
+/// four, and none of them is read apart from the others.
+struct Racing<'a> {
+    /// What is known about this request so far.
+    context: RequestContext,
+    /// What sends an arm out.
+    upstream: &'a dyn Upstream,
+    /// What picks which endpoint each arm goes to.
+    dispatcher: &'a Dispatcher,
+    /// The class it dispatches at, and which level named it.
+    dispatched: Dispatched,
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one race, whose arms and the waits that release them cannot be read apart"
 )]
 async fn race(
-    context: RequestContext,
-    upstream: &dyn Upstream,
-    dispatcher: &Dispatcher,
+    racing: Racing<'_>,
     request: Request<GatewayBody>,
     dispatching: &Dispatching<'_>,
-    dispatched: Dispatched,
 ) -> Result<Flow<Forwarded>, GatewayError> {
+    let Racing {
+        context,
+        upstream,
+        dispatcher,
+        dispatched,
+    } = racing;
     // Where an arm of the race went: an answer, all started arms answered, or the wait
     // for the next arm ran out.
     enum Settled {

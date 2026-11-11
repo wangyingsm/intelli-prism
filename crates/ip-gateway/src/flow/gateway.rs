@@ -5,7 +5,7 @@ use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use ip_auth::Authority;
 use ip_cache::Cache;
-use ip_core::{Decider, Hedge, Protocol, Replica, Served, TraceId, TurnId};
+use ip_core::{Decider, Protocol, Served, TraceId, TurnId};
 use ip_storage::UsageStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use super::followed::{
     EGRESS_REQUEST, EGRESS_RESPONSE, Followed, INGRESS_REQUEST, INGRESS_RESPONSE, stage_span,
 };
 use super::headers::set_length;
-use super::record::{Keeping, Limiting, Pending, Recording, Ruled};
+use super::record::{Attributed, Keeping, Limiting, Pending, Recording, Ruled};
 use crate::arbiter::Arbiter;
 use crate::body::{GatewayBody, from_bytes};
 use crate::cache::{CachedResponse, ResponseCache};
@@ -25,7 +25,7 @@ use crate::classifier::Classifier;
 use crate::dispatch::Dispatcher;
 use crate::embedder::{EMBED_DEADLINE, Embedder};
 use crate::error::{GatewayError, GatewayErrorKind};
-use crate::filter::{Filtered, Filtering, Reported};
+use crate::filter::Filtering;
 use crate::flow::stages::Egress;
 use crate::limit::{Asking, Decision, Limiter, Limits};
 use crate::meter::{Looked, Meters, Refused};
@@ -478,10 +478,12 @@ impl Gateway {
         let (mut done, dispatched) = self
             .upstream_answer(
                 processed,
-                &routing.table,
-                &chains,
-                &followed,
-                recording.clone(),
+                Egressing {
+                    table: &routing.table,
+                    chains: &chains,
+                    followed: &followed,
+                    recording: recording.clone(),
+                },
             )
             .await?;
         let served_by = done.served().clone();
@@ -518,7 +520,15 @@ impl Gateway {
         // The row is measured against what went upstream: a turn's remembered class is
         // the class it was dispatched at, whatever named it.
         Ok(measuring(
-            sent, recording, served_by, raced, dispatched, filtered, reported,
+            sent,
+            recording,
+            Attributed {
+                served_by,
+                raced,
+                dispatched,
+                filtered,
+                reported,
+            },
         ))
     }
 
@@ -608,11 +618,14 @@ impl Gateway {
     async fn upstream_answer(
         &self,
         processed: Flow<BodyProcessed>,
-        table: &RoutingTable,
-        chains: &Arc<ProcessorChain>,
-        followed: &Followed,
-        recording: Option<Recording>,
+        going: Egressing<'_>,
     ) -> Result<(Flow<ResponseBodyProcessed>, Dispatched), GatewayError> {
+        let Egressing {
+            table,
+            chains,
+            followed,
+            recording,
+        } = going;
         let egress = Egress::new(self.upstream.as_ref(), &self.dispatcher, table)
             .with_turns(self.turns.as_ref())
             .with_classifier(self.classifier.clone())
@@ -639,24 +652,32 @@ impl Gateway {
     }
 }
 
+/// What sending a request on and reading the answer back takes.
+///
+/// A struct rather than four more arguments: the table and the chains are the deployment's, the
+/// span and the record are this request's, and a stage needs all four to go anywhere.
+struct Egressing<'a> {
+    /// The rules in force.
+    table: &'a RoutingTable,
+    /// The plugins the request and its answer pass through.
+    chains: &'a Arc<ProcessorChain>,
+    /// What every span of this request is named by.
+    followed: &'a Followed,
+    /// Where what it costs is written, when anywhere is.
+    recording: Option<Recording>,
+}
+
 /// Measures what an answer costs as it goes out, when there is anywhere to record it.
 fn measuring(
     response: Response<GatewayBody>,
     recording: Option<Recording>,
-    served_by: Replica,
-    raced: Hedge,
-    dispatched: Dispatched,
-    filtered: Filtered,
-    reported: Option<Reported>,
+    attributed: Attributed,
 ) -> Response<GatewayBody> {
     let Some(recording) = recording else {
         return response;
     };
     let (parts, body) = response.into_parts();
-    Response::from_parts(
-        parts,
-        recording.measuring(body, served_by, raced, dispatched, filtered, reported),
-    )
+    Response::from_parts(parts, recording.measuring(body, attributed))
 }
 
 /// Answers from what the cache held, without any stage after the request body running.

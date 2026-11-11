@@ -173,18 +173,45 @@ pub(crate) fn filtered_events(
     reported: Reported,
 ) -> GatewayBody {
     let (sender, receiver) = mpsc::channel(BUFFERED_EVENTS);
-    tokio::spawn(sift(body, speaks, filtering, tenant, reported, sender));
+    tokio::spawn(sift(
+        body,
+        Sifting {
+            speaks,
+            filtering,
+            tenant,
+            reported,
+        },
+        sender,
+    ));
     ChannelBody::new(receiver).boxed_unsync()
 }
 
-async fn sift(
-    mut body: GatewayBody,
+/// What filtering a streamed answer takes, beside the answer and where it goes.
+struct Sifting {
+    /// Which family's events are being read and written again.
     speaks: Dialect,
+    /// What is looked for, and how wide a window is held back.
     filtering: Arc<Filtering>,
+    /// Whose detectors those are.
     tenant: TenantId,
+    /// Where what was taken out is counted.
     reported: Reported,
-    sender: Sender,
-) {
+}
+
+/// The three readers one event passes through, taken together because a pass needs all three.
+struct Passing<'a, 'b> {
+    reading: &'a mut Reading,
+    writing: &'a mut Writing,
+    trickle: &'a mut Trickle<'b>,
+}
+
+async fn sift(mut body: GatewayBody, sifting: Sifting, sender: Sender) {
+    let Sifting {
+        speaks,
+        filtering,
+        tenant,
+        reported,
+    } = sifting;
     let mut reading = Reading::new(speaks);
     let mut writing = Writing::new(speaks);
     let mut trickle = Trickle::new(filtering.detectors_for(&tenant), filtering.window());
@@ -208,9 +235,11 @@ async fn sift(
         going = sift_events(
             &mut pending,
             false,
-            &mut reading,
-            &mut writing,
-            &mut trickle,
+            Passing {
+                reading: &mut reading,
+                writing: &mut writing,
+                trickle: &mut trickle,
+            },
             &sender,
         )
         .await;
@@ -219,9 +248,11 @@ async fn sift(
         going = sift_events(
             &mut pending,
             true,
-            &mut reading,
-            &mut writing,
-            &mut trickle,
+            Passing {
+                reading: &mut reading,
+                writing: &mut writing,
+                trickle: &mut trickle,
+            },
             &sender,
         )
         .await;
@@ -259,11 +290,14 @@ async fn sift(
 async fn sift_events(
     pending: &mut BytesMut,
     at_end: bool,
-    reading: &mut Reading,
-    writing: &mut Writing,
-    trickle: &mut Trickle<'_>,
+    passing: Passing<'_, '_>,
     sender: &Sender,
 ) -> bool {
+    let Passing {
+        reading,
+        writing,
+        trickle,
+    } = passing;
     while let Some(end) = event_end(pending, at_end) {
         let block = pending.split_to(end);
         // Only a whole event is read, so no split can land inside a character.

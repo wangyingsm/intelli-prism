@@ -3,6 +3,12 @@
 # watch for. The lints themselves are `[workspace.lints]` in the root `Cargo.toml`.
 too-many-lines-threshold = 100
 
+# CLAUDE.md's own rule — "if a function's parameter list grows long, more than 5, introduce a
+# composite type" — which nothing checked until this line, because clippy's own default is 7.
+# `self` counts, so a method of five parameters has four of its own. The seven functions this
+# found are the seven composites beside them.
+too-many-arguments-threshold = 5
+
 # A test that unwraps states its own precondition, and a panic there is the failure being
 # reported rather than a fault escaping into a caller. Without this the lint answers 3738
 # findings here, 2839 of them in `#[test]` functions; with it, 899, of which exactly one was

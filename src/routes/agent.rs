@@ -538,6 +538,10 @@ mod tests {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a test fixture: one request, whose six parts a composite would only move"
+    )]
     async fn send(
         router: &Router,
         state: &AppState,
