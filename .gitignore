@@ -47,4 +47,8 @@ logs/
 .DS_Store
 
 # drsg — local database, logs, and the MCP configs carrying a live bearer token
+*.drsg.hnsw.tmp
+*.drsg.bm25.tmp
 .cursor/mcp.json
+.trae/mcp.json
+.gemini/settings.json
