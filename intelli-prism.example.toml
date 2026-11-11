@@ -7,6 +7,25 @@
 [server]
 listen = "127.0.0.1:8080"
 
+# One member of a cluster — optional, and nothing a single deployment needs.
+#
+# advertise is what this member tells the others to reach it on. Unset, the address the
+# listener binds is used, which is right for a member bound to one interface and says
+# nothing for one bound to all of them: a member on 0.0.0.0 that advertises nothing has
+# not said where it is, says so once at startup, and registers nowhere. Recording an
+# address nobody can dial would be worse than recording none.
+#
+# heartbeat is how often, in seconds, this member says it is still here. A member that
+# stops writing goes stale where it stands, so this is also what decides how long a
+# machine that died is still believed in. Default 10.
+#
+# Membership is kept in the run graph store's plane, so a deployment configured without
+# one registers nowhere however this block is set.
+#
+# [cluster]
+# advertise = "10.0.0.2:8080"
+# heartbeat = 10
+
 # Standalone deployment. The file is created and migrated on first start.
 [storage]
 backend = "sqlite"

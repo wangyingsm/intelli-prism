@@ -474,7 +474,7 @@ pub struct ServerConfig {
 }
 
 /// How the other members of this cluster reach this deployment.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Where to tell the rest of the cluster this deployment answers. Unset, the address
@@ -482,6 +482,25 @@ pub struct ClusterConfig {
     /// and says nothing for one bound to all of them.
     #[serde(default)]
     pub advertise: Option<ClusterAddress>,
+    /// How often this deployment tells the rest of the cluster it is still here, in seconds.
+    ///
+    /// A member that stops writing goes stale where it stands, so this is also what decides
+    /// how long a machine that died is still believed in. Default 10.
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat: Seconds,
+}
+
+fn default_heartbeat() -> Seconds {
+    Seconds::new(10)
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            advertise: None,
+            heartbeat: default_heartbeat(),
+        }
+    }
 }
 
 impl ClusterConfig {
@@ -1852,5 +1871,17 @@ model = "claude-sonnet-5"
 
             assert!(refused.is_err(), "{written:?} was taken as an address");
         }
+    }
+
+    /// A cluster block built rather than parsed must heartbeat on the same interval a parsed one
+    /// does, or a `Default` configuration spins on a zero wait.
+    #[test]
+    fn a_cluster_heartbeats_on_the_same_interval_however_its_config_was_made() {
+        let built = ClusterConfig::default();
+        let parsed: ClusterConfig = toml::from_str("").expect("an empty block is a whole one");
+
+        assert_eq!(built.heartbeat.get(), 10);
+        assert_eq!(parsed.heartbeat, built.heartbeat);
+        assert_eq!(parsed.advertise, built.advertise);
     }
 }

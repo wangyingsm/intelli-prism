@@ -4,6 +4,7 @@ mod admin;
 mod auth;
 mod classify;
 mod cli;
+mod cluster;
 mod cookie;
 mod embed;
 mod error;
@@ -90,6 +91,15 @@ async fn serve(config: &Path) -> Result<(), StartupError> {
         sweeper.keep_sweeping()
     });
     let _following = state.keep_rules_in_step();
+    let membership = cluster::Membership::of(
+        state.cluster(),
+        state.graphs(),
+        config.cluster.heartbeat.as_duration(),
+    )
+    .map(std::sync::Arc::new);
+    let _registering = membership
+        .clone()
+        .map(cluster::Membership::keep_registering);
     let address = config.server.listen;
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -109,6 +119,11 @@ async fn serve(config: &Path) -> Result<(), StartupError> {
         .is_err()
     {
         tracing::warn!("gave up waiting for the record of the last requests");
+    }
+    // Said on the way out while the plane is still reachable: a row left behind is read as a
+    // member that is still here.
+    if let Some(membership) = &membership {
+        membership.going().await;
     }
     telemetry.shutdown();
     served.map_err(StartupError::Serve)
