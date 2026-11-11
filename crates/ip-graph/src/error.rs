@@ -153,4 +153,10 @@ pub enum GraphError {
         /// What was wrong with it.
         detail: String,
     },
+    /// Text that is not the hex a run id is written as.
+    #[error("{value:?} is not a run id")]
+    NotARunId {
+        /// What was read.
+        value: String,
+    },
 }

@@ -20,6 +20,7 @@ mod event;
 mod graph;
 mod id;
 mod order;
+mod placement;
 mod plane;
 mod run;
 
@@ -28,5 +29,6 @@ pub use event::{GraphEvent, GraphReporting, GraphSaid};
 pub use graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
 pub use id::{GraphId, GraphName, GraphRunId, NodeName};
 pub use order::{Generation, Placed, RunOrder};
+pub use placement::Placement;
 pub use plane::{FEEDS, GRAPH_LABEL, GraphPlane, GraphSummary, Listing, NODE_LABEL};
 pub use run::{GraphRan, Graphing, NodeRan, RunningNode, RunsNode, run};

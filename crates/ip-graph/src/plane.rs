@@ -16,8 +16,10 @@ use serde_json::{Value, json};
 
 use crate::error::GraphError;
 use crate::graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
-use crate::id::{GraphId, GraphName, NodeName};
+use crate::id::{GraphId, GraphName, GraphRunId, NodeName};
 use crate::order::{Generation, Placed, RunOrder};
+use crate::placement::Placement;
+use ip_core::Timestamp;
 
 /// The label on the one node that holds what a graph says about itself.
 pub const GRAPH_LABEL: &str = "RunGraph";
@@ -27,6 +29,13 @@ pub const NODE_LABEL: &str = "GraphNode";
 
 /// The type of edge an answer travels along.
 pub const FEEDS: &str = "FEEDS";
+
+/// The label on every record of where a node is running.
+///
+/// A third label beside [`GRAPH_LABEL`] and [`NODE_LABEL`], so a record of a run collides with no
+/// stored graph: what a graph says about itself and where one of its nodes is running now are two
+/// different kinds of thing with the same owner and the same name.
+pub const PLACEMENT_LABEL: &str = "GraphPlacement";
 
 /// Which graph a row belongs to.
 const GRAPH: &str = "graph";
@@ -43,6 +52,18 @@ const AGENT: &str = "agent";
 /// The ceiling a graph carries.
 const MAX_NODES: &str = "max_nodes";
 
+/// Which run a record of a running node belongs to.
+const RUN: &str = "run";
+
+/// Which node of the graph is running.
+const NODE: &str = "node";
+
+/// Where the machine running it answers its own cluster.
+const ADDRESS: &str = "address";
+
+/// When it was dispatched, in unix seconds.
+const AT: &str = "at";
+
 /// The key a store addresses one graph's own node by.
 fn graph_key(owner: &GraphOwner, id: &GraphId) -> String {
     format!("{GRAPH_LABEL}/{}/{id}", owner.written())
@@ -51,6 +72,14 @@ fn graph_key(owner: &GraphOwner, id: &GraphId) -> String {
 /// The key a store addresses one node of one graph by.
 fn node_key(owner: &GraphOwner, id: &GraphId, name: &NodeName) -> String {
     format!("{NODE_LABEL}/{}/{id}/{name}", owner.written())
+}
+
+/// The key a store addresses one record of one running node by.
+///
+/// The run and the node, and neither alone: one run has a record per node, and one node of one
+/// graph may be running in two runs at once.
+fn placement_key(run: &GraphRunId, node: &NodeName) -> String {
+    format!("{PLACEMENT_LABEL}/{}/{node}", run.to_hex())
 }
 
 /// The label that is one graph's nodes and nothing else.
@@ -181,6 +210,61 @@ fn edges_plan(owner: &GraphOwner, id: &GraphId) -> Value {
             "limit": null,
         },
     })
+}
+
+/// The plan that reads what one owner's run is running.
+fn placements_plan(owner: &GraphOwner, run: &GraphRunId) -> Value {
+    json!({
+        "source": {"ScanLabel": PLACEMENT_LABEL},
+        "steps": [{"Filter": {
+            "Logic": {
+                "op": "And",
+                "lhs": eq(RUN, &run.to_hex()),
+                "rhs": eq(OWNER, owner.written()),
+            }
+        }}],
+    })
+}
+
+/// What a record of a running node carries.
+fn placement_properties(placement: &Placement) -> Value {
+    json!({
+        RUN: placement.run.to_hex(),
+        NODE: placement.node.as_str(),
+        GRAPH: placement.graph.as_str(),
+        OWNER: placement.owner.written(),
+        ADDRESS: placement.address.to_string(),
+        AT: placement.at.unix_seconds(),
+    })
+}
+
+/// One record of a running node, rebuilt from the row the store answered with.
+fn placement_from(row: &Value, owner: &GraphOwner) -> Result<Placement, GraphError> {
+    let properties = &row["properties"];
+    let said = |property: &'static str| -> Result<&str, GraphError> {
+        properties[property]
+            .as_str()
+            .ok_or(GraphError::PropertyMissing { property })
+    };
+    let at = properties[AT]
+        .as_i64()
+        .ok_or(GraphError::PropertyKind { property: AT })?;
+    let placed = Placement {
+        run: GraphRunId::from_hex(said(RUN)?)?,
+        node: NodeName::new(said(NODE)?)?,
+        graph: GraphId::new(said(GRAPH)?)?,
+        owner: owner.clone(),
+        address: said(ADDRESS)?
+            .parse()
+            .map_err(|_| GraphError::PropertyKind { property: ADDRESS })?,
+        at: Timestamp::from_unix_seconds(at)
+            .map_err(|_| GraphError::PropertyKind { property: AT })?,
+    };
+    // The owner is the caller's, so a row belonging to another is a read that leaked.
+    if properties[OWNER].as_str() != Some(owner.written()) {
+        return Err(GraphError::Foreign { property: OWNER });
+    }
+    Ok(placed)
 }
 
 /// What a graph's own node carries.
@@ -400,6 +484,49 @@ impl GraphPlane {
             return Err(GraphError::Cyclic { cycle });
         }
         Ok(())
+    }
+
+    /// Records that one node of one run is running, and where.
+    ///
+    /// Written again over whatever was there under the same key, so a dispatch retried after a
+    /// worker was lost replaces the record rather than being refused one: the store binds a key
+    /// once, and a retry is the case this is most needed in.
+    pub async fn placed(&self, placement: &Placement) -> Result<(), GraphError> {
+        let key = placement_key(&placement.run, &placement.node);
+        self.drsg.node_delete(&key).await?;
+        self.drsg
+            .node_create(&key, &[PLACEMENT_LABEL], placement_properties(placement))
+            .await?;
+        Ok(())
+    }
+
+    /// Takes away the record of a node that has finished, wherever it ran.
+    ///
+    /// Answers nothing about whether there was one: a node that was never recorded, because the
+    /// write was best effort and failed, must not make its own ending an error.
+    pub async fn finished(&self, run: &GraphRunId, node: &NodeName) -> Result<(), GraphError> {
+        self.drsg
+            .node_delete(&placement_key(run, node))
+            .await
+            .map(|_| ())
+            .map_err(GraphError::from)
+    }
+
+    /// What one owner's run is running, and where each of it is.
+    ///
+    /// Filtered on the owner in the plan, as every read here is, and on the run beside it.
+    pub async fn placements(
+        &self,
+        owner: &GraphOwner,
+        run: &GraphRunId,
+    ) -> Result<Vec<Placement>, GraphError> {
+        let rows = self.drsg.query(placements_plan(owner, run)).await?;
+        let rows = rows.as_array().ok_or_else(|| GraphError::Unreadable {
+            detail: "a placement read answered with something that is not rows".to_owned(),
+        })?;
+        rows.iter()
+            .map(|row| placement_from(row, owner))
+            .collect::<Result<Vec<_>, _>>()
     }
 
     /// The order one owner's graph runs in, as the store's own topological sort answers it.
@@ -645,6 +772,7 @@ mod tests {
     use ip_drsg::{Replies, StubPlane};
 
     use super::*;
+    use ip_core::route::ClusterAddress;
 
     fn tenant() -> GraphOwner {
         GraphOwner::Tenant(TenantId::new("acme").expect("a tenant id"))
@@ -1647,5 +1775,177 @@ mod tests {
             Err(GraphError::PropertyKind { property }) => assert_eq!(property, MAX_NODES),
             other => panic!("{other:?} was taken for a ceiling that is a word"),
         }
+    }
+
+    /// A run id a test can write down and read back.
+    fn run_id() -> GraphRunId {
+        GraphRunId::from_hex("0123456789abcdef0123456789abcdef").expect("a run id")
+    }
+
+    /// Where a test's own node is running.
+    fn address() -> ClusterAddress {
+        "10.0.0.2:8080".parse().expect("an address")
+    }
+
+    fn placement() -> Placement {
+        Placement {
+            run: run_id(),
+            node: node("intake").name,
+            graph: id(),
+            owner: tenant(),
+            address: address(),
+            at: Timestamp::from_unix_seconds(1_762_000_000).expect("a time"),
+        }
+    }
+
+    /// The row a plane answers a placement read with, built from what the write would have sent.
+    fn placement_rows(placement: &Placement) -> Value {
+        json!([{"id": 1, "properties": placement_properties(placement)}])
+    }
+
+    #[tokio::test]
+    async fn a_running_node_is_recorded_where_it_runs_and_read_back_whole() {
+        let placed = placement();
+        let stub = StubPlane::start(Replies::in_turn([placement_rows(&placed)])).await;
+
+        let read = GraphPlane::new(stub.client())
+            .placements(&tenant(), &run_id())
+            .await
+            .expect("the record reads back");
+
+        assert_eq!(read, vec![placed]);
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_retried_replaces_the_record_rather_than_being_refused_one() {
+        let stub = StubPlane::start(Replies::Echo).await;
+
+        GraphPlane::new(stub.client())
+            .placed(&placement())
+            .await
+            .expect("the stub takes the write");
+
+        let seen: Vec<String> = stub.seen().into_iter().map(|one| one.method).collect();
+        assert_eq!(
+            seen,
+            ["node.delete", "node.create"],
+            "a key the store binds once is cleared before it is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_is_keyed_by_the_run_and_the_node_together() {
+        let other = NodeName::new("reply").expect("a node name");
+
+        assert_ne!(
+            placement_key(&run_id(), &node("intake").name),
+            placement_key(&run_id(), &other),
+            "two nodes of one run"
+        );
+        let elsewhere = GraphRunId::from_hex("ffffffffffffffffffffffffffffffff").expect("a run id");
+        assert_ne!(
+            placement_key(&run_id(), &node("intake").name),
+            placement_key(&elsewhere, &node("intake").name),
+            "one node in two runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_that_finishes_takes_its_record_away() {
+        let stub = StubPlane::start(Replies::Deleted).await;
+
+        GraphPlane::new(stub.client())
+            .finished(&run_id(), &node("intake").name)
+            .await
+            .expect("the record goes");
+
+        let seen = stub.only();
+        assert_eq!(seen.method, "node.delete");
+        assert_eq!(
+            seen.params["key"],
+            placement_key(&run_id(), &node("intake").name)
+        );
+    }
+
+    /// A write that was best effort and failed leaves nothing to take away.
+    #[tokio::test]
+    async fn a_node_whose_record_was_never_written_still_finishes() {
+        let stub = StubPlane::start(Replies::Absent).await;
+
+        GraphPlane::new(stub.client())
+            .finished(&run_id(), &node("intake").name)
+            .await
+            .expect("nothing to delete is not a failure");
+    }
+
+    #[tokio::test]
+    async fn a_placement_read_filters_on_the_owner_and_the_run_in_the_plan() {
+        let stub = StubPlane::start(Replies::in_turn([json!([])])).await;
+
+        GraphPlane::new(stub.client())
+            .placements(&tenant(), &run_id())
+            .await
+            .expect("the stub answers nothing");
+
+        let plan = stub.only().params["plan"].clone();
+        assert_eq!(plan["source"]["ScanLabel"], PLACEMENT_LABEL);
+        let filter = &plan["steps"][0]["Filter"]["Logic"];
+        assert_eq!(filter["op"], "And");
+        assert_eq!(filter["lhs"]["Compare"]["lhs"]["Property"], RUN);
+        assert_eq!(
+            filter["lhs"]["Compare"]["rhs"]["Literal"]["Str"],
+            run_id().to_hex()
+        );
+        assert_eq!(filter["rhs"]["Compare"]["lhs"]["Property"], OWNER);
+        assert_eq!(filter["rhs"]["Compare"]["rhs"]["Literal"]["Str"], "acme");
+    }
+
+    #[tokio::test]
+    async fn a_record_belonging_to_another_owner_is_refused_rather_than_returned() {
+        let mut rows = placement_rows(&placement());
+        rows[0]["properties"][OWNER] = json!("globex");
+        let stub = StubPlane::start(Replies::in_turn([rows])).await;
+
+        let refusal = GraphPlane::new(stub.client())
+            .placements(&tenant(), &run_id())
+            .await;
+
+        match refusal {
+            Err(GraphError::Foreign { property }) => assert_eq!(property, OWNER),
+            other => panic!("{other:?} was taken"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_its_own_types_will_not_take_is_refused_by_name() {
+        for (property, stored) in [
+            (RUN, json!("not hex")),
+            (NODE, json!("")),
+            (GRAPH, json!("NOT AN ID")),
+            (ADDRESS, json!("10.0.0.2")),
+            (AT, json!("whenever")),
+            (ADDRESS, Value::Null),
+        ] {
+            let mut rows = placement_rows(&placement());
+            rows[0]["properties"][property] = stored.clone();
+            let stub = StubPlane::start(Replies::in_turn([rows])).await;
+
+            let refusal = GraphPlane::new(stub.client())
+                .placements(&tenant(), &run_id())
+                .await;
+
+            assert!(
+                refusal.is_err(),
+                "{property} stored as {stored:?} was taken"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_placement_read_refuses_when_its_one_read_cannot_be_used() {
+        refused_at_each_read(&[placement_rows(&placement())], 1, |plane| async move {
+            plane.placements(&tenant(), &run_id()).await
+        })
+        .await;
     }
 }

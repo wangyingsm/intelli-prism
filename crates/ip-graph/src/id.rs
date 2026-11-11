@@ -209,6 +209,18 @@ impl GraphRunId {
     pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
+
+    /// Reads back what [`GraphRunId::to_hex`] wrote.
+    ///
+    /// The one way back: a run that is recorded anywhere outside this process is recorded as its
+    /// own text, so a record of it is only as useful as this is strict.
+    pub fn from_hex(raw: &str) -> Result<Self, GraphError> {
+        let mut bytes = [0u8; GRAPH_RUN_BYTES];
+        hex::decode_to_slice(raw, &mut bytes).map_err(|_| GraphError::NotARunId {
+            value: raw.to_owned(),
+        })?;
+        Ok(Self(bytes))
+    }
 }
 
 impl fmt::Display for GraphRunId {
