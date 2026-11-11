@@ -546,6 +546,47 @@ nothing until the result would learn what was asked for only once it no longer m
 that can refuse a run is settled before the stream opens, so a refusal is a status code rather than
 one event inside a 200.
 
+### Run graphs
+
+`POST /_ip/graph_run/{id}` runs a DAG of agent templates, streamed as it happens, and
+`/_ip/graphs` manages them. A node's answer feeds its children; a node with several parents is
+given all of their answers at once.
+
+- **The graph lives in a `dr-strange` plane, not in our own tables**, which is the one place in
+this system where a request path depends on a service outside the process, and where tenancy is
+enforced by us against a store that knows nothing about tenants. Every row carries its owner and
+every read filters on it. A deployment with no `[graph_store]` answers 404 — that is no graph
+feature, not a graph store that is down, which is what the 503 of an unreachable plane means.
+- **The order to walk the nodes in is asked of the plane**, not written here: `plane.algo` answers
+`toposort` over the `FEEDS` edge type, with a generation per node, so a generation is what may run
+at once. A graph that feeds itself is refused when it is written, because no order can be taken of
+it. Both that and the acyclicity check are dr-strange's, from
+[#98](https://github.com/wangyingsm/dr-strange/issues/98) and
+[#99](https://github.com/wangyingsm/dr-strange/issues/99).
+- **A generation really runs at once.** Each node of it is spawned before any of it finishes, and
+the graph answers with every node nothing reads from, keyed by name.
+- **Fan-in is a json object keyed by parent node name.** One parent is an object with one key, so
+there is no special case to get wrong.
+- **A node that does not answer stops the graph, and its siblings are told to stop.** They end
+`cut_short`, and they are told *between turns* and never interrupted mid-turn: aborting a request
+in flight leaves the provider billing tokens this process then never records, so a dropped turn is
+worse than a wasted one. The result names which node stopped it.
+- **Every event names the graph run it belongs to.** Each node still mints a run id of its own, so
+a node's turns are a run's turns as they have always been; the graph run id is what ties them
+together.
+- **A node's turns go through the gateway**, like a single template's run and for the same reason:
+routing, dispatch, hedging, the filter, the semantic cache, metering, pricing, limits and the usage
+row all apply. The graph's only ceiling of its own is a node count — money and time stay with the
+per-turn and per-tenant limits rather than being counted a second time and disagreeing.
+- **Everything that can refuse is settled before the 200**, which means every node's template,
+model, target and tool set are resolved up front: a graph whose third node names a template that is
+not there is a status code, not a stream that stops two nodes in.
+- **A node's template is checked when the graph runs, not when it is written.** A template can be
+deleted after a graph names it, so "every node names a template that exists" is not an invariant
+this store can hold; checking it at write time would buy an early error for a typo, charge an
+ordering constraint for it, and still let the reference rot. The run is where the check can mean
+something.
+
 ## Shipped with a caveat
 
 - **Nothing in the sandbox runs.** A template's file tree is stored, checked and read back, and no
@@ -561,8 +602,25 @@ needs a key the deployment manages, which is not built.
 - **A run is not resumable and nothing lists one.** It lives as long as its stream: a client that
 hangs up loses it, nothing records that it happened beyond the usage rows its turns wrote, and
 there is no handle to ask after one. The run id is generated, streamed, and stored nowhere.
-- **The run graph composes nothing.** One template, one loop, one model. An agent calling another
-agent, a template naming a sub-agent, a plan split across several — none of it exists.
+- **A run graph's answers live only in the coordinator's memory.** Each node's answer is held by
+the process that took the request, so a coordinator lost halfway through a graph loses every answer
+already paid for: the spend is durable, because each turn writes a usage row, and the work is not.
+Nothing resumes a graph and nothing lists a run of one.
+- **Every node of a graph runs in the coordinator's own process.** The dispatch payload is shaped
+so a node needs nothing but its input — not the graph, not its order, not what its siblings
+answered — but nothing yet sends one to another machine, and nothing records where a node is
+running.
+- **A graph is backed up separately from everything else.** It lives in a dr-strange plane, so a
+deployment's state is no longer one database: the plane is backed up beside postgres or it is lost
+on its own. A plane restored from a different moment than the audit trail will disagree with it,
+and nothing reconciles the two.
+- **A graph write records no audit row.** Every other management write and its audit row share one
+transaction, and a graph's change lands in a store that transaction cannot reach; ordering them
+either way leaves a row without a change or a change without a row. `plane.history` is a graph's
+trail instead, which is a different place to look and a different format to read.
+- **A graph composes templates and nothing else.** An agent calling another agent, a template
+naming a sub-agent, a node that loops back — none of that exists; a node is a template, and the
+edges are declared when the graph is written.
 - **Nothing rate-limits a run as a run.** Each turn is counted and capped like any other request,
 so a run is limited turn by turn; the run itself is not. A template with a high turn ceiling is a
 loop that may make many requests before a per-request limit notices.
@@ -833,15 +891,10 @@ version per mutation and a CLI to sync up and down.
 - The preset tool set (core utilities, python, js/ts, bash) and optional MCP tools, all sandboxed.
 - Agent traffic routed through the gateway itself, so it is authenticated, authorized and processed
 like any other request.
-- Run graph: a `dr-strange` plane of agents in a DAG, run from `POST /_ip/graph_run/{id}`. A node
-with several parents receives their answers as a json object keyed by parent, a node that does not
-answer stops the graph, and the graph's only ceiling of its own is a node count — money and time
-stay with the per-turn and per-tenant limits rather than being counted a second time. The order to
-walk the nodes in, and the check that the graph is acyclic, are asked of the plane rather than
-written here: `plane.algo` answers `toposort` and `cycles`, each over one named edge type, from
-[#98](https://github.com/wangyingsm/dr-strange/issues/98) and
-[#99](https://github.com/wangyingsm/dr-strange/issues/99). The order comes back with a generation
-per node, so a generation is what may run at once.
+- Running a graph's nodes across a cluster: a dispatch sent to another machine, where it is
+running noted in the plane, and a stop that reaches it over the publication channel the rules
+already use. The dispatch payload and the stop signal are both shaped for it; nothing crosses a
+machine boundary yet.
 - A capped loop-back in a run graph, which is the one cycle worth permitting. A node unsatisfied
 with what a predecessor gave it answers something like `{"loop_back": "survey"}`, the flow reruns
 that node with the extra context, and a predefined loop count stops it. The loop target is

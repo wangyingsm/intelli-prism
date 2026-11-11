@@ -106,8 +106,8 @@ parallel generations, fan-in and unpriced spend.
 version 0.1.0, and nothing about it is stable — the configuration format, the storage schema, the
 wire headers and the plugin interface all still change without ceremony.
 
-Large parts of the design are unbuilt: there is no web ui, nothing that runs a system agent, no
-run graph, and no long term memory. The pieces that do exist are tested, but they have never run
+Large parts of the design are unbuilt: there is no web ui, nothing that runs a system agent, and
+no long term memory. A run graph exists but runs every node in one process. The pieces that do exist are tested, but they have never run
 under real traffic, and no security review has been done. Read `ROADMAP.md` before assuming a
 feature is there.
 
