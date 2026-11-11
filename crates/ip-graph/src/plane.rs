@@ -1348,4 +1348,304 @@ mod tests {
             Err(GraphError::PropertyKind { property: NAME })
         );
     }
+
+    /// What a store answers when it answers something no read can use.
+    fn not_rows() -> Value {
+        json!({"answered": "something that is not rows"})
+    }
+
+    /// Every read a method makes, answered unusably in turn, and each one must refuse.
+    ///
+    /// The control comes first — the same answers as they should be — so a refusal below is the
+    /// spoiled answer and not a fixture that never worked. The read count is asserted, which is
+    /// the lever M24's store sweep used: a method that gains or loses a read fails here rather
+    /// than quietly leaving a new arm untested.
+    async fn refused_at_each_read<Call, Answering, Answered>(
+        answers: &[Value],
+        reads: usize,
+        call: Call,
+    ) where
+        Call: Fn(GraphPlane) -> Answering,
+        Answering: std::future::Future<Output = Result<Answered, GraphError>>,
+        Answered: std::fmt::Debug,
+    {
+        assert_eq!(
+            answers.len(),
+            reads,
+            "the sweep prepares {} answers for {reads} reads",
+            answers.len()
+        );
+        let stub = StubPlane::start(Replies::in_turn(answers.to_vec())).await;
+        call(GraphPlane::new(stub.client()))
+            .await
+            .expect("the control: every read answered as it should be");
+
+        for spoiled in 0..reads {
+            let mut answers = answers.to_vec();
+            answers[spoiled] = not_rows();
+            let stub = StubPlane::start(Replies::in_turn(answers)).await;
+            let refusal = call(GraphPlane::new(stub.client())).await;
+            assert!(
+                refusal.is_err(),
+                "read {spoiled} answered unusably and the call carried on with {refusal:?}"
+            );
+        }
+    }
+
+    /// The order a plane answers for the fixture's two nodes, as `toposort` reports one.
+    fn sorted() -> Value {
+        json!({
+            "algo": "toposort",
+            "count": 2,
+            "results": [{"id": 1, "generation": 0}, {"id": 2, "generation": 1}],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_graph_read_refuses_at_whichever_of_its_three_reads_cannot_be_used() {
+        let graph = graph();
+        refused_at_each_read(
+            &[graph_rows(&graph), node_rows(&graph), edge_table(&graph)],
+            3,
+            |plane| async move { plane.get(&tenant(), &id()).await },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_order_refuses_at_whichever_of_its_two_reads_cannot_be_used() {
+        let graph = graph();
+        refused_at_each_read(&[sorted(), node_rows(&graph)], 2, |plane| async move {
+            plane.order(&tenant(), &id()).await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_listing_refuses_when_its_one_read_cannot_be_used() {
+        refused_at_each_read(
+            &[json!({
+                "columns": [GRAPH, NAME, MAX_NODES, OWNER],
+                "rows": [["triage", "Support triage", 8, "acme"]],
+            })],
+            1,
+            |plane| async move {
+                plane
+                    .graphs(
+                        &tenant(),
+                        Listing {
+                            limit: 5,
+                            offset: 0,
+                        },
+                    )
+                    .await
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_removal_refuses_at_whichever_of_its_two_reads_cannot_be_used() {
+        let graph = graph();
+        refused_at_each_read(
+            &[graph_rows(&graph), node_rows(&graph)],
+            2,
+            |plane| async move { plane.remove(&tenant(), &id()).await },
+        )
+        .await;
+    }
+
+    /// An order is read for what it places as well as for its shape.
+    #[tokio::test]
+    async fn an_order_this_code_cannot_act_on_is_refused_by_name() {
+        let graph = graph();
+        let cases: [(Value, &str); 4] = [
+            (
+                json!({"count": 2, "results": [{"generation": 0}, {"id": 2, "generation": 1}]}),
+                "a node it did not name",
+            ),
+            (
+                json!({"count": 2, "results": [{"id": 1}, {"id": 2, "generation": 1}]}),
+                "a node placed in no generation",
+            ),
+            (
+                json!({"count": 9, "results": [{"id": 1, "generation": 0}]}),
+                "an order the store cut short",
+            ),
+            (
+                json!({"count": 1, "results": [{"id": 404, "generation": 0}]}),
+                "an order placing a node this graph has not got",
+            ),
+        ];
+        for (answered, what) in cases {
+            let stub = StubPlane::start(Replies::in_turn([answered, node_rows(&graph)])).await;
+            let refusal = GraphPlane::new(stub.client()).order(&tenant(), &id()).await;
+            assert!(refusal.is_err(), "{what} was taken: {refusal:?}");
+        }
+    }
+
+    /// A ceiling past what the type holds, which no schema guard refuses first.
+    #[tokio::test]
+    async fn a_stored_ceiling_no_ceiling_can_hold_is_refused() {
+        let graph = graph();
+        let mut rows = graph_rows(&graph);
+        rows[0]["properties"][MAX_NODES] = json!(5_000_000_000u64);
+        let stub = StubPlane::start(Replies::in_turn([rows])).await;
+
+        let refusal = GraphPlane::new(stub.client()).get(&tenant(), &id()).await;
+
+        match refusal {
+            Err(GraphError::PropertyKind { property }) => assert_eq!(property, MAX_NODES),
+            other => panic!("{other:?} was taken"),
+        }
+    }
+
+    /// A listed row is read as strictly as a single one, and refuses the same things.
+    #[tokio::test]
+    async fn a_listed_graph_its_own_types_will_not_take_is_refused() {
+        let cases: [(Value, &str); 4] = [
+            (
+                json!([["triage", "Support triage", 5_000_000_000u64, "acme"]]),
+                "a ceiling no ceiling can hold",
+            ),
+            (
+                json!([["triage", "Support triage", 8, "globex"]]),
+                "another owner's row",
+            ),
+            (
+                json!([["", "Support triage", 8, "acme"]]),
+                "an id that is none",
+            ),
+            (
+                json!([["triage", 7, 8, "acme"]]),
+                "a name that is not even text",
+            ),
+        ];
+        for (rows, what) in cases {
+            let stub = StubPlane::start(Replies::scripted([(
+                "plane.query",
+                json!({"columns": [GRAPH, NAME, MAX_NODES, OWNER], "rows": rows}),
+            )]))
+            .await;
+
+            let refusal = GraphPlane::new(stub.client())
+                .graphs(
+                    &tenant(),
+                    Listing {
+                        limit: 5,
+                        offset: 0,
+                    },
+                )
+                .await;
+
+            assert!(refusal.is_err(), "{what} was listed: {refusal:?}");
+        }
+    }
+
+    /// A count is read before the rows are trusted, and an answer carrying none is refused.
+    #[tokio::test]
+    async fn an_algorithm_that_counted_nothing_is_refused_rather_than_believed() {
+        let graph = graph();
+        let countless = json!({"algo": "toposort", "results": []});
+
+        let stub = StubPlane::start(Replies::in_turn([countless.clone()])).await;
+        let ordered = GraphPlane::new(stub.client()).order(&tenant(), &id()).await;
+        assert!(ordered.is_err(), "an order with no count: {ordered:?}");
+
+        // The same arm one layer down, where a write checks what it just wrote for a cycle.
+        let stub = StubPlane::start(Replies::scripted([
+            ("plane.query", json!([])),
+            ("plane.algo", countless),
+        ]))
+        .await;
+        let written = GraphPlane::new(stub.client()).put(&graph).await;
+        assert!(written.is_err(), "a cycle check with no count: {written:?}");
+    }
+
+    /// What a refused write says about the cycle it found, as well as the store allows.
+    ///
+    /// Which of the three it can say depends on what the store hands back: a node's own name only
+    /// when the write was answered with the id the cycle then names, the bare id when it was not,
+    /// and `?` for an entry that is not an id at all.
+    #[tokio::test]
+    async fn a_cycle_is_named_as_well_as_the_store_allows() {
+        let graph = graph();
+        let cases: [(Value, Value, &str); 3] = [
+            (
+                json!({"id": 1}),
+                json!({"count": 1, "results": [{"cycle": [1]}]}),
+                "intake",
+            ),
+            (
+                json!({}),
+                json!({"count": 1, "results": [{"cycle": [404]}]}),
+                "404",
+            ),
+            (
+                json!({}),
+                json!({"count": 1, "results": [{"cycle": ["not an id"]}]}),
+                "?",
+            ),
+        ];
+        for (created, found, said) in cases {
+            let stub = StubPlane::start(Replies::scripted([
+                ("plane.query", json!([])),
+                ("node.create", created),
+                ("plane.algo", found),
+            ]))
+            .await;
+
+            let refusal = GraphPlane::new(stub.client()).put(&graph).await;
+
+            match refusal {
+                Err(GraphError::Cyclic { cycle }) => {
+                    assert!(cycle.contains(said), "{cycle:?} does not name {said}");
+                }
+                other => panic!("{other:?} was taken, wanting {said}"),
+            }
+        }
+    }
+
+    /// A cycle the store found but would not describe at all.
+    #[tokio::test]
+    async fn a_cycle_the_store_will_not_describe_is_still_refused() {
+        let stub = StubPlane::start(Replies::scripted([
+            ("plane.query", json!([])),
+            ("plane.algo", json!({"count": 1, "results": [{}]})),
+        ]))
+        .await;
+
+        let refusal = GraphPlane::new(stub.client()).put(&graph()).await;
+
+        match refusal {
+            Err(GraphError::Cyclic { cycle }) => {
+                assert_eq!(cycle, "nodes the store did not name");
+            }
+            other => panic!("{other:?} was taken"),
+        }
+    }
+
+    /// A stored ceiling that is absent, and one that is not a number at all.
+    ///
+    /// The two are told apart on purpose: an operator reading "the property is missing" looks for
+    /// a write that never set it, and one reading "the wrong kind" looks at what is in the column.
+    #[tokio::test]
+    async fn a_graph_stored_without_a_usable_ceiling_is_refused_by_name() {
+        let graph = graph();
+        let mut rows = graph_rows(&graph);
+        rows[0]["properties"][MAX_NODES] = Value::Null;
+        let stub = StubPlane::start(Replies::in_turn([rows])).await;
+        match GraphPlane::new(stub.client()).get(&tenant(), &id()).await {
+            Err(GraphError::PropertyMissing { property }) => assert_eq!(property, MAX_NODES),
+            other => panic!("{other:?} was taken for a ceiling nothing stored"),
+        }
+
+        let mut rows = graph_rows(&graph);
+        rows[0]["properties"][MAX_NODES] = json!("eight");
+        let stub = StubPlane::start(Replies::in_turn([rows])).await;
+        match GraphPlane::new(stub.client()).get(&tenant(), &id()).await {
+            Err(GraphError::PropertyKind { property }) => assert_eq!(property, MAX_NODES),
+            other => panic!("{other:?} was taken for a ceiling that is a word"),
+        }
+    }
 }
