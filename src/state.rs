@@ -9,6 +9,7 @@ use ip_cache::{Cache, CacheBackend, Counters, Ttl};
 use ip_cache::{LevelLimits, MaxBytes, SledCache};
 use ip_config::{CacheConfig, Config, StorageConfig};
 use ip_core::RouteRule;
+use ip_core::route::ClusterAddress;
 use ip_drsg::{DrsgClient, DrsgEndpoint, DrsgSettings, PlaneName};
 use ip_gateway::{
     Configured, Dispatcher, Gateway, HyperUpstream, Limiter, Limits, Prices, ResponseCache,
@@ -68,6 +69,9 @@ pub struct AppState {
     /// Where the run graphs are kept, where a deployment keeps any. Absent is not a degraded
     /// graph store but a deployment with no graph feature, and the routes answer accordingly.
     graphs: Option<Arc<GraphPlane>>,
+    /// Where this deployment answers the rest of its own cluster. Absent where it cannot say:
+    /// nothing records an address nobody can dial.
+    cluster: Option<ClusterAddress>,
     /// The store a test reads through, when the state was built for one, so the test can
     /// make it fail where it means to.
     #[cfg(test)]
@@ -131,6 +135,7 @@ impl AppState {
             });
         }
         let graphs = open_graphs(config)?;
+        let cluster = cluster_address(config)?;
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
         let backend: Arc<dyn Backend> = Arc::clone(&store);
@@ -298,6 +303,7 @@ impl AppState {
             reloader,
             started_at,
             graphs,
+            cluster,
             #[cfg(test)]
             failing_store: None,
             #[cfg(test)]
@@ -354,15 +360,28 @@ impl AppState {
             reloader,
             started_at: RuleRevision::new(0),
             graphs: None,
+            cluster: None,
             failing_store: Some(failing_store),
             failing_cache: Some(failing_cache),
         }
+    }
+
+    /// Where this deployment answers the rest of its own cluster, where it can say at all.
+    pub fn cluster(&self) -> Option<&ClusterAddress> {
+        self.cluster.as_ref()
     }
 
     /// The same state over a graph store, for a test that works on one.
     #[cfg(test)]
     pub fn with_graphs(mut self, graphs: Arc<GraphPlane>) -> Self {
         self.graphs = Some(graphs);
+        self
+    }
+
+    /// The same state as a member of a cluster, for a test that works on one.
+    #[cfg(test)]
+    pub fn with_cluster(mut self, address: ClusterAddress) -> Self {
+        self.cluster = Some(address);
         self
     }
 
@@ -530,6 +549,22 @@ async fn open_cache(config: &CacheConfig) -> Result<Arc<dyn CacheBackend>, Start
 /// store that is not up yet is not a startup failure. What `ip-config` already refused is the
 /// shape of the url, the token and the plane name; this only rebuilds them as the client's own
 /// types, which is why its errors are a startup failure rather than a graph refusal.
+/// Where this deployment answers the rest of its own cluster, when it can say at all.
+///
+/// Said once here, either way. A deployment that binds every interface and advertises nothing has
+/// not said where it is, and recording an address nobody can dial is worse than recording none:
+/// the records exist to be read by whoever would dial or drain this machine.
+fn cluster_address(config: &Config) -> Result<Option<ClusterAddress>, StartupError> {
+    let address = config.cluster.address(config.server.listen)?;
+    match &address {
+        Some(address) => tracing::info!(%address, "this deployment answers its cluster here"),
+        None => tracing::info!(
+            "no cluster address: nothing is advertised and the listener binds every interface"
+        ),
+    }
+    Ok(address)
+}
+
 fn open_graphs(config: &Config) -> Result<Option<Arc<GraphPlane>>, StartupError> {
     let Some(graph_store) = config.graph_store.as_ref() else {
         return Ok(None);

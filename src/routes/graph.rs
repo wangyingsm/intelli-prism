@@ -13,12 +13,13 @@ use axum::routing::{get, post};
 use futures_util::StreamExt;
 use ip_agents::AgentConfig;
 use ip_auth::Authority;
+use ip_core::route::ClusterAddress;
 use ip_core::{Capability, CapabilityScope, Protocol, TenantId};
 use ip_gateway::Gateway;
 use ip_graph::{
-    GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner, GraphRunId,
-    GraphSaid, GraphSummary, Graphing, Listing, MaxNodes, NodeName, NodeRan, RunGraph,
-    RunGraphParts, RunningNode, RunsNode,
+    GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner, GraphPlane,
+    GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, MaxNodes, NodeName, NodeRan, Placement,
+    RunGraph, RunGraphParts, RunningNode, RunsNode,
 };
 use ip_mcp::{McpServer, McpSettings};
 use ip_run::{
@@ -395,6 +396,71 @@ struct Nodes {
     prepared: BTreeMap<NodeName, Prepared>,
     /// Where the graph's stream is written.
     say: tokio::sync::mpsc::UnboundedSender<GraphSaid>,
+    /// Where a node's placement is recorded, when this deployment can say where it is.
+    placing: Option<Placing>,
+}
+
+/// What recording where a node is running takes.
+///
+/// Here rather than in `ip-graph`'s own run, because the dispatcher is what knows where a node is
+/// going: in this process that is our own address, and in a cluster it is the worker picked for it.
+struct Placing {
+    /// Where the record is kept.
+    plane: Arc<GraphPlane>,
+    /// Which graph the nodes are from.
+    graph: GraphId,
+    /// Whose graph it is.
+    owner: GraphOwner,
+    /// Where the machine running them answers its own cluster.
+    address: ClusterAddress,
+}
+
+/// Where the records of this run's nodes are kept, when this deployment keeps any.
+///
+/// Nothing is recorded by a deployment that cannot say where it answers, or that keeps no graphs:
+/// an address nobody can dial is worse than no record at all.
+fn placing_for(state: &AppState, graph: &RunGraph) -> Option<Placing> {
+    state
+        .cluster()
+        .zip(state.graphs())
+        .map(|(address, plane)| Placing {
+            plane: Arc::clone(plane),
+            graph: graph.id().clone(),
+            owner: graph.owner().clone(),
+            address: address.clone(),
+        })
+}
+
+impl Placing {
+    /// Records that this node is running here.
+    ///
+    /// **Best effort.** A record that cannot be written is a warning and not a refusal: the
+    /// alternative makes the plane a dependency of *running* a node rather than of reading a
+    /// graph, which is a cost the graph store was deliberately not given.
+    async fn note(&self, run: GraphRunId, node: &NodeName) {
+        let placement = Placement {
+            run,
+            node: node.clone(),
+            graph: self.graph.clone(),
+            owner: self.owner.clone(),
+            address: self.address.clone(),
+            at: ip_core::Timestamp::now(),
+        };
+        if let Err(error) = self.plane.placed(&placement).await {
+            tracing::warn!(%error, %node, "could not record where a node is running");
+        }
+    }
+
+    /// Takes the record away, now that the node has ended wherever it ran.
+    ///
+    /// Best effort for the same reason, and with the same consequence either way: a record left
+    /// behind says a node is running that is not, which is what a resume reads and what a sweep
+    /// is for. It is not worth failing an answer the caller already has.
+    async fn done(&self, run: GraphRunId, node: &NodeName) {
+        if let Err(error) = self.plane.finished(&run, node).await {
+            tracing::warn!(%error, %node, "could not clear where a node was running");
+        }
+    }
 }
 
 /// One node's turns, said into the graph's own stream under that node's name.
@@ -455,6 +521,9 @@ impl RunsNode for Nodes {
                 ));
             }
         };
+        if let Some(placing) = &self.placing {
+            placing.note(run, &node.name).await;
+        }
         let ran = ip_run::run(
             &Running {
                 id,
@@ -473,6 +542,9 @@ impl RunsNode for Nodes {
             &input,
         )
         .await;
+        if let Some(placing) = &self.placing {
+            placing.done(run, &node.name).await;
+        }
         NodeRan {
             answer: ran.text(),
             stopped: ran.stopped,
@@ -667,6 +739,7 @@ async fn start(
         }
     };
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let placing = placing_for(&state, &graph);
     let graphing = Graphing {
         id: run,
         graph,
@@ -675,6 +748,7 @@ async fn start(
             gateway: state.shared_gateway(),
             prepared,
             say: sender.clone(),
+            placing,
         }),
         input: asked.input,
         reporting: Arc::new(sender),
@@ -1802,5 +1876,123 @@ upstream_speaks = "anthropic"
         }
 
         assert_eq!(refused, 8, "a run's own reads");
+    }
+
+    /// Where a test's own deployment answers its cluster.
+    fn here() -> ClusterAddress {
+        "10.0.0.2:8080".parse().expect("an address")
+    }
+
+    /// The same fixture as [`running`], as a member of a cluster that can say where it is.
+    async fn running_in_a_cluster(
+        named: &[&str],
+        replies: Replies,
+    ) -> (Router, AppState, StubPlane) {
+        let plane = StubPlane::start(replies).await;
+        let state = super::super::harness::serving(
+            store_with_templates(named).await,
+            SERVING,
+            Arc::new(Answering),
+        )
+        .with_graphs(Arc::new(GraphPlane::new(plane.client())))
+        .with_cluster(here());
+        (super::super::router(state.clone()), state, plane)
+    }
+
+    #[tokio::test]
+    async fn a_run_notes_where_each_node_is_running_and_clears_it_after() {
+        let (router, state, plane) = running_in_a_cluster(
+            &["intake-agent", "reply-agent"],
+            chain_of_two(sorted_chain()),
+        )
+        .await;
+
+        let answered = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/graph_run/triage?tenant=acme",
+        )
+        .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let said = streamed(answered).await;
+
+        let seen = plane.seen();
+        let written: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|one| one.method == "node.create")
+            .map(|one| &one.params)
+            .collect();
+        assert_eq!(written.len(), 2, "one record per node of the graph");
+        let cleared = seen
+            .iter()
+            .filter(|one| one.method == "node.delete")
+            .count();
+        // Two per node: the key is cleared before it is written, and again when the node ends.
+        assert_eq!(cleared, 4, "every record is taken away again");
+
+        // The run the records name is the run the stream is about.
+        let run = said
+            .iter()
+            .find_map(|(name, body)| (name == "done").then(|| body["run"].clone()))
+            .expect("the run says it is done");
+        for record in written {
+            assert_eq!(record["properties"]["run"], run);
+            assert_eq!(record["properties"]["address"], here().to_string());
+            assert_eq!(record["properties"]["graph"], "triage");
+            assert_eq!(record["properties"]["owner"], "acme");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_cannot_say_where_it_is_records_nothing() {
+        let (router, state, plane) = running(
+            &["intake-agent", "reply-agent"],
+            chain_of_two(sorted_chain()),
+        )
+        .await;
+
+        let answered = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/graph_run/triage?tenant=acme",
+        )
+        .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        streamed(answered).await;
+
+        let wrote_or_cleared = plane
+            .seen()
+            .iter()
+            .filter(|one| one.method == "node.create" || one.method == "node.delete")
+            .count();
+        assert_eq!(
+            wrote_or_cleared, 0,
+            "a deployment with no cluster address records no placement"
+        );
+    }
+
+    /// A record that cannot be written does not stop the node that would have been recorded.
+    #[tokio::test]
+    async fn a_plane_that_refuses_the_record_does_not_stop_the_node() {
+        let plane = StubPlane::start(Replies::Failure).await;
+        let placing = Placing {
+            plane: Arc::new(GraphPlane::new(plane.client())),
+            graph: GraphId::new("triage").expect("a graph id"),
+            owner: GraphOwner::Tenant(TenantId::new("acme").expect("a tenant")),
+            address: here(),
+        };
+        let run = GraphRunId::generate().expect("a run id");
+        let node = NodeName::new("intake").expect("a node name");
+
+        // Neither says anything, and neither refuses: the warning is all that is left of it.
+        placing.note(run, &node).await;
+        placing.done(run, &node).await;
+
+        // It tried, and the first call is where it stopped: `placed` clears the key before it
+        // writes, so a plane that refuses everything refuses that delete and never gets to create.
+        let tried: Vec<String> = plane.seen().into_iter().map(|one| one.method).collect();
+        assert_eq!(tried, ["node.delete", "node.delete"]);
     }
 }
