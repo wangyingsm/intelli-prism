@@ -1,0 +1,121 @@
+name: gate
+
+# The two gates CLAUDE.md documents, run where nobody has to remember to type them. Eleven
+# adopted lints are only as good as the thing that runs them, and until this file nothing did:
+# `image.yml` built images and asked them what they were, and never once ran clippy or a test.
+#
+# What this cannot check, and so does not claim to: the arms that need a real model. The
+# classifier's and the embedder's artefacts are not in this repository, and without them those
+# tests say so and pass. A green run here means every test that can be run without an artefact
+# passed — the model arms are covered by the coverage run on a machine that has one.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The gate's own feature set. Which code exists at all depends on the features, so a run
+  # without them checks a build nobody ships: without `classifier` the classifier is not
+  # compiled, and without the standalone pair the sqlite and sled arms are not either.
+  GATE_FEATURES: standalone-storage,standalone-cache,classifier,semantic
+
+jobs:
+  shape:
+    name: formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: it is formatted
+        run: cargo fmt --all --check
+
+  style:
+    name: lints, ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Each combination is its own question, so one answer is not a reason to stop asking.
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            features: ''
+          - name: the full gate set
+            features: --features standalone-storage,standalone-cache,classifier,semantic
+          - name: the classifier alone
+            features: --features classifier
+          - name: neither cluster backend
+            features: >-
+              --no-default-features
+              --features standalone-storage,standalone-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: style-${{ matrix.name }}
+
+      # `-D warnings` is not optional: the levels stay "warn" in the manifest so that a
+      # work-in-progress `cargo check` is still usable, and this flag is what makes them bind.
+      # Four combinations because which lint fires depends on which code exists — one dead
+      # variant appears only with every backend compiled, another only without `classifier`.
+      - name: it passes the style gate
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }}
+
+  tests:
+    name: the test gate
+    runs-on: ubuntu-latest
+
+    # A live backend for each pair. Without `DATABASE_URL` the postgres tests return early
+    # having checked nothing, and `REDIS_URL` gates the redis tests the same way.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: ip
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:8-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tests
+
+      # The gate is a nextest run, and that is not only a preference: a test process installs
+      # the global tracing subscriber once and never undoes it, so tests that each install one
+      # need a process apiece.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: it passes the test gate
+        env:
+          DATABASE_URL: postgres://postgres:ip@127.0.0.1:5432/postgres
+          REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          cargo nextest run --workspace --locked --features "${GATE_FEATURES}"
+
+      - name: what it did not run
+        run: |
+          echo "::notice::the model arms were skipped: no classifier or embedder artefact here"
