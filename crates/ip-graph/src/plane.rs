@@ -17,9 +17,11 @@ use serde_json::{Value, json};
 use crate::error::GraphError;
 use crate::graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
 use crate::id::{GraphId, GraphName, GraphRunId, NodeName};
+use crate::member::ClusterMember;
 use crate::order::{Generation, Placed, RunOrder};
 use crate::placement::Placement;
 use ip_core::Timestamp;
+use ip_core::route::ClusterAddress;
 
 /// The label on the one node that holds what a graph says about itself.
 pub const GRAPH_LABEL: &str = "RunGraph";
@@ -36,6 +38,12 @@ pub const FEEDS: &str = "FEEDS";
 /// stored graph: what a graph says about itself and where one of its nodes is running now are two
 /// different kinds of thing with the same owner and the same name.
 pub const PLACEMENT_LABEL: &str = "GraphPlacement";
+
+/// The label on every member's record of itself.
+///
+/// The one label here no tenant owns: a member is the deployment's own machine, so nothing in a
+/// member read filters on an owner and no tenant's read can reach one.
+pub const MEMBER_LABEL: &str = "ClusterMember";
 
 /// Which graph a row belongs to.
 const GRAPH: &str = "graph";
@@ -80,6 +88,14 @@ fn node_key(owner: &GraphOwner, id: &GraphId, name: &NodeName) -> String {
 /// graph may be running in two runs at once.
 fn placement_key(run: &GraphRunId, node: &NodeName) -> String {
     format!("{PLACEMENT_LABEL}/{}/{node}", run.to_hex())
+}
+
+/// The key a store addresses one member by.
+///
+/// The address and nothing else: a machine that restarts is the same member, and a second row for
+/// it would be a second machine as far as every reader is concerned.
+fn member_key(address: &ClusterAddress) -> String {
+    format!("{MEMBER_LABEL}/{address}")
 }
 
 /// The label that is one graph's nodes and nothing else.
@@ -223,6 +239,39 @@ fn placements_plan(owner: &GraphOwner, run: &GraphRunId) -> Value {
                 "rhs": eq(OWNER, owner.written()),
             }
         }}],
+    })
+}
+
+/// The plan that reads every member of the cluster.
+///
+/// No filter: a member belongs to the deployment rather than to a tenant, so there is no owner to
+/// narrow by and nothing narrower that would be true.
+fn members_plan() -> Value {
+    json!({"source": {"ScanLabel": MEMBER_LABEL}, "steps": []})
+}
+
+/// What a member's record of itself carries.
+fn member_properties(member: &ClusterMember) -> Value {
+    json!({
+        ADDRESS: member.address.to_string(),
+        AT: member.at.unix_seconds(),
+    })
+}
+
+/// One member, rebuilt from the row the store answered with.
+fn member_from(row: &Value) -> Result<ClusterMember, GraphError> {
+    let properties = &row["properties"];
+    let at = properties[AT]
+        .as_i64()
+        .ok_or(GraphError::PropertyKind { property: AT })?;
+    Ok(ClusterMember {
+        address: properties[ADDRESS]
+            .as_str()
+            .ok_or(GraphError::PropertyMissing { property: ADDRESS })?
+            .parse()
+            .map_err(|_| GraphError::PropertyKind { property: ADDRESS })?,
+        at: Timestamp::from_unix_seconds(at)
+            .map_err(|_| GraphError::PropertyKind { property: AT })?,
     })
 }
 
@@ -527,6 +576,53 @@ impl GraphPlane {
         rows.iter()
             .map(|row| placement_from(row, owner))
             .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Records that this member is here, now.
+    ///
+    /// Rewrites rather than adding, as [`Self::placed`] does and for the same reason: a member
+    /// saying so again on its next heartbeat is the same member, and `node_create` refuses a key
+    /// that is already bound.
+    pub async fn joined(&self, member: &ClusterMember) -> Result<(), GraphError> {
+        let key = member_key(&member.address);
+        self.drsg.node_delete(&key).await?;
+        self.drsg
+            .node_create(&key, &[MEMBER_LABEL], member_properties(member))
+            .await?;
+        Ok(())
+    }
+
+    /// Takes away the record of a member that is going.
+    ///
+    /// Answers nothing about whether there was one, for the reason [`Self::finished`] does not: a
+    /// registration that was best effort and failed must not make its own machine's shutdown an
+    /// error.
+    pub async fn left(&self, address: &ClusterAddress) -> Result<(), GraphError> {
+        self.drsg
+            .node_delete(&member_key(address))
+            .await
+            .map(|_| ())
+            .map_err(GraphError::from)
+    }
+
+    /// Every member of the cluster, the one that wrote most recently first.
+    ///
+    /// Ordered here rather than in the store, because a scan answers in whatever order it holds
+    /// its rows, and a reader choosing between members should not choose differently each call.
+    ///
+    /// Liveness is not applied: how old a row may be before it is ignored belongs to the reader,
+    /// and only a reader that knows the heartbeat interval can say.
+    pub async fn members(&self) -> Result<Vec<ClusterMember>, GraphError> {
+        let rows = self.drsg.query(members_plan()).await?;
+        let rows = rows.as_array().ok_or_else(|| GraphError::Unreadable {
+            detail: "a member read answered with something that is not rows".to_owned(),
+        })?;
+        let mut members = rows
+            .iter()
+            .map(member_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        members.sort_by_key(|member| std::cmp::Reverse(member.at.unix_seconds()));
+        Ok(members)
     }
 
     /// The order one owner's graph runs in, as the store's own topological sort answers it.
@@ -1945,6 +2041,156 @@ mod tests {
     async fn a_placement_read_refuses_when_its_one_read_cannot_be_used() {
         refused_at_each_read(&[placement_rows(&placement())], 1, |plane| async move {
             plane.placements(&tenant(), &run_id()).await
+        })
+        .await;
+    }
+
+    fn member() -> ClusterMember {
+        ClusterMember {
+            address: address(),
+            at: Timestamp::from_unix_seconds(1_762_000_000).expect("a time"),
+        }
+    }
+
+    /// The rows a plane answers a member read with, built from what each write would have sent.
+    fn member_rows(members: &[ClusterMember]) -> Value {
+        Value::Array(
+            members
+                .iter()
+                .enumerate()
+                .map(|(at, one)| json!({"id": at + 1, "properties": member_properties(one)}))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_member_registers_itself_and_reads_back_whole() {
+        let joined = member();
+        let stub = StubPlane::start(Replies::in_turn([member_rows(std::slice::from_ref(
+            &joined,
+        ))]))
+        .await;
+
+        let read = GraphPlane::new(stub.client())
+            .members()
+            .await
+            .expect("the registration reads back");
+
+        assert_eq!(read, vec![joined]);
+    }
+
+    #[tokio::test]
+    async fn a_member_saying_so_again_replaces_its_row_rather_than_being_refused_one() {
+        let stub = StubPlane::start(Replies::Echo).await;
+
+        GraphPlane::new(stub.client())
+            .joined(&member())
+            .await
+            .expect("the stub takes the write");
+
+        let seen: Vec<String> = stub.seen().into_iter().map(|one| one.method).collect();
+        assert_eq!(
+            seen,
+            ["node.delete", "node.create"],
+            "every heartbeat rewrites a key the store would bind only once"
+        );
+    }
+
+    /// A machine that restarts is the same member, so its address is the whole of its key.
+    #[tokio::test]
+    async fn a_member_is_keyed_by_its_address_alone() {
+        let elsewhere: ClusterAddress = "10.0.0.3:8080".parse().expect("an address");
+
+        assert_eq!(member_key(&address()), member_key(&address()));
+        assert_ne!(member_key(&address()), member_key(&elsewhere));
+    }
+
+    #[tokio::test]
+    async fn a_member_that_goes_takes_its_row_away() {
+        let stub = StubPlane::start(Replies::Deleted).await;
+
+        GraphPlane::new(stub.client())
+            .left(&address())
+            .await
+            .expect("the row goes");
+
+        let seen = stub.only();
+        assert_eq!(seen.method, "node.delete");
+        assert_eq!(seen.params["key"], member_key(&address()));
+    }
+
+    /// A registration that was best effort and failed leaves nothing to take away.
+    #[tokio::test]
+    async fn a_member_whose_row_was_never_written_still_goes() {
+        let stub = StubPlane::start(Replies::Absent).await;
+
+        GraphPlane::new(stub.client())
+            .left(&address())
+            .await
+            .expect("nothing to delete is not a failure");
+    }
+
+    /// The one read here that narrows by nothing, because a member belongs to no tenant.
+    #[tokio::test]
+    async fn a_member_read_scans_the_label_and_filters_on_nobody() {
+        let stub = StubPlane::start(Replies::in_turn([json!([])])).await;
+
+        GraphPlane::new(stub.client())
+            .members()
+            .await
+            .expect("the stub answers nothing");
+
+        let plan = stub.only().params["plan"].clone();
+        assert_eq!(plan["source"]["ScanLabel"], MEMBER_LABEL);
+        assert_eq!(plan["steps"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn the_member_that_wrote_most_recently_is_answered_first() {
+        let newer = ClusterMember {
+            address: "10.0.0.3:8080".parse().expect("an address"),
+            at: Timestamp::from_unix_seconds(1_762_000_500).expect("a time"),
+        };
+        let stub =
+            StubPlane::start(Replies::in_turn([member_rows(&[member(), newer.clone()])])).await;
+
+        let read = GraphPlane::new(stub.client())
+            .members()
+            .await
+            .expect("both read back");
+
+        assert_eq!(
+            read,
+            vec![newer, member()],
+            "a scan's own order is not an order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_row_its_own_types_will_not_take_is_refused_by_name() {
+        for (property, stored) in [
+            (ADDRESS, json!("10.0.0.2")),
+            (ADDRESS, Value::Null),
+            (AT, json!("whenever")),
+            (AT, json!(i64::MIN)),
+        ] {
+            let mut rows = member_rows(&[member()]);
+            rows[0]["properties"][property] = stored.clone();
+            let stub = StubPlane::start(Replies::in_turn([rows])).await;
+
+            let refusal = GraphPlane::new(stub.client()).members().await;
+
+            assert!(
+                refusal.is_err(),
+                "{property} stored as {stored:?} was taken"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_member_read_refuses_when_its_one_read_cannot_be_used() {
+        refused_at_each_read(&[member_rows(&[member()])], 1, |plane| async move {
+            plane.members().await
         })
         .await;
     }
