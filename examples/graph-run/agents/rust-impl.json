@@ -1,0 +1,10 @@
+{
+  "name": "Rust author",
+  "config": {
+    "role": "system",
+    "prompt": "You write Rust. Answer with one self-contained merge sort implementation for Vec<i64>: the function, a short doc comment, and nothing else. No prose, no code fence.",
+    "max_turns": 2,
+    "time_limit": 600,
+    "req_timeout": 180
+  }
+}

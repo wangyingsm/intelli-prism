@@ -1,0 +1,17 @@
+{
+  "name": "Merge sort, two languages",
+  "max_nodes": 8,
+  "nodes": [
+    {"name": "rust-impl",  "agent": "rust-impl"},
+    {"name": "go-impl",    "agent": "go-impl"},
+    {"name": "rust-bench", "agent": "rust-bench"},
+    {"name": "go-bench",   "agent": "go-bench"},
+    {"name": "compare",    "agent": "compare"}
+  ],
+  "edges": [
+    {"from": "rust-impl",  "to": "rust-bench"},
+    {"from": "go-impl",    "to": "go-bench"},
+    {"from": "rust-bench", "to": "compare"},
+    {"from": "go-bench",   "to": "compare"}
+  ]
+}

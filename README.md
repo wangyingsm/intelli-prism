@@ -89,6 +89,17 @@ each works on a scratch schema or key prefix of its own. `tests/api/run.sh` star
 database and cache that go when the run does, makes a system administrator the way an operator
 does, and runs the `.hurl` files beside it in order.
 
+## Examples
+
+```
+examples/graph-run/run.sh                                # a five-node graph, a real model
+```
+
+`examples/graph-run` runs a graph that writes a merge sort in Rust and in Go, benchmarks each and
+compares the two, against a live provider and a real dr-strange plane. It needs `IP_API_KEY` and
+`drsg` 2.28.0 or newer; one recorded run is kept beside it, with what that run showed about
+parallel generations, fan-in and unpriced spend.
+
 ## Status
 
 **This is not production software.** It is an unfinished project under active development, at

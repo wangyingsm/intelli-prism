@@ -1,0 +1,16 @@
+  rust-impl   begins on     88 characters of input
+  go-impl     begins on     88 characters of input
+  rust-impl   answered  in    60/  202 tokens,    708 characters out
+  go-impl     answered  in    63/  320 tokens,    884 characters out
+  rust-bench  begins on    750 characters of input
+  go-bench    begins on   1072 characters of input
+  go-bench    answered  in   512/  212 tokens,    588 characters out
+  rust-bench  answered  in   305/  613 tokens,   2064 characters out
+  compare     begins on   2840 characters of input
+  compare     answered  in  1078/  594 tokens,   2630 characters out
+
+  answered with: compare
+  stopped at:    nothing — every node answered
+  spent:         2018/1941 tokens, 0 micros
+  run id:        f871bc2e36bff1a5addfa7e742c170c0
+  nodes, in the order they finished: rust-impl → go-impl → go-bench → rust-bench → compare

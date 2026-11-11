@@ -1,0 +1,10 @@
+{
+  "name": "Rust bencher",
+  "config": {
+    "role": "system",
+    "prompt": "You are given a Rust merge sort under the key of the node that wrote it. Answer with a complete, runnable Criterion benchmark for it over 10k random i64, plus the exact cargo command to run it. Code first, then the command on its own line.",
+    "max_turns": 2,
+    "time_limit": 600,
+    "req_timeout": 180
+  }
+}

@@ -1,0 +1,32 @@
+```go
+package main
+
+import (
+	"math/rand"
+	"sort"
+	"testing"
+)
+
+func BenchmarkMergeSort10k(b *testing.B) {
+	r := rand.New(rand.NewSource(42))
+	input := make([]int64, 10000)
+	for i := range input {
+		input[i] = r.Int63()
+	}
+	want := append([]int64(nil), input...)
+	sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		got := MergeSort(input)
+		if len(got) != len(want) {
+			b.Fatalf("len = %d, want %d", len(got), len(want))
+		}
+	}
+}
+```
+
+```
+go test -bench=BenchmarkMergeSort10k -benchmem -run=^$ -count=5
+```

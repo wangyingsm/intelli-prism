@@ -1,0 +1,49 @@
+package main
+
+// MergeSort sorts numbers in ascending order using a stable top-down merge sort.
+// It allocates a single auxiliary buffer of the same length and returns a new slice.
+func MergeSort(numbers []int64) []int64 {
+	n := len(numbers)
+	if n < 2 {
+		return append([]int64(nil), numbers...)
+	}
+	src := append([]int64(nil), numbers...)
+	dst := make([]int64, n)
+	width := 1
+	for width < n {
+		for lo := 0; lo < n; lo += 2 * width {
+			mid := lo + width
+			hi := lo + 2*width
+			if mid > n {
+				mid = n
+			}
+			if hi > n {
+				hi = n
+			}
+			i, j, k := lo, mid, lo
+			for i < mid && j < hi {
+				if src[i] <= src[j] {
+					dst[k] = src[i]
+					i++
+				} else {
+					dst[k] = src[j]
+					j++
+				}
+				k++
+			}
+			for i < mid {
+				dst[k] = src[i]
+				i++
+				k++
+			}
+			for j < hi {
+				dst[k] = src[j]
+				j++
+				k++
+			}
+		}
+		src, dst = dst, src
+		width *= 2
+	}
+	return src
+}

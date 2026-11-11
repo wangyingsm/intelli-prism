@@ -1,0 +1,10 @@
+{
+  "name": "Go author",
+  "config": {
+    "role": "system",
+    "prompt": "You write Go. Answer with one self-contained merge sort implementation for []int64 in package main: the function, a short doc comment, and nothing else. No prose, no code fence.",
+    "max_turns": 2,
+    "time_limit": 600,
+    "req_timeout": 180
+  }
+}

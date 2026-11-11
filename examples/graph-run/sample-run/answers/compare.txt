@@ -1,0 +1,16 @@
+No benchmark has been executed yet; none of the input contains measured numbers.
+
+**Algorithmic shape**
+- Rust: `merge_sort(Vec<i64>) -> Vec<i64>`, recursively `split_off(mid)` then merges with `Vec::with_capacity(len)` + `push` + `extend_from_slice`. Takes ownership; input is moved in, not copied in the sort itself.
+- Go: `MergeSort(input)` appears to take a slice and return one (implementation not shown). Classic bottom-up or top-down merge at 10k elements.
+
+**Allocation behaviour**
+- Rust: `split_off` allocates a new right-half `Vec`, and every merge level allocates a fresh `merged` of capacity `len`. For n=10k that's roughly n allocations totaling O(n log n) bytes copied; no in-place merging or scratch reuse. Additionally, per iteration, `data.clone()` is measured inside the timed closure.
+- Go: unknown from the snippet, but typical merge sorts allocate a scratch/result slice per level too; likely comparable O(n log n) allocation unless the implementation reuses buffers.
+
+**What each benchmark measures**
+- Go: pre-generates `input` and `want` once, then in the loop calls `MergeSort(input)` and only checks length (not sortedness — length check is nearly a no-op). `b.ReportAllocs()` reports per-op allocs. Whether `MergeSort` mutates or copies `input` matters: if it sorts in place, iterations after the first sort already-sorted data — a fundamentally different (and unfairly faster) workload than the first.
+- Rust: pre-generates `data`, but inside the timed loop it does `data.clone()` (deliberately black-boxed) and then sorts. `black_box` prevents elimination. So the Rust bench includes clone cost per iteration, plus full correctness of sorting is not verified (only black-boxed result). Criterion also adds statistical overhead estimation; throughput is set to elements.
+
+**Expected faster**
+The two benchmarks aren't directly comparable: Rust measures clone + owned sort; Go measures sort-of-possibly-already-sorted-input with no clone. On raw sort cost alone, expectations are roughly equivalent — both are allocating merge sorts. Rust would likely be somewhat faster per element (no GC, predictable allocations) *for sorting*, but its benchmark *as written* also pays for a 10k-element clone every iteration, which the Go bench does not (unless `MergeSort` copies internally). Net: Rust's measured number may be higher (slower) due to included clone, and Go's may be artificially low if `input` is mutated in place and subsequent iterations sort pre-sorted data. To compare fairly, both should clone the input inside the timed region (or both pre-clone and sort a fresh copy) and verify sortedness.
