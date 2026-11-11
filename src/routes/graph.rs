@@ -1697,4 +1697,106 @@ upstream_speaks = "anthropic"
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
+
+    /// A plane that answers every management read, so a 500 can only be the store's.
+    fn answering_plane() -> Replies {
+        Replies::scripted([
+            ("plane.query", serde_json::json!([])),
+            ("plane.algo", serde_json::json!({"count": 0, "results": []})),
+        ])
+    }
+
+    /// Every store call a graph request makes carries its own "the store could not answer" arm,
+    /// and a database that works reaches none of them. Failing each in turn reaches them all.
+    ///
+    /// The sweep starts at the first call of the whole request — the extractor's own read of the
+    /// caller's standing — and the count is asserted, so a handler that gains or loses a store
+    /// call fails here rather than quietly leaving a new arm untested. Each refused request
+    /// changes nothing, which is what lets one fixture serve a whole sweep.
+    ///
+    /// The graphs themselves are in the plane and not in the store, so what is swept here is the
+    /// door rather than the write: the plane answers everything, and a 500 is the store's alone.
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_is_the_servers_own_failure() {
+        for (method, uri, body, calls) in [
+            ("GET", "/_ip/graphs?tenant=acme", None, 3),
+            ("GET", "/_ip/graphs/triage?tenant=acme", None, 3),
+            (
+                "PUT",
+                "/_ip/graphs/triage?tenant=acme",
+                Some(r#"{"name":"Triage","max_nodes":4,"nodes":[{"name":"a","agent":"x"}]}"#),
+                3,
+            ),
+            ("DELETE", "/_ip/graphs/triage?tenant=acme", None, 3),
+        ] {
+            let (router, state, _plane) = running(&[], answering_plane()).await;
+            let cookie = cookie_of(&state, &user("alice")).await;
+            let mut refused = 0;
+
+            loop {
+                state.store_failure().answer_only(refused);
+                let response = router
+                    .clone()
+                    .oneshot(request(method, uri, &cookie, body))
+                    .await
+                    .unwrap();
+                state.store_failure().answer_again();
+                if response.status() != StatusCode::INTERNAL_SERVER_ERROR {
+                    break;
+                }
+                refused += 1;
+                assert!(refused <= 9, "{method} {uri} refuses whatever it is given");
+            }
+
+            assert_eq!(refused, calls, "{method} {uri}");
+        }
+    }
+
+    /// The same sweep over a run, which reaches past the door into what a run itself reads.
+    ///
+    /// A fixture of its own per request, where the management sweep reuses one: the plane answers
+    /// a graph read in three queries and an order in two more, scripted in the order they arrive,
+    /// so a second request through one fixture would be answered the first one's answers.
+    ///
+    /// Eight calls, and the count is what makes this worth keeping: a run that gains a node, or a
+    /// handler that reads one more row before it starts, fails here rather than quietly adding an
+    /// arm nothing reaches.
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_refuses_a_run_at_every_read_it_makes() {
+        let mut refused = 0;
+
+        loop {
+            let (router, state, _plane) = running(
+                &["intake-agent", "reply-agent"],
+                chain_of_two(sorted_chain()),
+            )
+            .await;
+            // Minted before the store is told to fail, or the cookie itself cannot be made.
+            let cookie = cookie_of(&state, &user("alice")).await;
+            state.store_failure().answer_only(refused);
+
+            let response = router
+                .oneshot(request(
+                    "POST",
+                    "/_ip/graph_run/triage?tenant=acme",
+                    &cookie,
+                    Some(r#"{"input":"how many?"}"#),
+                ))
+                .await
+                .unwrap();
+
+            if response.status() != StatusCode::INTERNAL_SERVER_ERROR {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "the sweep ended on something that is neither a refusal nor a run"
+                );
+                break;
+            }
+            refused += 1;
+            assert!(refused <= 12, "a run refuses whatever it is given");
+        }
+
+        assert_eq!(refused, 8, "a run's own reads");
+    }
 }
