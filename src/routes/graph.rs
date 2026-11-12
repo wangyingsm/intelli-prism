@@ -11,10 +11,11 @@ use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
-use ip_agents::AgentConfig;
+use ip_agents::{AgentConfig, AgentId};
 use ip_auth::Authority;
+use ip_cluster::{ClusterClient, Dispatch, NodeEvent};
 use ip_core::route::ClusterAddress;
-use ip_core::{Capability, CapabilityScope, Protocol, TenantId};
+use ip_core::{Capability, CapabilityScope, Protocol, TenantId, UserId};
 use ip_gateway::Gateway;
 use ip_graph::{
     GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner, GraphPlane,
@@ -377,6 +378,8 @@ struct Start {
 
 /// Everything one node needs, resolved before the stream opens.
 struct Prepared {
+    /// Which template it names, which a dispatch carries instead of what was resolved from it.
+    agent: AgentId,
     /// What the node's agent runs under.
     config: AgentConfig,
     /// What it settled on for a model and a family.
@@ -387,13 +390,14 @@ struct Prepared {
     shed: Toolshed,
 }
 
-/// Runs one node of a graph through the deployment's own gateway.
+/// Runs one node of a graph, here or on another machine of this cluster.
 ///
 /// Holds every node's resolved template rather than reading one when its turn comes: what a graph
 /// run can refuse is settled before the 200, and a template that has gone missing halfway through
-/// a stream is not a status code any more.
+/// a stream is not a status code any more. A node sent elsewhere is resolved here all the same,
+/// because that resolution is what makes the local fallback possible at all.
 struct Nodes {
-    /// The gateway every node's turns go through.
+    /// The gateway every node's turns go through, when the node runs here.
     gateway: Arc<Gateway>,
     /// What each node of this graph needs, by name.
     prepared: BTreeMap<NodeName, Prepared>,
@@ -401,6 +405,8 @@ struct Nodes {
     say: tokio::sync::mpsc::UnboundedSender<GraphSaid>,
     /// Where a node's placement is recorded, when this deployment can say where it is.
     placing: Option<Placing>,
+    /// Where a node may be sent instead, when this deployment is in a cluster it can dispatch in.
+    dispatching: Option<Dispatching>,
 }
 
 /// What recording where a node is running takes.
@@ -414,8 +420,67 @@ struct Placing {
     graph: GraphId,
     /// Whose graph it is.
     owner: GraphOwner,
-    /// Where the machine running them answers its own cluster.
-    address: ClusterAddress,
+    /// Where this machine answers its own cluster, which is where a node runs unless it is sent.
+    us: ClusterAddress,
+}
+
+/// What every dispatch of this run carries, whichever of its nodes it is for.
+///
+/// The caller is *named* rather than resolved: the member that runs the node builds the authority
+/// itself, from its own reads of the same two rows. A dispatch is intent, never permission.
+struct Sending {
+    /// Which graph the node is from.
+    graph: GraphId,
+    /// Whose graph it is.
+    owner: GraphOwner,
+    /// The tenant the run is charged to.
+    tenant: TenantId,
+    /// The account the run was started by.
+    user: UserId,
+    /// What the request asked for, where it asked for anything.
+    requested: Requested,
+}
+
+/// Where this run's nodes may be sent, when this deployment is in a cluster that can take one.
+struct Dispatching {
+    /// What every dispatch carries.
+    sending: Sending,
+    /// The pooled client they go out on.
+    client: Arc<ClusterClient>,
+    /// Where this machine answers, so it is never picked to run its own node.
+    us: ClusterAddress,
+    /// Where the members of the cluster say they are here.
+    plane: Arc<GraphPlane>,
+    /// How often a member says so, which is what tells one that is late from one that is gone.
+    heartbeat: Duration,
+}
+
+/// How many heartbeats a member may miss before this coordinator stops picking it.
+///
+/// Three rather than one, because a member a moment late on one write has not died and the cost
+/// of being wrong is small in one direction only: a dispatch to a member that *has* died fails
+/// before its first event, which falls back and runs the node here. Skipping a member that is
+/// merely late would send every node to one machine for no reason.
+const BELIEVED_FOR: u32 = 3;
+
+/// Which node of which run is being sent, and what it is being asked.
+struct OneNode<'a> {
+    /// The graph run it belongs to.
+    run: GraphRunId,
+    /// Which node it is.
+    node: &'a NodeName,
+    /// Which template that node names.
+    agent: &'a AgentId,
+    /// What it is being asked to do.
+    input: &'a str,
+}
+
+/// What came of trying to run a node somewhere else.
+enum Sent {
+    /// It ran there, and this is what it came to — an answer or a failure that is the node's.
+    Ran(NodeRan),
+    /// Nothing was said and nothing was spent, so the node may still run here.
+    Nowhere,
 }
 
 /// Where the records of this run's nodes are kept, when this deployment keeps any.
@@ -430,23 +495,92 @@ fn placing_for(state: &AppState, graph: &RunGraph) -> Option<Placing> {
             plane: Arc::clone(plane),
             graph: graph.id().clone(),
             owner: graph.owner().clone(),
-            address: address.clone(),
+            us: address.clone(),
         })
 }
 
+/// Where this run's nodes may be sent, when all three of the things that takes are there.
+///
+/// The plane, because that is where the members are; an address of this machine's own, so it can
+/// tell its own row from a peer's; and a client, which exists only where the secret does. Any one
+/// missing and every node of the run is run here, which is what every deployment did until now.
+fn dispatching_for(state: &AppState, run: &Run<'_>) -> Option<Dispatching> {
+    Some(Dispatching {
+        sending: Sending {
+            graph: run.graph.id().clone(),
+            owner: run.graph.owner().clone(),
+            tenant: run.tenant.clone(),
+            user: run.user.clone(),
+            requested: run.requested.clone(),
+        },
+        client: Arc::clone(state.cluster_client()?),
+        us: state.cluster()?.clone(),
+        plane: Arc::clone(state.graphs()?),
+        heartbeat: state.heartbeat(),
+    })
+}
+
+/// What runs this graph's nodes.
+///
+/// The gateway, every node's resolved template, and — where this deployment is in a cluster it
+/// can dispatch in — the members it may send a node to instead of running it here.
+fn driving(
+    state: &AppState,
+    run: &Run<'_>,
+    prepared: BTreeMap<NodeName, Prepared>,
+    say: tokio::sync::mpsc::UnboundedSender<GraphSaid>,
+) -> Nodes {
+    Nodes {
+        gateway: state.shared_gateway(),
+        prepared,
+        say,
+        placing: placing_for(state, run.graph),
+        dispatching: dispatching_for(state, run),
+    }
+}
+
+/// What one graph run is, beyond the graph itself.
+struct Run<'a> {
+    /// The graph being run.
+    graph: &'a RunGraph,
+    /// The tenant it is charged to.
+    tenant: &'a TenantId,
+    /// The account that started it.
+    user: &'a UserId,
+    /// What it was asked to run on, where anything was named.
+    requested: &'a Requested,
+}
+
+impl<'a> Run<'a> {
+    /// The same four, named at a call site that has them all to hand.
+    const fn of(
+        graph: &'a RunGraph,
+        tenant: &'a TenantId,
+        user: &'a UserId,
+        requested: &'a Requested,
+    ) -> Self {
+        Self {
+            graph,
+            tenant,
+            user,
+            requested,
+        }
+    }
+}
+
 impl Placing {
-    /// Records that this node is running here.
+    /// Records that this node is running at `address`, which is this machine unless it was sent.
     ///
     /// **Best effort.** A record that cannot be written is a warning and not a refusal: the
     /// alternative makes the plane a dependency of *running* a node rather than of reading a
     /// graph, which is a cost the graph store was deliberately not given.
-    async fn note(&self, run: GraphRunId, node: &NodeName) {
+    async fn note(&self, run: GraphRunId, node: &NodeName, address: &ClusterAddress) {
         let placement = Placement {
             run,
             node: node.clone(),
             graph: self.graph.clone(),
             owner: self.owner.clone(),
-            address: self.address.clone(),
+            address: address.clone(),
             at: ip_core::Timestamp::now(),
         };
         if let Err(error) = self.plane.placed(&placement).await {
@@ -463,6 +597,142 @@ impl Placing {
         if let Err(error) = self.plane.finished(&run, node).await {
             tracing::warn!(%error, %node, "could not clear where a node was running");
         }
+    }
+}
+
+impl Dispatching {
+    /// A live member other than this machine, where the cluster has one to offer.
+    ///
+    /// The membership read is best effort in the same way the placement write is: a plane that
+    /// cannot answer means this run has no cluster to speak of, and the node runs here.
+    async fn peer(&self) -> Option<ClusterAddress> {
+        let members = match self.plane.members().await {
+            Ok(members) => members,
+            Err(error) => {
+                tracing::warn!(%error, "could not read this cluster's members; running here");
+                return None;
+            }
+        };
+        let believed = i64::try_from(self.heartbeat.as_secs())
+            .unwrap_or(i64::MAX)
+            .saturating_mul(i64::from(BELIEVED_FOR));
+        let now = ip_core::Timestamp::now().unix_seconds();
+        members
+            .into_iter()
+            .find(|member| {
+                member.address != self.us
+                    && now.saturating_sub(member.at.unix_seconds()) <= believed
+            })
+            .map(|member| member.address)
+    }
+
+    /// One node's work, as the member running it is asked for it.
+    fn work(&self, one: &OneNode<'_>) -> Dispatch {
+        Dispatch {
+            run: one.run,
+            node: one.node.clone(),
+            graph: self.sending.graph.clone(),
+            owner: self.sending.owner.clone(),
+            tenant: self.sending.tenant.clone(),
+            user: self.sending.user.clone(),
+            agent: one.agent.clone(),
+            requested: self.sending.requested.clone(),
+            input: one.input.to_owned(),
+        }
+    }
+
+    /// Runs this node on a live member of the cluster, where there is one to run it.
+    ///
+    /// The placement is written before the dispatch and at the member picked for it, so a record
+    /// exists for the whole time the work is away from here.
+    async fn attempt(&self, placing: Option<&Placing>, one: &OneNode<'_>, saying: &Saying) -> Sent {
+        let Some(at) = self.peer().await else {
+            return Sent::Nowhere;
+        };
+        if let Some(placing) = placing {
+            placing.note(one.run, one.node, &at).await;
+        }
+        self.elsewhere(&at, &self.work(one), saying).await
+    }
+
+    /// Runs the node on `at`, saying what it says into this graph's own stream as it arrives.
+    ///
+    /// **Where the boundary between a retry and a double charge is.** A member that will not take
+    /// the work, or refuses before saying anything, has spent nothing, so the node may still run
+    /// here — [`Sent::Nowhere`]. Once it has said *anything* it has reported a turn, and a turn is
+    /// reported before it is taken, so the money is gone whether we hear the answer or not. From
+    /// there a member that stops answering is a failed node and never a node run twice. That is
+    /// M10's ruling for a hedge — only the winner is counted — applied to a boundary.
+    async fn elsewhere(&self, at: &ClusterAddress, work: &Dispatch, saying: &Saying) -> Sent {
+        let mut stream = match self.client.dispatch(at, work).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(
+                    %error, %at, node = %work.node,
+                    "a member would not take a node; running it here"
+                );
+                return Sent::Nowhere;
+            }
+        };
+        let mut heard = 0usize;
+        loop {
+            let said = match stream.next().await {
+                Ok(Some(said)) => said,
+                Ok(None) | Err(_) if heard == 0 => {
+                    tracing::warn!(
+                        %at, node = %work.node,
+                        "a member took a node and said nothing of it; running it here"
+                    );
+                    return Sent::Nowhere;
+                }
+                // Unreachable: the client answers `Ok(None)` only once a terminal event has
+                // been read, and this loop returns on every terminal event. Kept as a cut-off
+                // rather than a panic, since the safe reading of an ended stream is that the
+                // turns already reported were taken.
+                Ok(None) => return Sent::Ran(cut_off(at, &work.node, "it ended its stream")),
+                Err(error) => {
+                    return Sent::Ran(cut_off(at, &work.node, &error.to_string()));
+                }
+            };
+            match said {
+                NodeEvent::Said(event) => {
+                    heard += 1;
+                    saying.say(event);
+                }
+                NodeEvent::Answered(ran) => return Sent::Ran(ran),
+                // A refusal is the worker's considered answer that it cannot run this node at
+                // all, and it only ever arrives before any turn — so it is the one failure this
+                // coordinator can answer by running the node itself.
+                NodeEvent::Refused(why) if heard == 0 => {
+                    tracing::warn!(%at, node = %work.node, %why, "a member refused a node; running it here");
+                    return Sent::Nowhere;
+                }
+                NodeEvent::Refused(why) => {
+                    return Sent::Ran(NodeRan {
+                        answer: String::new(),
+                        stopped: Stopped::Refused { why },
+                        spend: Spend::NOTHING,
+                        traces: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// A node whose member stopped answering with turns already taken.
+///
+/// The spend is recorded as nothing because this machine cannot know what the other spent, which
+/// understates the run's cost. The placement left behind in the plane is what says where to look.
+fn cut_off(at: &ClusterAddress, node: &NodeName, why: &str) -> NodeRan {
+    tracing::warn!(%at, %node, %why, "a member stopped answering for a node it had begun");
+    NodeRan {
+        answer: String::new(),
+        stopped: Stopped::Refused {
+            why: format!("the node {node} was running on {at} and that member stopped: {why}"),
+        },
+        spend: Spend::NOTHING,
+        traces: Vec::new(),
     }
 }
 
@@ -524,8 +794,36 @@ impl RunsNode for Nodes {
                 ));
             }
         };
+        let saying = Saying {
+            run,
+            node: node.name.clone(),
+            say: self.say.clone(),
+        };
+        // Sent first, because a node that ran elsewhere is recorded at the member it went to:
+        // a reader of the plane learns where the work is and not where it was dispatched from.
+        // `Sent::Nowhere` spent nothing there, so the lines below rewrite the record and run it.
+        let one = OneNode {
+            run,
+            node: &node.name,
+            agent: &prepared.agent,
+            input: &input,
+        };
+        let sent = match &self.dispatching {
+            Some(dispatching) => {
+                dispatching
+                    .attempt(self.placing.as_ref(), &one, &saying)
+                    .await
+            }
+            None => Sent::Nowhere,
+        };
+        if let Sent::Ran(ran) = sent {
+            if let Some(placing) = &self.placing {
+                placing.done(run, &node.name).await;
+            }
+            return ran;
+        }
         if let Some(placing) = &self.placing {
-            placing.note(run, &node.name).await;
+            placing.note(run, &node.name, &placing.us).await;
         }
         let ran = ip_run::run(
             &Running {
@@ -535,11 +833,7 @@ impl RunsNode for Nodes {
                 shed: &prepared.shed,
                 config: &prepared.config,
                 pinned: &prepared.pinned,
-                reporting: &Saying {
-                    run,
-                    node: node.name.clone(),
-                    say: self.say.clone(),
-                },
+                reporting: &saying,
                 signals: &signals,
             },
             &input,
@@ -631,6 +925,7 @@ async fn prepare(
         prepared.insert(
             node.name.clone(),
             Prepared {
+                agent: node.agent.clone(),
                 config,
                 pinned,
                 target,
@@ -742,17 +1037,17 @@ async fn start(
         }
     };
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let placing = placing_for(&state, &graph);
+    let runner = driving(
+        &state,
+        &Run::of(&graph, &tenant, manager.user(), &asked.requested),
+        prepared,
+        sender.clone(),
+    );
     let graphing = Graphing {
         id: run,
         graph,
         order,
-        runner: Arc::new(Nodes {
-            gateway: state.shared_gateway(),
-            prepared,
-            say: sender.clone(),
-            placing,
-        }),
+        runner: Arc::new(runner),
         input: asked.input,
         reporting: Arc::new(sender),
     };
@@ -1984,18 +2279,601 @@ upstream_speaks = "anthropic"
             plane: Arc::new(GraphPlane::new(plane.client())),
             graph: GraphId::new("triage").expect("a graph id"),
             owner: GraphOwner::Tenant(TenantId::new("acme").expect("a tenant")),
-            address: here(),
+            us: here(),
         };
         let run = GraphRunId::generate().expect("a run id");
         let node = NodeName::new("intake").expect("a node name");
 
         // Neither says anything, and neither refuses: the warning is all that is left of it.
-        placing.note(run, &node).await;
+        placing.note(run, &node, &here()).await;
         placing.done(run, &node).await;
 
         // It tried, and the first call is where it stopped: `placed` clears the key before it
         // writes, so a plane that refuses everything refuses that delete and never gets to create.
         let tried: Vec<String> = plane.seen().into_iter().map(|one| one.method).collect();
         assert_eq!(tried, ["node.delete", "node.delete"]);
+    }
+
+    /// A membership row, as the plane hands one back.
+    fn member_row(address: &str, ago: i64) -> serde_json::Value {
+        serde_json::json!({
+            "properties": {
+                "address": address,
+                "at": ip_core::Timestamp::now().unix_seconds() - ago,
+            },
+        })
+    }
+
+    /// The plane's answers for a chain of two whose nodes are dispatched to `members`.
+    ///
+    /// Every call in the order it arrives, which for a dispatched node is the membership read
+    /// and then the two writes that rewrite its placement. A call past the end is answered with
+    /// an empty object, which the membership read refuses — so a script that runs out is a run
+    /// that stops dispatching rather than one that hangs.
+    fn dispatching_chain(members: &[serde_json::Value]) -> Replies {
+        let nodes = || {
+            serde_json::json!([
+                node_row(2, "acme", "triage", "intake", "intake-agent"),
+                node_row(3, "acme", "triage", "reply", "reply-agent"),
+            ])
+        };
+        let ignored = serde_json::json!({});
+        Replies::in_turn([
+            serde_json::json!([graph_row("acme", "triage")]),
+            nodes(),
+            serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
+            sorted_chain(),
+            nodes(),
+            // intake: the members, its placement, and clearing it.
+            serde_json::json!(members),
+            ignored.clone(),
+            ignored.clone(),
+            ignored.clone(),
+            // reply: the same again.
+            serde_json::json!(members),
+            ignored.clone(),
+            ignored.clone(),
+            ignored,
+        ])
+    }
+
+    /// The plane's answers for a graph of one node, whose node is dispatched to `members`.
+    ///
+    /// One node rather than two wherever a test is about the fallback: the script is read in the
+    /// order the calls arrive, and a node that falls back writes its placement twice — once at
+    /// the member and once here — so a chain of two would put the second node's membership read
+    /// at a position that depends on what the first node did.
+    fn one_node(members: &[serde_json::Value]) -> Replies {
+        let nodes = || serde_json::json!([node_row(2, "acme", "triage", "intake", "intake-agent")]);
+        Replies::in_turn([
+            serde_json::json!([graph_row("acme", "triage")]),
+            nodes(),
+            serde_json::json!({"columns": ["from", "to"], "rows": []}),
+            serde_json::json!({
+                "algo": "toposort",
+                "count": 1,
+                "results": [{"id": 2, "generation": 0}],
+            }),
+            nodes(),
+            serde_json::json!(members),
+        ])
+    }
+
+    /// The same fixture as [`running_in_a_cluster`], dispatching on a client of the test's own.
+    async fn dispatching(
+        named: &[&str],
+        replies: Replies,
+        client: ClusterClient,
+    ) -> (Router, AppState, StubPlane) {
+        let plane = StubPlane::start(replies).await;
+        let state = super::super::harness::serving(
+            store_with_templates(named).await,
+            SERVING,
+            Arc::new(Answering),
+        )
+        .with_graphs(Arc::new(GraphPlane::new(plane.client())))
+        .with_cluster(here())
+        .with_cluster_client(Arc::new(client))
+        // Stated rather than inherited, so the tests that turn on how stale a member is read
+        // against a number written here and not against whatever the default becomes.
+        .with_heartbeat(Duration::from_secs(10));
+        (super::super::router(state.clone()), state, plane)
+    }
+
+    /// The whole point of the milestone: a node runs somewhere else and nothing about the
+    /// stream says so.
+    ///
+    /// The names are asserted against the local run's own — `a_graph_run_streams_every_node_and_
+    /// then_the_graphs_own_answer` — rather than against a list written here, because what is
+    /// being claimed is that the two are the same and not that both match something.
+    #[tokio::test]
+    async fn a_node_dispatched_to_a_member_streams_as_a_local_one_does() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let names: Vec<&str> = said.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "node",
+                "turn",
+                "text",
+                "node_done",
+                "node",
+                "turn",
+                "text",
+                "node_done",
+                "done"
+            ],
+            "{said:?}"
+        );
+        let whose: Vec<&str> = said
+            .iter()
+            .filter(|(name, _)| name != "done")
+            .map(|(name, body)| {
+                body["node"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name} carried no node: {body}"))
+            })
+            .collect();
+        assert_eq!(
+            whose,
+            [
+                "intake", "intake", "intake", "intake", "reply", "reply", "reply", "reply"
+            ]
+        );
+        // The worker's answer and not this deployment's: `Answering` says "four".
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(
+            done["answer"],
+            serde_json::json!({"reply": "41 crates in bay 3."})
+        );
+        assert_eq!(
+            done["tokens"]["input"], 240,
+            "the spend both members reported: {done}"
+        );
+        assert_eq!(worker.seen().len(), 2, "both nodes went to the member");
+    }
+
+    /// What a dispatch names, which is a caller and never what that caller may do.
+    #[tokio::test]
+    async fn a_dispatch_names_the_run_the_node_and_whose_it_is() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let seen = worker.seen();
+        let work = &seen.first().expect("a dispatch").work;
+        assert_eq!(work["node"], "intake");
+        assert_eq!(work["graph"], "triage");
+        assert_eq!(work["agent"], "intake-agent");
+        assert_eq!(work["tenant"], "acme");
+        assert_eq!(work["user"], "alice");
+        assert_eq!(work["input"], "how many?");
+        assert_eq!(work["owner"], serde_json::json!({"tenant": "acme"}));
+        // Nothing about what that caller may do: the member reads that for itself.
+        for widened in ["authority", "grants", "capabilities", "standing", "kind"] {
+            assert!(
+                work.get(widened).is_none(),
+                "a dispatch carried {widened}: {work}"
+            );
+        }
+        assert_eq!(
+            seen[1].work["run"], work["run"],
+            "both nodes belong to one run: {seen:?}"
+        );
+        // The second node is handed what the first answered, in the keyed-json form a local
+        // chain hands on — so a dispatched node's answer re-enters the graph as any other does.
+        assert_eq!(seen[1].work["input"], r#"{"intake":"41 crates in bay 3."}"#);
+    }
+
+    /// The record says where the work went, which is the whole use of keeping it.
+    #[tokio::test]
+    async fn a_dispatched_nodes_placement_names_the_member_and_not_this_machine() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, plane) = dispatching(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let recorded: Vec<String> = plane
+            .seen()
+            .into_iter()
+            .filter(|one| one.method == "node.create")
+            .filter_map(|one| {
+                one.params["properties"]["address"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [worker.address().to_string(), worker.address().to_string()],
+            "a placement named this machine for a node running elsewhere"
+        );
+        assert!(
+            !recorded.contains(&here().to_string()),
+            "the coordinator recorded itself: {recorded:?}"
+        );
+    }
+
+    /// A cluster of one is this machine, so there is nothing to dispatch to.
+    #[tokio::test]
+    async fn a_member_that_is_this_machine_is_never_picked_for_its_own_node() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, plane) = dispatching(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&here().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert!(
+            worker.seen().is_empty(),
+            "this machine dispatched to itself"
+        );
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(
+            done["answer"],
+            serde_json::json!({"reply": "four"}),
+            "the node did not run here: {done}"
+        );
+        let recorded: Vec<String> = plane
+            .seen()
+            .into_iter()
+            .filter(|one| one.method == "node.create")
+            .filter_map(|one| {
+                one.params["properties"]["address"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(recorded, [here().to_string(), here().to_string()]);
+    }
+
+    /// A member that stopped writing goes stale where it stands, and three heartbeats — thirty
+    /// seconds on the ten-second interval this fixture sets — is how long it is believed in.
+    #[tokio::test]
+    async fn a_member_that_stopped_saying_it_is_here_is_not_picked() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&worker.address().to_string(), 31)]),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert!(
+            worker.seen().is_empty(),
+            "a member thirty-one seconds quiet was dispatched to"
+        );
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(done["answer"], serde_json::json!({"reply": "four"}));
+    }
+
+    /// The same member one heartbeat later, which is late rather than gone.
+    #[tokio::test]
+    async fn a_member_merely_late_on_one_heartbeat_is_still_picked() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&worker.address().to_string(), 12)]),
+            worker.client(),
+        )
+        .await;
+
+        streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            worker.seen().len(),
+            2,
+            "a member twelve seconds quiet is here"
+        );
+    }
+
+    /// A plane that cannot say who is in the cluster is a run with no cluster.
+    #[tokio::test]
+    async fn a_membership_that_cannot_be_read_runs_every_node_here() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent", "reply-agent"],
+            chain_of_two(sorted_chain()),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert!(worker.seen().is_empty());
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(done["answer"], serde_json::json!({"reply": "four"}));
+    }
+
+    /// Nothing was spent, so the node runs here. This is the safe half of the boundary.
+    #[tokio::test]
+    async fn a_member_that_cannot_be_reached_at_all_falls_back_to_running_here() {
+        let gone = ip_cluster::vacant_address().await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&gone.to_string(), 1)]),
+            ClusterClient::new(ip_cluster::stub_settings()),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let names: Vec<&str> = said.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "node",
+                "turn",
+                "text",
+                "node_done",
+                "node",
+                "turn",
+                "text",
+                "node_done",
+                "done"
+            ]
+        );
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(
+            done["answer"],
+            serde_json::json!({"reply": "four"}),
+            "a dead member's node did not run here: {done}"
+        );
+    }
+
+    /// A member that will not run the node says so as its only event, before taking a turn, so
+    /// the coordinator — which resolved every node before the stream opened — runs it itself.
+    #[tokio::test]
+    async fn a_member_that_refuses_before_any_turn_falls_back_to_running_here() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Refused).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent"],
+            one_node(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(worker.seen().len(), 1, "the node was offered to the member");
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(
+            done["answer"],
+            serde_json::json!({"intake": "four"}),
+            "a refused node was not run here: {done}"
+        );
+        assert_eq!(done["stopped_at"], serde_json::Value::Null);
+    }
+
+    /// **The unsafe half, and the one ruling of this commit worth getting right.** A member that
+    /// said something has reported a turn, and a turn is reported before it is taken, so the money
+    /// is already gone. The node fails where it is and is never run a second time.
+    #[tokio::test]
+    async fn a_member_that_stops_after_an_event_fails_the_node_rather_than_rerunning_it() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::CutOff).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent"],
+            one_node(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            worker.seen().len(),
+            1,
+            "the node was offered once and never again: {said:?}"
+        );
+        let names: Vec<&str> = said.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["node", "turn", "node_done", "done"],
+            "what the member managed to say is in the stream, and then the node ends: {said:?}"
+        );
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(
+            done["stopped_at"], "intake",
+            "a cut-off node did not stop the graph: {done}"
+        );
+        let (_, ended) = said
+            .iter()
+            .find(|(name, _)| name == "node_done")
+            .expect("the node ends");
+        assert_eq!(ended["stop"], "refused", "{ended}");
+        let why = ended["why"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a cut-off node said no reason: {ended}"));
+        assert!(
+            why.contains("intake") && why.contains(&worker.address().to_string()),
+            "the failure does not say which node stopped where: {why}"
+        );
+    }
+
+    /// A deployment that cannot say where it answers dispatches nothing, because it could not
+    /// tell its own membership row from a peer's.
+    #[tokio::test]
+    async fn a_deployment_with_no_address_of_its_own_dispatches_nothing() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let plane = StubPlane::start(dispatching_chain(&[member_row(
+            &worker.address().to_string(),
+            1,
+        )]))
+        .await;
+        let state = super::super::harness::serving(
+            store_with_templates(&["intake-agent", "reply-agent"]).await,
+            SERVING,
+            Arc::new(Answering),
+        )
+        .with_graphs(Arc::new(GraphPlane::new(plane.client())))
+        .with_cluster_client(Arc::new(worker.client()));
+        let router = super::super::router(state.clone());
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert!(worker.seen().is_empty());
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(done["answer"], serde_json::json!({"reply": "four"}));
+    }
+
+    /// A deployment holding no cluster secret has no client, so every node runs here — which is
+    /// what every deployment did before this commit and must keep doing.
+    #[tokio::test]
+    async fn a_deployment_in_no_cluster_runs_every_node_here() {
+        let (router, state, plane) = running_in_a_cluster(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row("10.0.0.9:8080", 1)]),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(done["answer"], serde_json::json!({"reply": "four"}));
+        // Not even read: a deployment that cannot dispatch does not ask who is in the cluster.
+        let asked = plane
+            .seen()
+            .into_iter()
+            .filter(|one| one.method == "plane.query")
+            .count();
+        // Four queries are the graph's own — its row, its nodes, its edges, and its nodes
+        // again to turn the order's ids back into names. A membership read would be a fifth.
+        assert_eq!(
+            asked, 4,
+            "a run that dispatches nothing reads no membership"
+        );
     }
 }

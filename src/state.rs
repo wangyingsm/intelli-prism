@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ip_auth::{Logins, RequestVerifier, SessionTokens};
 #[cfg(feature = "cluster-cache")]
@@ -7,6 +8,7 @@ use ip_cache::RedisCache;
 use ip_cache::{Cache, CacheBackend, Counters, Ttl};
 #[cfg(feature = "standalone-cache")]
 use ip_cache::{LevelLimits, MaxBytes, SledCache};
+use ip_cluster::{ClusterClient, ClusterSettings};
 use ip_config::{CacheConfig, Config, Secret, StorageConfig};
 use ip_core::RouteRule;
 use ip_core::route::ClusterAddress;
@@ -75,6 +77,14 @@ pub struct AppState {
     /// What the members of this cluster present to one another. Absent in a deployment that is
     /// in no cluster, which then refuses every node dispatched to it.
     cluster_secret: Option<Secret>,
+    /// What this deployment dispatches a node on, when it is in a cluster it can both reach and
+    /// authenticate to. One pooled client for the process, as the gateway's own is.
+    cluster_client: Option<Arc<ClusterClient>>,
+    /// How often a member of this cluster says it is still here.
+    ///
+    /// Held because a reader of the membership needs it: a row carries only when it was written,
+    /// and only this interval says whether a member is late or gone.
+    heartbeat: Duration,
     /// The store a test reads through, when the state was built for one, so the test can
     /// make it fail where it means to.
     #[cfg(test)]
@@ -140,6 +150,7 @@ impl AppState {
         let graphs = open_graphs(config)?;
         let cluster = cluster_address(config)?;
         let cluster_secret = cluster_secret(config, cluster.as_ref())?;
+        let cluster_client = dispatching_on(cluster.as_ref(), cluster_secret.as_ref());
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
         let backend: Arc<dyn Backend> = Arc::clone(&store);
@@ -309,6 +320,8 @@ impl AppState {
             graphs,
             cluster,
             cluster_secret,
+            cluster_client,
+            heartbeat: config.cluster.heartbeat.as_duration(),
             #[cfg(test)]
             failing_store: None,
             #[cfg(test)]
@@ -367,6 +380,12 @@ impl AppState {
             graphs: None,
             cluster: None,
             cluster_secret: None,
+            cluster_client: None,
+            // The configured default rather than a number of its own, so a test believes a
+            // member for as long as a deployment does.
+            heartbeat: ip_config::config::ClusterConfig::default()
+                .heartbeat
+                .as_duration(),
             failing_store: Some(failing_store),
             failing_cache: Some(failing_cache),
         }
@@ -383,6 +402,16 @@ impl AppState {
     /// refuse everything rather than accept anything: a deployment with no secret has no peers.
     pub fn cluster_secret(&self) -> Option<&Secret> {
         self.cluster_secret.as_ref()
+    }
+
+    /// What this deployment dispatches a node on, where it may dispatch one at all.
+    pub fn cluster_client(&self) -> Option<&Arc<ClusterClient>> {
+        self.cluster_client.as_ref()
+    }
+
+    /// How often a member of this cluster says it is still here.
+    pub const fn heartbeat(&self) -> Duration {
+        self.heartbeat
     }
 
     /// The same state over a graph store, for a test that works on one.
@@ -403,6 +432,24 @@ impl AppState {
     #[cfg(test)]
     pub fn with_cluster_secret(mut self, secret: Secret) -> Self {
         self.cluster_secret = Some(secret);
+        self
+    }
+
+    /// The same state dispatching on a client of the test's own, which a stub member answers.
+    ///
+    /// The client and the secret are set apart, because a test of the dispatching half wants a
+    /// client that talks to its stub while this deployment holds whatever secret it likes.
+    #[cfg(test)]
+    pub fn with_cluster_client(mut self, client: Arc<ClusterClient>) -> Self {
+        self.cluster_client = Some(client);
+        self
+    }
+
+    /// The same state believing a member for as long as this test needs, for one that works on
+    /// a membership it wrote by hand rather than one a heartbeat keeps fresh.
+    #[cfg(test)]
+    pub const fn with_heartbeat(mut self, heartbeat: Duration) -> Self {
+        self.heartbeat = heartbeat;
         self
     }
 
@@ -617,6 +664,30 @@ fn cluster_secret(
     Ok(None)
 }
 
+/// How long a dispatched node may say nothing before the member running it is given up on.
+///
+/// Between two events and not over the whole run: a worker reports a turn before it takes one, so
+/// a silence this long is a member that stopped rather than a node that is thinking. It is ten
+/// times the longest a tool call may take, which is the longest legitimate gap there is.
+const DISPATCH_IDLE: Duration = Duration::from_secs(300);
+
+/// What this deployment dispatches a node on, where it may dispatch one at all.
+///
+/// Both halves are needed and for different reasons. Without the secret a peer would refuse every
+/// node, so there is nothing to dispatch on. Without an address of its own this deployment cannot
+/// tell its own membership row from a peer's, and would dispatch a node to itself over a loopback
+/// of its own making — so a deployment that cannot say where it answers runs every node here.
+fn dispatching_on(
+    address: Option<&ClusterAddress>,
+    secret: Option<&Secret>,
+) -> Option<Arc<ClusterClient>> {
+    let (_, secret) = address.zip(secret)?;
+    Some(Arc::new(ClusterClient::new(ClusterSettings {
+        secret: secret.clone(),
+        idle: DISPATCH_IDLE,
+    })))
+}
+
 fn open_graphs(config: &Config) -> Result<Option<Arc<GraphPlane>>, StartupError> {
     let Some(graph_store) = config.graph_store.as_ref() else {
         return Ok(None);
@@ -710,6 +781,32 @@ secret = "0123456789abcdef0123456789abcdef"
             secret.as_ref().map(Secret::expose),
             Some("cluster-not-a-real-one")
         );
+    }
+
+    /// Dispatching takes both halves, and each is missing for its own reason.
+    ///
+    /// Without the secret a peer would refuse every node. Without an address of its own this
+    /// deployment could not tell its own membership row from a peer's, and would dispatch a node
+    /// to itself. `routes/graph.rs` refuses on the same two counts when it assembles a run; this
+    /// is the earlier of the two guards and is asserted here because nothing else reaches it.
+    #[test]
+    fn dispatching_takes_both_an_address_and_a_secret() {
+        let address: ClusterAddress = "10.0.0.2:8080".parse().expect("an address");
+        let secret = Secret::from("cluster-not-a-real-one");
+
+        assert!(
+            dispatching_on(Some(&address), Some(&secret)).is_some(),
+            "a member with both halves cannot dispatch"
+        );
+        assert!(
+            dispatching_on(None, Some(&secret)).is_none(),
+            "a deployment that cannot say where it answers would dispatch to itself"
+        );
+        assert!(
+            dispatching_on(Some(&address), None).is_none(),
+            "a deployment with no secret would have every node refused"
+        );
+        assert!(dispatching_on(None, None).is_none());
     }
 
     /// A single-node deployment that never asked to be in a cluster still starts, because
