@@ -1,5 +1,6 @@
 mod agent;
 mod audit;
+mod cluster;
 mod grant;
 mod graph;
 #[cfg(test)]
@@ -72,6 +73,12 @@ pub fn router(state: AppState) -> Router {
         .nest("/_ip/graphs", graph::router())
         .nest("/_ip/graph_run", graph::run_router())
         .nest("/_ip/mcps", mcp::router())
+        // Mounted at the path `ip-cluster` dials rather than at a prefix of our own, so the
+        // client and the route cannot drift apart. Not nested, and so not covered by the
+        // isolation audit that reads every `.nest(`: it is machine to machine, takes no tenant in
+        // its path and reads nothing of a tenant's until the cluster secret has checked out.
+        // `routes/isolation.rs` carries the case that says so.
+        .route(ip_cluster::DISPATCH_PATH, post(cluster::node))
         .route("/_ip/whoami", get(whoami))
         .route("/_ip/{*rest}", any(reserved))
         .fallback(any(proxy))

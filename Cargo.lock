@@ -1585,6 +1585,7 @@ dependencies = [
  "ip-auth",
  "ip-cache",
  "ip-classify",
+ "ip-cluster",
  "ip-config",
  "ip-core",
  "ip-drsg",

@@ -348,14 +348,17 @@ fn unprocessable<E: std::fmt::Display>(error: E) -> Refusal {
 }
 
 /// How long a graph run's tool calls wait on an MCP server.
-const MCP_SETTINGS: McpSettings = McpSettings {
+///
+/// Shared with the dispatch route rather than written twice: a node runs the same way whichever
+/// machine it runs on, and two sets of timeouts for one node would be a difference nobody chose.
+pub(super) const MCP_SETTINGS: McpSettings = McpSettings {
     connect_timeout: Duration::from_secs(10),
     request_timeout: Duration::from_secs(30),
     max_answer_bytes: 4 * 1024 * 1024,
 };
 
 /// How many registered servers a graph's nodes may choose their tools from.
-const REGISTRY_LIMIT: u32 = 1_000;
+pub(super) const REGISTRY_LIMIT: u32 = 1_000;
 
 /// Running one graph, under the prefix the router nests it at.
 pub fn run_router() -> Router<AppState> {
@@ -644,7 +647,7 @@ async fn prepare(
 /// tenant's templates and the deployment's graph composes the deployment's. There is deliberately
 /// no fallback from the one to the other — a graph that quietly ran a global template under a
 /// tenant's name would be a hole in the tenancy rather than a convenience.
-fn templates_of(owner: &GraphOwner) -> AgentOwner {
+pub(super) fn templates_of(owner: &GraphOwner) -> AgentOwner {
     match owner {
         GraphOwner::Global => AgentOwner::Global,
         GraphOwner::Tenant(tenant) => AgentOwner::Tenant(tenant.clone()),

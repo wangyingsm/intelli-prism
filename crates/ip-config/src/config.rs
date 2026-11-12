@@ -488,6 +488,18 @@ pub struct ClusterConfig {
     /// how long a machine that died is still believed in. Default 10.
     #[serde(default = "default_heartbeat")]
     pub heartbeat: Seconds,
+    /// What the members of this cluster present to one another, and to nothing else.
+    ///
+    /// One secret for the whole deployment, held by every member. All it says is "a member of my
+    /// own cluster", which is what lets one member take another's word for *which* run a
+    /// dispatched node belongs to and whose it is — never for what that caller may do, which the
+    /// member running the node reads for itself.
+    ///
+    /// Unset, a deployment refuses every node dispatched to it. A deployment that advertises an
+    /// address without one does not start at all, since its peers could reach it and could not
+    /// authenticate to it.
+    #[serde(default)]
+    pub secret: Option<Secret>,
 }
 
 fn default_heartbeat() -> Seconds {
@@ -499,6 +511,7 @@ impl Default for ClusterConfig {
         Self {
             advertise: None,
             heartbeat: default_heartbeat(),
+            secret: None,
         }
     }
 }
@@ -1846,6 +1859,37 @@ model = "claude-sonnet-5"
             .expect("what was advertised");
 
         assert_eq!(address.to_string(), "10.0.0.2:8443");
+    }
+
+    /// Taken as a bare string, like every other secret, and never printed back.
+    #[test]
+    fn a_cluster_takes_its_secret_as_a_bare_string() {
+        let config = Config::parse(&format!(
+            "{MINIMAL}\n[cluster]\nsecret = \"cluster-not-a-real-one\"\n"
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.cluster.secret.as_ref().map(Secret::expose),
+            Some("cluster-not-a-real-one")
+        );
+        assert!(
+            !format!("{:?}", config.cluster).contains("cluster-not-a-real-one"),
+            "a cluster secret printed itself"
+        );
+    }
+
+    /// Absent, which is a deployment that is in no cluster rather than one with an empty secret.
+    #[test]
+    fn a_cluster_with_no_secret_written_holds_none() {
+        assert_eq!(Config::parse(MINIMAL).unwrap().cluster.secret, None);
+        assert_eq!(
+            Config::parse(&format!("{MINIMAL}\n[cluster]\nheartbeat = 5\n"))
+                .unwrap()
+                .cluster
+                .secret,
+            None
+        );
     }
 
     #[test]

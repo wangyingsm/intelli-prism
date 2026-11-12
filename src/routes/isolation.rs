@@ -350,6 +350,64 @@ mod tests {
         }
     }
 
+    /// Whether the byte at `at` sits on a line that is a comment.
+    ///
+    /// What makes the tripwire read the router table rather than what is written about it.
+    fn commented(source: &str, at: usize) -> bool {
+        source[..at]
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .trim_start()
+            .starts_with("//")
+    }
+
+    /// The one route under the reserved prefix that the tripwire below cannot see, written
+    /// down here so the exemption is argued rather than assumed.
+    ///
+    /// `POST /_ip/cluster/node` is mounted with a plain `.route(`, like `/_ip/healthz`, because
+    /// it is machine to machine and names no tenant in its path. There is nothing for the cases
+    /// above to ask: a dispatch reads nothing of any tenant's until the cluster secret has
+    /// checked out, and `alice`'s cookie is not a cluster secret. So what is asserted is that
+    /// the door is shut — with no credential, with hers, and with a secret that is not this
+    /// cluster's — and that the body is never even looked at.
+    #[tokio::test]
+    async fn a_dispatch_reaches_no_tenants_data_without_the_clusters_own_secret() {
+        let (router, cookie) = fixture().await;
+        let dispatched = |credential: Option<String>| {
+            let builder = axum::http::Request::builder()
+                .method("POST")
+                .uri("/_ip/cluster/node")
+                .header("content-type", "application/json");
+            let builder = match credential {
+                Some(credential) => builder.header("authorization", credential),
+                None => builder,
+            };
+            builder
+                .body(Body::from(
+                    serde_json::to_string(&ip_cluster::stub_dispatch()).unwrap(),
+                ))
+                .unwrap()
+        };
+
+        for credential in [
+            None,
+            Some(format!("Bearer {}", ip_cluster::STUB_SECRET)),
+            Some(format!("Bearer {cookie}")),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(dispatched(credential.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "a dispatch carrying {credential:?} was taken by a deployment in no cluster"
+            );
+        }
+    }
+
     /// The tripwire. Every router nested under the reserved prefix must be reachable
     /// from a case above, or isolation has a gap exactly where nobody looked.
     ///
@@ -361,8 +419,11 @@ mod tests {
         // Taken from each `.nest(` to the quoted prefix after it, wherever the line
         // breaks fall: rustfmt puts a long one on a line of its own, and a parser that
         // reads single lines quietly misses exactly those.
+        // Prose about nesting is not nesting. A comment beside the dispatch route, naming this
+        // very test, was read as an eighteenth router and blamed the line after it.
         let nested: Vec<String> = SOURCE
             .match_indices(".nest(")
+            .filter(|(at, _)| !commented(SOURCE, *at))
             .filter_map(|(at, _)| SOURCE[at..].split('"').nth(1).map(str::to_owned))
             .collect();
         // Every prefix, and what this file does about it. A prefix that holds nothing

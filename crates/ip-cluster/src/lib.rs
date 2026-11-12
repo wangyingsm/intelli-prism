@@ -36,4 +36,7 @@ pub use dispatch::Dispatch;
 pub use error::ClusterError;
 pub use event::NodeEvent;
 #[cfg(any(feature = "testing", test))]
-pub use testing::{Answers, STUB_REFUSAL, STUB_SECRET, Seen, SilentMember, StubWorker};
+pub use testing::{
+    Answers, STUB_REFUSAL, STUB_SECRET, Seen, SilentMember, StubWorker, stub_answer, stub_dispatch,
+    stub_settings, stub_stream, vacant_address,
+};

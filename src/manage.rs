@@ -86,20 +86,36 @@ impl Manager {
         store: &dyn Storage,
         tenant: &ip_core::TenantId,
     ) -> Result<Option<Authority>, StorageError> {
-        let Some(membership) = store.membership(&self.user, tenant).await? else {
-            // Someone outside a tenant holds nothing inside it, whatever they were granted.
-            return Ok(None);
-        };
-        let role = role_of(self.kind, membership.standing, tenant.clone());
-        Ok(Some(Authority::new(
-            Identity {
-                user: self.user.clone(),
-                tenant: tenant.clone(),
-                role,
-            },
-            store.grants_of(&self.user).await?,
-        )))
+        authority_of(store, &self.user, self.kind, tenant).await
     }
+}
+
+/// What one caller holds inside one tenant, read from the store and from nowhere else.
+///
+/// Free rather than a method on [`Manager`], because a caller does not always arrive as a
+/// management request: a node dispatched from another member of this cluster *names* its caller,
+/// and the member that runs it builds the authority here, from the same two reads. That is the
+/// whole of why a dispatch carries a user and not an authority — a member takes another member's
+/// word for which run a node belongs to, never for what its caller may do.
+pub async fn authority_of(
+    store: &dyn Storage,
+    user: &UserId,
+    kind: AccountKind,
+    tenant: &ip_core::TenantId,
+) -> Result<Option<Authority>, StorageError> {
+    let Some(membership) = store.membership(user, tenant).await? else {
+        // Someone outside a tenant holds nothing inside it, whatever they were granted.
+        return Ok(None);
+    };
+    let role = role_of(kind, membership.standing, tenant.clone());
+    Ok(Some(Authority::new(
+        Identity {
+            user: user.clone(),
+            tenant: tenant.clone(),
+            role,
+        },
+        store.grants_of(user).await?,
+    )))
 }
 
 impl FromRequestParts<AppState> for Manager {

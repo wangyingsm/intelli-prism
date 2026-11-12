@@ -26,6 +26,7 @@ hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2"
 ip-agents = { version = "0.1.0", path = "crates/ip-agents" }
 ip-auth = { version = "0.1.0", path = "crates/ip-auth" }
 ip-cache = { version = "0.1.0", path = "crates/ip-cache", default-features = false }
+ip-cluster = { version = "0.1.0", path = "crates/ip-cluster" }
 ip-config = { version = "0.1.0", path = "crates/ip-config" }
 ip-core = { version = "0.1.0", path = "crates/ip-core" }
 ip-drsg = { version = "0.1.0", path = "crates/ip-drsg" }
@@ -113,6 +114,7 @@ wildcard_imports = "warn"           # name what a module takes, `super` and prel
 
 [dev-dependencies]
 hex.workspace = true
+ip-cluster = { version = "0.1.0", path = "crates/ip-cluster", features = ["testing"] }
 ip-drsg = { version = "0.1.0", path = "crates/ip-drsg", features = ["testing"] }
 sha2.workspace = true
 bytes = "1.12.1"

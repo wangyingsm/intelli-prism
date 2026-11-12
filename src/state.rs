@@ -7,7 +7,7 @@ use ip_cache::RedisCache;
 use ip_cache::{Cache, CacheBackend, Counters, Ttl};
 #[cfg(feature = "standalone-cache")]
 use ip_cache::{LevelLimits, MaxBytes, SledCache};
-use ip_config::{CacheConfig, Config, StorageConfig};
+use ip_config::{CacheConfig, Config, Secret, StorageConfig};
 use ip_core::RouteRule;
 use ip_core::route::ClusterAddress;
 use ip_drsg::{DrsgClient, DrsgEndpoint, DrsgSettings, PlaneName};
@@ -72,6 +72,9 @@ pub struct AppState {
     /// Where this deployment answers the rest of its own cluster. Absent where it cannot say:
     /// nothing records an address nobody can dial.
     cluster: Option<ClusterAddress>,
+    /// What the members of this cluster present to one another. Absent in a deployment that is
+    /// in no cluster, which then refuses every node dispatched to it.
+    cluster_secret: Option<Secret>,
     /// The store a test reads through, when the state was built for one, so the test can
     /// make it fail where it means to.
     #[cfg(test)]
@@ -136,6 +139,7 @@ impl AppState {
         }
         let graphs = open_graphs(config)?;
         let cluster = cluster_address(config)?;
+        let cluster_secret = cluster_secret(config, cluster.as_ref())?;
         let stores = open_store(&config.storage).await?;
         let store = stores.backend();
         let backend: Arc<dyn Backend> = Arc::clone(&store);
@@ -304,6 +308,7 @@ impl AppState {
             started_at,
             graphs,
             cluster,
+            cluster_secret,
             #[cfg(test)]
             failing_store: None,
             #[cfg(test)]
@@ -361,6 +366,7 @@ impl AppState {
             started_at: RuleRevision::new(0),
             graphs: None,
             cluster: None,
+            cluster_secret: None,
             failing_store: Some(failing_store),
             failing_cache: Some(failing_cache),
         }
@@ -369,6 +375,14 @@ impl AppState {
     /// Where this deployment answers the rest of its own cluster, where it can say at all.
     pub fn cluster(&self) -> Option<&ClusterAddress> {
         self.cluster.as_ref()
+    }
+
+    /// What a member of this cluster must present to be dispatched a node, where there is one.
+    ///
+    /// Absent in a deployment that is in no cluster, which is what makes the dispatch route
+    /// refuse everything rather than accept anything: a deployment with no secret has no peers.
+    pub fn cluster_secret(&self) -> Option<&Secret> {
+        self.cluster_secret.as_ref()
     }
 
     /// The same state over a graph store, for a test that works on one.
@@ -382,6 +396,13 @@ impl AppState {
     #[cfg(test)]
     pub fn with_cluster(mut self, address: ClusterAddress) -> Self {
         self.cluster = Some(address);
+        self
+    }
+
+    /// The same state holding its cluster's secret, for a test that dispatches to it.
+    #[cfg(test)]
+    pub fn with_cluster_secret(mut self, secret: Secret) -> Self {
+        self.cluster_secret = Some(secret);
         self
     }
 
@@ -565,6 +586,37 @@ fn cluster_address(config: &Config) -> Result<Option<ClusterAddress>, StartupErr
     Ok(address)
 }
 
+/// What this deployment's own cluster presents to it, where it is in one.
+///
+/// A deployment that *advertises* an address without a secret does not start: its peers could
+/// reach it and could not authenticate, so every node dispatched to it would be refused and
+/// every graph run in that cluster would quietly fall back to one machine. A secret with no
+/// advertised address is allowed and is the ordinary shape of a worker.
+///
+/// A deployment that advertises nothing but is reachable anyway — bound to one interface, so it
+/// registers itself with the address it bound — gets a warning rather than a refusal: it never
+/// asked to be in a cluster, and refusing to start would break every single-node deployment that
+/// keeps graphs.
+fn cluster_secret(
+    config: &Config,
+    address: Option<&ClusterAddress>,
+) -> Result<Option<Secret>, StartupError> {
+    if let Some(secret) = &config.cluster.secret {
+        return Ok(Some(secret.clone()));
+    }
+    if config.cluster.advertise.is_some() {
+        return Err(StartupError::ClusterWithoutSecret);
+    }
+    if let Some(address) = address {
+        tracing::warn!(
+            %address,
+            "no `[cluster] secret`: this deployment registers in its cluster and will refuse \
+             every node dispatched to it"
+        );
+    }
+    Ok(None)
+}
+
 fn open_graphs(config: &Config) -> Result<Option<Arc<GraphPlane>>, StartupError> {
     let Some(graph_store) = config.graph_store.as_ref() else {
         return Ok(None);
@@ -601,6 +653,77 @@ secret = "0123456789abcdef0123456789abcdef"
 "#
         ))
         .unwrap()
+    }
+
+    /// A deployment whose `[cluster]` block says exactly what the test is about.
+    fn clustered(block: &str) -> Config {
+        Config::parse(&format!(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[storage]
+backend = "sqlite"
+path = "./unopened.db"
+
+[cache]
+backend = "sled"
+path = "./unopened"
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "0123456789abcdef0123456789abcdef"
+
+{block}
+"#
+        ))
+        .unwrap()
+    }
+
+    /// A machine its own cluster could reach and could not authenticate to is worse than one
+    /// that never came up, so it does not come up.
+    #[test]
+    fn a_deployment_that_advertises_a_cluster_address_without_a_secret_does_not_start() {
+        let config = clustered("[cluster]\nadvertise = \"10.0.0.2:8443\"");
+        let address = config.cluster.address(config.server.listen).unwrap();
+
+        let refused = cluster_secret(&config, address.as_ref())
+            .expect_err("a cluster address with no secret was taken");
+
+        assert!(matches!(refused, StartupError::ClusterWithoutSecret));
+        assert!(
+            refused.to_string().contains("[cluster] secret"),
+            "the refusal did not say which half is missing: {refused}"
+        );
+    }
+
+    /// The ordinary shape of a worker: it is dispatched to and does not dispatch.
+    #[test]
+    fn a_cluster_secret_without_an_advertised_address_is_not_an_error() {
+        let config = clustered("[cluster]\nsecret = \"cluster-not-a-real-one\"");
+        let address = config.cluster.address(config.server.listen).unwrap();
+
+        let secret = cluster_secret(&config, address.as_ref())
+            .expect("a secret with nothing advertised is a worker, not a mistake");
+
+        assert_eq!(
+            secret.as_ref().map(Secret::expose),
+            Some("cluster-not-a-real-one")
+        );
+    }
+
+    /// A single-node deployment that never asked to be in a cluster still starts, because
+    /// refusing would break every one of them that keeps graphs.
+    #[test]
+    fn a_deployment_that_asked_for_no_cluster_starts_without_a_secret() {
+        let config = clustered("");
+        let address = config.cluster.address(config.server.listen).unwrap();
+
+        assert!(address.is_some(), "bound to one interface, so reachable");
+        assert_eq!(
+            cluster_secret(&config, address.as_ref()).expect("a warning, not a refusal"),
+            None
+        );
     }
 
     /// A cache block naming `path`, which sled creates when the cache is opened.

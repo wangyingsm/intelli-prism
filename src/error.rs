@@ -106,6 +106,18 @@ pub enum StartupError {
         reason: String,
     },
 
+    /// A deployment advertises a cluster address but has no secret for its peers to present.
+    ///
+    /// A refusal rather than a warning, because the alternative is a machine its own cluster can
+    /// reach and cannot authenticate to: every node dispatched to it would be refused, and every
+    /// graph run would quietly fall back to the one machine that read the graph. The other way
+    /// round is not an error — a member can be dispatched *to* without dispatching.
+    #[error(
+        "`[cluster] advertise` names an address but `[cluster] secret` is unset: \
+         a member of a cluster needs the secret its peers present"
+    )]
+    ClusterWithoutSecret,
+
     /// The listener could not take the configured address.
     #[error("cannot listen on {address}")]
     Bind {
