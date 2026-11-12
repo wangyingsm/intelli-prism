@@ -31,7 +31,7 @@ use ip_storage::{AgentOwner, Page};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{Paged, store_refusal};
-use crate::cluster::{Signalling, Spreading};
+use crate::cluster::{Kept, Signalling, Spreading};
 use crate::manage::Manager;
 use crate::state::AppState;
 
@@ -408,6 +408,8 @@ struct Nodes {
     placing: Option<Placing>,
     /// Where a node may be sent instead, when this deployment is in a cluster it can dispatch in.
     dispatching: Option<Dispatching>,
+    /// Where a node's answer is kept, when there is another coordinator that could ask for it.
+    kept: Option<Arc<Kept>>,
 }
 
 /// What recording where a node is running takes.
@@ -531,7 +533,17 @@ fn dispatching_for(state: &AppState, run: &Run<'_>) -> Option<Dispatching> {
 /// publication would be a write nothing follows.
 fn stopping_for(state: &AppState) -> Option<Arc<dyn Stopping>> {
     state.cluster_client()?;
-    Some(Arc::new(Signalling::new(Arc::clone(state.publication()))))
+    Some(Arc::new(Signalling::new(Arc::clone(state.shared_cache()))))
+}
+
+/// Where this run's answers are kept, where anything else could ask for them.
+///
+/// Gated on the cluster for the same reason the stop is: a deployment that is the only machine
+/// serving a run is also the only one that could pick it up, and it holds the answers in memory
+/// while it does. Alone, this would be a write nobody reads.
+fn keeping_for(state: &AppState) -> Option<Arc<Kept>> {
+    state.cluster_client()?;
+    Some(Arc::new(Kept::new(Arc::clone(state.shared_cache()))))
 }
 
 /// What runs this graph's nodes.
@@ -550,6 +562,7 @@ fn driving(
         say,
         placing: placing_for(state, run.graph),
         dispatching: dispatching_for(state, run),
+        kept: keeping_for(state),
     }
 }
 
@@ -797,6 +810,16 @@ impl RunsNode for Nodes {
             spend: Spend::NOTHING,
             traces: Vec::new(),
         };
+        // Before everything, including the template and the dispatch: a node whose answer is
+        // already in hand needs no template, no run id and no member to send it to. What a retry
+        // must not pay for twice is the turn, not the crossing — a node already answered is
+        // already paid for wherever it ran. One cache read against a node about to take upstream
+        // turns, and only in a cluster, where something else could be asking.
+        if let Some(kept) = &self.kept
+            && let Some(ran) = kept.answer(run, &node.name).await
+        {
+            return ran;
+        }
         let Some(prepared) = self.prepared.get(&node.name) else {
             // Unreachable from the route, which prepares every node the graph holds: it would
             // mean the graph that was prepared and the graph being run are not the same one.
@@ -837,6 +860,7 @@ impl RunsNode for Nodes {
             if let Some(placing) = &self.placing {
                 placing.done(run, &node.name).await;
             }
+            self.worth_keeping(run, &node.name, &ran).await;
             return ran;
         }
         if let Some(placing) = &self.placing {
@@ -859,11 +883,30 @@ impl RunsNode for Nodes {
         if let Some(placing) = &self.placing {
             placing.done(run, &node.name).await;
         }
-        NodeRan {
+        let ran = NodeRan {
             answer: ran.text(),
             stopped: ran.stopped,
             spend: ran.spend,
             traces: ran.traces,
+        };
+        self.worth_keeping(run, &node.name, &ran).await;
+        ran
+    }
+}
+
+impl Nodes {
+    /// Keeps this node's answer where another coordinator can find it, if it cost anything.
+    ///
+    /// **What spent nothing is not kept**, and that is the whole rule: the saving being bought is
+    /// money already paid to an upstream, so a node that paid nothing has nothing to protect and
+    /// is left free to run again. It also keeps the two refusals out of the cache that would
+    /// otherwise be permanent — a template that has gone missing, and a member that could not be
+    /// reached — neither of which is a reason to answer a retry the same way for a day.
+    async fn worth_keeping(&self, run: GraphRunId, node: &NodeName, ran: &NodeRan) {
+        if let Some(kept) = &self.kept
+            && ran.spend != Spend::NOTHING
+        {
+            kept.keep(run, node, ran).await;
         }
     }
 }
@@ -3044,7 +3087,7 @@ upstream_speaks = "anthropic"
             .expect("the stream names a run this crate made");
         let topic = crate::cluster::signal_topic(run).expect("a run names a topic");
         state
-            .publication()
+            .shared_cache()
             .published(&topic)
             .await
             .expect("the cache answers")
@@ -3139,7 +3182,7 @@ upstream_speaks = "anthropic"
     async fn saying_a_run_stopped_twice_announces_it_once() {
         let (_, state, _plane) = running(&[], answering_plane()).await;
         let run = ip_graph::GraphRunId::generate().expect("a run id");
-        let signalling = crate::cluster::Signalling::new(Arc::clone(state.publication()));
+        let signalling = crate::cluster::Signalling::new(Arc::clone(state.shared_cache()));
 
         <crate::cluster::Signalling as Stopping>::stopped(&signalling, run).await;
         let once = signalled(&state, &serde_json::json!(run.to_string())).await;
@@ -3162,7 +3205,7 @@ upstream_speaks = "anthropic"
 
         // Answers nothing and refuses nothing: the warning is all that is left of it.
         <crate::cluster::Signalling as Stopping>::stopped(
-            &crate::cluster::Signalling::new(Arc::clone(state.publication())),
+            &crate::cluster::Signalling::new(Arc::clone(state.shared_cache())),
             run,
         )
         .await;
@@ -3172,5 +3215,203 @@ upstream_speaks = "anthropic"
             signalled(&state, &serde_json::json!(run.to_string())).await,
             None
         );
+    }
+
+    /// What is kept for this run's one node, if anything is.
+    async fn kept_answer(state: &AppState, run: &serde_json::Value) -> Option<NodeRan> {
+        let run = ip_graph::GraphRunId::from_hex(run.as_str().expect("a run id is a string"))
+            .expect("the stream names a run this crate made");
+        crate::cluster::Kept::new(Arc::clone(state.shared_cache()))
+            .answer(run, &NodeName::new("intake").expect("a node name"))
+            .await
+    }
+
+    /// The run id of the one node in these fixtures, for a test that writes the answer itself.
+    fn one_run() -> ip_graph::GraphRunId {
+        ip_graph::GraphRunId::generate().expect("a run id")
+    }
+
+    /// A node that ran and spent something is kept, so a second coordinator can see what was paid.
+    #[tokio::test]
+    async fn what_a_node_answered_is_kept_for_a_coordinator_that_asks_later() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent"],
+            one_node(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let (_, done) = said.last().expect("a graph says it is over");
+        let kept = kept_answer(&state, &done["run"])
+            .await
+            .expect("what the node answered was not kept");
+        assert_eq!(kept.answer, done["answer"]["intake"], "{done}");
+        assert_ne!(kept.spend, Spend::NOTHING);
+    }
+
+    /// The saving itself, and it is driven directly rather than over the route for a reason:
+    /// nothing in M27 starts a run under an id somebody else already used, so the only caller
+    /// that can reach this is the second coordinator the cache exists for. The route generates a
+    /// fresh id every time and would never find a kept answer.
+    ///
+    /// `prepared` is left **empty** and `dispatching` `None` on purpose. A node that reached
+    /// either would answer "never prepared", so an answer that is the kept one is proof the read
+    /// came before the template, the run id, the dispatch and the gateway alike.
+    #[tokio::test]
+    async fn a_node_already_answered_is_neither_run_nor_dispatched() {
+        let (_, state, _plane) = running(&["intake-agent"], one_node(&[])).await;
+        let run = one_run();
+        let node = NodeName::new("intake").expect("a node name");
+        let kept = Arc::new(crate::cluster::Kept::new(Arc::clone(state.shared_cache())));
+        let answered = NodeRan {
+            answer: "what the first coordinator paid for".to_owned(),
+            stopped: ip_run::Stopped::Answered,
+            spend: Spend::NOTHING,
+            traces: Vec::new(),
+        };
+        kept.keep(run, &node, &answered).await;
+        let (say, _said) = tokio::sync::mpsc::unbounded_channel();
+        let nodes = Nodes {
+            gateway: state.shared_gateway(),
+            prepared: BTreeMap::new(),
+            say,
+            placing: None,
+            dispatching: None,
+            kept: Some(Arc::clone(&kept)),
+        };
+
+        let ran = RunsNode::run(
+            &nodes,
+            RunningNode {
+                run,
+                node: GraphNode {
+                    name: node,
+                    agent: ip_agents::AgentId::new("intake-agent").expect("a template name"),
+                },
+                input: "asked again".to_owned(),
+                signals: ip_run::RunSignal::never(),
+            },
+        )
+        .await;
+
+        assert_eq!(ran, answered, "the node was run again rather than recalled");
+    }
+
+    /// A node that spent nothing is left free to run again: there is no payment to protect, and a
+    /// kept refusal would answer every retry the same way for a day.
+    ///
+    /// Driven at the rule rather than over the route, because the route cannot produce a node
+    /// that spent nothing *and* finished: commit 5 answers a member's refusal by running the node
+    /// at home, which then spends. The two arms are what the rule is, so both are asserted here.
+    #[tokio::test]
+    async fn a_node_is_kept_when_it_spent_something_and_not_when_it_spent_nothing() {
+        let (_, state, _plane) = running(&["intake-agent"], one_node(&[])).await;
+        let kept = Arc::new(crate::cluster::Kept::new(Arc::clone(state.shared_cache())));
+        let (say, _said) = tokio::sync::mpsc::unbounded_channel();
+        let nodes = Nodes {
+            gateway: state.shared_gateway(),
+            prepared: BTreeMap::new(),
+            say,
+            placing: None,
+            dispatching: None,
+            kept: Some(Arc::clone(&kept)),
+        };
+        let free = one_run();
+        let paid = one_run();
+        let node = NodeName::new("intake").expect("a node name");
+        let answered = |spend| NodeRan {
+            answer: "four".to_owned(),
+            stopped: ip_run::Stopped::Answered,
+            spend,
+            traces: Vec::new(),
+        };
+
+        nodes
+            .worth_keeping(free, &node, &answered(Spend::NOTHING))
+            .await;
+        nodes
+            .worth_keeping(
+                paid,
+                &node,
+                &answered(Spend::new(
+                    ip_core::Tokens::ZERO,
+                    ip_core::Money::from_micros(12),
+                )),
+            )
+            .await;
+
+        assert!(
+            kept.answer(free, &node).await.is_none(),
+            "a node that paid nothing was kept, so a retry would get its refusal for a day"
+        );
+        assert!(kept.answer(paid, &node).await.is_some());
+    }
+
+    /// Best effort, as everywhere else: a cache that cannot answer is a node that runs, never a
+    /// run that refuses. One node run twice against every graph run failing is not a trade.
+    ///
+    /// At the reader rather than over the route: `None` is exactly what makes the caller above
+    /// fall through to running the node, and a route test would have to break the cache the
+    /// session cookie is minted from to reach it.
+    #[tokio::test]
+    async fn a_cache_that_cannot_answer_keeps_nothing_and_recalls_nothing() {
+        let (_, state, _plane) = running(&["intake-agent"], one_node(&[])).await;
+        let kept = crate::cluster::Kept::new(Arc::clone(state.shared_cache()));
+        let run = one_run();
+        let node = NodeName::new("intake").expect("a node name");
+        state.cache_failure().fail_now();
+
+        kept.keep(
+            run,
+            &node,
+            &NodeRan {
+                answer: "four".to_owned(),
+                stopped: ip_run::Stopped::Answered,
+                spend: Spend::NOTHING,
+                traces: Vec::new(),
+            },
+        )
+        .await;
+        assert!(kept.answer(run, &node).await.is_none());
+
+        state.cache_failure().answer_again();
+        assert!(
+            kept.answer(run, &node).await.is_none(),
+            "a cache that could not take the answer kept it anyway"
+        );
+    }
+
+    /// A deployment that is the only machine serving a run holds the answers in memory while it
+    /// does, so keeping them would be a write nobody reads.
+    #[tokio::test]
+    async fn a_deployment_alone_keeps_nothing() {
+        let (router, state, _plane) = running(&["intake-agent"], one_node(&[])).await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(done["answer"]["intake"], "four", "{done}");
+        assert!(kept_answer(&state, &done["run"]).await.is_none());
     }
 }

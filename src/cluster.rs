@@ -13,15 +13,19 @@
 //! publication channel the rules have used on both cache backends since M6. Both ends of that
 //! channel are here — what a coordinator publishes and what a worker follows — so the topic is
 //! named once and the two cannot drift apart.
+//!
+//! [`Kept`] is the other thing this module puts in the cache: what a node answered, under the run
+//! and the node that answered it, so a coordinator picking up a run somebody else started can see
+//! what has already been paid for instead of paying for it again.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ip_cache::{CacheBackend, CacheError, CacheKey, CacheLevel};
+use ip_cache::{CacheBackend, CacheError, CacheKey, CacheLevel, Ttl};
 use ip_core::Timestamp;
 use ip_core::route::{ClusterAddress, ClusterStrategy};
-use ip_graph::{ClusterMember, GraphPlane, GraphRunId};
+use ip_graph::{ClusterMember, GraphPlane, GraphRunId, NodeName, NodeRan};
 use tokio::task::JoinHandle;
 
 /// This machine's own membership of the cluster.
@@ -225,6 +229,85 @@ pub async fn already_stopped(cache: &dyn CacheBackend, run: GraphRunId) -> bool 
         .published(&topic)
         .await
         .is_ok_and(|published| published.is_some_and(|published| published.revision >= STOPPED_AT))
+}
+
+/// Where one node's answer is kept.
+///
+/// Under the run *and* the node, because a graph runs each node once: the pair is what a second
+/// coordinator of the same run would ask by, and it is the only pair that identifies the work.
+///
+/// # Errors
+///
+/// [`CacheError`] when the pair will not make a key, which a hex id and a node name cannot — a
+/// node name is checked when the graph is stored.
+pub fn answer_key(run: GraphRunId, node: &NodeName) -> Result<CacheKey, CacheError> {
+    CacheKey::new(CacheLevel::System, &format!("graph-run/{run}/node/{node}"))
+}
+
+/// How long a node's answer is worth keeping.
+///
+/// A day, which is a statement about retries and not about the answer: a coordinator picking the
+/// run up long after this is not retrying it, and an answer nobody will ask for again is a row
+/// that should fall out of the cache rather than one somebody has to sweep.
+const KEPT_FOR: u64 = 86_400;
+
+/// What a node answered, kept where another coordinator of the same run can find it.
+///
+/// This is what makes the placement records M26 leaves behind actionable. The records say a node
+/// ran at a member; what it *answered* was only ever in the coordinator's memory, so a coordinator
+/// that died took the answer with it and a retry paid the upstream twice for the same node.
+pub struct Kept {
+    /// Where the answers live.
+    cache: Arc<dyn CacheBackend>,
+}
+
+impl Kept {
+    /// Keeping answers in this deployment's own cache.
+    #[must_use]
+    pub const fn new(cache: Arc<dyn CacheBackend>) -> Self {
+        Self { cache }
+    }
+
+    /// What this node already answered, where it has and the answer can still be read.
+    ///
+    /// **Best effort.** Nothing when the cache cannot answer, which runs the node — the cost of
+    /// being wrong that way is one node run again, against a cache outage making every graph run
+    /// refuse. An answer that will not read back as a `NodeRan` is treated the same way and said
+    /// in a warning, since the only thing that writes this key is the line below.
+    pub async fn answer(&self, run: GraphRunId, node: &NodeName) -> Option<NodeRan> {
+        let kept = self.cache.get(&answer_key(run, node).ok()?).await;
+        let held = match kept {
+            Ok(held) => held?,
+            Err(error) => {
+                tracing::warn!(%error, %run, %node, "could not read what this node answered");
+                return None;
+            }
+        };
+        match serde_json::from_slice(&held) {
+            Ok(ran) => Some(ran),
+            Err(error) => {
+                tracing::warn!(%error, %run, %node, "what this node answered will not read back");
+                None
+            }
+        }
+    }
+
+    /// Keeps what this node answered, for a coordinator that asks after this one is gone.
+    ///
+    /// **Best effort**, and silent about a key or a ttl it cannot build: failing a run over an
+    /// answer that could not be kept would trade a saving for an outage.
+    pub async fn keep(&self, run: GraphRunId, node: &NodeName, ran: &NodeRan) {
+        let Ok(key) = answer_key(run, node) else {
+            return;
+        };
+        let Ok(value) = serde_json::to_vec(ran) else {
+            return;
+        };
+        let ttl = Ttl::seconds(KEPT_FOR).ok();
+        if let Err(error) = self.cache.put(&key, &value, ttl).await {
+            tracing::warn!(%error, %run, %node, "could not keep what this node answered");
+        }
+    }
 }
 
 /// A number below `total`, drawn from the operating system entropy source.

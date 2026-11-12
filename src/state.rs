@@ -89,9 +89,9 @@ pub struct AppState {
     /// How this deployment picks which member a node goes to. One for the process, because what
     /// round-robin remembers belongs to the machine and not to one run.
     spreading: Arc<Spreading>,
-    /// The cache as something that publishes, which the gateway's own `Arc<dyn Cache>` is not.
-    /// What a graph run's stop is carried over, the way the rules are.
-    publication: Arc<dyn CacheBackend>,
+    /// The cache as a backend, which the gateway's own `Arc<dyn Cache>` is not: what a graph
+    /// run's stop is published over and what its nodes' answers are kept in.
+    shared_cache: Arc<dyn CacheBackend>,
     /// The store a test reads through, when the state was built for one, so the test can
     /// make it fail where it means to.
     #[cfg(test)]
@@ -168,7 +168,7 @@ impl AppState {
             tracing::warn!(%error, "could not publish the rules at startup; healing will");
         }
         let counters = Arc::clone(&published) as Arc<dyn Counters>;
-        let publication = Arc::clone(&published);
+        let shared_cache = Arc::clone(&published);
         let cache = published as Arc<dyn Cache>;
         // The revision is read first, so a change that lands while the table is read is
         // followed rather than missed.
@@ -331,7 +331,7 @@ impl AppState {
             cluster_client,
             heartbeat: config.cluster.heartbeat.as_duration(),
             spreading: Arc::new(Spreading::new(config.cluster.strategy)),
-            publication,
+            shared_cache,
             #[cfg(test)]
             failing_store: None,
             #[cfg(test)]
@@ -399,7 +399,7 @@ impl AppState {
             spreading: Arc::new(Spreading::new(
                 ip_config::config::ClusterConfig::default().strategy,
             )),
-            publication: Arc::clone(&failing_cache) as Arc<dyn CacheBackend>,
+            shared_cache: Arc::clone(&failing_cache) as Arc<dyn CacheBackend>,
             failing_store: Some(failing_store),
             failing_cache: Some(failing_cache),
         }
@@ -433,9 +433,9 @@ impl AppState {
         &self.spreading
     }
 
-    /// The cache as something that publishes, which is what a run's signals travel over.
-    pub fn publication(&self) -> &Arc<dyn CacheBackend> {
-        &self.publication
+    /// The cache as a backend: what a run's signals travel over and its answers are kept in.
+    pub fn shared_cache(&self) -> &Arc<dyn CacheBackend> {
+        &self.shared_cache
     }
 
     /// The same state over a graph store, for a test that works on one.

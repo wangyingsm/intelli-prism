@@ -117,7 +117,7 @@ const UNWRITABLE: &str = r#"{"refused":"an event of this node could not be writt
 /// the coordinator off to run the node at home, which for a run that has already stopped is the
 /// one wrong answer there is — it would turn a stop into the work happening anyway, elsewhere.
 async fn cut_short_already(state: &AppState, run: GraphRunId) -> Option<NodeEvent> {
-    already_stopped(state.publication().as_ref(), run)
+    already_stopped(state.shared_cache().as_ref(), run)
         .await
         .then(|| {
             NodeEvent::Answered(NodeRan {
@@ -266,7 +266,7 @@ async fn dispatched(state: AppState, work: Dispatch, say: UnboundedSender<NodeEv
         return;
     }
     let (stop, signals) = watch::channel(RunSignal::Carry);
-    let following = follow_the_stop(state.publication(), work.run, stop).await;
+    let following = follow_the_stop(state.shared_cache(), work.run, stop).await;
     let ran = ip_run::run(
         &Running {
             id,
@@ -864,7 +864,7 @@ upstream_speaks = "anthropic"
     /// Publishes a run's stop the way a coordinator does, through the seam that carries it.
     async fn publish_the_stop(state: &AppState, run: GraphRunId) {
         <Signalling as ip_graph::Stopping>::stopped(
-            &Signalling::new(Arc::clone(state.publication())),
+            &Signalling::new(Arc::clone(state.shared_cache())),
             run,
         )
         .await;
