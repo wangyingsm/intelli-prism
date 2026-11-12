@@ -1,0 +1,95 @@
+# A cluster on one machine: two gateways sharing one store, one cache and one plane.
+#
+# What it is for is the half of this system a single process cannot show — a node
+# dispatched to another member, the record of where it ran, and a stop that has to cross
+# a boundary to reach it. Everything else is quicker to test with `cargo nextest`.
+#
+#   docker compose -f docker/cluster/compose.yaml up --build -d
+#   docker compose -f docker/cluster/compose.yaml run --rm -it alpha admin create root
+#
+# Dev only. The secrets below are in plain text on purpose: they are worth nothing, and a
+# stack whose passwords must be fetched before it starts is one nobody starts.
+
+name: ip-cluster
+
+services:
+  # The store both members share, which is what makes them one deployment rather than two.
+  store:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: ip
+    ports: ["127.0.0.1:55433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes: ["store:/var/lib/postgresql/data"]
+
+  # The cache they share. A nonce spent on one member is spent on both, and from M27 the
+  # stop signal travels this way too.
+  cache:
+    image: redis:8-alpine
+    ports: ["127.0.0.1:56380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # The dr-strange plane the run graphs live in, and where a coordinator records which
+  # member each node is running on.
+  #
+  # The binary is this machine's own, bind-mounted rather than built into an image: there
+  # is no published dr-strange image yet, and a dev stack that needs one built first is a
+  # dev stack nobody runs. It links only libc, libm and libgcc, so a debian base runs it
+  # unchanged. Point DRSG_BIN elsewhere if yours is not on the default path.
+  plane:
+    image: debian:trixie-slim
+    command: ["/usr/local/bin/drsg", "serve", "--addr", "0.0.0.0:7700", "--db", "/data/graph.drsg"]
+    environment:
+      DRSG_TOKEN: cluster-dev-not-a-secret
+    ports: ["127.0.0.1:17700:7700"]
+    volumes:
+      - ${DRSG_BIN:-${HOME}/.local/bin/drsg}:/usr/local/bin/drsg:ro
+      - plane:/data
+
+  # The two members. They differ in exactly two keys — which address each listens on and
+  # which it advertises — because everything else about a cluster member is shared by
+  # definition.
+  alpha:
+    # The image both members run. Built once here and named, so `beta` below can only ever
+    # run the same binary: two members built separately drift the moment one is rebuilt,
+    # and a cluster test over two different binaries is worse than no test.
+    image: ip-cluster-prism:dev
+    build:
+      context: ../..
+      target: plain
+      # Direct crates.io is ~11 KB/s from here; the mirror is what makes this build
+      # finish. Empty uses crates.io, which is what anyone outside this network wants.
+      args:
+        CARGO_MIRROR: ${CARGO_MIRROR:-sparse+https://mirrors.ustc.edu.cn/crates.io-index/}
+    command: ["--config", "/etc/intelli-prism/config.toml"]
+    ports: ["127.0.0.1:18080:8080"]
+    volumes: ["./alpha.toml:/etc/intelli-prism/config.toml:ro"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      store: {condition: service_healthy}
+      cache: {condition: service_healthy}
+      plane: {condition: service_started}
+
+  beta:
+    # No build of its own: the image alpha builds, by name.
+    image: ip-cluster-prism:dev
+    command: ["--config", "/etc/intelli-prism/config.toml"]
+    ports: ["127.0.0.1:18081:8080"]
+    volumes: ["./beta.toml:/etc/intelli-prism/config.toml:ro"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      store: {condition: service_healthy}
+      cache: {condition: service_healthy}
+      plane: {condition: service_started}
+
+volumes:
+  store:
+  plane:

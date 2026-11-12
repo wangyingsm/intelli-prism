@@ -1,0 +1,57 @@
+# One member of the local cluster. See compose.yaml; beta.toml differs in two keys.
+
+[server]
+listen = "0.0.0.0:8080"
+
+# What this member tells the rest of the cluster to reach it on. Without it a member
+# bound to every interface has not said where it is, and records no placement at all —
+# inside a compose network the service name is the honest answer.
+[cluster]
+advertise = "beta:8080"
+# One secret for the whole cluster, identical in beta.toml: it is what lets one member
+# take another's word for which run a dispatched node belongs to. A member that
+# advertises an address without one does not start, since its peers could reach it and
+# could not authenticate to it.
+secret = "cluster-dev-shared-not-worth-stealing"
+
+[storage]
+backend = "postgres"
+url = "postgres://postgres:ip@store:5432/postgres"
+
+[cache]
+backend = "redis"
+url = "redis://cache:6379"
+response_ttl = 60
+
+[auth]
+nonce_ttl = 300
+
+[auth.jwt]
+issuer = "intelli-prism"
+secret = "cluster-dev-secret-not-worth-stealing-32+"
+ttl = 21600
+
+[usage]
+
+[telemetry]
+log_level = "info"
+
+# Where the run graphs live, and from M26 where each dispatched node is recorded. Both
+# members name the same plane: that sharing is what makes a placement written by one
+# readable by the other.
+[graph_store]
+# The json-rpc endpoint itself, not the server root: the client posts to this url
+# verbatim, and the root answers the dashboard's html.
+url = "http://plane:7700/rpc"
+token = "cluster-dev-not-a-secret"
+plane = "cluster-runs"
+timeout = 10
+
+# Point this at something that actually answers before expecting a run to finish. The
+# host entry reaches this laptop's own port from inside the network; swap in a real
+# provider and key to test against one.
+[[upstream]]
+id = "local"
+base_url = "http://host.docker.internal:11435/"
+api_key = "not-checked-by-a-local-server"
+model = "qwen3:8b"
