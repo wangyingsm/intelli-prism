@@ -16,6 +16,7 @@
 //! home.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -23,16 +24,23 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
+use ip_cache::CacheBackend;
 use ip_cluster::{Dispatch, NodeEvent};
 use ip_config::Secret;
 use ip_core::Protocol;
-use ip_graph::NodeRan;
-use ip_run::{AsWhom, Pinned, Reporting, RunEvent, RunId, RunSignal, Running, Target, Toolshed};
+use ip_graph::{GraphRunId, NodeRan};
+use ip_run::{
+    AsWhom, Pinned, Reporting, RunEvent, RunId, RunSignal, Running, Spend, Stopped, Target,
+    Toolshed,
+};
 use ip_storage::Page;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::graph::{MCP_SETTINGS, REGISTRY_LIMIT, templates_of};
+use crate::cluster::{already_stopped, signal_topic};
 use crate::manage::authority_of;
 use crate::state::AppState;
 
@@ -98,6 +106,64 @@ fn written(event: &NodeEvent) -> SseEvent {
 
 /// What is streamed when an event will not write down, which is a [`NodeEvent::Refused`].
 const UNWRITABLE: &str = r#"{"refused":"an event of this node could not be written down"}"#;
+
+/// What a node of a run that has already stopped answers, where the run has.
+///
+/// Read before the node runs rather than only followed, because a follower starts at the revision
+/// standing *now* and wakes only on what comes after: a node handed to this member after the
+/// coordinator published the stop has nothing to wake on and would otherwise run in full.
+///
+/// Answered as a node that ran and was cut short, and never as a refusal. A refusal is what sends
+/// the coordinator off to run the node at home, which for a run that has already stopped is the
+/// one wrong answer there is — it would turn a stop into the work happening anyway, elsewhere.
+async fn cut_short_already(state: &AppState, run: GraphRunId) -> Option<NodeEvent> {
+    already_stopped(state.publication().as_ref(), run)
+        .await
+        .then(|| {
+            NodeEvent::Answered(NodeRan {
+                answer: String::new(),
+                stopped: Stopped::CutShort,
+                spend: Spend::NOTHING,
+                traces: Vec::new(),
+            })
+        })
+}
+
+/// Flips `stop` when this run's stop is published, for as long as the task is left running.
+///
+/// Nothing when the topic cannot be followed, and that is **not** a reason to refuse the node: a
+/// stop that cannot arrive leaves a node running its course, which is what every member did
+/// before the stop existed. The alternative turns a cache that is down into work nobody can take.
+async fn follow_the_stop(
+    cache: &Arc<dyn CacheBackend>,
+    run: GraphRunId,
+    stop: watch::Sender<RunSignal>,
+) -> Option<JoinHandle<()>> {
+    let topic = match signal_topic(run) {
+        Ok(topic) => topic,
+        Err(error) => {
+            tracing::warn!(%error, %run, "a dispatched node has no signal topic to follow");
+            return None;
+        }
+    };
+    let mut following = match cache.follow(&topic).await {
+        Ok(following) => following,
+        Err(error) => {
+            tracing::warn!(
+                %error, %run,
+                "could not follow a run's signals; this node runs its course"
+            );
+            return None;
+        }
+    };
+    Some(tokio::spawn(async move {
+        // One kind of thing is published under this topic, so the first move of the revision is
+        // the stop and there is nothing after it to go on waiting for.
+        if following.changed().await.is_ok() {
+            let _ = stop.send(RunSignal::Stop);
+        }
+    }))
+}
 
 /// One node's turns, said into the dispatch's own stream.
 struct Saying {
@@ -195,6 +261,12 @@ async fn dispatched(state: AppState, work: Dispatch, say: UnboundedSender<NodeEv
         Ok(id) => id,
         Err(error) => return refuse(format!("this run could not be named: {error}")),
     };
+    if let Some(cut) = cut_short_already(&state, work.run).await {
+        let _ = say.send(cut);
+        return;
+    }
+    let (stop, signals) = watch::channel(RunSignal::Carry);
+    let following = follow_the_stop(state.publication(), work.run, stop).await;
     let ran = ip_run::run(
         &Running {
             id,
@@ -204,13 +276,16 @@ async fn dispatched(state: AppState, work: Dispatch, say: UnboundedSender<NodeEv
             config: &config,
             pinned: &pinned,
             reporting: &Saying { say: say.clone() },
-            // Nothing stops a dispatched node yet: the coordinator's stop reaches it over the
-            // cluster's own bus, which is its own commit.
-            signals: &RunSignal::never(),
+            signals: &signals,
         },
         &work.input,
     )
     .await;
+    // For the life of the node and no longer: the topic outlives this node, and a follower left
+    // behind would hold a connection for a run this machine has finished with.
+    if let Some(following) = following {
+        following.abort();
+    }
     let _ = say.send(NodeEvent::Answered(NodeRan {
         answer: ran.text(),
         stopped: ran.stopped,
@@ -243,6 +318,7 @@ mod tests {
 
     use super::super::harness::{body_of, hashed};
     use super::*;
+    use crate::cluster::Signalling;
 
     /// The deployment a worker serves: one upstream, answering anthropic.
     const SERVING: &str = r#"
@@ -738,5 +814,170 @@ upstream_speaks = "anthropic"
         for (name, event) in streamed(answered).await {
             assert_eq!(name, event.name());
         }
+    }
+
+    /// A worker whose turns are slow enough that a stop published mid-run can reach it.
+    ///
+    /// The template this fixture stores allows four turns, so a run that is never stopped takes
+    /// four and a run that is stopped takes fewer — which is what the assertions read.
+    struct Slowly;
+
+    #[async_trait::async_trait]
+    impl ip_gateway::upstream::Upstream for Slowly {
+        async fn send(
+            &self,
+            _request: Request<ip_gateway::body::GatewayBody>,
+        ) -> Result<axum::http::Response<ip_gateway::body::GatewayBody>, ip_gateway::UpstreamError>
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            // A tool call, so the loop takes another turn rather than finishing on this one.
+            let body = serde_json::json!({
+                "id": "msg_1",
+                "model": "claude-opus-5",
+                "role": "assistant",
+                "type": "message",
+                "stop_reason": "tool_use",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "nothing",
+                    "input": {},
+                }],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            })
+            .to_string();
+            Ok(axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(ip_gateway::from_bytes(body.into()))
+                .unwrap())
+        }
+    }
+
+    /// A worker taking its time over each turn, so a stop has somewhere to land.
+    async fn slow_worker() -> (Router, AppState) {
+        let state = super::super::harness::serving(store().await, SERVING, Arc::new(Slowly))
+            .with_cluster_secret(Secret::from(STUB_SECRET));
+        (super::super::router(state.clone()), state)
+    }
+
+    /// Publishes a run's stop the way a coordinator does, through the seam that carries it.
+    async fn publish_the_stop(state: &AppState, run: GraphRunId) {
+        <Signalling as ip_graph::Stopping>::stopped(
+            &Signalling::new(Arc::clone(state.publication())),
+            run,
+        )
+        .await;
+    }
+
+    /// The whole of commit 6: a stop said on one machine ends a node running on another.
+    #[tokio::test]
+    async fn a_stop_the_coordinator_published_ends_a_node_running_here() {
+        let (router, state) = slow_worker().await;
+        let work = stub_dispatch();
+        let stopping = {
+            let state = state.clone();
+            let run = work.run;
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+                publish_the_stop(&state, run).await;
+            }
+        };
+
+        let (answered, ()) = tokio::join!(router.oneshot(sent(Some(STUB_SECRET), &work)), stopping);
+
+        let said = streamed(answered.unwrap()).await;
+        let Some((_, NodeEvent::Answered(ran))) = said.last() else {
+            panic!("a stopped node did not answer: {said:?}");
+        };
+        assert_eq!(
+            ran.stopped,
+            ip_run::Stopped::CutShort,
+            "a node that was told to stop reported something else: {said:?}"
+        );
+        let turns = said
+            .iter()
+            .filter(|(name, _)| name == "said")
+            .filter(|(_, event)| matches!(event, NodeEvent::Said(RunEvent::Turn { .. })))
+            .count();
+        assert!(
+            (1..4).contains(&turns),
+            "the node took every turn it was allowed, so nothing stopped it: {turns}"
+        );
+    }
+
+    /// A stop is addressed to one run, which is what keeps one tenant's stop out of another's.
+    #[tokio::test]
+    async fn a_stop_published_for_another_run_does_not_touch_this_node() {
+        let (router, state) = slow_worker().await;
+        let other = GraphRunId::generate().expect("a run id");
+        let stopping = {
+            let state = state.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                publish_the_stop(&state, other).await;
+            }
+        };
+
+        let (answered, ()) = tokio::join!(
+            router.oneshot(sent(Some(STUB_SECRET), &stub_dispatch())),
+            stopping
+        );
+
+        let said = streamed(answered.unwrap()).await;
+        let Some((_, NodeEvent::Answered(ran))) = said.last() else {
+            panic!("the node did not answer: {said:?}");
+        };
+        assert!(
+            matches!(ran.stopped, ip_run::Stopped::OutOfTurns { .. }),
+            "somebody else's stop ended this node: {said:?}"
+        );
+    }
+
+    /// Read before the node runs, because a follower started now has nothing to wake on.
+    ///
+    /// Answered as a node that ran and was cut short, never refused: a refusal is what sends the
+    /// coordinator off to run the node at home, which for a stopped run is the one wrong answer.
+    #[tokio::test]
+    async fn a_node_dispatched_after_the_stop_was_published_is_cut_short_and_never_run() {
+        let (router, state) = slow_worker().await;
+        let work = stub_dispatch();
+        publish_the_stop(&state, work.run).await;
+
+        let answered = router
+            .oneshot(sent(Some(STUB_SECRET), &work))
+            .await
+            .unwrap();
+
+        let said = streamed(answered).await;
+        let [(name, NodeEvent::Answered(ran))] = said.as_slice() else {
+            panic!("a node of a stopped run said more than that it was cut short: {said:?}");
+        };
+        assert_eq!(name, "answered");
+        assert_eq!(ran.stopped, ip_run::Stopped::CutShort);
+        assert_eq!(ran.spend, Spend::NOTHING, "a stopped node spent something");
+        assert!(ran.traces.is_empty(), "a stopped node took a turn");
+    }
+
+    /// A stop that cannot arrive is not a reason to refuse work — it is what every member did
+    /// before the stop existed.
+    #[tokio::test]
+    async fn a_worker_that_cannot_follow_the_signals_runs_the_node_to_completion() {
+        let state = super::super::harness::serving(store().await, SERVING, Arc::new(Answering))
+            .with_cluster_secret(Secret::from(STUB_SECRET));
+        state.cache_failure().fail_now();
+        let router = super::super::router(state.clone());
+
+        let answered = router
+            .oneshot(sent(Some(STUB_SECRET), &stub_dispatch()))
+            .await
+            .unwrap();
+
+        let said = streamed(answered).await;
+        let Some((_, NodeEvent::Answered(ran))) = said.last() else {
+            panic!("a cache that cannot answer stopped the node: {said:?}");
+        };
+        assert_eq!(ran.answer, "four");
+        assert_eq!(ran.stopped, ip_run::Stopped::Answered);
     }
 }

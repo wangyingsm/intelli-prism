@@ -8,14 +8,20 @@
 //! is dispatched to. It is in this module and not in the route because it is a property of the
 //! deployment rather than of one run — round-robin's place in the order is shared by every run
 //! this machine serves.
+//!
+//! And [`Signalling`] carries a graph run's stop to the members running its nodes, over the
+//! publication channel the rules have used on both cache backends since M6. Both ends of that
+//! channel are here — what a coordinator publishes and what a worker follows — so the topic is
+//! named once and the two cannot drift apart.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use ip_cache::{CacheBackend, CacheError, CacheKey, CacheLevel};
 use ip_core::Timestamp;
 use ip_core::route::{ClusterAddress, ClusterStrategy};
-use ip_graph::{ClusterMember, GraphPlane};
+use ip_graph::{ClusterMember, GraphPlane, GraphRunId};
 use tokio::task::JoinHandle;
 
 /// This machine's own membership of the cluster.
@@ -136,6 +142,89 @@ impl Spreading {
             }
         }
     }
+}
+
+/// The topic one graph run's signals are published under.
+///
+/// Per run, so a stop reaches the members running that run's nodes and nobody else — which the
+/// publication channel already guarantees, since a follower hears only its own topic.
+///
+/// `System` rather than a tenant's level because this is control traffic between the machines of
+/// one deployment, like the rules: which tenant's run it concerns is in the key and is not what
+/// decides who may read it.
+///
+/// # Errors
+///
+/// [`CacheError`] when the run's own name will not make a key, which a hex id cannot.
+pub fn signal_topic(run: GraphRunId) -> Result<CacheKey, CacheError> {
+    CacheKey::new(CacheLevel::System, &format!("graph-run/{run}/signal"))
+}
+
+/// What is published under that topic when a run stops.
+///
+/// Written for whoever reads the cache by hand rather than read back: the topic carries one kind
+/// of thing, so a revision above where a follower started *is* the stop. A second kind of signal
+/// is what would make reading the value worth the second call it costs.
+const STOP: &[u8] = b"stop";
+
+/// The revision a stop is published at.
+///
+/// One, because there is one transition: a run that has stopped does not un-stop, and a
+/// publication lands only when its revision is newer than what is there — so saying it twice is
+/// idempotent rather than a second announcement.
+const STOPPED_AT: u64 = 1;
+
+/// Carries a graph run's stop to the members of this cluster running its nodes.
+pub struct Signalling {
+    /// Where the topic lives.
+    cache: Arc<dyn CacheBackend>,
+}
+
+impl Signalling {
+    /// Signalling over this deployment's own cache.
+    #[must_use]
+    pub const fn new(cache: Arc<dyn CacheBackend>) -> Self {
+        Self { cache }
+    }
+}
+
+#[async_trait::async_trait]
+impl ip_graph::Stopping for Signalling {
+    /// **Best effort**, as every other cluster write here is.
+    ///
+    /// A stop that cannot be published is a warning: the node it would have cut short is already
+    /// paid for, the run ends on this machine either way, and refusing over it would turn a cache
+    /// that is down into graph runs that cannot finish.
+    async fn stopped(&self, run: GraphRunId) {
+        let topic = match signal_topic(run) {
+            Ok(topic) => topic,
+            Err(error) => {
+                tracing::warn!(%error, %run, "a graph run has no signal topic");
+                return;
+            }
+        };
+        if let Err(error) = self.cache.publish(&topic, STOPPED_AT, STOP).await {
+            tracing::warn!(
+                %error, %run,
+                "could not tell this cluster a run stopped; its nodes elsewhere run their course"
+            );
+        }
+    }
+}
+
+/// Whether this run has already been told to stop.
+///
+/// Read before a dispatched node runs, because [`ip_cache::Publication::follow`] starts a
+/// follower at the revision standing *now* and wakes it only on what comes after: a node handed
+/// to a member after the stop was published has nothing to wake on and would otherwise run.
+pub async fn already_stopped(cache: &dyn CacheBackend, run: GraphRunId) -> bool {
+    let Ok(topic) = signal_topic(run) else {
+        return false;
+    };
+    cache
+        .published(&topic)
+        .await
+        .is_ok_and(|published| published.is_some_and(|published| published.revision >= STOPPED_AT))
 }
 
 /// A number below `total`, drawn from the operating system entropy source.

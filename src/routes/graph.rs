@@ -20,7 +20,7 @@ use ip_gateway::Gateway;
 use ip_graph::{
     ClusterMember, GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner,
     GraphPlane, GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, MaxNodes, NodeName,
-    NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode,
+    NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode, Stopping,
 };
 use ip_mcp::{McpServer, McpSettings};
 use ip_run::{
@@ -31,7 +31,7 @@ use ip_storage::{AgentOwner, Page};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{Paged, store_refusal};
-use crate::cluster::Spreading;
+use crate::cluster::{Signalling, Spreading};
 use crate::manage::Manager;
 use crate::state::AppState;
 
@@ -522,6 +522,16 @@ fn dispatching_for(state: &AppState, run: &Run<'_>) -> Option<Dispatching> {
         heartbeat: state.heartbeat(),
         spreading: Arc::clone(state.spreading()),
     })
+}
+
+/// What carries this run's stop to the members running its nodes, where any are.
+///
+/// Gated on the same thing dispatching is, and for a reason rather than for symmetry: a
+/// deployment that never sends a node elsewhere has nobody running one of its nodes, so the
+/// publication would be a write nothing follows.
+fn stopping_for(state: &AppState) -> Option<Arc<dyn Stopping>> {
+    state.cluster_client()?;
+    Some(Arc::new(Signalling::new(Arc::clone(state.publication()))))
 }
 
 /// What runs this graph's nodes.
@@ -1057,6 +1067,7 @@ async fn start(
         runner: Arc::new(runner),
         input: asked.input,
         reporting: Arc::new(sender),
+        stopping: stopping_for(&state),
     };
     tokio::spawn(async move {
         ip_graph::run(&graphing).await;
@@ -3025,5 +3036,141 @@ upstream_speaks = "anthropic"
         .await;
 
         assert_eq!(worker.seen().len(), 2);
+    }
+
+    /// What is published under a run's signal topic, if anything is.
+    async fn signalled(state: &AppState, run: &serde_json::Value) -> Option<u64> {
+        let run = ip_graph::GraphRunId::from_hex(run.as_str().expect("a run id is a string"))
+            .expect("the stream names a run this crate made");
+        let topic = crate::cluster::signal_topic(run).expect("a run names a topic");
+        state
+            .publication()
+            .published(&topic)
+            .await
+            .expect("the cache answers")
+            .map(|published| published.revision)
+    }
+
+    /// A graph that stops tells the cluster, so a node of it running on another member hears.
+    ///
+    /// The node is stopped by a member cutting it off, which is the one way this fixture can make
+    /// a node fail — and it is also the realistic one: the node that broke broke elsewhere.
+    #[tokio::test]
+    async fn a_run_that_stops_publishes_the_stop_for_the_members_running_its_nodes() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::CutOff).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent"],
+            one_node(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(done["stopped_at"], "intake", "{done}");
+        assert_eq!(
+            signalled(&state, &done["run"]).await,
+            Some(1),
+            "a stopped run told nobody: {done}"
+        );
+    }
+
+    /// A graph that answers has no stop to pass on, so nothing is published at all.
+    #[tokio::test]
+    async fn a_run_that_answers_publishes_no_stop() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = dispatching(
+            &["intake-agent"],
+            one_node(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(done["stopped_at"], serde_json::Value::Null);
+        assert_eq!(signalled(&state, &done["run"]).await, None);
+    }
+
+    /// A deployment that never sends a node elsewhere has nobody running one of its nodes, so
+    /// the publication would be a write nothing follows.
+    #[tokio::test]
+    async fn a_deployment_that_dispatches_nothing_publishes_no_stop() {
+        let (router, state, _plane) = running(&["intake-agent"], one_node(&[])).await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(signalled(&state, &done["run"]).await, None);
+    }
+
+    /// Said twice is said once: a run that has stopped does not un-stop, and a publication lands
+    /// only above what is there — so a coordinator repeating itself raises no second announcement.
+    #[tokio::test]
+    async fn saying_a_run_stopped_twice_announces_it_once() {
+        let (_, state, _plane) = running(&[], answering_plane()).await;
+        let run = ip_graph::GraphRunId::generate().expect("a run id");
+        let signalling = crate::cluster::Signalling::new(Arc::clone(state.publication()));
+
+        <crate::cluster::Signalling as Stopping>::stopped(&signalling, run).await;
+        let once = signalled(&state, &serde_json::json!(run.to_string())).await;
+        <crate::cluster::Signalling as Stopping>::stopped(&signalling, run).await;
+
+        assert_eq!(once, Some(1));
+        assert_eq!(
+            signalled(&state, &serde_json::json!(run.to_string())).await,
+            once
+        );
+    }
+
+    /// A cache that cannot take the stop does not fail the run: the node it would have cut short
+    /// is already paid for, and the run ends on this machine either way.
+    #[tokio::test]
+    async fn a_stop_that_cannot_be_published_does_not_fail_the_run() {
+        let (_, state, _plane) = running(&[], answering_plane()).await;
+        let run = ip_graph::GraphRunId::generate().expect("a run id");
+        state.cache_failure().fail_now();
+
+        // Answers nothing and refuses nothing: the warning is all that is left of it.
+        <crate::cluster::Signalling as Stopping>::stopped(
+            &crate::cluster::Signalling::new(Arc::clone(state.publication())),
+            run,
+        )
+        .await;
+
+        state.cache_failure().answer_again();
+        assert_eq!(
+            signalled(&state, &serde_json::json!(run.to_string())).await,
+            None
+        );
     }
 }

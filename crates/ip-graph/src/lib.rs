@@ -33,4 +33,4 @@ pub use member::ClusterMember;
 pub use order::{Generation, Placed, RunOrder};
 pub use placement::Placement;
 pub use plane::{FEEDS, GRAPH_LABEL, GraphPlane, GraphSummary, Listing, NODE_LABEL};
-pub use run::{GraphRan, Graphing, NodeRan, RunningNode, RunsNode, run};
+pub use run::{GraphRan, Graphing, NodeRan, RunningNode, RunsNode, Stopping, run};

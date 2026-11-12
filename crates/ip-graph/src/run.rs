@@ -78,6 +78,24 @@ pub trait RunsNode: Send + Sync {
     async fn run(&self, running: RunningNode) -> NodeRan;
 }
 
+/// Whatever carries a graph's stop to the nodes of it that are not in this process.
+///
+/// A seam for the reason [`RunsNode`] is one: reaching the other members of a cluster is the
+/// binary's to do and not a graph's. A graph knows only that it has stopped, and says so once.
+///
+/// The local stop is a [`watch`] channel and needs none of this — it is the nodes *elsewhere*
+/// that cannot be reached by sharing a channel with them. A deployment with nobody else to tell
+/// is told nothing, which is why [`Graphing::stopping`] is optional.
+#[async_trait]
+pub trait Stopping: Send + Sync {
+    /// Says that this run has stopped.
+    ///
+    /// Answers nothing, because there is nothing a graph would do about a stop it could not
+    /// pass on: the node it is stopping has already been paid for, and the run ends either way.
+    /// An implementation that cannot reach the cluster says so in a log and returns.
+    async fn stopped(&self, run: GraphRunId);
+}
+
 /// A graph, the order it runs in, and whatever runs one node of it.
 pub struct Graphing {
     /// What this run is followed under.
@@ -92,6 +110,8 @@ pub struct Graphing {
     pub input: String,
     /// Where it says what it is doing as it does it.
     pub reporting: Arc<dyn GraphReporting>,
+    /// What carries the stop to the nodes of this run that are running elsewhere, where any are.
+    pub stopping: Option<Arc<dyn Stopping>>,
 }
 
 /// What running a whole graph came to.
@@ -231,8 +251,12 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
             {
                 stopped_at = Some(name.clone());
                 // Said while the rest of the generation is still running, which is the only
-                // moment it can save a turn.
+                // moment it can save a turn — and awaited for that reason, before the siblings
+                // still in flight are reaped.
                 let _ = stop.send(RunSignal::Stop);
+                if let Some(stopping) = &graphing.stopping {
+                    stopping.stopped(graphing.id).await;
+                }
             }
             done.insert(name.clone());
             answered.insert(name, ran);
@@ -421,6 +445,7 @@ mod tests {
             runner,
             input: "a ticket".to_owned(),
             reporting: Arc::new(()),
+            stopping: None,
         }
     }
 
@@ -439,6 +464,7 @@ mod tests {
                 runner,
                 input: "a ticket".to_owned(),
                 reporting: Arc::new(sender),
+                stopping: None,
             },
             receiver,
         )
@@ -566,6 +592,86 @@ mod tests {
             Some(name("left")),
             "the sibling that was cut short was named as the cause"
         );
+    }
+
+    /// Everything the stop was carried to, in the order it was carried.
+    #[derive(Default)]
+    struct Carried {
+        told: Mutex<Vec<GraphRunId>>,
+    }
+
+    #[async_trait]
+    impl Stopping for Carried {
+        async fn stopped(&self, run: GraphRunId) {
+            self.told
+                .lock()
+                .expect("the record is not poisoned")
+                .push(run);
+        }
+    }
+
+    /// The nodes of this run that are not in this process are told, once, and told which run.
+    #[tokio::test]
+    async fn a_graph_that_stops_says_so_to_whatever_carries_it_elsewhere() {
+        let carried = Arc::new(Carried::default());
+        let mut graphing = graphing(
+            graph(
+                &["left", "right", "merge"],
+                &[("left", "merge"), ("right", "merge")],
+            ),
+            order(&[("left", 0), ("right", 0), ("merge", 1)]),
+            Echo::new(SLOW, 2, &["left"]),
+        );
+        graphing.stopping = Some(Arc::clone(&carried) as Arc<dyn Stopping>);
+        let id = graphing.id;
+
+        run(&graphing).await;
+
+        assert_eq!(
+            *carried.told.lock().expect("the record is not poisoned"),
+            vec![id],
+            "a stop was carried more than once, or under the wrong run"
+        );
+    }
+
+    /// A graph that finishes carries nothing: there is no stop to pass on.
+    #[tokio::test]
+    async fn a_graph_that_answers_carries_no_stop() {
+        let carried = Arc::new(Carried::default());
+        let mut graphing = graphing(
+            graph(&["a", "b"], &[("a", "b")]),
+            order(&[("a", 0), ("b", 1)]),
+            Echo::new(Duration::ZERO, 1, &[]),
+        );
+        graphing.stopping = Some(Arc::clone(&carried) as Arc<dyn Stopping>);
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(ran.stopped_at, None);
+        assert!(
+            carried
+                .told
+                .lock()
+                .expect("the record is not poisoned")
+                .is_empty()
+        );
+    }
+
+    /// A deployment with nobody else to tell runs exactly as it did before the stop existed.
+    #[tokio::test]
+    async fn a_graph_with_nothing_to_carry_the_stop_still_stops_itself() {
+        let ran = run(&graphing(
+            graph(
+                &["left", "right", "merge"],
+                &[("left", "merge"), ("right", "merge")],
+            ),
+            order(&[("left", 0), ("right", 0), ("merge", 1)]),
+            Echo::new(SLOW, 2, &["left"]),
+        ))
+        .await;
+
+        assert_eq!(ran.stopped_at, Some(name("left")));
+        assert_eq!(ran.nodes[&name("right")].stopped, Stopped::CutShort);
     }
 
     /// The whole point of the signal: a sibling of a node that broke takes no further turn.
@@ -743,6 +849,7 @@ mod tests {
             runner: Arc::new(Costs),
             input: "a ticket".to_owned(),
             reporting: Arc::new(()),
+            stopping: None,
         })
         .await;
         assert_eq!(ran.spend.tokens.input.get(), 6);
