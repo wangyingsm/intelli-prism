@@ -1,0 +1,10 @@
+{
+  "name": "Cache scout",
+  "config": {
+    "role": "system",
+    "prompt": "You answer in exactly one sentence, under 25 words, no preamble. Say what a gateway needs a shared cache for.",
+    "max_turns": 1,
+    "time_limit": 120,
+    "req_timeout": 60
+  }
+}

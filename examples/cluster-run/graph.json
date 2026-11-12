@@ -1,0 +1,36 @@
+{
+  "name": "What a gateway needs",
+  "max_nodes": 8,
+  "nodes": [
+    {
+      "name": "storage",
+      "agent": "storage"
+    },
+    {
+      "name": "cache",
+      "agent": "cache"
+    },
+    {
+      "name": "limits",
+      "agent": "limits"
+    },
+    {
+      "name": "editor",
+      "agent": "editor"
+    }
+  ],
+  "edges": [
+    {
+      "from": "storage",
+      "to": "editor"
+    },
+    {
+      "from": "cache",
+      "to": "editor"
+    },
+    {
+      "from": "limits",
+      "to": "editor"
+    }
+  ]
+}

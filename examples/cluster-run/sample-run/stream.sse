@@ -1,0 +1,53 @@
+event: node
+data: {"input":"What does an enterprise AI gateway need?","node":"storage","run":"c20f90068b32b69df116eeef735c032d"}
+
+event: node
+data: {"input":"What does an enterprise AI gateway need?","node":"cache","run":"c20f90068b32b69df116eeef735c032d"}
+
+event: node
+data: {"input":"What does an enterprise AI gateway need?","node":"limits","run":"c20f90068b32b69df116eeef735c032d"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"limits","number":1,"run":"c20f90068b32b69df116eeef735c032d"}
+
+event: text
+data: {"node":"limits","run":"c20f90068b32b69df116eeef735c032d","text":"Per-tenant limits for rate, token, and cost control to prevent abuse and enforce fair usage across tenants."}
+
+event: turn
+data: {"model":"deepseek-flash","node":"storage","number":1,"run":"c20f90068b32b69df116eeef735c032d"}
+
+event: text
+data: {"node":"storage","run":"c20f90068b32b69df116eeef735c032d","text":"An enterprise AI gateway needs persistent storage for audit logs, usage quotas, model routing configs, and cached responses."}
+
+event: node_done
+data: {"cost_micros":0,"node":"limits","run":"c20f90068b32b69df116eeef735c032d","stop":"answered","text":"Per-tenant limits for rate, token, and cost control to prevent abuse and enforce fair usage across tenants.","tokens":{"input":39,"output":22},"why":"the model answered"}
+
+event: node_done
+data: {"cost_micros":0,"node":"storage","run":"c20f90068b32b69df116eeef735c032d","stop":"answered","text":"An enterprise AI gateway needs persistent storage for audit logs, usage quotas, model routing configs, and cached responses.","tokens":{"input":37,"output":23},"why":"the model answered"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"cache","number":1,"run":"c20f90068b32b69df116eeef735c032d"}
+
+event: text
+data: {"node":"cache","run":"c20f90068b32b69df116eeef735c032d","text":"An enterprise AI gateway needs a shared cache to deduplicate identical model requests, cut latency and cost, and enforce consistent governance across services."}
+
+event: node_done
+data: {"cost_micros":0,"node":"cache","run":"c20f90068b32b69df116eeef735c032d","stop":"answered","text":"An enterprise AI gateway needs a shared cache to deduplicate identical model requests, cut latency and cost, and enforce consistent governance across services.","tokens":{"input":38,"output":28},"why":"the model answered"}
+
+event: node
+data: {"input":"{\"cache\":\"An enterprise AI gateway needs a shared cache to deduplicate identical model requests, cut latency and cost, and enforce consistent governance across services.\",\"limits\":\"Per-tenant limits for rate, token, and cost control to prevent abuse and enforce fair usage across tenants.\",\"storage\":\"An enterprise AI gateway needs persistent storage for audit logs, usage quotas, model routing configs, and cached responses.\"}","node":"editor","run":"c20f90068b32b69df116eeef735c032d"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"editor","number":1,"run":"c20f90068b32b69df116eeef735c032d"}
+
+event: text
+data: {"node":"editor","run":"c20f90068b32b69df116eeef735c032d","text":"An enterprise AI gateway needs a shared cache to deduplicate identical model requests while cutting latency and cost and enforcing consistent governance across services, backed by persistent storage for audit logs, usage quotas, model routing configs, and cached responses, plus per-tenant limits on rate, token, and cost to prevent abuse and ensure fair usage across tenants."}
+
+event: node_done
+data: {"cost_micros":0,"node":"editor","run":"c20f90068b32b69df116eeef735c032d","stop":"answered","text":"An enterprise AI gateway needs a shared cache to deduplicate identical model requests while cutting latency and cost and enforcing consistent governance across services, backed by persistent storage for audit logs, usage quotas, model routing configs, and cached responses, plus per-tenant limits on rate, token, and cost to prevent abuse and ensure fair usage across tenants.","tokens":{"input":125,"output":69},"why":"the model answered"}
+
+event: done
+data: {"answer":{"editor":"An enterprise AI gateway needs a shared cache to deduplicate identical model requests while cutting latency and cost and enforcing consistent governance across services, backed by persistent storage for audit logs, usage quotas, model routing configs, and cached responses, plus per-tenant limits on rate, token, and cost to prevent abuse and ensure fair usage across tenants."},"cost_micros":0,"run":"c20f90068b32b69df116eeef735c032d","stopped_at":null,"tokens":{"input":239,"output":142}}
+
+
+[status 200]

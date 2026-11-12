@@ -101,12 +101,20 @@ does, and runs the `.hurl` files beside it in order.
 
 ```
 examples/graph-run/run.sh                                # a five-node graph, a real model
+examples/cluster-run/run.sh                              # the same, across three machines
 ```
 
 `examples/graph-run` runs a graph that writes a merge sort in Rust and in Go, benchmarks each and
 compares the two, against a live provider and a real dr-strange plane. It needs `IP_API_KEY` and
 `drsg` 2.28.0 or newer; one recorded run is kept beside it, with what that run showed about
 parallel generations, fan-in and unpriced spend.
+
+`examples/cluster-run` is the half of that a single process cannot show: three gateways sharing one
+store, one cache and one plane, a graph started on one of them, and its nodes spread over all
+three. It needs a postgres and a redis as well, since a cluster is machines that share a store and
+a cache. The recorded run beside it shows which member ran each node — the coordinator included,
+since it is a candidate for its own work — and the four answers left in the shared cache under the
+run that paid for them.
 
 ## Status
 

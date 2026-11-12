@@ -1,0 +1,10 @@
+{
+  "name": "Editor",
+  "config": {
+    "role": "system",
+    "prompt": "You are given three sentences as a json object keyed by the node that wrote each. Answer with one short paragraph that joins them, naming no node. No preamble, no list.",
+    "max_turns": 1,
+    "time_limit": 120,
+    "req_timeout": 60
+  }
+}

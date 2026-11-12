@@ -1,0 +1,19 @@
+  limits    answered  on 127.0.0.1:18101      crossed        39/   22 tokens
+  storage   answered  on 127.0.0.1:18100      here           37/   23 tokens
+  cache     answered  on 127.0.0.1:18102      crossed        38/   28 tokens
+  editor    answered  on 127.0.0.1:18100      here          125/   69 tokens
+
+  answered with: editor
+  stopped at:    nothing — every node answered
+  spent:         239/142 tokens, 0 micros
+  run id:        c20f90068b32b69df116eeef735c032d
+  finished in:   limits → storage → cache → editor
+
+  members that ran a node: 127.0.0.1:18100, 127.0.0.1:18101, 127.0.0.1:18102
+  the coordinator was:     127.0.0.1:18100
+  nodes crossed to:        127.0.0.1:18101, 127.0.0.1:18102
+  answers kept in the cache: 4
+    ip:sys:graph-run/c20f90068b32b69df116eeef735c032d/node/cache
+    ip:sys:graph-run/c20f90068b32b69df116eeef735c032d/node/editor
+    ip:sys:graph-run/c20f90068b32b69df116eeef735c032d/node/limits
+    ip:sys:graph-run/c20f90068b32b69df116eeef735c032d/node/storage
