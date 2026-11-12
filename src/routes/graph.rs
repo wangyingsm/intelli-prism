@@ -18,9 +18,9 @@ use ip_core::route::ClusterAddress;
 use ip_core::{Capability, CapabilityScope, Protocol, TenantId, UserId};
 use ip_gateway::Gateway;
 use ip_graph::{
-    GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner, GraphPlane,
-    GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, MaxNodes, NodeName, NodeRan, Placement,
-    RunGraph, RunGraphParts, RunningNode, RunsNode,
+    ClusterMember, GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner,
+    GraphPlane, GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, MaxNodes, NodeName,
+    NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode,
 };
 use ip_mcp::{McpServer, McpSettings};
 use ip_run::{
@@ -31,6 +31,7 @@ use ip_storage::{AgentOwner, Page};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{Paged, store_refusal};
+use crate::cluster::Spreading;
 use crate::manage::Manager;
 use crate::state::AppState;
 
@@ -453,6 +454,8 @@ struct Dispatching {
     plane: Arc<GraphPlane>,
     /// How often a member says so, which is what tells one that is late from one that is gone.
     heartbeat: Duration,
+    /// How one of the live members is picked.
+    spreading: Arc<Spreading>,
 }
 
 /// How many heartbeats a member may miss before this coordinator stops picking it.
@@ -517,6 +520,7 @@ fn dispatching_for(state: &AppState, run: &Run<'_>) -> Option<Dispatching> {
         us: state.cluster()?.clone(),
         plane: Arc::clone(state.graphs()?),
         heartbeat: state.heartbeat(),
+        spreading: Arc::clone(state.spreading()),
     })
 }
 
@@ -617,13 +621,16 @@ impl Dispatching {
             .unwrap_or(i64::MAX)
             .saturating_mul(i64::from(BELIEVED_FOR));
         let now = ip_core::Timestamp::now().unix_seconds();
-        members
+        // Filtered here and picked there: whether a member may be sent a node is this
+        // coordinator's decision, and which of the ones that may is the strategy's.
+        let live: Vec<ClusterMember> = members
             .into_iter()
-            .find(|member| {
+            .filter(|member| {
                 member.address != self.us
                     && now.saturating_sub(member.at.unix_seconds()) <= believed
             })
-            .map(|member| member.address)
+            .collect();
+        self.spreading.pick(&live)
     }
 
     /// One node's work, as the member running it is asked for it.
@@ -2875,5 +2882,148 @@ upstream_speaks = "anthropic"
             asked, 4,
             "a run that dispatches nothing reads no membership"
         );
+    }
+
+    /// The same fixture again, picking members the way the test is about.
+    async fn spreading(
+        named: &[&str],
+        replies: Replies,
+        client: ClusterClient,
+        strategy: ip_core::route::ClusterStrategy,
+    ) -> (Router, AppState, StubPlane) {
+        let plane = StubPlane::start(replies).await;
+        let state = super::super::harness::serving(
+            store_with_templates(named).await,
+            SERVING,
+            Arc::new(Answering),
+        )
+        .with_graphs(Arc::new(GraphPlane::new(plane.client())))
+        .with_cluster(here())
+        .with_cluster_client(Arc::new(client))
+        .with_heartbeat(Duration::from_secs(10))
+        .with_strategy(strategy);
+        (super::super::router(state.clone()), state, plane)
+    }
+
+    /// Round-robin over two live members sends one node to each, which is the whole point of
+    /// configuring it: the strategy reaches the dispatch rather than stopping at the config.
+    #[tokio::test]
+    async fn round_robin_sends_a_graphs_two_nodes_to_two_different_members() {
+        let one = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let other = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = spreading(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[
+                member_row(&one.address().to_string(), 1),
+                member_row(&other.address().to_string(), 1),
+            ]),
+            one.client(),
+            ip_core::route::ClusterStrategy::RoundRobin,
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            (one.seen().len(), other.seen().len()),
+            (1, 1),
+            "both nodes went to the same member: {said:?}"
+        );
+        let names: Vec<&str> = said.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "node",
+                "turn",
+                "text",
+                "node_done",
+                "node",
+                "turn",
+                "text",
+                "node_done",
+                "done"
+            ]
+        );
+    }
+
+    /// Whichever member each node went to, the record says which — so a reader of the plane can
+    /// tell a spread run from one that piled onto a single machine.
+    #[tokio::test]
+    async fn each_dispatched_nodes_placement_names_the_member_that_ran_it() {
+        let one = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let other = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, plane) = spreading(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[
+                member_row(&one.address().to_string(), 1),
+                member_row(&other.address().to_string(), 1),
+            ]),
+            one.client(),
+            ip_core::route::ClusterStrategy::RoundRobin,
+        )
+        .await;
+
+        streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        let mut recorded: Vec<String> = plane
+            .seen()
+            .into_iter()
+            .filter(|seen| seen.method == "node.create")
+            .filter_map(|seen| {
+                seen.params["properties"]["address"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        recorded.sort_unstable();
+        let mut expected = vec![one.address().to_string(), other.address().to_string()];
+        expected.sort_unstable();
+
+        assert_eq!(recorded, expected);
+    }
+
+    /// Random over one live member is that member, so the default dispatches as surely as
+    /// round-robin does — what differs is only which of several it picks.
+    #[tokio::test]
+    async fn the_default_strategy_dispatches_to_the_one_live_member_there_is() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = spreading(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+            ip_core::route::ClusterStrategy::default(),
+        )
+        .await;
+
+        streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(worker.seen().len(), 2);
     }
 }

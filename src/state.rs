@@ -25,6 +25,7 @@ use ip_storage::PostgresStore;
 use ip_storage::SqliteStore;
 use ip_storage::{Backend, RuleRevision, Storage};
 
+use crate::cluster::Spreading;
 use crate::error::StartupError;
 use crate::rules::{Reloader, RuleFeed};
 
@@ -85,6 +86,9 @@ pub struct AppState {
     /// Held because a reader of the membership needs it: a row carries only when it was written,
     /// and only this interval says whether a member is late or gone.
     heartbeat: Duration,
+    /// How this deployment picks which member a node goes to. One for the process, because what
+    /// round-robin remembers belongs to the machine and not to one run.
+    spreading: Arc<Spreading>,
     /// The store a test reads through, when the state was built for one, so the test can
     /// make it fail where it means to.
     #[cfg(test)]
@@ -322,6 +326,7 @@ impl AppState {
             cluster_secret,
             cluster_client,
             heartbeat: config.cluster.heartbeat.as_duration(),
+            spreading: Arc::new(Spreading::new(config.cluster.strategy)),
             #[cfg(test)]
             failing_store: None,
             #[cfg(test)]
@@ -381,11 +386,14 @@ impl AppState {
             cluster: None,
             cluster_secret: None,
             cluster_client: None,
-            // The configured default rather than a number of its own, so a test believes a
-            // member for as long as a deployment does.
+            // The configured defaults rather than numbers of their own, so a test believes a
+            // member for as long as a deployment does and spreads the way one does.
             heartbeat: ip_config::config::ClusterConfig::default()
                 .heartbeat
                 .as_duration(),
+            spreading: Arc::new(Spreading::new(
+                ip_config::config::ClusterConfig::default().strategy,
+            )),
             failing_store: Some(failing_store),
             failing_cache: Some(failing_cache),
         }
@@ -412,6 +420,11 @@ impl AppState {
     /// How often a member of this cluster says it is still here.
     pub const fn heartbeat(&self) -> Duration {
         self.heartbeat
+    }
+
+    /// How this deployment picks which member a node goes to.
+    pub fn spreading(&self) -> &Arc<Spreading> {
+        &self.spreading
     }
 
     /// The same state over a graph store, for a test that works on one.
@@ -450,6 +463,13 @@ impl AppState {
     #[cfg(test)]
     pub const fn with_heartbeat(mut self, heartbeat: Duration) -> Self {
         self.heartbeat = heartbeat;
+        self
+    }
+
+    /// The same state picking members the way this test is about.
+    #[cfg(test)]
+    pub fn with_strategy(mut self, strategy: ip_core::route::ClusterStrategy) -> Self {
+        self.spreading = Arc::new(Spreading::new(strategy));
         self
     }
 

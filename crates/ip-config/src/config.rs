@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ip_core::route::ClusterAddress;
+use ip_core::route::{ClusterAddress, ClusterStrategy};
 use ip_embed::MOST_HELD;
 use serde::Deserialize;
 use url::Url;
@@ -500,6 +500,12 @@ pub struct ClusterConfig {
     /// authenticate to it.
     #[serde(default)]
     pub secret: Option<Secret>,
+    /// How this deployment picks which member runs a node it dispatches. Default random.
+    ///
+    /// It says nothing about where a node dispatched *to* this deployment runs, which is here by
+    /// definition: a member that has taken a node does not pass it on.
+    #[serde(default)]
+    pub strategy: ClusterStrategy,
 }
 
 fn default_heartbeat() -> Seconds {
@@ -512,6 +518,7 @@ impl Default for ClusterConfig {
             advertise: None,
             heartbeat: default_heartbeat(),
             secret: None,
+            strategy: ClusterStrategy::default(),
         }
     }
 }
@@ -1889,6 +1896,30 @@ model = "claude-sonnet-5"
                 .cluster
                 .secret,
             None
+        );
+    }
+
+    /// Picking a member is configured by name, and a cluster that says nothing spreads at random.
+    #[test]
+    fn a_cluster_takes_how_it_picks_a_member_by_name() {
+        assert_eq!(
+            Config::parse(MINIMAL).unwrap().cluster.strategy,
+            ClusterStrategy::Random,
+            "a cluster that says nothing piles every node onto one machine"
+        );
+
+        let written = Config::parse(&format!(
+            "{MINIMAL}\n[cluster]\nstrategy = \"round_robin\"\n"
+        ))
+        .unwrap();
+
+        assert_eq!(written.cluster.strategy, ClusterStrategy::RoundRobin);
+        assert!(
+            Config::parse(&format!(
+                "{MINIMAL}\n[cluster]\nstrategy = \"least_load\"\n"
+            ))
+            .is_err(),
+            "a member publishes no load, so there is nothing to pick the least of"
         );
     }
 

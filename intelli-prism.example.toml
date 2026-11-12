@@ -19,12 +19,31 @@ listen = "127.0.0.1:8080"
 # stops writing goes stale where it stands, so this is also what decides how long a
 # machine that died is still believed in. Default 10.
 #
+# secret is what the members of this cluster present to one another, and the whole of
+# what authenticates one member to another: a cluster whose members are not on a network
+# you control needs TLS in front of them. One secret for the whole deployment, held by
+# every member. Unset, this deployment refuses every node dispatched to it; set alongside
+# advertise it is required, and a deployment that advertises an address without one does
+# not start, since its peers could reach it and could not authenticate to it.
+#
+# strategy is how this member picks which other member runs a node it dispatches:
+# "random" (the default) spreads uniformly over the live members and needs no coordination,
+# "round_robin" takes each in turn in an order every member computes the same way. There is
+# deliberately no least-loaded — a member publishes no load — and no weighting, since
+# members register themselves and have nowhere to declare one.
+#
+# A member is believed in for three heartbeats after its last. Dispatching also needs an
+# address of this machine's own, so a member that cannot say where it answers runs every
+# node itself rather than risk dispatching one to itself.
+#
 # Membership is kept in the run graph store's plane, so a deployment configured without
 # one registers nowhere however this block is set.
 #
 # [cluster]
 # advertise = "10.0.0.2:8080"
 # heartbeat = 10
+# secret = "a-long-random-string-shared-by-every-member"
+# strategy = "random"
 
 # Standalone deployment. The file is created and migrated on first start.
 [storage]

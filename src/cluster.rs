@@ -3,12 +3,18 @@
 //! A member registers itself and keeps saying so. Nothing else records a member, because nothing
 //! else knows one is there; what a reader makes of a row that has stopped being written again is
 //! the reader's own decision, which [`ip_graph::ClusterMember`] records and this does not.
+//!
+//! The other half of that decision is here too: [`Spreading`] picks which of the members a node
+//! is dispatched to. It is in this module and not in the route because it is a property of the
+//! deployment rather than of one run — round-robin's place in the order is shared by every run
+//! this machine serves.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ip_core::Timestamp;
-use ip_core::route::ClusterAddress;
+use ip_core::route::{ClusterAddress, ClusterStrategy};
 use ip_graph::{ClusterMember, GraphPlane};
 use tokio::task::JoinHandle;
 
@@ -78,6 +84,71 @@ impl Membership {
             }
         })
     }
+}
+
+/// How this deployment picks the member a node is dispatched to.
+///
+/// One of these per deployment, shared by every run, because what round-robin remembers is where
+/// *this machine* got to in the order and not where one run did.
+pub struct Spreading {
+    /// Which way a member is picked.
+    strategy: ClusterStrategy,
+    /// Where round-robin has got to. Only read by that strategy, and wraps rather than growing
+    /// without bound, since what is taken from it is a remainder.
+    turn: AtomicUsize,
+}
+
+impl Spreading {
+    /// Picking members the way this deployment was configured to.
+    #[must_use]
+    pub const fn new(strategy: ClusterStrategy) -> Self {
+        Self {
+            strategy,
+            turn: AtomicUsize::new(0),
+        }
+    }
+
+    /// One of `live`, or nothing when there is nobody to pick.
+    ///
+    /// Takes members already filtered for liveness, so what each strategy decides is only *which*
+    /// of them and never *whether*: a coordinator that sends a node to a member it believes is
+    /// gone has made two decisions where it should have made one.
+    #[must_use]
+    pub fn pick(&self, live: &[ClusterMember]) -> Option<ClusterAddress> {
+        if live.is_empty() {
+            return None;
+        }
+        match self.strategy {
+            ClusterStrategy::Random => {
+                let total = u64::try_from(live.len()).unwrap_or(1);
+                let at = usize::try_from(roll(total)).unwrap_or(0);
+                live.get(at).map(|member| member.address.clone())
+            }
+            ClusterStrategy::RoundRobin => {
+                let mut ordered: Vec<&ClusterAddress> =
+                    live.iter().map(|member| &member.address).collect();
+                // An order every member agrees on, so two coordinators walking the same cluster
+                // walk it the same way. By how an address prints, which is the one total order
+                // it has without giving the type an `Ord` nothing else asked for.
+                ordered.sort_unstable_by_key(|address| address.to_string());
+                let at = self.turn.fetch_add(1, Ordering::Relaxed) % ordered.len();
+                ordered.get(at).map(|&address| address.clone())
+            }
+        }
+    }
+}
+
+/// A number below `total`, drawn from the operating system entropy source.
+///
+/// Half of `total` when it will not answer, as the gateway's own roll does: a member picked
+/// without spreading is a worse placement and not a failure, and refusing the node over it would
+/// turn a missing entropy source into a run that cannot start.
+fn roll(total: u64) -> u64 {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        return total / 2;
+    }
+    u64::from_le_bytes(bytes) % total
 }
 
 #[cfg(test)]
@@ -211,5 +282,145 @@ mod tests {
             .filter(|one| one.method == "node.create")
             .count();
         assert!(written >= 2, "wrote {written} times in six intervals");
+    }
+
+    /// A member at `address` that said so just now.
+    fn member(address: &str) -> ClusterMember {
+        ClusterMember {
+            address: address.parse().expect("an address"),
+            at: Timestamp::now(),
+        }
+    }
+
+    /// Three members, handed over in an order the store happened to scan them in.
+    fn three() -> Vec<ClusterMember> {
+        vec![
+            member("10.0.0.7:8080"),
+            member("10.0.0.3:8080"),
+            member("10.0.0.5:8080"),
+        ]
+    }
+
+    #[test]
+    fn a_cluster_with_nobody_live_in_it_offers_nobody() {
+        for strategy in [ClusterStrategy::Random, ClusterStrategy::RoundRobin] {
+            assert_eq!(
+                Spreading::new(strategy).pick(&[]),
+                None,
+                "{strategy} picked somebody out of nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cluster_of_one_live_member_offers_that_member_however_it_picks() {
+        for strategy in [ClusterStrategy::Random, ClusterStrategy::RoundRobin] {
+            let spreading = Spreading::new(strategy);
+            for _ in 0..8 {
+                assert_eq!(
+                    spreading.pick(&[member("10.0.0.3:8080")]),
+                    Some("10.0.0.3:8080".parse().expect("an address")),
+                    "{strategy}"
+                );
+            }
+        }
+    }
+
+    /// The point of the default: work does not pile onto one machine.
+    ///
+    /// Two hundred draws over three members, so a member left out would be a one in `3·(2/3)^200`
+    /// accident rather than a flaky test — which is to say the assertion is about the code.
+    #[test]
+    fn random_offers_every_live_member_over_enough_draws() {
+        let spreading = Spreading::new(ClusterStrategy::Random);
+        let live = three();
+
+        let mut picked: Vec<String> = (0..200)
+            .filter_map(|_| spreading.pick(&live))
+            .map(|address| address.to_string())
+            .collect();
+        picked.sort_unstable();
+        picked.dedup();
+
+        assert_eq!(
+            picked,
+            ["10.0.0.3:8080", "10.0.0.5:8080", "10.0.0.7:8080"],
+            "a live member was never offered a node"
+        );
+    }
+
+    /// Each member once before any of them twice, which is what round-robin is for.
+    #[test]
+    fn round_robin_offers_each_live_member_in_turn_and_then_wraps() {
+        let spreading = Spreading::new(ClusterStrategy::RoundRobin);
+        let live = three();
+
+        let picked: Vec<String> = (0..4)
+            .filter_map(|_| spreading.pick(&live))
+            .map(|address| address.to_string())
+            .collect();
+
+        assert_eq!(
+            picked,
+            [
+                "10.0.0.3:8080",
+                "10.0.0.5:8080",
+                "10.0.0.7:8080",
+                "10.0.0.3:8080",
+            ]
+        );
+    }
+
+    /// The order is the members', not the store's.
+    ///
+    /// A scan answers rows in whatever order it holds them, and `members` sorts by recency, which
+    /// changes with every heartbeat. Round-robin over that order would revisit a member it had
+    /// just used, so it imposes one of its own that every coordinator computes the same way.
+    #[test]
+    fn round_robins_order_does_not_depend_on_the_order_the_members_arrive_in() {
+        let forwards = Spreading::new(ClusterStrategy::RoundRobin);
+        let backwards = Spreading::new(ClusterStrategy::RoundRobin);
+        let live = three();
+        let mut reversed = three();
+        reversed.reverse();
+
+        let one: Vec<_> = (0..3).filter_map(|_| forwards.pick(&live)).collect();
+        let other: Vec<_> = (0..3).filter_map(|_| backwards.pick(&reversed)).collect();
+
+        assert_eq!(one, other);
+    }
+
+    /// What round-robin remembers is this machine's place in the order, not one run's, so two
+    /// runs served by one deployment carry on from each other rather than both starting over.
+    #[test]
+    fn round_robin_is_remembered_across_the_runs_one_deployment_serves() {
+        let spreading = Spreading::new(ClusterStrategy::RoundRobin);
+        let live = three();
+
+        let first = spreading.pick(&live).expect("a member");
+        let second = spreading.pick(&live).expect("a member");
+
+        assert_ne!(
+            first, second,
+            "a second run was offered the member the first one used"
+        );
+    }
+
+    /// A member joining or leaving shifts the order, which is round-robin's known cost and is
+    /// recorded here so it is a decision rather than a surprise.
+    #[test]
+    fn a_member_joining_shifts_where_round_robin_is_in_the_order() {
+        let spreading = Spreading::new(ClusterStrategy::RoundRobin);
+
+        let before = spreading
+            .pick(&[member("10.0.0.3:8080"), member("10.0.0.7:8080")])
+            .expect("a member");
+        let mut joined = three();
+        joined.push(member("10.0.0.1:8080"));
+        let after = spreading.pick(&joined).expect("a member");
+
+        assert_eq!(before.to_string(), "10.0.0.3:8080");
+        // The second pick of four members, in the new order, rather than the second of two.
+        assert_eq!(after.to_string(), "10.0.0.3:8080");
     }
 }

@@ -96,6 +96,13 @@ pub enum CoreError {
         value: String,
     },
 
+    /// A way of picking a cluster member this application does not carry.
+    #[error("unknown cluster strategy {value:?}")]
+    UnknownClusterStrategy {
+        /// The text that named no strategy.
+        value: String,
+    },
+
     /// A difficulty class this application does not carry.
     #[error("unknown difficulty {value:?}")]
     UnknownDifficulty {

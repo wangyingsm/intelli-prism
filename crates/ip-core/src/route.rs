@@ -635,6 +635,66 @@ impl fmt::Display for Strategy {
     }
 }
 
+/// How a coordinator picks which member of its own cluster runs a node.
+///
+/// Deliberately not a [`Strategy`], which says how requests are spread across the endpoints
+/// behind one target. Two of that enum's three have nothing to read here: a member publishes no
+/// load, so there is no least-loaded to pick, and members register themselves, so there is
+/// nowhere for an operator to declare the weights a ratio would divide.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterStrategy {
+    /// One of the live members, uniformly, which is what a cluster that says nothing does.
+    #[default]
+    Random,
+    /// Each node to the member after the last, in an order every member agrees on.
+    RoundRobin,
+}
+
+impl ClusterStrategy {
+    /// The name this is configured and reported under.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::RoundRobin => "round_robin",
+        }
+    }
+
+    /// Reads it back from that name.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownClusterStrategy`] when nothing is spelled that way.
+    pub fn named(name: &str) -> Result<Self, CoreError> {
+        match name {
+            "random" => Ok(Self::Random),
+            "round_robin" => Ok(Self::RoundRobin),
+            other => Err(CoreError::UnknownClusterStrategy {
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for ClusterStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// The most endpoints one request may be raced across.
 ///
 /// Past this the upstream cost grows with every endpoint while the latency saved does not, so a
@@ -1483,6 +1543,33 @@ mod tests {
             Err(CoreError::UnknownStrategy { .. })
         ));
         assert_eq!(Strategy::default(), Strategy::RoundRobin);
+    }
+
+    #[test]
+    fn every_cluster_strategy_round_trips_through_its_name() {
+        for strategy in [ClusterStrategy::Random, ClusterStrategy::RoundRobin] {
+            assert_eq!(ClusterStrategy::named(strategy.name()).unwrap(), strategy);
+            assert_eq!(strategy.to_string(), strategy.name());
+            assert_eq!(
+                serde_json::from_str::<ClusterStrategy>(&format!("\"{}\"", strategy.name()))
+                    .unwrap(),
+                strategy,
+                "a strategy is configured under the name it reports"
+            );
+        }
+        assert!(matches!(
+            ClusterStrategy::named("least_load"),
+            Err(CoreError::UnknownClusterStrategy { .. })
+        ));
+        assert_eq!(ClusterStrategy::default(), ClusterStrategy::Random);
+    }
+
+    /// The two enums are not interchangeable, and a name one carries is not one the other does.
+    #[test]
+    fn a_cluster_strategy_is_not_a_dispatch_strategy() {
+        assert!(ClusterStrategy::named("ratio").is_err());
+        assert!(ClusterStrategy::named("least_load").is_err());
+        assert!(Strategy::named("random").is_err());
     }
 
     #[test]
