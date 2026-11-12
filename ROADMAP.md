@@ -895,6 +895,16 @@ like any other request.
 running noted in the plane, and a stop that reaches it over the publication channel the rules
 already use. The dispatch payload and the stop signal are both shaped for it; nothing crosses a
 machine boundary yet.
+- Least-loaded placement across a cluster. A coordinator picks the member a node runs on at
+random or each in turn, and both spread work without ever measuring it: a member publishes a
+heartbeat and nothing else, so there is no load to be the least of. Doing it means a member
+writing a score beside its membership row on the same heartbeat — runs in flight, and what its
+recent turns have been costing — and every member computing that score the same way, or a
+coordinator ends up comparing numbers that do not mean the same thing. The gateway already keeps
+a score of this shape per endpoint, which is the model and not the mechanism: that one lives in
+one process's memory and is never read by another machine. Weighting is the same gap from the
+other side, and is not planned for the same reason — members register themselves, so there is
+nowhere for an operator to declare a share.
 - A capped loop-back in a run graph, which is the one cycle worth permitting. A node unsatisfied
 with what a predecessor gave it answers something like `{"loop_back": "survey"}`, the flow reruns
 that node with the extra context, and a predefined loop count stops it. The loop target is
