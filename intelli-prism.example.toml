@@ -50,8 +50,9 @@ listen = "127.0.0.1:8080"
 backend = "sqlite"
 path = "./intelli-prism.db"
 
-# Cluster deployment uses postgres instead, which only a build with the fast-storage
-# feature serves (cargo build --features fast-storage):
+# Cluster deployment uses postgres instead, which the fast-storage feature serves — and
+# that one is on by default, so a plain `cargo build` carries it and the sqlite arm above
+# is the one needing `--features standalone-storage`:
 # [storage]
 # backend = "postgres"
 # url = "postgres://intelli_prism:secret@localhost/intelli_prism"
@@ -67,8 +68,10 @@ url = "redis://localhost:6379"
 # sets the span, and no-store, no-cache or private keeps nothing.
 response_ttl = 60
 
-# Standalone deployment caches into a local directory instead, which only a build
-# with the standalone-cache feature serves (cargo build --features standalone-cache):
+# Standalone deployment caches into a local directory instead, which the standalone-cache
+# feature serves (cargo build --features standalone-cache). The redis arm above is the
+# default, so the usual pair is a plain build for a cluster and
+# --no-default-features --features standalone-storage,standalone-cache for one machine:
 # [cache]
 # backend = "sled"
 # path = "./intelli-prism-cache"
