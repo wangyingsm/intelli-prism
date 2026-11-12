@@ -1672,6 +1672,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-cluster"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "ip-agents",
+ "ip-config",
+ "ip-core",
+ "ip-graph",
+ "ip-run",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "ip-config"
 version = "0.1.0"
 dependencies = [
