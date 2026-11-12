@@ -227,8 +227,7 @@ pub(crate) fn template(tools: &[&str], max_turns: u16, time_limit: u32, req: u32
         max_turns: MaxTurns::new(max_turns).unwrap(),
         time_limit: TimeLimit::new(time_limit).unwrap(),
         req_timeout: ReqTimeout::new(req).unwrap(),
-        use_best_effort: false,
-        best_effort_strategy: None,
+        best_effort: None,
         model: None,
         api: None,
     })

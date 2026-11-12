@@ -336,10 +336,17 @@ impl TryFrom<Vec<ToolName>> for ToolSet {
     }
 }
 
-/// How a best-effort run picks its answer.
+/// Whether a run asks every upstream rather than one, and how it picks its answer.
+///
+/// [`Self::Auto`] is the whole of what a template says to ask for best effort while leaving the
+/// picking to the deployment, which is why no flag sits beside it: a field that may be absent
+/// already says "one upstream, like any other run", and this says the rest. Two fields said it
+/// before, and three of their four combinations were legal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum BestEffortStrategy {
+    /// Asked of every upstream, with how to pick left to the deployment.
+    Auto,
     /// Put every upstream's answer together.
     Aggregate,
     /// Take one of them.
@@ -354,6 +361,7 @@ impl BestEffortStrategy {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Aggregate => "aggr",
             Self::One => "one",
         }
@@ -362,6 +370,7 @@ impl BestEffortStrategy {
     /// Reads it back from that name, refusing one this code does not carry.
     pub fn named(name: &str) -> Result<Self, AgentError> {
         match name {
+            "auto" => Ok(Self::Auto),
             "aggr" => Ok(Self::Aggregate),
             "one" => Ok(Self::One),
             other => Err(AgentError::Unknown {
@@ -526,12 +535,10 @@ pub struct AgentConfigParts {
     pub time_limit: TimeLimit,
     /// How long one upstream request may wait.
     pub req_timeout: ReqTimeout,
-    /// Whether it should ask every upstream rather than one.
-    #[serde(default)]
-    pub use_best_effort: bool,
-    /// How such a run picks its answer, and none where it is left to the deployment.
+    /// Whether it asks every upstream rather than one and how it picks, and none where it asks
+    /// one upstream like any other run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub best_effort_strategy: Option<BestEffortStrategy>,
+    pub best_effort: Option<BestEffortStrategy>,
     /// Which model its turns go to, and none where the template does not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ChosenModel>,
@@ -587,19 +594,13 @@ impl AgentConfig {
         self.0.req_timeout
     }
 
-    /// Whether it asks every upstream rather than one.
+    /// Whether it asks every upstream rather than one, and how it picks where it does.
     ///
     /// Nothing reads this yet: the best-effort endpoint is unbuilt, and a template may say so
     /// ahead of it so that a deployment needs no second write when it lands.
     #[must_use]
-    pub const fn uses_best_effort(&self) -> bool {
-        self.0.use_best_effort
-    }
-
-    /// How such a run picks its answer, where the template says.
-    #[must_use]
-    pub const fn best_effort_strategy(&self) -> Option<BestEffortStrategy> {
-        self.0.best_effort_strategy
+    pub const fn best_effort(&self) -> Option<BestEffortStrategy> {
+        self.0.best_effort
     }
 
     /// Which model its turns go to, where the template says.
@@ -624,9 +625,6 @@ impl TryFrom<AgentConfigParts> for AgentConfig {
                 timeout: parts.req_timeout.seconds(),
                 limit: parts.time_limit.seconds(),
             });
-        }
-        if !parts.use_best_effort && parts.best_effort_strategy.is_some() {
-            return Err(AgentError::StrategyWithoutBestEffort);
         }
         Ok(Self(parts))
     }
@@ -654,8 +652,7 @@ mod tests {
             max_turns: MaxTurns::new(10).unwrap(),
             time_limit: TimeLimit::new(60).unwrap(),
             req_timeout: ReqTimeout::new(10).unwrap(),
-            use_best_effort: false,
-            best_effort_strategy: None,
+            best_effort: None,
             model: None,
             api: None,
         }
@@ -1016,12 +1013,17 @@ mod tests {
 
     #[test]
     fn a_strategy_survives_the_name_it_is_stored_under() {
-        for strategy in [BestEffortStrategy::Aggregate, BestEffortStrategy::One] {
+        for strategy in [
+            BestEffortStrategy::Auto,
+            BestEffortStrategy::Aggregate,
+            BestEffortStrategy::One,
+        ] {
             assert_eq!(
                 BestEffortStrategy::named(strategy.name()).unwrap(),
                 strategy
             );
         }
+        assert_eq!(BestEffortStrategy::Auto.name(), "auto");
         assert_eq!(BestEffortStrategy::Aggregate.name(), "aggr");
         assert_eq!(BestEffortStrategy::One.name(), "one");
         assert_eq!(
@@ -1042,8 +1044,7 @@ mod tests {
         assert_eq!(config.max_turns().get(), 10);
         assert_eq!(config.time_limit().seconds(), 60);
         assert_eq!(config.req_timeout().seconds(), 10);
-        assert!(!config.uses_best_effort());
-        assert_eq!(config.best_effort_strategy(), None);
+        assert_eq!(config.best_effort(), None);
     }
 
     #[test]
@@ -1066,30 +1067,31 @@ mod tests {
         assert!(AgentConfig::new(parts).is_ok());
     }
 
-    #[test]
-    fn a_strategy_for_a_run_nobody_asked_for_is_refused() {
-        let mut parts = parts();
-        parts.best_effort_strategy = Some(BestEffortStrategy::One);
-        assert_eq!(
-            AgentConfig::new(parts),
-            Err(AgentError::StrategyWithoutBestEffort)
-        );
-    }
-
+    /// The three states one field now carries, where two fields carried three of four.
+    ///
+    /// Asking for best effort without saying how is [`BestEffortStrategy::Auto`], which is the
+    /// state that used to need the flag; asking for nothing is the absent field; and the old
+    /// fourth state, a strategy beside a flag that was off, cannot be written at all.
     #[test]
     fn best_effort_is_carried_whether_or_not_a_strategy_names_how() {
         let mut asked = parts();
-        asked.use_best_effort = true;
-        let config = AgentConfig::new(asked.clone()).unwrap();
-        assert!(config.uses_best_effort());
-        assert_eq!(config.best_effort_strategy(), None);
 
-        asked.best_effort_strategy = Some(BestEffortStrategy::Aggregate);
-        let config = AgentConfig::new(asked).unwrap();
         assert_eq!(
-            config.best_effort_strategy(),
-            Some(BestEffortStrategy::Aggregate)
+            AgentConfig::new(asked.clone()).unwrap().best_effort(),
+            None,
+            "a template that says nothing asks one upstream"
         );
+        for named in [
+            BestEffortStrategy::Auto,
+            BestEffortStrategy::Aggregate,
+            BestEffortStrategy::One,
+        ] {
+            asked.best_effort = Some(named);
+            assert_eq!(
+                AgentConfig::new(asked.clone()).unwrap().best_effort(),
+                Some(named)
+            );
+        }
     }
 
     #[test]

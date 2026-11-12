@@ -147,8 +147,7 @@ mod tests {
                 max_turns: MaxTurns::new(4).unwrap(),
                 time_limit: TimeLimit::new(30).unwrap(),
                 req_timeout: ReqTimeout::new(10).unwrap(),
-                use_best_effort: false,
-                best_effort_strategy: None,
+                best_effort: None,
                 model: None,
                 api: None,
             })

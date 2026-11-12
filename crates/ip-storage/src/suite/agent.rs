@@ -40,8 +40,7 @@ fn config(prompt: &str, turns: u16) -> AgentConfig {
         max_turns: MaxTurns::new(turns).unwrap(),
         time_limit: TimeLimit::new(60).unwrap(),
         req_timeout: ReqTimeout::new(10).unwrap(),
-        use_best_effort: false,
-        best_effort_strategy: None,
+        best_effort: None,
         model: None,
         api: None,
     })
@@ -104,8 +103,7 @@ pub(crate) async fn every_part_of_a_template_survives_the_database(store: &impl 
             max_turns: MaxTurns::new(12).unwrap(),
             time_limit: TimeLimit::new(600).unwrap(),
             req_timeout: ReqTimeout::new(30).unwrap(),
-            use_best_effort: true,
-            best_effort_strategy: Some(BestEffortStrategy::Aggregate),
+            best_effort: Some(BestEffortStrategy::Aggregate),
             model: Some(ChosenModel::new("claude-sonnet-4-5").unwrap()),
             api: Some(ChosenApi::Anthropic),
         })

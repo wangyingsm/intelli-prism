@@ -108,8 +108,4 @@ pub enum AgentError {
         /// The deepest its kind holds.
         max: usize,
     },
-
-    /// A strategy for a best-effort run the template does not ask for.
-    #[error("a best effort strategy is set while best effort is off")]
-    StrategyWithoutBestEffort,
 }
