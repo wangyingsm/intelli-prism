@@ -100,6 +100,39 @@ ttl = 21600
 # How often rows past their keeping are swept away. Default one hour.
 # sweep_every = 3600
 
+# Where run graphs live — optional, and the one store in this system that is not ours.
+#
+# A run graph is a DAG of agent templates, written over /_ip/graphs and run over
+# /_ip/graph_run/{id}. The graphs themselves are kept in a dr-strange plane rather than in
+# our own tables, which makes this the only request path that depends on a service outside
+# the process, and the only place tenancy is enforced by us against a store that knows
+# nothing about tenants: every row carries its owner and every read filters on it.
+#
+# Without this block there is no graph feature at all — /_ip/graphs and /_ip/graph_run
+# answer 404, which is a different thing from the 503 a configured store that cannot be
+# reached answers. Nothing else in the gateway needs it.
+#
+# url is where the store answers JSON-RPC, which is its /rpc path and not its root.
+#
+# token is the bearer every call presents. The store gates every write on this one shared
+# credential, so an empty one is arbitration silently off and is refused here instead.
+#
+# plane is which plane the graphs live in. One plane per deployment, named here and never
+# by a caller, so no request can reach another deployment's graphs. It is also where a
+# cluster's members register themselves and where a coordinator records which member each
+# node is running on — so a deployment with no graph store registers nowhere, however
+# [cluster] above is set.
+#
+# timeout is how long one call may take, in seconds, before the store is given up on.
+# Default 10, and 60 is the most allowed: a graph write is a handful of small calls, and a
+# store slower than this is a dependency rather than a wait.
+#
+# [graph_store]
+# url = "http://127.0.0.1:7700/rpc"
+# token = "the-token-this-plane-is-gated-on"
+# plane = "ip_graphs"
+# timeout = 10
+
 [telemetry]
 # trace, debug, info, warn or error. Default info.
 log_level = "info"
