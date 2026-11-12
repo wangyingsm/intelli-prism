@@ -7,11 +7,20 @@ use std::ops::Add;
 use ip_core::{ModelName, Money, TokenCount, Tokens};
 use ip_protocol::{Block, ToolCallId, ToolName};
 
+use crate::error::RunError;
+
 /// Which turn of a run this is, counting from one.
 ///
 /// A number rather than an index because every place it appears — a limit, an event, a message
 /// to a person — counts turns the way a person does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Counting from one is the whole of the type, so reading one back off a wire refuses a zero.
+/// Nothing in this process can build one — there is no constructor but [`TurnNumber::FIRST`] and
+/// [`TurnNumber::next`] — and a json form that could would be a second way in with a weaker rule.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "u32", into = "u32")]
 pub struct TurnNumber(u32);
 
 impl TurnNumber {
@@ -34,6 +43,23 @@ impl TurnNumber {
     }
 }
 
+impl TryFrom<u32> for TurnNumber {
+    type Error = RunError;
+
+    fn try_from(number: u32) -> Result<Self, Self::Error> {
+        if number == 0 {
+            return Err(RunError::NotATurnNumber { number });
+        }
+        Ok(Self(number))
+    }
+}
+
+impl From<TurnNumber> for u32 {
+    fn from(number: TurnNumber) -> Self {
+        number.0
+    }
+}
+
 impl fmt::Display for TurnNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -45,7 +71,7 @@ impl fmt::Display for TurnNumber {
 /// A run is many requests, so this is what the turns add up to rather than what one of them
 /// spent. The cost is what the gateway priced each turn at, which is nothing for a turn whose
 /// model carries no price.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Spend {
     /// Tokens, in each direction.
     pub tokens: Tokens,
@@ -150,7 +176,11 @@ impl Turn {
 }
 
 /// Why a run ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its json tag is the word [`Stopped::name`] already streams, so the two spell one vocabulary
+/// rather than two: what a reader sees in an event is what a wire carries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Stopped {
     /// The model answered and asked for nothing further, which is a run going as intended.
     Answered,
@@ -244,6 +274,70 @@ mod tests {
     fn a_turn_count_that_cannot_grow_stays_where_it_is() {
         let last = (0..3).fold(TurnNumber(u32::MAX - 1), |turn, _| turn.next());
         assert_eq!(last.get(), u32::MAX);
+    }
+
+    /// A plain number on the wire, and the count still starts where turns start.
+    #[test]
+    fn a_turn_number_is_written_down_as_its_number_and_read_back() {
+        let second = TurnNumber::FIRST.next();
+
+        assert_eq!(serde_json::to_string(&second).unwrap(), "2");
+        assert_eq!(serde_json::from_str::<TurnNumber>("2").unwrap(), second);
+    }
+
+    /// Nothing in this process can build a turn zero, so nothing off a wire may either.
+    #[test]
+    fn a_turn_numbered_zero_is_refused() {
+        assert_eq!(
+            TurnNumber::try_from(0),
+            Err(RunError::NotATurnNumber { number: 0 })
+        );
+        assert!(serde_json::from_str::<TurnNumber>("0").is_err());
+        assert!(serde_json::from_str::<TurnNumber>("-1").is_err());
+    }
+
+    /// The json tag and the streamed name are one word, for every reason a run can end.
+    #[test]
+    fn every_reason_a_run_ended_survives_being_written_down_under_its_own_name() {
+        for stopped in [
+            Stopped::Answered,
+            Stopped::OutOfTurns {
+                after: TurnNumber::FIRST.next(),
+            },
+            Stopped::OutOfTime,
+            Stopped::Refused {
+                why: "the gateway said no".to_owned(),
+            },
+            Stopped::CutShort,
+        ] {
+            let written = serde_json::to_value(&stopped).unwrap();
+            let tag = match &written {
+                serde_json::Value::String(tag) => tag.clone(),
+                serde_json::Value::Object(fields) => fields
+                    .keys()
+                    .next()
+                    .cloned()
+                    .expect("a tagged reason is an object of one key"),
+                other => panic!("a reason was written down as {other}"),
+            };
+
+            assert_eq!(tag, stopped.name());
+            assert_eq!(
+                serde_json::from_value::<Stopped>(written).unwrap(),
+                stopped,
+                "{} did not come back as what it went out as",
+                stopped.name()
+            );
+        }
+    }
+
+    /// The whole of what a run spent, both directions and the cost.
+    #[test]
+    fn what_a_run_spent_survives_being_written_down() {
+        let spend = spent(120, 34, 5_600);
+        let written = serde_json::to_string(&spend).unwrap();
+
+        assert_eq!(serde_json::from_str::<Spend>(&written).unwrap(), spend);
     }
 
     #[test]

@@ -15,7 +15,8 @@ const NODES_MOST: u32 = MaxNodes::MOST;
 ///
 /// Mirrors `ip-storage`'s `AgentOwner` rather than sharing it. This crate takes no i/o, and a type
 /// from the storage crate here would make a database part of what a graph is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GraphOwner {
     /// The deployment's own, which no tenant may change.
     Global,
@@ -385,5 +386,34 @@ mod tests {
         assert_eq!(theirs.tenant(), Some(&tenant));
         assert_eq!(GraphOwner::Global.written(), "global");
         assert_eq!(GraphOwner::Global.tenant(), None);
+    }
+
+    /// Both halves, since whose a graph is decides which templates a machine may read.
+    #[test]
+    fn an_owner_survives_being_written_down_and_read_back() {
+        for owner in [
+            GraphOwner::Global,
+            GraphOwner::Tenant(TenantId::new("acme").expect("a tenant id")),
+        ] {
+            let written = serde_json::to_string(&owner).expect("an owner writes down");
+            assert_eq!(
+                serde_json::from_str::<GraphOwner>(&written).expect("an owner reads back"),
+                owner,
+                "{written} did not come back as what it went out as"
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&GraphOwner::Global).expect("an owner writes down"),
+            "\"global\""
+        );
+    }
+
+    /// A tenant id is read back through its own rule, wherever it arrived from.
+    #[test]
+    fn an_owner_naming_a_tenant_that_is_not_one_is_refused() {
+        assert!(
+            serde_json::from_str::<GraphOwner>(r#"{"tenant": "two words"}"#).is_err(),
+            "json got past the rule the constructor applies"
+        );
     }
 }

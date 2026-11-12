@@ -190,7 +190,11 @@ const GRAPH_RUN_BYTES: usize = 16;
 /// node's turns are a run's turns as they have always been. This is what ties those runs together:
 /// what a stream is about, what a persisted answer would be keyed by, and what tells a dispatch
 /// that was retried from one that is new.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Its json form is the hex and it is read back through [`GraphRunId::from_hex`], which that
+/// method's own doc already demanded: a run recorded outside this process is recorded as its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct GraphRunId([u8; GRAPH_RUN_BYTES]);
 
 impl GraphRunId {
@@ -226,6 +230,20 @@ impl GraphRunId {
 impl fmt::Display for GraphRunId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_hex())
+    }
+}
+
+impl TryFrom<String> for GraphRunId {
+    type Error = GraphError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::from_hex(&raw)
+    }
+}
+
+impl From<GraphRunId> for String {
+    fn from(run: GraphRunId) -> Self {
+        run.to_hex()
     }
 }
 
@@ -316,5 +334,29 @@ mod tests {
                 .to_string(),
             "Support triage"
         );
+    }
+
+    /// The hex, as a json string — not the sixteen numbers the bytes would otherwise become.
+    #[test]
+    fn a_run_id_is_written_down_as_its_hex_and_read_back() {
+        let run = GraphRunId::generate().expect("a run id");
+        let written = serde_json::to_string(&run).expect("a run id writes down");
+
+        assert_eq!(written, format!("\"{}\"", run.to_hex()));
+        assert_eq!(
+            serde_json::from_str::<GraphRunId>(&written).expect("a run id reads back"),
+            run
+        );
+    }
+
+    /// Reading goes through `from_hex`, so the wire is as strict as the record.
+    #[test]
+    fn a_json_string_that_is_not_a_run_id_is_refused() {
+        for raw in [r#""not hex""#, r#""abcd""#, "[1, 2, 3]"] {
+            assert!(
+                serde_json::from_str::<GraphRunId>(raw).is_err(),
+                "{raw} was taken as a run id"
+            );
+        }
     }
 }

@@ -14,16 +14,19 @@ use crate::error::ProtocolError;
 /// Two families carry it as a string on both halves; the third joins by function name
 /// instead and has one synthesised for it. Either way nothing may hold an empty one,
 /// because a call that cannot be matched to its result is a conversation with a hole.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// It reads back off a wire through [`ToolCallId::new`], so an empty one is refused there too: a
+/// hole that would be refused in a body is not let in because it arrived as json instead.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String")]
 pub struct ToolCallId(String);
 
 impl ToolCallId {
     /// Wraps an id, refusing an empty one.
     pub fn new(id: &str) -> Result<Self, ProtocolError> {
-        if id.is_empty() {
-            return Err(ProtocolError::EmptyToolCallId);
-        }
-        Ok(Self(id.to_owned()))
+        Self::try_from(id.to_owned())
     }
 
     /// The id as the families spell it.
@@ -39,17 +42,30 @@ impl std::fmt::Display for ToolCallId {
     }
 }
 
+impl TryFrom<String> for ToolCallId {
+    type Error = ProtocolError;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        if id.is_empty() {
+            return Err(ProtocolError::EmptyToolCallId);
+        }
+        Ok(Self(id))
+    }
+}
+
 /// What a tool is called, in a declaration and in the call that uses it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// It reads back off a wire through [`ToolName::new`], for the reason [`ToolCallId`] does.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String")]
 pub struct ToolName(String);
 
 impl ToolName {
     /// Wraps a name, refusing an empty one.
     pub fn new(name: &str) -> Result<Self, ProtocolError> {
-        if name.is_empty() {
-            return Err(ProtocolError::EmptyToolName);
-        }
-        Ok(Self(name.to_owned()))
+        Self::try_from(name.to_owned())
     }
 
     /// The name as the families spell it.
@@ -62,6 +78,17 @@ impl ToolName {
 impl std::fmt::Display for ToolName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for ToolName {
+    type Error = ProtocolError;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if name.is_empty() {
+            return Err(ProtocolError::EmptyToolName);
+        }
+        Ok(Self(name))
     }
 }
 
@@ -257,6 +284,34 @@ mod tests {
         assert_eq!(ToolCallId::new("call_1").unwrap().as_str(), "call_1");
         assert_eq!(ToolName::new("search").unwrap().to_string(), "search");
         assert_eq!(ToolCallId::new("call_1").unwrap().to_string(), "call_1");
+    }
+
+    /// Both are plain json strings, and both come back as what they went out as.
+    #[test]
+    fn an_id_and_a_name_are_written_down_as_text_and_read_back() {
+        let id = ToolCallId::new("call_1").unwrap();
+        let name = ToolName::new("warehouse.get_stock").unwrap();
+
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"call_1\"");
+        assert_eq!(
+            serde_json::to_string(&name).unwrap(),
+            "\"warehouse.get_stock\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolCallId>("\"call_1\"").unwrap(),
+            id
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolName>("\"warehouse.get_stock\"").unwrap(),
+            name
+        );
+    }
+
+    /// The emptiness rule holds on the wire too: it is the same `try_from` either way in.
+    #[test]
+    fn an_empty_id_or_name_is_refused_as_json_as_well() {
+        assert!(serde_json::from_str::<ToolCallId>("\"\"").is_err());
+        assert!(serde_json::from_str::<ToolName>("\"\"").is_err());
     }
 
     #[test]

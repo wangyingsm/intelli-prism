@@ -9,7 +9,7 @@ use crate::error::RunError;
 ///
 /// It is spelled in the template's own types rather than in types of its own, so that `auto`
 /// means one thing in a stored template and in a request, and is refused the same way in both.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Requested {
     /// Which model, where the request names one.
     #[serde(default)]
@@ -237,5 +237,28 @@ mod tests {
             serde_json::from_str::<Requested>("{}").unwrap(),
             Requested::default()
         );
+    }
+
+    /// Written down the way it is read, so what one machine was asked is what another is asked.
+    #[test]
+    fn what_a_request_asks_for_is_written_down_the_way_it_is_read() {
+        for asked in [
+            Requested::default(),
+            Requested {
+                model: Some(ChosenModel::Auto),
+                api: Some(ChosenApi::Gemini),
+            },
+            Requested {
+                model: Some(ChosenModel::try_from("gpt-4o".to_owned()).unwrap()),
+                api: None,
+            },
+        ] {
+            let written = serde_json::to_string(&asked).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Requested>(&written).unwrap(),
+                asked,
+                "{written} did not come back as what it went out as"
+            );
+        }
     }
 }

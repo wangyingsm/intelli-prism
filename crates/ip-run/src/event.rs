@@ -10,7 +10,14 @@ use crate::turn::{Spend, Stopped, TurnNumber};
 /// A call and its result are two events rather than one, because a tool is run *after* the call
 /// is known and may take as long as it likes: a watcher that saw nothing until the result would
 /// be told what the model asked for only once it no longer mattered.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Its json tag is the word [`RunEvent::name`] streams it under, and its fields are its own —
+/// which is what [`RunEvent::body`] is not. `body` is written for a reader and loses what a reader
+/// does not need: a `done` body says `out_of_turns` and a sentence, and the turn it stopped after
+/// is gone. So an event that has to be read back — one that crossed a wire — is read back from
+/// this, and `body` stays the thing a person's stream carries.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunEvent {
     /// A turn has begun, and this is what will answer it.
     Turn {
@@ -209,5 +216,107 @@ mod tests {
         assert_eq!(event.body()["cost_micros"], 0);
         assert_eq!(event.body()["tokens"]["input"], 0);
         assert_eq!(event.body()["stop"], "answered");
+    }
+
+    /// Every variant, since what a wire loses it loses one variant at a time.
+    #[test]
+    fn every_event_survives_being_written_down_and_read_back() {
+        let events = [
+            RunEvent::Turn {
+                number: TurnNumber::FIRST.next(),
+                model: Some(ModelName::new("gpt-4o").unwrap()),
+            },
+            RunEvent::Turn {
+                number: TurnNumber::FIRST,
+                model: None,
+            },
+            RunEvent::ToolCall {
+                id: ToolCallId::new("c1").unwrap(),
+                name: ToolName::new("warehouse.get_stock").unwrap(),
+                arguments: serde_json::json!({"sku": "A-1"}),
+            },
+            RunEvent::ToolResult {
+                id: ToolCallId::new("c1").unwrap(),
+                text: "41 crates".to_owned(),
+                failed: true,
+            },
+            RunEvent::Text {
+                text: "Looking it up.".to_owned(),
+            },
+            RunEvent::Done {
+                text: "41 crates in bay 3.".to_owned(),
+                stopped: Stopped::OutOfTurns {
+                    after: TurnNumber::FIRST.next(),
+                },
+                spend: Spend::new(
+                    Tokens::new(TokenCount::new(120), TokenCount::new(34)),
+                    Money::from_micros(5_600),
+                ),
+            },
+        ];
+
+        for event in events {
+            let written = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RunEvent>(&written).unwrap(),
+                event,
+                "{written} did not come back as what it went out as"
+            );
+        }
+    }
+
+    /// What `body` drops and this keeps: the turn a run was stopped after.
+    ///
+    /// The reason the two forms are both here rather than one serving both purposes.
+    #[test]
+    fn the_json_form_keeps_the_turn_the_body_throws_away() {
+        let event = RunEvent::Done {
+            text: String::new(),
+            stopped: Stopped::OutOfTurns {
+                after: TurnNumber::FIRST.next(),
+            },
+            spend: Spend::NOTHING,
+        };
+
+        assert_eq!(event.body()["stop"], "out_of_turns");
+        assert_eq!(event.body().get("after"), None);
+        let read: RunEvent = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(read, event);
+    }
+
+    /// One vocabulary, not two: the json tag is the word the event is streamed under.
+    #[test]
+    fn an_events_json_tag_is_the_name_it_streams_under() {
+        for event in [
+            RunEvent::Turn {
+                number: TurnNumber::FIRST,
+                model: None,
+            },
+            RunEvent::ToolCall {
+                id: ToolCallId::new("c1").unwrap(),
+                name: ToolName::new("search").unwrap(),
+                arguments: serde_json::Value::Null,
+            },
+            RunEvent::ToolResult {
+                id: ToolCallId::new("c1").unwrap(),
+                text: String::new(),
+                failed: false,
+            },
+            RunEvent::Text {
+                text: String::new(),
+            },
+            RunEvent::Done {
+                text: String::new(),
+                stopped: Stopped::Answered,
+                spend: Spend::NOTHING,
+            },
+        ] {
+            let written: serde_json::Value = serde_json::to_value(&event).unwrap();
+            let tag = written
+                .as_object()
+                .and_then(|written| written.keys().next().cloned())
+                .expect("an externally tagged event is an object of one key");
+            assert_eq!(tag, event.name());
+        }
     }
 }

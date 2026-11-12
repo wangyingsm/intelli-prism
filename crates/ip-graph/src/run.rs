@@ -25,7 +25,11 @@ use crate::order::RunOrder;
 /// [`Spend`] and [`Stopped`] are `ip-run`'s own types rather than this crate's: a graph is a second
 /// place a run is accounted for, and a second accounting is the one most likely to disagree with
 /// the first.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// It is what a node answers wherever a node runs, so it is also what comes back when one ran on
+/// another machine — the same struct, not a wire copy of it, because nothing in it is a thing a
+/// wire cannot carry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NodeRan {
     /// What the node answered.
     pub answer: String,
@@ -743,5 +747,47 @@ mod tests {
         .await;
         assert_eq!(ran.spend.tokens.input.get(), 6);
         assert_eq!(ran.spend.tokens.output.get(), 9);
+    }
+
+    /// What a node came to is the same struct wherever it ran, so it has to survive the trip.
+    #[test]
+    fn what_a_node_came_to_survives_being_written_down_and_read_back() {
+        let ran = NodeRan {
+            answer: "41 crates in bay 3.".to_owned(),
+            stopped: Stopped::Refused {
+                why: "the gateway said no".to_owned(),
+            },
+            spend: Spend::new(
+                Tokens::new(TokenCount::new(120), TokenCount::new(34)),
+                Money::from_micros(5_600),
+            ),
+            traces: vec![
+                TraceId::generate().expect("a trace id"),
+                TraceId::generate().expect("another trace id"),
+            ],
+        };
+
+        let written = serde_json::to_string(&ran).expect("an answer writes down");
+        assert_eq!(
+            serde_json::from_str::<NodeRan>(&written).expect("an answer reads back"),
+            ran
+        );
+    }
+
+    /// A node that ran and spent nothing is not a node that is missing its accounting.
+    #[test]
+    fn a_node_that_came_to_nothing_still_says_so() {
+        let ran = NodeRan {
+            answer: String::new(),
+            stopped: Stopped::CutShort,
+            spend: Spend::NOTHING,
+            traces: Vec::new(),
+        };
+
+        let written = serde_json::to_string(&ran).expect("an answer writes down");
+        assert_eq!(
+            serde_json::from_str::<NodeRan>(&written).expect("an answer reads back"),
+            ran
+        );
     }
 }

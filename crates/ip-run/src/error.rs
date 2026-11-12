@@ -126,6 +126,16 @@ pub enum RunError {
         detail: String,
     },
 
+    /// A turn numbered zero, which is a count that did not start where turns start.
+    ///
+    /// Reachable only from outside this process, since nothing in it can build one: a turn read
+    /// back off a wire is the one place the count is taken on somebody else's word.
+    #[error("a turn is counted from one, and {number} is not a turn")]
+    NotATurnNumber {
+        /// What was read.
+        number: u32,
+    },
+
     /// Two tools a model could not tell apart once both are named for it.
     #[error("{first:?} and {second:?} are both declared as {wire:?}")]
     ToolNameCollides {
