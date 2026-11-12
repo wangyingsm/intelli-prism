@@ -587,8 +587,68 @@ this store can hold; checking it at write time would buy an early error for a ty
 ordering constraint for it, and still let the reference rot. The run is where the check can mean
 something.
 
+### Running a graph across a cluster
+
+A coordinator sends a node to another member of the cluster, which runs it and streams back the
+same events a local node says. Members find each other by registering themselves in the plane and
+publishing a heartbeat; `POST /_ip/cluster/node` is where a node arrives.
+
+- **A member is authenticated by a shared cluster secret, and that is all it buys.** The secret
+says one thing: whoever presented it is a member of this deployment's own cluster. That lets a
+member take another's word for *which* run a node belongs to and whose — never for what that
+caller may do. The authority every turn goes out under is built on the machine that runs the node,
+from its own reads of the same database, by the same code a local run uses, so a dispatch naming
+somebody who is not in that tenant is refused before anything of that tenant's is read. A
+deployment whose members are not on a network it controls needs TLS in front of them; the secret
+is authentication, not confidentiality.
+- **A deployment that names an address to advertise must name a secret too**, or it will not
+start. One merely reachable at the address it bound gets a warning, so a single-node deployment
+that keeps graphs still starts.
+- **The secret and the shape of the request are statuses; everything about the work is an event.**
+A dispatch that will not authenticate is a 401 before the work is looked at. A template that has
+gone missing is a `refused` event on an open stream, because by then the coordinator is already
+streaming to somebody and a status code has nowhere to go.
+- **A refusal means no turn was taken, so the node can still be run at home.** That is the whole
+retry rule, and it rests on a worker reporting a turn before taking one: nothing said means
+nothing begun, which is safe to run here; anything said means money is gone, so the node fails and
+is never rerun. It is M10's hedging ruling applied to a machine boundary.
+- **Which member gets a node is a strategy, and liveness is not.** Whether a member *may* be sent
+a node — alive by its heartbeat, and not this machine — is the coordinator's single decision;
+which of the ones that may is `[cluster] strategy`, `random` or `round_robin`. Round-robin imposes
+its own order, sorted by printed address, because the plane lists members by recency and that
+changes with every heartbeat. A member joining shifts where the order stands.
+- **A stop reaches a node running elsewhere over the publication channel the rules already use**,
+under a topic per run. The revision is the message: one kind of thing is published there, so a
+follower that sees it move has heard the stop. A worker also reads the topic *before* it starts,
+because a follower begins at the revision standing now and a node handed over after the stop was
+published would otherwise run in full — and it answers that node `cut_short`, never refused, since
+a refusal is what would send the coordinator off to run it at home.
+- **What a node answered is kept in the cluster cache under the run and the node**, for a day, so
+a coordinator picking up a run somebody else started can see what has already been paid for. Only
+a node that spent something is kept: a node that paid nothing has nothing to protect, and a kept
+refusal would answer every retry the same way for a day. This is what makes the placement records
+actionable — they say where a node ran, and until now what it answered lived only in the
+coordinator's memory.
+- **Everything about the cluster is best effort.** A membership that cannot be read runs every
+node here. A stop that cannot be published is a warning. A cache that cannot answer runs the node
+rather than refusing it. The alternative in each case is a cluster whose degraded parts stop graph
+runs that would otherwise have finished.
+
 ## Shipped with a caveat
 
+- **A dispatched node weakens "everything that can refuse is settled before the 200".** For a
+node that runs here that invariant holds: every template, model, target and tool set is resolved
+before the stream opens. A node that runs on another member is resolved *there*, after the stream
+is open, so a member whose database disagrees with the coordinator's — or that has lost its
+plane, or cannot reach the model — answers a `refused` event mid-stream where a local run would
+have answered a status code. The run still ends honestly and the node can still be run at home
+when nothing was said; what is gone is the promise that a graph run which opened will not refuse
+a node partway.
+- **A node that fails after its first event is not rerun anywhere.** Once a worker has said
+anything, the coordinator takes it that money has been spent, so a member that dies mid-node ends
+that node and the graph with it rather than running it again. That is deliberate — a rerun would
+double-charge a tenant for the same turn — but it means one machine dying takes a graph run with
+it, where a retry would have saved it.
 - **Nothing in the sandbox runs.** A template's file tree is stored, checked and read back, and no
 part of it is mounted, fetched or executed: a run reaches its tools over MCP and nothing else. The
 sandbox remains a description waiting for Ip-VFS.
@@ -891,10 +951,6 @@ version per mutation and a CLI to sync up and down.
 - The preset tool set (core utilities, python, js/ts, bash) and optional MCP tools, all sandboxed.
 - Agent traffic routed through the gateway itself, so it is authenticated, authorized and processed
 like any other request.
-- Running a graph's nodes across a cluster: a dispatch sent to another machine, where it is
-running noted in the plane, and a stop that reaches it over the publication channel the rules
-already use. The dispatch payload and the stop signal are both shaped for it; nothing crosses a
-machine boundary yet.
 - Least-loaded placement across a cluster. A coordinator picks the member a node runs on at
 random or each in turn, and both spread work without ever measuring it: a member publishes a
 heartbeat and nothing else, so there is no load to be the least of. Doing it means a member

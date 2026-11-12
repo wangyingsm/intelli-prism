@@ -56,6 +56,13 @@ spend, in tokens, in requests or in money, over a minute, an hour, a day or a mo
 live in the cache and are seeded from the usage rows; a caller past its limit is told with 429,
 which of the three ran out, and when to come back. A money cap counts only what is priced, so it
 is as complete as the prices are.
+- **Run graphs, across machines.** `POST /_ip/graph_run/{id}` runs a DAG of agent templates and
+streams it as it happens: a node's answer feeds its children, a node with several parents is given
+all of their answers at once, and a generation really runs at once. Where a deployment is a
+cluster, a node is sent to another member and streams back the same events a local one says — the
+member authenticating itself with a shared cluster secret and building the caller's authority from
+its own reads, so a dispatch buys the right to say which run a node belongs to and never what that
+caller may do.
 - **Two storage backends.** sqlite for a single node, postgres for a cluster, behind one trait and
 one conformance suite so neither drifts from the other.
 - **Two cache backends.** sled for a single node, redis for a cluster, same arrangement. The
@@ -107,9 +114,10 @@ version 0.1.0, and nothing about it is stable — the configuration format, the 
 wire headers and the plugin interface all still change without ceremony.
 
 Large parts of the design are unbuilt: there is no web ui, nothing that runs a system agent, and
-no long term memory. A run graph exists but runs every node in one process. The pieces that do exist are tested, but they have never run
-under real traffic, and no security review has been done. Read `ROADMAP.md` before assuming a
-feature is there.
+no long term memory. A graph's nodes cross machines now, but a member is picked at random or in
+turn and never by how busy it is, and a node that fails after its first event is not rerun
+anywhere. The pieces that do exist are tested, but they have never run under real traffic, and no
+security review has been done. Read `ROADMAP.md` before assuming a feature is there.
 
 ## License
 
