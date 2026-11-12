@@ -32,9 +32,13 @@ listen = "127.0.0.1:8080"
 # deliberately no least-loaded — a member publishes no load — and no weighting, since
 # members register themselves and have nowhere to declare one.
 #
-# A member is believed in for three heartbeats after its last. Dispatching also needs an
-# address of this machine's own, so a member that cannot say where it answers runs every
-# node itself rather than risk dispatching one to itself.
+# Every strategy picks from the live members *including this one*: a member that happens to
+# be the one a caller asked is still a machine with a gateway on it, and picked for its own
+# node it runs the node rather than dispatching it. A member is believed in for three
+# heartbeats after its last, except itself — a machine knows it is running better than its
+# own heartbeat row can say. That is also what the advertised address is needed for:
+# without one a member cannot tell its own row from a peer's, so it cannot tell running a
+# node here from dialling itself, and runs every node itself instead.
 #
 # Membership is kept in the run graph store's plane, so a deployment configured without
 # one registers nowhere however this block is set.

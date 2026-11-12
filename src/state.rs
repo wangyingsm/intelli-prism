@@ -706,8 +706,10 @@ const DISPATCH_IDLE: Duration = Duration::from_secs(300);
 ///
 /// Both halves are needed and for different reasons. Without the secret a peer would refuse every
 /// node, so there is nothing to dispatch on. Without an address of its own this deployment cannot
-/// tell its own membership row from a peer's, and would dispatch a node to itself over a loopback
-/// of its own making — so a deployment that cannot say where it answers runs every node here.
+/// tell its own membership row from a peer's — and since it is a candidate for its own work, it
+/// could not tell "run this here" from "dial this address", so it would send a node to itself over
+/// a loopback of its own making. A deployment that cannot say where it answers runs every node
+/// here instead.
 fn dispatching_on(
     address: Option<&ClusterAddress>,
     secret: Option<&Secret>,
@@ -817,9 +819,10 @@ secret = "0123456789abcdef0123456789abcdef"
     /// Dispatching takes both halves, and each is missing for its own reason.
     ///
     /// Without the secret a peer would refuse every node. Without an address of its own this
-    /// deployment could not tell its own membership row from a peer's, and would dispatch a node
-    /// to itself. `routes/graph.rs` refuses on the same two counts when it assembles a run; this
-    /// is the earlier of the two guards and is asserted here because nothing else reaches it.
+    /// deployment could not tell its own membership row from a peer's — and it is a candidate for
+    /// its own work, so it could not tell running a node here from dialling itself.
+    /// `routes/graph.rs` refuses on the same two counts when it assembles a run; this is the
+    /// earlier of the two guards and is asserted here because nothing else reaches it.
     #[test]
     fn dispatching_takes_both_an_address_and_a_secret() {
         let address: ClusterAddress = "10.0.0.2:8080".parse().expect("an address");

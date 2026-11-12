@@ -59,10 +59,11 @@ is as complete as the prices are.
 - **Run graphs, across machines.** `POST /_ip/graph_run/{id}` runs a DAG of agent templates and
 streams it as it happens: a node's answer feeds its children, a node with several parents is given
 all of their answers at once, and a generation really runs at once. Where a deployment is a
-cluster, a node is sent to another member and streams back the same events a local one says — the
-member authenticating itself with a shared cluster secret and building the caller's authority from
-its own reads, so a dispatch buys the right to say which run a node belongs to and never what that
-caller may do.
+cluster, its nodes are spread over the live members — the one the caller asked included, since it
+is a machine with a gateway on it like the rest — and a node sent elsewhere streams back the same
+events a local one says, the member authenticating itself with a shared cluster secret and
+building the caller's authority from its own reads, so a dispatch buys the right to say which run
+a node belongs to and never what that caller may do.
 - **Two storage backends.** sqlite for a single node, postgres for a cluster, behind one trait and
 one conformance suite so neither drifts from the other.
 - **Two cache backends.** sled for a single node, redis for a cluster, same arrangement. The

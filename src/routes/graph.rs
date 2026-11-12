@@ -628,11 +628,24 @@ impl Placing {
 }
 
 impl Dispatching {
-    /// A live member other than this machine, where the cluster has one to offer.
+    /// A live member to run this node on, which may well be this machine.
+    ///
+    /// **This coordinator is a candidate like any other member.** A cluster of three spreads a
+    /// generation over three machines and not over the two that are not coordinating: a member
+    /// that happens to be the one a caller asked is still a machine with a gateway on it, and
+    /// leaving it out would make the busiest member the one doing none of the work. Picked for
+    /// itself, the node runs here and nothing is dispatched — see [`Self::attempt`].
+    ///
+    /// **Our own liveness is not read from the plane.** Every other member is believed in for as
+    /// long as its last heartbeat allows, because a heartbeat is all we know of it. Of ourselves
+    /// we know more than any heartbeat can say, so this machine is a candidate whether the plane
+    /// holds a fresh row for it, a stale one or none at all — otherwise a plane this machine is
+    /// struggling to write to would send every node away at exactly the moment the cluster is
+    /// least able to take it.
     ///
     /// The membership read is best effort in the same way the placement write is: a plane that
     /// cannot answer means this run has no cluster to speak of, and the node runs here.
-    async fn peer(&self) -> Option<ClusterAddress> {
+    async fn pick(&self) -> Option<ClusterAddress> {
         let members = match self.plane.members().await {
             Ok(members) => members,
             Err(error) => {
@@ -644,15 +657,18 @@ impl Dispatching {
             .unwrap_or(i64::MAX)
             .saturating_mul(i64::from(BELIEVED_FOR));
         let now = ip_core::Timestamp::now().unix_seconds();
-        // Filtered here and picked there: whether a member may be sent a node is this
+        // Filtered here and picked there: whether a member may be given a node is this
         // coordinator's decision, and which of the ones that may is the strategy's.
-        let live: Vec<ClusterMember> = members
+        let mut live: Vec<ClusterMember> = members
             .into_iter()
-            .filter(|member| {
-                member.address != self.us
-                    && now.saturating_sub(member.at.unix_seconds()) <= believed
-            })
+            .filter(|member| now.saturating_sub(member.at.unix_seconds()) <= believed)
             .collect();
+        if !live.iter().any(|member| member.address == self.us) {
+            live.push(ClusterMember {
+                address: self.us.clone(),
+                at: ip_core::Timestamp::now(),
+            });
+        }
         self.spreading.pick(&live)
     }
 
@@ -671,14 +687,24 @@ impl Dispatching {
         }
     }
 
-    /// Runs this node on a live member of the cluster, where there is one to run it.
+    /// Runs this node on a live member of the cluster, which may be this machine.
     ///
     /// The placement is written before the dispatch and at the member picked for it, so a record
-    /// exists for the whole time the work is away from here.
+    /// exists for the whole time the work is away from here. Picked for ourselves, nothing is
+    /// written here: the caller records this address and runs the node.
     async fn attempt(&self, placing: Option<&Placing>, one: &OneNode<'_>, saying: &Saying) -> Sent {
-        let Some(at) = self.peer().await else {
+        let Some(at) = self.pick().await else {
             return Sent::Nowhere;
         };
+        // Picked ourselves, which is this machine taking its share and not a dispatch at all.
+        // Answered as [`Sent::Nowhere`] because that is exactly what it means — nothing was sent
+        // and nothing was spent elsewhere — so the caller notes the placement at this address and
+        // runs the node, down the same path a cluster with nobody else to ask takes. Dialling our
+        // own listener would buy a round trip, a second authority built from the same rows and a
+        // second stream, and arrive at the same turns.
+        if at == self.us {
+            return Sent::Nowhere;
+        }
         if let Some(placing) = placing {
             placing.note(one.run, one.node, &at).await;
         }
@@ -2238,8 +2264,13 @@ upstream_speaks = "anthropic"
     }
 
     /// Where a test's own deployment answers its cluster.
+    ///
+    /// Chosen to sort *after* a stub worker's `127.0.0.1:<port>`, because round-robin's order is
+    /// the printed address and the fixture below runs on it: a coordinator that sorted first
+    /// would take the first node of every two-node graph, and every test about what a dispatch
+    /// does would be a test about the second node instead.
     fn here() -> ClusterAddress {
-        "10.0.0.2:8080".parse().expect("an address")
+        "192.168.0.2:8080".parse().expect("an address")
     }
 
     /// The same fixture as [`running`], as a member of a cluster that can say where it is.
@@ -2421,6 +2452,13 @@ upstream_speaks = "anthropic"
     }
 
     /// The same fixture as [`running_in_a_cluster`], dispatching on a client of the test's own.
+    ///
+    /// **Round-robin rather than the default**, and not because these tests are about the
+    /// strategy: this coordinator is a candidate for its own work, so under `random` a one-peer
+    /// cluster sends each node to the peer only about half the time and every test below that
+    /// asserts a dispatch happened would be a coin flip. Round-robin over a peer that sorts
+    /// before [`here`] picks the peer first, every time. What `random` does over many draws is
+    /// asserted where it belongs, in `crate::cluster`.
     async fn dispatching(
         named: &[&str],
         replies: Replies,
@@ -2437,7 +2475,8 @@ upstream_speaks = "anthropic"
         .with_cluster_client(Arc::new(client))
         // Stated rather than inherited, so the tests that turn on how stale a member is read
         // against a number written here and not against whatever the default becomes.
-        .with_heartbeat(Duration::from_secs(10));
+        .with_heartbeat(Duration::from_secs(10))
+        .with_strategy(ip_core::route::ClusterStrategy::RoundRobin);
         (super::super::router(state.clone()), state, plane)
     }
 
@@ -2449,10 +2488,16 @@ upstream_speaks = "anthropic"
     /// being claimed is that the two are the same and not that both match something.
     #[tokio::test]
     async fn a_node_dispatched_to_a_member_streams_as_a_local_one_does() {
+        // Two peers, so that a two-node graph still crosses on both: this coordinator takes
+        // its turn in the rotation, so one peer and two nodes would leave the second here.
         let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let spare = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
         let (router, state, _plane) = dispatching(
             &["intake-agent", "reply-agent"],
-            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
+            dispatching_chain(&[
+                member_row(&worker.address().to_string(), 1),
+                member_row(&spare.address().to_string(), 1),
+            ]),
             worker.client(),
         )
         .await;
@@ -2509,17 +2554,36 @@ upstream_speaks = "anthropic"
             done["tokens"]["input"], 240,
             "the spend both members reported: {done}"
         );
-        assert_eq!(worker.seen().len(), 2, "both nodes went to the member");
+        assert_eq!(
+            worker.seen().len() + spare.seen().len(),
+            2,
+            "both nodes went to a member"
+        );
     }
 
     /// What a dispatch names, which is a caller and never what that caller may do.
     #[tokio::test]
     async fn a_dispatch_names_the_run_the_node_and_whose_it_is() {
-        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        // Two peers, so a two-node graph crosses on both: this coordinator takes its turn in
+        // the rotation, so one peer would leave the second node here and there would be no
+        // second dispatch to read. Which peer goes first is round-robin's order, the printed
+        // address, so the two are sorted here rather than assumed.
+        let one = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let other = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let ones = one.address().to_string();
+        let others = other.address().to_string();
+        let (first, second) = if ones < others {
+            (&one, &other)
+        } else {
+            (&other, &one)
+        };
         let (router, state, _plane) = dispatching(
             &["intake-agent", "reply-agent"],
-            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
-            worker.client(),
+            dispatching_chain(&[
+                member_row(&one.address().to_string(), 1),
+                member_row(&other.address().to_string(), 1),
+            ]),
+            one.client(),
         )
         .await;
 
@@ -2534,7 +2598,7 @@ upstream_speaks = "anthropic"
         )
         .await;
 
-        let seen = worker.seen();
+        let seen = first.seen();
         let work = &seen.first().expect("a dispatch").work;
         assert_eq!(work["node"], "intake");
         assert_eq!(work["graph"], "triage");
@@ -2550,22 +2614,31 @@ upstream_speaks = "anthropic"
                 "a dispatch carried {widened}: {work}"
             );
         }
+        let crossed = second.seen();
+        let next = &crossed.first().expect("the second dispatch").work;
+        assert_eq!(next["node"], "reply");
         assert_eq!(
-            seen[1].work["run"], work["run"],
+            next["run"], work["run"],
             "both nodes belong to one run: {seen:?}"
         );
         // The second node is handed what the first answered, in the keyed-json form a local
         // chain hands on — so a dispatched node's answer re-enters the graph as any other does.
-        assert_eq!(seen[1].work["input"], r#"{"intake":"41 crates in bay 3."}"#);
+        assert_eq!(next["input"], r#"{"intake":"41 crates in bay 3."}"#);
     }
 
     /// The record says where the work went, which is the whole use of keeping it.
     #[tokio::test]
     async fn a_dispatched_nodes_placement_names_the_member_and_not_this_machine() {
+        // Two peers, so that a two-node graph still crosses on both: this coordinator takes
+        // its turn in the rotation, so one peer and two nodes would leave the second here.
         let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let spare = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
         let (router, state, plane) = dispatching(
             &["intake-agent", "reply-agent"],
-            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
+            dispatching_chain(&[
+                member_row(&worker.address().to_string(), 1),
+                member_row(&spare.address().to_string(), 1),
+            ]),
             worker.client(),
         )
         .await;
@@ -2591,10 +2664,13 @@ upstream_speaks = "anthropic"
                     .map(str::to_owned)
             })
             .collect();
+        let mut named = recorded.clone();
+        named.sort();
+        let mut peers = vec![worker.address().to_string(), spare.address().to_string()];
+        peers.sort();
         assert_eq!(
-            recorded,
-            [worker.address().to_string(), worker.address().to_string()],
-            "a placement named this machine for a node running elsewhere"
+            named, peers,
+            "a placement named the wrong machine for a node running elsewhere"
         );
         assert!(
             !recorded.contains(&here().to_string()),
@@ -2602,9 +2678,15 @@ upstream_speaks = "anthropic"
         );
     }
 
-    /// A cluster of one is this machine, so there is nothing to dispatch to.
+    /// Picked for its own node, this machine runs it rather than dialling itself.
+    ///
+    /// A cluster of one is this machine, so it is the only candidate and is certain to be
+    /// picked. Nothing is dispatched: the node runs here, down the same path a deployment with
+    /// no cluster at all takes, and the placement names this address. Sending the work to our
+    /// own listener would buy a round trip, a second authority built from the same rows and a
+    /// second stream, and arrive at the same turns.
     #[tokio::test]
-    async fn a_member_that_is_this_machine_is_never_picked_for_its_own_node() {
+    async fn a_coordinator_picked_for_its_own_node_runs_it_here_rather_than_dialling_itself() {
         let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
         let (router, state, plane) = dispatching(
             &["intake-agent", "reply-agent"],
@@ -2702,8 +2784,8 @@ upstream_speaks = "anthropic"
 
         assert_eq!(
             worker.seen().len(),
-            2,
-            "a member twelve seconds quiet is here"
+            1,
+            "a member twelve seconds quiet was passed over"
         );
     }
 
@@ -3054,16 +3136,62 @@ upstream_speaks = "anthropic"
         assert_eq!(recorded, expected);
     }
 
-    /// Random over one live member is that member, so the default dispatches as surely as
-    /// round-robin does — what differs is only which of several it picks.
+    /// A cluster whose only member is this machine runs every node here, whichever strategy is
+    /// configured, because this machine is the only thing there is to pick.
+    ///
+    /// Asserted of the **default** strategy on purpose: it is the one case about `random` at this
+    /// level that is a certainty rather than a draw. Over one peer and this machine, random sends
+    /// each node away about half the time, so a route test that asserted a dispatch would be a
+    /// coin flip — what random does over many draws is asserted in `crate::cluster`, 200 of them.
     #[tokio::test]
-    async fn the_default_strategy_dispatches_to_the_one_live_member_there_is() {
+    async fn the_default_strategy_with_nobody_else_live_runs_every_node_here() {
         let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
         let (router, state, _plane) = spreading(
             &["intake-agent", "reply-agent"],
-            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
+            dispatching_chain(&[]),
             worker.client(),
             ip_core::route::ClusterStrategy::default(),
+        )
+        .await;
+
+        let said = streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert!(
+            worker.seen().is_empty(),
+            "a node was dispatched to a member the plane does not hold"
+        );
+        let (_, done) = said.last().expect("a graph says it is over");
+        assert_eq!(
+            done["answer"],
+            serde_json::json!({"reply": "four"}),
+            "the nodes did not run here: {done}"
+        );
+    }
+
+    /// **The coordinator takes its share.** Two nodes over one peer and this machine is one
+    /// each, because a member that happens to be the one a caller asked is still a machine with
+    /// a gateway on it — leaving it out would make the busiest member the one doing none of the
+    /// work.
+    ///
+    /// Round-robin, so the turn is a certainty and not a draw: the peer sorts before [`here`],
+    /// takes the first node, and the second comes back to this machine.
+    #[tokio::test]
+    async fn a_coordinator_takes_its_turn_in_the_rotation_like_any_other_member() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, plane) = spreading(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[member_row(&worker.address().to_string(), 1)]),
+            worker.client(),
+            ip_core::route::ClusterStrategy::RoundRobin,
         )
         .await;
 
@@ -3078,7 +3206,67 @@ upstream_speaks = "anthropic"
         )
         .await;
 
-        assert_eq!(worker.seen().len(), 2);
+        assert_eq!(
+            worker.seen().len(),
+            1,
+            "the peer took both nodes, so this machine was passed over"
+        );
+        let mut recorded: Vec<String> = plane
+            .seen()
+            .into_iter()
+            .filter(|one| one.method == "node.create")
+            .filter_map(|one| {
+                one.params["properties"]["address"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        recorded.sort();
+        let mut both = vec![worker.address().to_string(), here().to_string()];
+        both.sort();
+        assert_eq!(
+            recorded, both,
+            "a node ran on each, so each should have a placement naming it"
+        );
+    }
+
+    /// This machine is a candidate however the plane reads its own row — fresh, stale or absent.
+    ///
+    /// The plane here holds a row for this machine far past any heartbeat, beside a live peer. A
+    /// coordinator that believed that row would hand the peer both nodes; one that knows it is
+    /// running takes its turn. The point is not kindness to ourselves: a plane this machine
+    /// cannot write to would otherwise send every node away at the moment the cluster is least
+    /// able to take it.
+    #[tokio::test]
+    async fn a_coordinator_is_a_candidate_even_with_no_fresh_row_of_its_own() {
+        let worker = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = spreading(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[
+                member_row(&worker.address().to_string(), 1),
+                member_row(&here().to_string(), 86_400),
+            ]),
+            worker.client(),
+            ip_core::route::ClusterStrategy::RoundRobin,
+        )
+        .await;
+
+        streamed(
+            start_run(
+                &router,
+                &state,
+                "alice",
+                "/_ip/graph_run/triage?tenant=acme",
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            worker.seen().len(),
+            1,
+            "a stale row of our own took this machine out of its own rotation"
+        );
     }
 
     /// What is published under a run's signal topic, if anything is.

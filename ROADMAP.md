@@ -612,11 +612,22 @@ streaming to somebody and a status code has nowhere to go.
 retry rule, and it rests on a worker reporting a turn before taking one: nothing said means
 nothing begun, which is safe to run here; anything said means money is gone, so the node fails and
 is never rerun. It is M10's hedging ruling applied to a machine boundary.
-- **Which member gets a node is a strategy, and liveness is not.** Whether a member *may* be sent
-a node — alive by its heartbeat, and not this machine — is the coordinator's single decision;
-which of the ones that may is `[cluster] strategy`, `random` or `round_robin`. Round-robin imposes
-its own order, sorted by printed address, because the plane lists members by recency and that
-changes with every heartbeat. A member joining shifts where the order stands.
+- **Which member gets a node is a strategy, and liveness is not.** Whether a member *may* be
+given a node — alive by its heartbeat — is the coordinator's single decision; which of the ones
+that may is `[cluster] strategy`, `random` or `round_robin`. Round-robin imposes its own order,
+sorted by printed address, because the plane lists members by recency and that changes with every
+heartbeat. A member joining shifts where the order stands.
+- **The coordinator is a candidate for its own work**, so a cluster of three spreads a generation
+over three machines and not over the two that are not coordinating: a member that happens to be
+the one a caller asked is still a machine with a gateway on it, and leaving it out would make the
+busiest member the one doing none of the work. Picked for itself it *runs* the node — nothing is
+dispatched, and dialling its own listener would buy a round trip, a second authority built from
+the same rows and a second stream to arrive at the same turns. This is also the one thing a
+member needs its own advertised address for: without it, it cannot tell "run this here" from
+"dial this address", which is why a deployment that cannot say where it answers runs every node
+itself. Its own liveness is not read from the plane either — a machine knows it is running better
+than any heartbeat can say, and a plane it is struggling to write to would otherwise send every
+node away at the moment the cluster is least able to take it.
 - **A stop reaches a node running elsewhere over the publication channel the rules already use**,
 under a topic per run. The revision is the message: one kind of thing is published there, so a
 follower that sees it move has heard the stop. A worker also reads the topic *before* it starts,

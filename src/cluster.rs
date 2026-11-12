@@ -123,6 +123,10 @@ impl Spreading {
     /// Takes members already filtered for liveness, so what each strategy decides is only *which*
     /// of them and never *whether*: a coordinator that sends a node to a member it believes is
     /// gone has made two decisions where it should have made one.
+    ///
+    /// The coordinator itself is one of `live`, and a strategy knows nothing of that: picked for
+    /// its own node it runs the node rather than dispatching it, which is the caller's business
+    /// and not a strategy's.
     #[must_use]
     pub fn pick(&self, live: &[ClusterMember]) -> Option<ClusterAddress> {
         if live.is_empty() {
