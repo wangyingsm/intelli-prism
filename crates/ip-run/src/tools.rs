@@ -307,7 +307,7 @@ mod tests {
             .iter()
             .map(|one| one.name.as_str())
             .collect();
-        assert_eq!(names, ["warehouse__sql", "ledger__sql"]);
+        assert_eq!(names, ["ledger__sql", "warehouse__sql"]);
         assert_eq!(
             box_of
                 .find(&ToolName::new("ledger__sql").unwrap())
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(
             Toolbox::assemble(&stored, &[]),
             Err(RunError::UnqualifiedTool {
-                tool: "sql".to_owned()
+                tool: "search".to_owned()
             })
         );
     }

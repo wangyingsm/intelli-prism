@@ -661,7 +661,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["warehouse__sql", "warehouse__search"]);
+        // Name order, which is the order a tool set holds its tools in.
+        assert_eq!(names, ["warehouse__search", "warehouse__sql"]);
         assert_eq!(sent["stream"], serde_json::Value::Null);
     }
 

@@ -159,7 +159,8 @@ mod tests {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect();
-        assert_eq!(declared, ["warehouse__sql", "warehouse__search"]);
+        // Name order, which is the order a tool set holds its tools in.
+        assert_eq!(declared, ["warehouse__search", "warehouse__sql"]);
         assert!(!shed.is_empty());
     }
 

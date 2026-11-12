@@ -1,5 +1,6 @@
 //! What a template would run under: its role, its model, its tool set and its ceilings.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::error::AgentError;
@@ -283,7 +284,7 @@ impl TryFrom<String> for ToolName {
     }
 }
 
-/// Every tool a template asks for, each named once.
+/// Every tool a template asks for, each held once however often it was named.
 ///
 /// Empty is allowed: an agent with no tools is a conversation, which is a legitimate thing to
 /// configure.
@@ -295,12 +296,12 @@ impl ToolSet {
     /// Name of this kind, as it appears in errors.
     pub const KIND: &'static str = "tool set";
 
-    /// Validates and wraps a set, refusing a tool named twice.
+    /// Wraps a set, keeping one of each name and refusing only more tools than it holds.
     pub fn new(tools: Vec<ToolName>) -> Result<Self, AgentError> {
         Self::try_from(tools)
     }
 
-    /// The tools, in the order the template named them.
+    /// The tools, in name order.
     #[must_use]
     pub fn tools(&self) -> &[ToolName] {
         &self.0
@@ -316,23 +317,22 @@ impl ToolSet {
 impl TryFrom<Vec<ToolName>> for ToolSet {
     type Error = AgentError;
 
+    /// Collects the names into a set rather than refusing one given more than once.
+    ///
+    /// A template naming `bash` twice has asked for `bash`, and dropping the second says
+    /// everything a refusal would. Being a set, it holds them in name order and not in the order
+    /// they were written, and the cap is counted after the collapse — so a list long only because
+    /// it repeats itself is not refused for a size it does not really have.
     fn try_from(tools: Vec<ToolName>) -> Result<Self, Self::Error> {
-        if tools.len() > TOOL_SET_MAX {
+        let named: BTreeSet<ToolName> = tools.into_iter().collect();
+        if named.len() > TOOL_SET_MAX {
             return Err(AgentError::TooMany {
                 kind: Self::KIND,
-                count: tools.len(),
+                count: named.len(),
                 max: TOOL_SET_MAX,
             });
         }
-        let mut seen = tools.clone();
-        seen.sort_unstable();
-        if let Some(pair) = seen.windows(2).find(|pair| pair[0] == pair[1]) {
-            return Err(AgentError::Duplicate {
-                kind: Self::KIND,
-                value: pair[0].as_str().to_owned(),
-            });
-        }
-        Ok(Self(tools))
+        Ok(Self(named.into_iter().collect()))
     }
 }
 
@@ -938,14 +938,23 @@ mod tests {
 
     /// The failure this guards against is a stored row no longer reading back, which is why the
     /// dot is permitted rather than required.
+    ///
+    /// It is also where the set shows through the column: a row keeps whatever order it was
+    /// written in, and reading it collapses that to name order. The write-back is therefore
+    /// *canonical* rather than identical, which is asserted here because it is the one place
+    /// anything outside this file can see the difference.
     #[test]
     fn a_tool_named_before_any_server_existed_still_reads_back() {
         let stored = r#"["sql","search"]"#;
         let set: ToolSet = serde_json::from_str(stored).unwrap();
 
         let named: Vec<&str> = set.tools().iter().map(ToolName::as_str).collect();
-        assert_eq!(named, ["sql", "search"]);
-        assert_eq!(serde_json::to_string(&set).unwrap(), stored);
+        assert_eq!(named, ["search", "sql"], "a stored row did not read back");
+        assert_eq!(
+            serde_json::to_string(&set).unwrap(),
+            r#"["search","sql"]"#,
+            "the write-back is the set's own order, not the row's"
+        );
     }
 
     /// A server id and a tool name are 64 bytes each, and a qualified name is both and a dot.
@@ -956,11 +965,12 @@ mod tests {
         assert_eq!(tool(&qualified).as_str(), qualified);
     }
 
+    /// A set, so it answers in name order whatever order it was written in.
     #[test]
-    fn a_tool_set_keeps_the_order_it_was_named_in() {
+    fn a_tool_set_holds_its_tools_in_name_order() {
         let set = ToolSet::new(vec![tool("python"), tool("bash"), tool("awk")]).unwrap();
         let named: Vec<&str> = set.tools().iter().map(ToolName::as_str).collect();
-        assert_eq!(named, ["python", "bash", "awk"]);
+        assert_eq!(named, ["awk", "bash", "python"]);
         assert!(!set.is_empty());
     }
 
@@ -971,15 +981,24 @@ mod tests {
         assert_eq!(set, ToolSet::default());
     }
 
+    /// The second mention adds nothing, however far from the first it sits.
     #[test]
-    fn a_tool_named_twice_is_refused_however_far_apart_the_two_sit() {
-        assert_eq!(
-            ToolSet::new(vec![tool("python"), tool("bash"), tool("python")]),
-            Err(AgentError::Duplicate {
-                kind: ToolSet::KIND,
-                value: "python".to_owned(),
-            })
-        );
+    fn a_tool_named_twice_is_held_once_however_far_apart_the_two_sit() {
+        let set = ToolSet::new(vec![tool("python"), tool("bash"), tool("python")])
+            .expect("a name given twice is still one tool");
+        let named: Vec<&str> = set.tools().iter().map(ToolName::as_str).collect();
+
+        assert_eq!(named, ["bash", "python"]);
+    }
+
+    /// The cap counts tools and not mentions, so repetition cannot push a legal set past it.
+    #[test]
+    fn a_tool_set_long_only_because_it_repeats_itself_is_held() {
+        let repeated: Vec<ToolName> = (0..=TOOL_SET_MAX).map(|_| tool("python")).collect();
+
+        let set = ToolSet::new(repeated).expect("one tool named many times is one tool");
+
+        assert_eq!(set.tools().len(), 1);
     }
 
     #[test]
