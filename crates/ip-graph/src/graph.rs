@@ -487,7 +487,9 @@ mod tests {
 
         assert_eq!(graph.loops().len(), 1);
         assert_eq!(
-            graph.loop_back(&name("reply"), &name("intake")).map(|back| back.cap.get()),
+            graph
+                .loop_back(&name("reply"), &name("intake"))
+                .map(|back| back.cap.get()),
             Some(2)
         );
         assert_eq!(

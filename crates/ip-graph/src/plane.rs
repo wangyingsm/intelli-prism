@@ -1539,7 +1539,11 @@ mod tests {
             .expect("the stub takes the write");
 
         let edges = stub.calls("edge.create");
-        assert_eq!(edges.len(), 2, "a loop back is an edge beside the feeding one");
+        assert_eq!(
+            edges.len(),
+            2,
+            "a loop back is an edge beside the feeding one"
+        );
         assert_eq!(edges[0]["type"], FEEDS);
         assert_eq!(edges[1]["type"], LOOPS_BACK);
         assert_eq!(
@@ -1561,7 +1565,11 @@ mod tests {
             .expect("the stub takes the write");
 
         let asked = stub.calls("plane.algo");
-        assert_eq!(asked.len(), 2, "a looping write asks for the cycle and the ancestry");
+        assert_eq!(
+            asked.len(),
+            2,
+            "a looping write asks for the cycle and the ancestry"
+        );
         for one in &asked {
             assert_eq!(
                 one["edge_type"], FEEDS,
@@ -1634,7 +1642,11 @@ mod tests {
             .expect("a self loop needs no ancestry");
 
         let asked = stub.calls("plane.algo");
-        assert_eq!(asked.len(), 1, "the ancestry of a node to itself was asked for");
+        assert_eq!(
+            asked.len(),
+            1,
+            "the ancestry of a node to itself was asked for"
+        );
         assert_eq!(asked[0]["algo"], "cycles");
     }
 
@@ -1660,7 +1672,11 @@ mod tests {
             "the node whose work is redone was left out of what runs again"
         );
         let asked = stub.calls("plane.cypher");
-        assert_eq!(asked.len(), 1, "a walk of the graph took more than one read");
+        assert_eq!(
+            asked.len(),
+            1,
+            "a walk of the graph took more than one read"
+        );
         assert_eq!(asked[0]["params"]["key"], "GraphNode/acme/triage/intake");
         assert_eq!(asked[0]["params"][GRAPH], "triage");
         assert_eq!(asked[0]["params"][OWNER], "acme");
@@ -1682,7 +1698,8 @@ mod tests {
             json!({"columns": ["name"], "rows": [[7]]}),
             json!({"columns": ["name"], "rows": [["two words"]]}),
         ] {
-            let stub = StubPlane::start(Replies::scripted([("plane.cypher", answer.clone())])).await;
+            let stub =
+                StubPlane::start(Replies::scripted([("plane.cypher", answer.clone())])).await;
             let refusal = GraphPlane::new(stub.client())
                 .downstream(&tenant(), &id(), &name("intake"))
                 .await;
@@ -1926,7 +1943,11 @@ mod tests {
             .expect("a plane holding the graph answers with it")
             .expect("the graph is there");
 
-        assert_eq!(read.loops()[0].cap.get(), 2, "the stored cap did not come back");
+        assert_eq!(
+            read.loops()[0].cap.get(),
+            2,
+            "the stored cap did not come back"
+        );
         let asked = stub.calls("plane.cypher");
         let statement = asked[0]["query"].as_str().expect("a statement crossed");
         assert!(
