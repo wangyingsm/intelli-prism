@@ -19,8 +19,9 @@ use ip_core::{Capability, CapabilityScope, Protocol, TenantId, UserId};
 use ip_gateway::Gateway;
 use ip_graph::{
     ClusterMember, Downstream, GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode,
-    GraphOwner, GraphPlane, GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, MaxNodes,
-    NodeName, NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode, Stopping,
+    GraphOwner, GraphPlane, GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, LoopBack,
+    MaxNodes, NodeName, NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode,
+    Stopping,
 };
 use ip_mcp::{McpServer, McpSettings};
 use ip_run::{
@@ -73,6 +74,8 @@ pub struct GraphView {
     pub nodes: Vec<GraphNode>,
     /// The edges between them.
     pub edges: Vec<GraphEdge>,
+    /// The loop backs declared on it, each with how often it may be taken.
+    pub loops: Vec<LoopBack>,
     /// The most nodes it may hold.
     pub max_nodes: u32,
 }
@@ -86,6 +89,7 @@ impl From<RunGraph> for GraphView {
             max_nodes: graph.max_nodes().get(),
             nodes: graph.nodes().to_vec(),
             edges: graph.edges().to_vec(),
+            loops: graph.loops().to_vec(),
         }
     }
 }
@@ -101,6 +105,10 @@ struct Written {
     /// The edges between them; none at all when left out, which is a graph of one generation.
     #[serde(default)]
     edges: Vec<GraphEdge>,
+    /// The loop backs declared on it; none at all when left out, which is a graph that runs once
+    /// through.
+    #[serde(default)]
+    loops: Vec<LoopBack>,
     /// The most nodes it may hold.
     max_nodes: MaxNodes,
 }
@@ -204,7 +212,7 @@ async fn put(
         owner: owner.clone(),
         nodes: written.nodes,
         edges: written.edges,
-        loops: Vec::new(),
+        loops: written.loops,
         max_nodes: written.max_nodes,
     }) {
         Ok(graph) => graph,
@@ -1266,6 +1274,17 @@ mod tests {
         serde_json::json!({"algo": "cycles", "count": 0, "results": []})
     }
 
+    /// The same graph with a loop back on it, which is how a caller asks for one.
+    const LOOPING: &str = r#"{"name":"Support triage","nodes":[{"name":"intake","agent":"acme-triage"},{"name":"reply","agent":"acme-triage"}],"edges":[{"from":"intake","to":"reply"}],"loops":[{"from":"reply","to":"intake","cap":2}],"max_nodes":8}"#;
+
+    /// What the plane answers both asks of a looping write with.
+    ///
+    /// One answer carrying a count *and* a path, because a script answers per method and such a
+    /// write asks `plane.algo` twice: once for a cycle, once for the ancestry of each loop back.
+    fn no_cycle_and_a_path() -> serde_json::Value {
+        serde_json::json!({"algo": "cycles", "count": 0, "results": [], "found": true})
+    }
+
     /// One node row as the plane answers it.
     fn node_row(id: u64, owner: &str, graph: &str, name: &str, agent: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1396,6 +1415,124 @@ mod tests {
         assert_eq!(view["max_nodes"], 8);
         assert_eq!(view["edges"][0]["from"], "intake");
         assert_eq!(view["edges"][0]["to"], "reply");
+    }
+
+    #[tokio::test]
+    async fn a_graph_may_be_written_with_a_loop_back_on_it() {
+        let (router, state, plane) = over(Replies::scripted([
+            ("plane.query", serde_json::json!([])),
+            ("node.create", graph_row("acme", "triage")),
+            ("edge.create", serde_json::json!({"id": 1})),
+            ("plane.algo", no_cycle_and_a_path()),
+        ]))
+        .await;
+
+        let answered = send(
+            &router,
+            &state,
+            "PUT",
+            "alice",
+            "/_ip/graphs/triage?tenant=acme",
+            Some(LOOPING),
+        )
+        .await;
+
+        assert_eq!(answered.status(), StatusCode::CREATED);
+        let view: serde_json::Value = serde_json::from_str(&body_of(answered).await).unwrap();
+        assert_eq!(
+            view["loops"],
+            serde_json::json!([{"from": "reply", "to": "intake", "cap": 2}]),
+            "the graph as it was taken did not report the loop back"
+        );
+        assert_eq!(
+            plane.calls("edge.create").len(),
+            2,
+            "a loop back is a second edge beside the feeding one"
+        );
+        assert_eq!(
+            plane.calls("plane.algo").len(),
+            2,
+            "a looping write asks for the cycle and for the ancestry"
+        );
+    }
+
+    /// A cap of nothing is refused where the body is read, so nothing is written for it.
+    #[tokio::test]
+    async fn a_loop_back_that_may_never_be_taken_is_refused() {
+        let (router, state, plane) =
+            over(Replies::scripted([("plane.query", serde_json::json!([]))])).await;
+
+        let answered = send(
+            &router,
+            &state,
+            "PUT",
+            "alice",
+            "/_ip/graphs/triage?tenant=acme",
+            Some(&LOOPING.replace(r#""cap":2"#, r#""cap":0"#)),
+        )
+        .await;
+
+        assert_eq!(answered.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            plane.calls("node.create").is_empty(),
+            "a refused graph wrote rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loop_back_naming_a_node_the_graph_does_not_hold_is_refused() {
+        let (router, state, plane) =
+            over(Replies::scripted([("plane.query", serde_json::json!([]))])).await;
+
+        let answered = send(
+            &router,
+            &state,
+            "PUT",
+            "alice",
+            "/_ip/graphs/triage?tenant=acme",
+            Some(&LOOPING.replace(r#""to":"intake""#, r#""to":"survey""#)),
+        )
+        .await;
+
+        assert_eq!(answered.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            plane.calls("node.create").is_empty(),
+            "a refused graph wrote rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_loop_back_is_reported_by_a_read() {
+        let (router, state, _plane) = over(Replies::in_turn([
+            serde_json::json!([graph_row("acme", "triage")]),
+            serde_json::json!([
+                node_row(2, "acme", "triage", "intake", "acme-triage"),
+                node_row(3, "acme", "triage", "reply", "acme-triage"),
+            ]),
+            serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
+            serde_json::json!({
+                "columns": ["from", "to", "cap"],
+                "rows": [["reply", "intake", 3]],
+            }),
+        ]))
+        .await;
+
+        let answered = send(
+            &router,
+            &state,
+            "GET",
+            "alice",
+            "/_ip/graphs/triage?tenant=acme",
+            None,
+        )
+        .await;
+
+        assert_eq!(answered.status(), StatusCode::OK);
+        let view: serde_json::Value = serde_json::from_str(&body_of(answered).await).unwrap();
+        assert_eq!(
+            view["loops"],
+            serde_json::json!([{"from": "reply", "to": "intake", "cap": 3}])
+        );
     }
 
     #[tokio::test]
