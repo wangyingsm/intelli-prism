@@ -151,6 +151,108 @@ x-ip-csrf: 1
 }
 HTTP 422
 
+# A loop back, written and read back out of the plane with the cap it was given.
+#
+# This is the half no stub can prove, and the reason it is here: the cap is a property of the
+# *edge*, and a read plan asking a real plane for one answers null, which a scripted stub happily
+# answers 2 to. What proves the cap crossed the wire is a real plane handing it back.
+PUT {{host}}/_ip/graphs/looping?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "Loops back",
+  "max_nodes": 8,
+  "nodes": [
+    {"name": "intake", "agent": "intake"},
+    {"name": "reply", "agent": "reply"}
+  ],
+  "edges": [{"from": "intake", "to": "reply"}],
+  "loops": [{"from": "reply", "to": "intake", "cap": 2}]
+}
+HTTP 201
+[Asserts]
+jsonpath "$.loops" count == 1
+jsonpath "$.loops[0].cap" == 2
+
+GET {{host}}/_ip/graphs/looping?tenant=graphers
+HTTP 200
+[Asserts]
+jsonpath "$.edges" count == 1
+jsonpath "$.edges[0].from" == "intake"
+jsonpath "$.loops" count == 1
+jsonpath "$.loops[0].from" == "reply"
+jsonpath "$.loops[0].to" == "intake"
+jsonpath "$.loops[0].cap" == 2
+
+DELETE {{host}}/_ip/graphs/looping?tenant=graphers
+x-ip-csrf: 1
+HTTP 204
+
+# A loop back a node declares on itself is taken: a node may always ask for its own work again,
+# and a self loop closes no cycle in the feeding edges, which is what the plane is asked about.
+PUT {{host}}/_ip/graphs/self-loop?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "Asks itself again",
+  "max_nodes": 4,
+  "nodes": [{"name": "only", "agent": "intake"}],
+  "loops": [{"from": "only", "to": "only", "cap": 1}]
+}
+HTTP 201
+
+GET {{host}}/_ip/graphs/self-loop?tenant=graphers
+HTTP 200
+[Asserts]
+jsonpath "$.loops[0].from" == "only"
+jsonpath "$.loops[0].to" == "only"
+
+DELETE {{host}}/_ip/graphs/self-loop?tenant=graphers
+x-ip-csrf: 1
+HTTP 204
+
+# A loop back pointing the way the work already goes is refused, and the graph is taken back out.
+#
+# Whether one node's answer reaches another is reachability, which the types cannot see: `intake`
+# feeds `reply`, so sending work back from `intake` to `reply` sends it forwards. The plane is
+# asked for a feeding path from the target to the asker, and there is none.
+PUT {{host}}/_ip/graphs/forward-loop?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "Loops the wrong way",
+  "max_nodes": 4,
+  "nodes": [
+    {"name": "intake", "agent": "intake"},
+    {"name": "reply", "agent": "reply"}
+  ],
+  "edges": [{"from": "intake", "to": "reply"}],
+  "loops": [{"from": "intake", "to": "reply", "cap": 1}]
+}
+HTTP 422
+
+GET {{host}}/_ip/graphs/forward-loop?tenant=graphers
+HTTP 404
+
+# A cap of nothing, which would declare a loop back that may never be taken.
+PUT {{host}}/_ip/graphs/never-loops?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "A loop that may never run",
+  "max_nodes": 4,
+  "nodes": [{"name": "only", "agent": "intake"}],
+  "loops": [{"from": "only", "to": "only", "cap": 0}]
+}
+HTTP 422
+
+# A loop back naming a node the graph has not got.
+PUT {{host}}/_ip/graphs/loop-to-nowhere?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "A loop back to nowhere",
+  "max_nodes": 4,
+  "nodes": [{"name": "only", "agent": "intake"}],
+  "loops": [{"from": "only", "to": "nowhere", "cap": 1}]
+}
+HTTP 422
+
 # An edge naming a node the graph has not got.
 PUT {{host}}/_ip/graphs/dangling?tenant=graphers
 x-ip-csrf: 1
