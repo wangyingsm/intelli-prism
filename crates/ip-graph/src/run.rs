@@ -419,6 +419,7 @@ mod tests {
             owner: GraphOwner::Tenant(TenantId::new("acme").expect("a tenant id")),
             nodes: nodes.iter().map(|raw| node(raw)).collect(),
             edges: edges.iter().map(|(from, to)| edge(from, to)).collect(),
+            loops: Vec::new(),
             max_nodes: MaxNodes::new(8).expect("a ceiling"),
         })
         .expect("the fixture's own graph holds together")

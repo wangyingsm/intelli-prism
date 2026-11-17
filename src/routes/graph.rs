@@ -204,6 +204,7 @@ async fn put(
         owner: owner.clone(),
         nodes: written.nodes,
         edges: written.edges,
+        loops: Vec::new(),
         max_nodes: written.max_nodes,
     }) {
         Ok(graph) => graph,

@@ -61,6 +61,15 @@ pub enum GraphError {
         limit: u32,
     },
 
+    /// A cap that permits no loop at all, or more of them than a run is built for.
+    #[error("a loop back may be taken between 1 and {limit} times, not {value}")]
+    LoopCeiling {
+        /// What was asked for.
+        value: u32,
+        /// The most that may be asked for.
+        limit: u32,
+    },
+
     /// Two nodes of one graph spelled the same, so an edge could not name one of them.
     #[error("the node {name} is declared more than once")]
     DuplicateNode {
@@ -74,6 +83,15 @@ pub enum GraphError {
         /// Whose answer it carries.
         from: NodeName,
         /// Which node receives it.
+        to: NodeName,
+    },
+
+    /// One loop back declared twice, which would give one of them two caps.
+    #[error("the loop back from {from} to {to} is declared more than once")]
+    DuplicateLoop {
+        /// The node that may ask for it.
+        from: NodeName,
+        /// The node it sends the work back to.
         to: NodeName,
     },
 

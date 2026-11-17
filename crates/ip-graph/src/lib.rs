@@ -27,7 +27,9 @@ mod run;
 
 pub use error::GraphError;
 pub use event::{GraphEvent, GraphReporting, GraphSaid};
-pub use graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
+pub use graph::{
+    GraphEdge, GraphNode, GraphOwner, LoopBack, LoopCap, MaxNodes, RunGraph, RunGraphParts,
+};
 pub use id::{GraphId, GraphName, GraphRunId, NodeName};
 pub use member::ClusterMember;
 pub use order::{Generation, Placed, RunOrder};

@@ -813,6 +813,7 @@ impl GraphPlane {
             owner: owner.clone(),
             nodes,
             edges,
+            loops: Vec::new(),
             max_nodes,
         })
         .map(Some)
@@ -895,6 +896,7 @@ mod tests {
             id: id(),
             name: GraphName::new("Support triage").expect("a graph name"),
             owner: tenant(),
+            loops: Vec::new(),
             nodes: vec![node("intake"), node("reply")],
             edges: vec![GraphEdge {
                 from: name("intake"),
@@ -1467,6 +1469,7 @@ mod tests {
             owner: GraphOwner::Tenant(TenantId::new("globex").expect("another tenant")),
             nodes: vec![node("intake")],
             edges: Vec::new(),
+            loops: Vec::new(),
             max_nodes: MaxNodes::new(8).expect("a ceiling"),
         })
         .expect("another tenant's graph holds together");

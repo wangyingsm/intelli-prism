@@ -11,6 +11,9 @@ use crate::id::{GraphId, GraphName, NodeName};
 /// The most nodes a graph's own ceiling may allow.
 const NODES_MOST: u32 = MaxNodes::MOST;
 
+/// The most times one loop back's own cap may allow it to be taken.
+const LOOPS_MOST: u32 = LoopCap::MOST;
+
 /// Whose a graph is: the deployment's, or one tenant's.
 ///
 /// Mirrors `ip-storage`'s `AgentOwner` rather than sharing it. This crate takes no i/o, and a type
@@ -88,6 +91,50 @@ impl TryFrom<u32> for MaxNodes {
     }
 }
 
+/// How many times one loop back may be taken in a run.
+///
+/// Per loop back rather than per graph, so a cheap critique loop and an expensive re-survey get
+/// their own budgets. What follows from that, recorded because it is the cost of the choice: a
+/// graph with several loop backs has several caps, and what bounds a whole run is their sum, so no
+/// one number here says what a run may come to.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "u32")]
+pub struct LoopCap(u32);
+
+impl LoopCap {
+    /// The most any cap may be, whatever a graph asks for.
+    ///
+    /// A run that doubles back nine times is a graph that wants a different shape, and a ceiling
+    /// here is what stops a stored graph from costing without bound.
+    pub const MOST: u32 = 8;
+
+    /// A cap, if it is one a loop back can be taken under.
+    pub fn new(value: u32) -> Result<Self, GraphError> {
+        if value == 0 || value > LOOPS_MOST {
+            return Err(GraphError::LoopCeiling {
+                value,
+                limit: LOOPS_MOST,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// The cap as a number.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for LoopCap {
+    type Error = GraphError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
 /// One node of a graph: what it is called, and the template it runs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphNode {
@@ -106,6 +153,26 @@ pub struct GraphEdge {
     pub to: NodeName,
 }
 
+/// One declared loop back: who may ask for it, which node it sends work back to, and how often.
+///
+/// Its own list on a graph rather than a kind on [`GraphEdge`], which is the whole reason this is
+/// a separate type. Every reader of the edges — the keying of a node's input, what the graph
+/// answers with, the plane's topological sort and its cycle check — is over feeding edges alone,
+/// and a kind field would make each of them a place that can forget to filter. Here there is
+/// nothing to filter: a loop back is simply not an edge.
+///
+/// Whether the loop is taken is the asking node's own decision, up to the cap. Nothing in this
+/// crate reads one yet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoopBack {
+    /// The node whose answer may ask for it.
+    pub from: NodeName,
+    /// The node the work goes back to, which runs again.
+    pub to: NodeName,
+    /// How many times this one may be taken in a run.
+    pub cap: LoopCap,
+}
+
 /// Everything a graph is made of, before anything has checked that it holds together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunGraphParts {
@@ -119,6 +186,8 @@ pub struct RunGraphParts {
     pub nodes: Vec<GraphNode>,
     /// The edges between them.
     pub edges: Vec<GraphEdge>,
+    /// The loop backs it declares, where it declares any.
+    pub loops: Vec<LoopBack>,
     /// The most nodes it may hold.
     pub max_nodes: MaxNodes,
 }
@@ -134,6 +203,7 @@ pub struct RunGraph {
     owner: GraphOwner,
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
+    loops: Vec<LoopBack>,
     max_nodes: MaxNodes,
 }
 
@@ -141,14 +211,21 @@ impl RunGraph {
     /// A graph, if its own shape holds together.
     ///
     /// What is refused here is local to the graph: a graph with no node, more nodes than its own
-    /// ceiling, one node name declared twice, one edge declared twice, and an edge naming a node
-    /// the graph does not hold.
+    /// ceiling, one node name declared twice, one edge declared twice, an edge naming a node the
+    /// graph does not hold, one loop back declared twice, and a loop back naming such a node.
     ///
     /// **Acyclicity is not among them, and neither is the run order.** Both are the plane's to
     /// answer — `plane.algo` `cycles` when a graph is written and `toposort` when one is read — so
     /// that the one graph algorithm this crate carries is none. A node naming no template is not
     /// checked either: [`AgentId`] refuses an empty id, so a node without one cannot be built in
     /// the first place.
+    ///
+    /// **Two things about a loop back are deliberately not refused here.** A node may declare one
+    /// on itself, which is a second pass over its own work and the commonest use of the thing;
+    /// unlike a self-edge it closes no cycle in the feeding edges, so nothing downstream has to
+    /// cope with it. And whether the asking node even descends from its target is reachability,
+    /// which this crate does not carry — the plane refuses a loop back that points sideways or
+    /// forwards, when the graph is written.
     pub fn checked(parts: RunGraphParts) -> Result<Self, GraphError> {
         let RunGraphParts {
             id,
@@ -156,6 +233,7 @@ impl RunGraph {
             owner,
             nodes,
             edges,
+            loops,
             max_nodes,
         } = parts;
         if nodes.is_empty() {
@@ -189,12 +267,27 @@ impl RunGraph {
                 });
             }
         }
+        let mut backwards = BTreeSet::new();
+        for loop_back in &loops {
+            for end in [&loop_back.from, &loop_back.to] {
+                if !held.contains(end) {
+                    return Err(GraphError::UnknownNode { name: end.clone() });
+                }
+            }
+            if !backwards.insert((&loop_back.from, &loop_back.to)) {
+                return Err(GraphError::DuplicateLoop {
+                    from: loop_back.from.clone(),
+                    to: loop_back.to.clone(),
+                });
+            }
+        }
         Ok(Self {
             id,
             name,
             owner,
             nodes,
             edges,
+            loops,
             max_nodes,
         })
     }
@@ -222,6 +315,21 @@ impl RunGraph {
     /// The edges between them.
     pub fn edges(&self) -> &[GraphEdge] {
         &self.edges
+    }
+
+    /// The loop backs it declares.
+    pub fn loops(&self) -> &[LoopBack] {
+        &self.loops
+    }
+
+    /// The loop back one node declares to another, where it declares one.
+    ///
+    /// This is the question a run asks of a node that has asked to double back: a graph that did
+    /// not declare it is a graph where it may not happen, however the node phrased it.
+    pub fn loop_back(&self, from: &NodeName, to: &NodeName) -> Option<&LoopBack> {
+        self.loops
+            .iter()
+            .find(|back| &back.from == from && &back.to == to)
     }
 
     /// The most nodes it may hold.
@@ -263,6 +371,14 @@ mod tests {
         }
     }
 
+    fn back(from: &str, to: &str, cap: u32) -> LoopBack {
+        LoopBack {
+            from: name(from),
+            to: name(to),
+            cap: LoopCap::new(cap).expect("a cap"),
+        }
+    }
+
     fn parts(nodes: Vec<GraphNode>, edges: Vec<GraphEdge>) -> RunGraphParts {
         RunGraphParts {
             id: GraphId::new("triage").expect("a graph id"),
@@ -270,8 +386,19 @@ mod tests {
             owner: GraphOwner::Tenant(TenantId::new("acme").expect("a tenant id")),
             nodes,
             edges,
+            loops: Vec::new(),
             max_nodes: MaxNodes::new(8).expect("a ceiling"),
         }
+    }
+
+    /// A graph of three in a chain, with a loop back from the last node to the first.
+    fn looping(loops: Vec<LoopBack>) -> RunGraphParts {
+        let mut parts = parts(
+            vec![node("intake"), node("triage"), node("reply")],
+            vec![edge("intake", "triage"), edge("triage", "reply")],
+        );
+        parts.loops = loops;
+        parts
     }
 
     #[test]
@@ -350,6 +477,101 @@ mod tests {
         assert!(
             RunGraph::checked(parts(vec![node("a")], vec![edge("a", "a")])).is_ok(),
             "the shape check started looking for cycles"
+        );
+    }
+
+    #[test]
+    fn a_declared_loop_back_is_carried_and_can_be_looked_up() {
+        let graph = RunGraph::checked(looping(vec![back("reply", "intake", 2)]))
+            .expect("a chain that may double back");
+
+        assert_eq!(graph.loops().len(), 1);
+        assert_eq!(
+            graph.loop_back(&name("reply"), &name("intake")).map(|back| back.cap.get()),
+            Some(2)
+        );
+        assert_eq!(
+            graph.loop_back(&name("intake"), &name("reply")),
+            None,
+            "a loop back was found in the direction it was not declared in"
+        );
+    }
+
+    /// The point of a loop back being its own list: nothing that reads the edges sees it.
+    #[test]
+    fn a_loop_back_is_not_an_edge() {
+        let graph = RunGraph::checked(looping(vec![back("reply", "intake", 2)]))
+            .expect("a chain that may double back");
+
+        assert_eq!(graph.edges().len(), 2, "a loop back was counted as an edge");
+        let target = name("intake");
+        let parents: Vec<&NodeName> = graph.parents_of(&target).collect();
+        assert!(
+            parents.is_empty(),
+            "a loop back fed a node its input, as {parents:?}"
+        );
+    }
+
+    /// Both ends, for the reason the same case on an edge tests both.
+    #[test]
+    fn a_loop_back_naming_a_node_the_graph_does_not_hold_is_refused() {
+        for (from, to) in [("reply", "survey"), ("survey", "intake")] {
+            assert_eq!(
+                RunGraph::checked(looping(vec![back(from, to, 2)])),
+                Err(GraphError::UnknownNode {
+                    name: name("survey"),
+                }),
+                "the loop back {from} to {to} was taken"
+            );
+        }
+    }
+
+    #[test]
+    fn one_loop_back_declared_twice_is_refused() {
+        assert_eq!(
+            RunGraph::checked(looping(vec![
+                back("reply", "intake", 2),
+                back("reply", "intake", 3),
+            ])),
+            Err(GraphError::DuplicateLoop {
+                from: name("reply"),
+                to: name("intake"),
+            })
+        );
+    }
+
+    /// Unlike a self-edge, which is a cycle: a node asking to read its own work again closes no
+    /// loop in the feeding edges, so it is permitted here and needs nothing of the plane.
+    #[test]
+    fn a_node_may_declare_a_loop_back_on_itself() {
+        let graph = RunGraph::checked(looping(vec![back("reply", "reply", 1)]))
+            .expect("a node may think again");
+
+        assert!(graph.loop_back(&name("reply"), &name("reply")).is_some());
+    }
+
+    #[test]
+    fn a_cap_that_loops_never_or_too_often_is_refused() {
+        for value in [0, 9] {
+            assert_eq!(
+                LoopCap::new(value),
+                Err(GraphError::LoopCeiling { value, limit: 8 }),
+                "a cap of {value} was taken"
+            );
+        }
+        assert!(LoopCap::new(8).is_ok(), "the limit itself is allowed");
+        assert!(LoopCap::new(1).is_ok(), "one pass back is allowed");
+    }
+
+    #[test]
+    fn a_cap_is_read_from_json_through_its_own_rule() {
+        assert_eq!(
+            serde_json::from_str::<LoopCap>("2").expect("a cap"),
+            LoopCap::new(2).expect("the same cap")
+        );
+        assert!(
+            serde_json::from_str::<LoopCap>("0").is_err(),
+            "json got past the rule the constructor applies"
         );
     }
 
