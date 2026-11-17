@@ -1,0 +1,14 @@
+{
+  "name": "Draft and review, with one way back",
+  "max_nodes": 4,
+  "nodes": [
+    {"name": "draft",  "agent": "draft"},
+    {"name": "review", "agent": "review"}
+  ],
+  "edges": [
+    {"from": "draft", "to": "review"}
+  ],
+  "loops": [
+    {"from": "review", "to": "draft", "cap": 2}
+  ]
+}

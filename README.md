@@ -107,6 +107,7 @@ does, and runs the `.hurl` files beside it in order.
 
 ```
 examples/graph-run/run.sh                                # a five-node graph, a real model
+examples/loop-back/run.sh                                # a graph that doubles back on itself
 examples/cluster-run/run.sh                              # the same, across three machines
 ```
 
@@ -114,6 +115,12 @@ examples/cluster-run/run.sh                              # the same, across thre
 compares the two, against a live provider and a real dr-strange plane. It needs `IP_API_KEY` and
 `drsg` 2.28.0 or newer; one recorded run is kept beside it, with what that run showed about
 parallel generations, fan-in and unpriced spend.
+
+`examples/loop-back` runs the smallest graph that shows a loop back: a reviewer that holds a
+drafter to a house style the drafter was never told, so the first pass fails and the second
+succeeds on the notes the reviewer wrote. The recorded run beside it keeps every step's input, one
+of which is the feature in a single file, and the README says what the example was tuned to avoid —
+including a model that sent work back while saying it had passed.
 
 `examples/cluster-run` is the half of that a single process cannot show: three gateways sharing one
 store, one cache and one plane, a graph started on one of them, and its nodes spread over all

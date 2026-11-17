@@ -1,0 +1,17 @@
+  draft   begins on     86 characters  
+  draft   answered  in   147/  520 tokens,   2479 characters out
+  review  begins on   2509 characters  
+  review  answered  in   895/  157 tokens,    631 characters out
+  * review sends the work back to draft, taken 1 of 2
+    notes: The note breaks all three house-style rules. (1) There is no section headed exactly '## Risks...
+  draft   begins on    740 characters  attempt 2, on what review said
+  draft   answered  in   309/  449 tokens,   2171 characters out
+  review  begins on   2201 characters  
+  review  answered  in   822/  449 tokens,   2171 characters out
+
+  loops taken:   1
+  answered with: review
+  stopped at:    nothing — every node answered
+  spent:         2173/1575 tokens, 0 micros
+  run id:        7f5f490569293deca1494d7c35b6e04e
+  nodes, in the order they finished: draft -> review -> draft -> review

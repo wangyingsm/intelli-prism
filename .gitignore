@@ -40,6 +40,9 @@ RTK.md
 logs/
 *.log
 
+# What running an example wrote; `sample-run/` beside it is the copy that is kept
+examples/*/out/
+
 # Editors / OS
 .idea/
 .vscode/

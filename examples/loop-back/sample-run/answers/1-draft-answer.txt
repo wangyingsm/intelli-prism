@@ -1,0 +1,15 @@
+**Why a write-through cache can still serve stale reads**
+
+Write-through caches forward every store to the backing store before acknowledging it, so many assume the cache is "always coherent." That guarantee covers one thing only—at the moment of the write, the backing store receives the update. It says nothing about freshness of reads in a concurrent or distributed setting, and several mechanisms can still expose stale data.
+
+**1. Write visibility is not read isolation.** The store and cache update together during the write, but a subsequent read is served from whatever value the cache holds at that instant. If the cache write and the store write are not atomic with respect to readers (or the store write is asynchronous beneath the cache), a window exists.
+
+**2. Remote writers bypass the cache.** In multi-node deployments the cache is usually *write-through on miss or on local stores only*. Writes from other nodes go directly to the backing store, leaving this node's copy untouched until invalidated. Between the remote write and the invalidation arriving, the local cache serves stale data. This is the dominant cause in practice.
+
+**3. Invalidation and update races.** A common sequence: reader misses, loads value *v1* from the store; writer updates the store to *v2* and invalidates; the invalidation arrives *before* the reader's fill completes, then the stale *v1* fill overwrites the invalidated entry and stays resident indefinitely. Similar reordering plagues "update cache then invalidate" schemes.
+
+**4. Replicas and eventual consistency.** If the backing store is itself replicated or read-served from followers, the cache faithfully write-throughs to one replica while reads hit a lagging one. Write-through cannot provide a guarantee the store does not.
+
+**5. TTL and coherence-protocol gaps.** Entries with time-to-live outlive an invalidation that was lost, dropped, or for which the cache was partitioned. Also, many caches treat a *peer* write-through as a fill, not an authoritative update.
+
+**Mitigation.** Use cache-aside with invalidate-on-write and lease/token schemes to reject stale fills; version entries with the store's monotonic version and validate on read; prefer invalidation over update so races are bounded; make fills conditional (compare-and-set on version); keep TTLs short on cross-node data; and expose read-your-writes only by pinning to the primary. Treat write-through as a write-policy, not a read-consistency guarantee.
