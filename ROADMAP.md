@@ -579,9 +579,14 @@ by asking the plane for a feeding path from the target back to the asker.
 - **Each loop back carries its own cap**, so a cheap critique loop and an expensive re-survey get
 their own budgets. What follows, and is the cost of the choice: a graph with several loop backs has
 several caps, and what bounds a whole run is their sum, so no one number says what a run may come
-to. A node run again is given the asking node's answer keyed by the asker's name — that is the
-whole value of a loop, a node running once more knowing what the work downstream made of its last
-answer — with the run's own question beside it under `$input` where that node is one nothing feeds.
+to. **A node run again is given what the asker said about its last answer, which is the whole value
+of a loop**: `{"loop_back": "survey", "notes": "the figures are for the wrong year"}` reaches the
+survey as `{"$again": {"review": {"notes": "…", "attempt": 2}}}`, keyed by the asking node as
+fan-in is, because several nodes may loop back to one target. Everything the asker said crosses
+except the ask itself — this code names no field for the revision, so a template and its prompt can
+agree on a shape without a change here — and the attempt number is put in last, where a node
+cannot overwrite it. The run's own question comes beside it under `$input` where that node is one
+nothing feeds.
 What the run comes to holds the last attempt of each node, while every attempt is in the stream.
 Every ask is answered there, the refused ones too (`unknown`, `undeclared`, `spent`,
 `unreachable`), and a refusal leaves the answer the node gave standing rather than failing the run.

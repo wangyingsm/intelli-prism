@@ -105,6 +105,19 @@ pub trait Stopping: Send + Sync {
 /// something left.
 pub const LOOP_BACK_KEY: &str = "loop_back";
 
+/// The key a node's own run-again arrives under, holding what each node that sent work back said.
+///
+/// Keyed by the asking node, as fan-in is, because several nodes may declare a loop back to one
+/// target and a run may have taken more than one of them. What sits under each name is everything
+/// that node answered *except* [`LOOP_BACK_KEY`] — the ask is addressed to the engine and is not
+/// the target's to read — with the attempt number put in beside it.
+///
+/// This is where a revision is asked for. A node that doubles back without saying what was wrong
+/// has sent the work back to a node that will do the same thing again, so the amendment is the
+/// point rather than an extra: `{"loop_back": "survey", "notes": "the figures are for the wrong
+/// year"}` reaches the survey as `{"$again": {"review": {"notes": "…", "attempt": 2}}}`.
+pub const AGAIN_KEY: &str = "$again";
+
 /// The key a graph's own input arrives under when a node nothing feeds runs again.
 ///
 /// A node nothing feeds is given the graph's input as it stands, there being no parent to key it
@@ -188,16 +201,17 @@ pub struct GraphRan {
 ///
 /// A node nothing feeds is given the graph's own input, since there is no parent to key it by.
 ///
-/// A node something has doubled back to is given one more answer, keyed the same way: the node
-/// that asked. That is the whole of what a loop is worth — a node runs again *knowing what the
-/// work downstream of it made of its last answer* — and it is why the asker's answer is kept
-/// rather than dropped with its place in the run. Where that node is also one nothing feeds, the
-/// graph's own input comes with it under [`GRAPH_INPUT_KEY`], because the question the run was
-/// asked is not the asker's to replace.
+/// A node something has doubled back to is given [`AGAIN_KEY`] as well, holding what each node
+/// that sent the work back said about it. That is the whole of what a loop is worth — a node runs
+/// again *knowing what the work downstream of it made of its last answer* — and it is why the
+/// asker's words are kept rather than dropped with its place in the run. Where that node is also
+/// one nothing feeds, the graph's own input comes with it under [`GRAPH_INPUT_KEY`], because the
+/// question the run was asked is not the asker's to replace.
 fn input_for(
     graphing: &Graphing,
     name: &NodeName,
     answered: &BTreeMap<NodeName, NodeRan>,
+    taken: &BTreeMap<(NodeName, NodeName), u32>,
 ) -> String {
     let mut from: Map<String, Value> = Map::new();
     for parent in graphing.graph.parents_of(name) {
@@ -207,13 +221,24 @@ fn input_for(
         from.insert(parent.to_string(), Value::String(answer));
     }
     let fed = !from.is_empty();
+    let mut again: Map<String, Value> = Map::new();
     for back in graphing.graph.loops() {
         if &back.to != name {
             continue;
         }
-        if let Some(ran) = answered.get(&back.from) {
-            from.insert(back.from.to_string(), Value::String(ran.answer.clone()));
+        let count = taken
+            .get(&(back.from.clone(), back.to.clone()))
+            .copied()
+            .unwrap_or_default();
+        if count == 0 {
+            continue;
         }
+        if let Some(ran) = answered.get(&back.from) {
+            again.insert(back.from.to_string(), amendment(&ran.answer, count));
+        }
+    }
+    if !again.is_empty() {
+        from.insert(AGAIN_KEY.to_owned(), Value::Object(again));
     }
     if from.is_empty() {
         return graphing.input.clone();
@@ -225,6 +250,27 @@ fn input_for(
         );
     }
     Value::Object(from).to_string()
+}
+
+/// What one node that sent the work back said about it, as the node running again is given it.
+///
+/// Everything the asker answered except the ask itself, which keeps whatever shape that node chose
+/// — a sentence under `notes`, a list of what is missing, a corrected figure — rather than one
+/// field this crate picked. Nothing is dropped, so a template and its prompt can agree on a shape
+/// this code does not have to know.
+///
+/// An answer that is not a json object carries no amendment and still counts as an attempt: a
+/// model that asked for a loop back wrote an object, so the only way here is a node whose answer
+/// changed shape between the ask and this read.
+fn amendment(answer: &str, taken: u32) -> Value {
+    let mut said = match serde_json::from_str::<Value>(answer) {
+        Ok(Value::Object(said)) => said,
+        _ => Map::new(),
+    };
+    said.remove(LOOP_BACK_KEY);
+    // Put in last, so a node that answered with an `attempt` of its own cannot overwrite the count.
+    said.insert("attempt".to_owned(), json!(taken + 1));
+    Value::Object(said)
 }
 
 /// The node an answer asks to send the work back to, where it asks for one.
@@ -392,7 +438,7 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
                 // can only mean the two were taken from different graphs.
                 continue;
             };
-            let input = input_for(graphing, &name, &answered);
+            let input = input_for(graphing, &name, &answered, &taken);
             say(GraphEvent::Node {
                 name: name.clone(),
                 input: input.clone(),
@@ -740,7 +786,11 @@ mod tests {
             };
             NodeRan {
                 answer: if asking {
-                    json!({LOOP_BACK_KEY: self.back_to}).to_string()
+                    json!({
+                        LOOP_BACK_KEY: self.back_to,
+                        "notes": format!("{node} wants another pass"),
+                    })
+                    .to_string()
                 } else {
                     format!("{node} is content")
                 },
@@ -1357,7 +1407,12 @@ mod tests {
             serde_json::from_str(&runs[2].1).expect("a node run again is given json");
         assert_eq!(
             again,
-            json!({"reply": r#"{"loop_back":"intake"}"#, GRAPH_INPUT_KEY: "a ticket"}),
+            json!({
+                AGAIN_KEY: {
+                    "reply": {"notes": "reply wants another pass", "attempt": 2},
+                },
+                GRAPH_INPUT_KEY: "a ticket",
+            }),
             "a node nothing feeds lost the question the run was asked"
         );
         let after: Value = serde_json::from_str(&runs[3].1).expect("a fed node is given json");
@@ -1528,12 +1583,74 @@ mod tests {
         assert_eq!(order.iter().filter(|node| *node == "review").count(), 2);
     }
 
+    /// The amendment is the point of a loop, so what crosses is pinned shape by shape.
+    ///
+    /// Everything the asker said travels except the ask itself: this crate does not name the
+    /// field a template writes its revision in, so a prompt and a template can agree on one
+    /// without a change here.
+    #[test]
+    fn an_amendment_carries_everything_the_asker_said_but_the_ask() {
+        assert_eq!(
+            amendment(
+                r#"{"loop_back": "survey", "notes": "the year is wrong"}"#,
+                1
+            ),
+            json!({"notes": "the year is wrong", "attempt": 2}),
+            "the ask reached the node it was not addressed to, or the notes did not"
+        );
+        assert_eq!(
+            amendment(
+                r#"{"loop_back": "survey", "missing": ["eu"], "confidence": 0.4}"#,
+                2
+            ),
+            json!({"missing": ["eu"], "confidence": 0.4, "attempt": 3}),
+            "a template's own shape did not survive"
+        );
+        assert_eq!(
+            amendment(r#"{"loop_back": "survey"}"#, 1),
+            json!({"attempt": 2}),
+            "an ask with nothing said about it should still count as an attempt"
+        );
+        assert_eq!(
+            amendment("not json at all", 1),
+            json!({"attempt": 2}),
+            "an answer that is not an object should carry no amendment and still count"
+        );
+        assert_eq!(
+            amendment(r#"{"loop_back": "survey", "attempt": 99}"#, 1),
+            json!({"attempt": 2}),
+            "a node overwrote the count of its own attempts"
+        );
+    }
+
+    /// A node that has not been doubled back to is given no [`AGAIN_KEY`] at all.
+    #[tokio::test]
+    async fn a_node_on_its_first_run_is_given_nothing_about_a_loop_that_declares_it() {
+        let runner = Doubling::new(&[("reply", 1)], "intake", &[]);
+        let (graphing, _events) = looping(
+            doubling_back(2),
+            order(&[("intake", 0), ("reply", 1)]),
+            Arc::clone(&runner),
+            Some(Reaching::over(&[("intake", &["intake", "reply"])]) as Arc<dyn Downstream>),
+        );
+
+        run(&graphing).await;
+
+        assert_eq!(
+            runner.runs()[0].1,
+            "a ticket",
+            "a node declared a loop back's target was told so before anything asked"
+        );
+    }
+
     /// The claim [`GRAPH_INPUT_KEY`] rests on, which is why it is spelled with a `$`.
     #[test]
     fn the_key_the_question_arrives_under_can_be_no_nodes_name() {
-        assert!(
-            NodeName::new(GRAPH_INPUT_KEY).is_err(),
-            "the reserved key is a name a node could be given"
-        );
+        for reserved in [GRAPH_INPUT_KEY, AGAIN_KEY] {
+            assert!(
+                NodeName::new(reserved).is_err(),
+                "{reserved} is a name a node could be given"
+            );
+        }
     }
 }
