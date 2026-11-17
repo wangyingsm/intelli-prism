@@ -22,8 +22,7 @@ x-ip-csrf: 1
     "max_turns": 8,
     "time_limit": 300,
     "req_timeout": 60,
-    "use_best_effort": true,
-    "best_effort_strategy": "aggr"
+    "best_effort": "aggr"
   }
 }
 HTTP 201
@@ -34,7 +33,7 @@ jsonpath "$.tenant" not exists
 jsonpath "$.sandbox.bin.python" == "s3://mybucket/bin/python"
 jsonpath "$.sandbox['notes.md']" == "s3://mybucket/notes.md"
 jsonpath "$.config.tool_set" contains "sql"
-jsonpath "$.config.best_effort_strategy" == "aggr"
+jsonpath "$.config.best_effort" == "aggr"
 jsonpath "$.created_at" isInteger
 
 GET {{host}}/_ip/agents/triage
@@ -65,7 +64,7 @@ HTTP 200
 jsonpath "$[?(@.id == 'triage')]" count == 1
 
 # What the types refuse, each for its own reason: a request that may outlive the run it is
-# part of, a strategy named where nothing asked for one, a path that climbs out of the
+# part of, a way of picking that is not one of the three, a path that climbs out of the
 # sandbox, a name padded with whitespace, and a field this build does not carry.
 PUT {{host}}/_ip/agents/bad
 x-ip-csrf: 1
@@ -74,7 +73,7 @@ HTTP 422
 
 PUT {{host}}/_ip/agents/bad
 x-ip-csrf: 1
-{"name": "Bad", "config": {"role": "system", "prompt": "x", "max_turns": 2, "time_limit": 60, "req_timeout": 10, "best_effort_strategy": "one"}}
+{"name": "Bad", "config": {"role": "system", "prompt": "x", "max_turns": 2, "time_limit": 60, "req_timeout": 10, "best_effort": "guess"}}
 HTTP 422
 
 PUT {{host}}/_ip/agents/bad
