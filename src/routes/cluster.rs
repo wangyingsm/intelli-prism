@@ -24,6 +24,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
+use ip_agents::{AgentConfig, Prompt};
 use ip_cache::CacheBackend;
 use ip_cluster::{Dispatch, NodeEvent};
 use ip_config::Secret;
@@ -185,6 +186,64 @@ impl Reporting for Saying {
     }
 }
 
+/// What the dispatched node runs under: the template this machine stores, told what it may ask for.
+async fn node_config(state: &AppState, work: &Dispatch) -> Result<AgentConfig, String> {
+    let config = match state
+        .store()
+        .agent(&templates_of(&work.owner), &work.agent)
+        .await
+    {
+        Ok(Some(held)) => held.template.config,
+        Ok(None) => {
+            return Err(format!(
+                "the template {} is not stored for this owner",
+                work.agent
+            ));
+        }
+        Err(error) => return Err(format!("the templates could not be read: {error}")),
+    };
+    told_about_looping(state, work, config).await
+}
+
+/// The dispatched node's configuration with what the graph lets it ask for added to its prompt.
+///
+/// **Derived here rather than carried on the dispatch**, which is the same decision
+/// [`Dispatch`] records for the authority and for the same reason: both machines read the one
+/// plane, so a member works out what this node may ask for exactly as the coordinator did. A
+/// dispatch that carried the instruction could carry one the graph does not say, and a member
+/// taking the coordinator's word for it would be told what a node may do by something other than
+/// the graph that declares it.
+///
+/// One statement rather than a whole graph read: only the loop backs decide this.
+///
+/// A member that cannot reach the plane refuses the node. It cannot tell a graph with no loop
+/// backs from one it failed to read, and running a node that may send its work back without
+/// telling it so is the defect this exists to close — the same node would have been told, had the
+/// coordinator run it itself.
+async fn told_about_looping(
+    state: &AppState,
+    work: &Dispatch,
+    config: AgentConfig,
+) -> Result<AgentConfig, String> {
+    let Some(plane) = state.graphs() else {
+        return Err("this deployment keeps no graphs, so a node of one cannot run here".to_owned());
+    };
+    let loops = plane
+        .loops(&work.owner, &work.graph)
+        .await
+        .map_err(|error| format!("the graph's loop backs could not be read: {error}"))?;
+    let Some(advice) = ip_graph::loop_advice(&loops, &work.node) else {
+        return Ok(config);
+    };
+    let told = Prompt::new(&format!("{}\n\n{advice}", config.prompt().as_str())).map_err(|_| {
+        format!(
+            "the node {} declares a loop back, and its prompt has no room to be told so",
+            work.node
+        )
+    })?;
+    Ok(config.with_prompt(told))
+}
+
 /// Resolves the dispatched node against this machine's own database and runs it.
 ///
 /// Every refusal is an event rather than a return, because the stream is already open by the
@@ -220,15 +279,9 @@ async fn dispatched(state: AppState, work: Dispatch, say: UnboundedSender<NodeEv
             ));
         }
     };
-    let config = match store.agent(&templates_of(&work.owner), &work.agent).await {
-        Ok(Some(held)) => held.template.config,
-        Ok(None) => {
-            return refuse(format!(
-                "the template {} is not stored for this owner",
-                work.agent
-            ));
-        }
-        Err(error) => return refuse(format!("the templates could not be read: {error}")),
+    let config = match node_config(&state, &work).await {
+        Ok(config) => config,
+        Err(why) => return refuse(why),
     };
     let pinned = match Pinned::resolve(&work.requested, &config) {
         Ok(pinned) => pinned,
@@ -308,7 +361,8 @@ mod tests {
     use ip_core::{
         Capability, CapabilityScope, Grant, TenantId, TnKey, UserId, route::ClusterAddress,
     };
-    use ip_graph::{GraphOwner, NodeName};
+    use ip_drsg::{Replies, StubPlane};
+    use ip_graph::{GraphOwner, GraphPlane, NodeName};
     use ip_run::Requested;
     use ip_storage::{
         AccountKind, AgentOwner, AgentStore, By, GrantStore, Membership, MembershipStore, NewAgent,
@@ -481,16 +535,84 @@ upstream_speaks = "anthropic"
         Arc::new(store)
     }
 
+    /// An upstream that keeps what it was sent, so a test can read what the model was told.
+    struct Recording {
+        /// Each request the gateway sent on, in order.
+        seen: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ip_gateway::upstream::Upstream for Recording {
+        async fn send(
+            &self,
+            request: axum::http::Request<ip_gateway::body::GatewayBody>,
+        ) -> Result<axum::http::Response<ip_gateway::body::GatewayBody>, ip_gateway::UpstreamError>
+        {
+            use http_body_util::BodyExt;
+
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            if let Ok(said) = serde_json::from_slice::<serde_json::Value>(&body) {
+                self.seen
+                    .lock()
+                    .expect("the record is not poisoned")
+                    .push(said);
+            }
+            Answering
+                .send(axum::http::Request::new(ip_gateway::from_bytes(
+                    Vec::new().into(),
+                )))
+                .await
+        }
+    }
+
+    /// What a plane answers a worker's loop-back read with when the graph declares none.
+    fn no_loops() -> Replies {
+        Replies::scripted([(
+            "plane.cypher",
+            serde_json::json!({"columns": ["from", "to", "cap"], "rows": []}),
+        )])
+    }
+
     /// A worker holding its cluster's secret, with a template its peers may dispatch.
-    async fn worker() -> Router {
+    ///
+    /// It holds a plane, as a member of a cluster must: membership is kept there, so a deployment
+    /// that cannot read it cannot be dispatched to. The stub comes back with the router because a
+    /// dropped one closes its socket, and then the worker refuses what it cannot read.
+    async fn worker_over(replies: Replies) -> (Router, StubPlane) {
+        let plane = StubPlane::start(replies).await;
         let state = super::super::harness::serving(store().await, SERVING, Arc::new(Answering))
             .with_cluster_secret(Secret::from(STUB_SECRET))
+            .with_graphs(Arc::new(GraphPlane::new(plane.client())))
             .with_cluster(
                 ClusterAddress::of("127.0.0.1:8080".parse().unwrap())
                     .unwrap()
                     .unwrap(),
             );
-        super::super::router(state)
+        (super::super::router(state), plane)
+    }
+
+    /// The same over a graph that declares no loop back, which is every test but one.
+    async fn worker() -> Worker {
+        let (router, plane) = worker_over(no_loops()).await;
+        Worker { router, plane }
+    }
+
+    /// A worker and the plane it reads, kept together so neither outlives the other.
+    struct Worker {
+        /// What a dispatch is sent to.
+        router: Router,
+        /// The plane it reads the graph's loop backs from, held open for as long as the router
+        /// is: a dropped stub closes its socket, and the worker then refuses what it cannot read.
+        #[expect(dead_code, reason = "held for its lifetime, not read")]
+        plane: StubPlane,
+    }
+
+    impl Worker {
+        /// Sends one request, shaped like [`tower::ServiceExt::oneshot`] so that a test of a
+        /// worker reads exactly as a test of a bare router does.
+        async fn oneshot(&self, request: Request<Body>) -> Result<Response<Body>, Infallible> {
+            self.router.clone().oneshot(request).await
+        }
     }
 
     /// A dispatch as another member sends one, with whatever the test changes about it.
@@ -546,6 +668,80 @@ upstream_speaks = "anthropic"
         assert_eq!(ran.answer, "four");
         assert_eq!(ran.stopped, ip_run::Stopped::Answered);
         assert_eq!(ran.traces.len(), 1, "one turn, followed under one trace");
+    }
+
+    /// A node that runs here is told what a node of that graph may ask for, derived here.
+    ///
+    /// **The point of the test is that nothing told it.** The dispatch carries the node, the
+    /// graph and the owner, and no instruction; this machine reads the loop backs from the plane
+    /// both machines share and works out the same text the coordinator would have. A member that
+    /// believed a dispatch instead could be told a node may do what its graph does not say.
+    #[tokio::test]
+    async fn a_dispatched_node_is_told_what_the_graph_lets_it_ask_for() {
+        let upstream = Arc::new(Recording {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let plane = StubPlane::start(Replies::scripted([(
+            "plane.cypher",
+            serde_json::json!({
+                "columns": ["from", "to", "cap"],
+                "rows": [["triage", "intake", 3]],
+            }),
+        )]))
+        .await;
+        let state = super::super::harness::serving(
+            store().await,
+            SERVING,
+            Arc::clone(&upstream) as Arc<dyn ip_gateway::upstream::Upstream>,
+        )
+        .with_cluster_secret(Secret::from(STUB_SECRET))
+        .with_graphs(Arc::new(GraphPlane::new(plane.client())));
+        let router = super::super::router(state);
+
+        let answered = router
+            .oneshot(sent(Some(STUB_SECRET), &stub_dispatch()))
+            .await
+            .unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        let _ = streamed(answered).await;
+
+        let sent = upstream
+            .seen
+            .lock()
+            .expect("the record is not poisoned")
+            .clone();
+        let told = sent
+            .first()
+            .expect("the node took a turn")
+            .get("system")
+            .expect("a system prompt crossed")
+            .to_string();
+        assert!(
+            told.contains(ip_graph::LOOP_BACK_KEY) && told.contains("intake (at most 3 times)"),
+            "a node dispatched here was not told what its graph lets it ask for: {told}"
+        );
+    }
+
+    /// A worker that cannot read the graph refuses the node rather than running it uninstructed.
+    ///
+    /// The coordinator runs a refused node at home, where it is told properly, so this degrades
+    /// to a local run rather than to a node that cannot ask for what its graph declares.
+    #[tokio::test]
+    async fn a_worker_that_cannot_read_the_graph_refuses_the_node() {
+        let state = super::super::harness::serving(store().await, SERVING, Arc::new(Answering))
+            .with_cluster_secret(Secret::from(STUB_SECRET));
+        let router = super::super::router(state);
+
+        let answered = router
+            .oneshot(sent(Some(STUB_SECRET), &stub_dispatch()))
+            .await
+            .unwrap();
+
+        let said = streamed(answered).await;
+        let Some((_, NodeEvent::Refused(why))) = said.last() else {
+            panic!("a worker with no plane ran the node anyway: {said:?}");
+        };
+        assert!(why.contains("keeps no graphs"), "{why}");
     }
 
     /// What a node said on the way is the run's own vocabulary, not a second one.
@@ -854,10 +1050,12 @@ upstream_speaks = "anthropic"
     }
 
     /// A worker taking its time over each turn, so a stop has somewhere to land.
-    async fn slow_worker() -> (Router, AppState) {
+    async fn slow_worker() -> (Router, AppState, StubPlane) {
+        let plane = StubPlane::start(no_loops()).await;
         let state = super::super::harness::serving(store().await, SERVING, Arc::new(Slowly))
-            .with_cluster_secret(Secret::from(STUB_SECRET));
-        (super::super::router(state.clone()), state)
+            .with_cluster_secret(Secret::from(STUB_SECRET))
+            .with_graphs(Arc::new(GraphPlane::new(plane.client())));
+        (super::super::router(state.clone()), state, plane)
     }
 
     /// Publishes a run's stop the way a coordinator does, through the seam that carries it.
@@ -872,7 +1070,7 @@ upstream_speaks = "anthropic"
     /// The whole of commit 6: a stop said on one machine ends a node running on another.
     #[tokio::test]
     async fn a_stop_the_coordinator_published_ends_a_node_running_here() {
-        let (router, state) = slow_worker().await;
+        let (router, state, _plane) = slow_worker().await;
         let work = stub_dispatch();
         let stopping = {
             let state = state.clone();
@@ -908,7 +1106,7 @@ upstream_speaks = "anthropic"
     /// A stop is addressed to one run, which is what keeps one tenant's stop out of another's.
     #[tokio::test]
     async fn a_stop_published_for_another_run_does_not_touch_this_node() {
-        let (router, state) = slow_worker().await;
+        let (router, state, _plane) = slow_worker().await;
         let other = GraphRunId::generate().expect("a run id");
         let stopping = {
             let state = state.clone();
@@ -939,7 +1137,7 @@ upstream_speaks = "anthropic"
     /// coordinator off to run the node at home, which for a stopped run is the one wrong answer.
     #[tokio::test]
     async fn a_node_dispatched_after_the_stop_was_published_is_cut_short_and_never_run() {
-        let (router, state) = slow_worker().await;
+        let (router, state, _plane) = slow_worker().await;
         let work = stub_dispatch();
         publish_the_stop(&state, work.run).await;
 
@@ -962,8 +1160,10 @@ upstream_speaks = "anthropic"
     /// before the stop existed.
     #[tokio::test]
     async fn a_worker_that_cannot_follow_the_signals_runs_the_node_to_completion() {
+        let plane = StubPlane::start(no_loops()).await;
         let state = super::super::harness::serving(store().await, SERVING, Arc::new(Answering))
-            .with_cluster_secret(Secret::from(STUB_SECRET));
+            .with_cluster_secret(Secret::from(STUB_SECRET))
+            .with_graphs(Arc::new(GraphPlane::new(plane.client())));
         state.cache_failure().fail_now();
         let router = super::super::router(state.clone());
 

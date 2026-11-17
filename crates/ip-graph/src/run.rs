@@ -129,6 +129,11 @@ pub const GRAPH_INPUT_KEY: &str = "$input";
 
 /// What a node that may send work back is told, beyond what its own template says.
 ///
+/// The loop backs rather than the graph, because a member running one node of somebody else's
+/// graph reads only those: it derives this for itself from the plane both machines share, so what
+/// a node is told cannot differ between the machine that holds the graph and the machine that runs
+/// the node.
+///
 /// Nothing, where the graph declares no loop back from it: a node that cannot double back is told
 /// nothing about doubling back, so a template written for one graph is not read differently by
 /// another.
@@ -145,12 +150,8 @@ pub const GRAPH_INPUT_KEY: &str = "$input";
 /// attempt. A node that asks when the cap is spent is told no, the stream says `spent`, and its
 /// own answer stands — which costs a turn and breaks nothing.
 #[must_use]
-pub fn loop_advice(graph: &RunGraph, node: &NodeName) -> Option<String> {
-    let mut declared: Vec<&LoopBack> = graph
-        .loops()
-        .iter()
-        .filter(|back| &back.from == node)
-        .collect();
+pub fn loop_advice(loops: &[LoopBack], node: &NodeName) -> Option<String> {
+    let mut declared: Vec<&LoopBack> = loops.iter().filter(|back| &back.from == node).collect();
     if declared.is_empty() {
         return None;
     }
@@ -1696,7 +1697,8 @@ mod tests {
             &[("review", "survey", 2), ("review", "draft", 1)],
         );
 
-        let told = loop_advice(&graph, &name("review")).expect("the node declares two loop backs");
+        let told =
+            loop_advice(graph.loops(), &name("review")).expect("the node declares two loop backs");
 
         assert!(
             told.contains(r#"{"loop_back": "<step>", "notes": "<what must change>"}"#),
@@ -1721,10 +1723,10 @@ mod tests {
             &[("reply", "intake", 2)],
         );
 
-        assert_eq!(loop_advice(&looping, &name("intake")), None);
-        assert!(loop_advice(&looping, &name("reply")).is_some());
+        assert_eq!(loop_advice(looping.loops(), &name("intake")), None);
+        assert!(loop_advice(looping.loops(), &name("reply")).is_some());
         assert_eq!(
-            loop_advice(&graph(&["only"], &[]), &name("only")),
+            loop_advice(graph(&["only"], &[]).loops(), &name("only")),
             None,
             "a graph with no loop back at all told a node about one"
         );

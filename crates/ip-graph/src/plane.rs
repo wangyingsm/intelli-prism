@@ -986,6 +986,30 @@ impl GraphPlane {
         Ok(())
     }
 
+    /// One graph's loop backs, without reading the rest of it.
+    ///
+    /// A read of its own because a member running one node of somebody else's graph needs this and
+    /// nothing else of the graph: it is one statement where [`get`](Self::get) is four reads, and
+    /// what it answers is what says whether that node may send its work back.
+    ///
+    /// Nothing distinguishes a graph that is not there from one that declares no loop back. Both
+    /// answer with nothing, and a caller that needs to know which has [`get`](Self::get).
+    pub async fn loops(
+        &self,
+        owner: &GraphOwner,
+        id: &GraphId,
+    ) -> Result<Vec<LoopBack>, GraphError> {
+        loops_from(
+            &self
+                .drsg
+                .cypher(
+                    &stored_loops(),
+                    json!({"graph": id.as_str(), "owner": owner.written()}),
+                )
+                .await?,
+        )
+    }
+
     /// One owner's graph, or nothing where that owner has none under the id.
     ///
     /// Four reads — the graph, its nodes, its edges, its loop backs — each filtered on the owner,
@@ -1025,15 +1049,7 @@ impl GraphPlane {
             })?)?;
         let nodes = nodes_from(&self.drsg.query(nodes_plan(owner, id)).await?, owner, id)?;
         let edges = edges_from(&self.drsg.query(edges_plan(owner, id)).await?)?;
-        let loops = loops_from(
-            &self
-                .drsg
-                .cypher(
-                    &stored_loops(),
-                    json!({"graph": id.as_str(), "owner": owner.written()}),
-                )
-                .await?,
-        )?;
+        let loops = self.loops(owner, id).await?;
         RunGraph::checked(RunGraphParts {
             id: id.clone(),
             name,

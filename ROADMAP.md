@@ -592,7 +592,11 @@ answer is good enough is a role instruction, so it belongs in the prompt; but wh
 may send work back to, and how often, is in the graph, which the node never sees. So the run
 appends it: the shape to answer in, that the notes are the point, and each target with its cap. A
 node the graph declares no loop back from is told nothing, so one template reads the same in any
-graph, and the stored template is untouched — a read of it answers what the operator wrote. What is
+graph, and the stored template is untouched — a read of it answers what the operator wrote. **A
+node dispatched to another member is told the same thing by that member**, which reads the loop
+backs from the plane both machines share rather than being sent the instruction: a dispatch that
+carried it could carry one the graph does not say. A member that cannot read the graph refuses the
+node, and the coordinator runs it at home, where it is told properly. What is
 deliberately left out is how much of each cap is *left*: every node is prepared before the first
 one runs, so that number would be stale by the second attempt. A node that asks when the cap is
 spent is told no, and its own answer stands.

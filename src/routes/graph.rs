@@ -1056,7 +1056,7 @@ fn told_about_looping(
     graph: &RunGraph,
     node: &NodeName,
 ) -> Result<AgentConfig, Refusal> {
-    let Some(advice) = ip_graph::loop_advice(graph, node) else {
+    let Some(advice) = ip_graph::loop_advice(graph.loops(), node) else {
         return Ok(config.clone());
     };
     let told = Prompt::new(&format!("{}\n\n{advice}", config.prompt().as_str())).map_err(|_| {
