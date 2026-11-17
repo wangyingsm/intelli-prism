@@ -587,6 +587,15 @@ except the ask itself — this code names no field for the revision, so a templa
 agree on a shape without a change here — and the attempt number is put in last, where a node
 cannot overwrite it. The run's own question comes beside it under `$input` where that node is one
 nothing feeds.
+- **A node that may send work back is told so by the engine, not by its operator.** Whether an
+answer is good enough is a role instruction, so it belongs in the prompt; but which steps this node
+may send work back to, and how often, is in the graph, which the node never sees. So the run
+appends it: the shape to answer in, that the notes are the point, and each target with its cap. A
+node the graph declares no loop back from is told nothing, so one template reads the same in any
+graph, and the stored template is untouched — a read of it answers what the operator wrote. What is
+deliberately left out is how much of each cap is *left*: every node is prepared before the first
+one runs, so that number would be stale by the second attempt. A node that asks when the cap is
+spent is told no, and its own answer stands.
 What the run comes to holds the last attempt of each node, while every attempt is in the stream.
 Every ask is answered there, the refused ones too (`unknown`, `undeclared`, `spent`,
 `unreachable`), and a refusal leaves the answer the node gave standing rather than failing the run.

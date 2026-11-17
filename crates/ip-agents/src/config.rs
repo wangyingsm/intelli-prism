@@ -570,6 +570,18 @@ impl AgentConfig {
         &self.0.prompt
     }
 
+    /// The same configuration told something else, for a caller that must add to the prompt.
+    ///
+    /// Nothing is re-checked, and nothing needs to be: what [`AgentConfig::new`] refuses is parts
+    /// that contradict each other, and a prompt contradicts none of them. The stored template is
+    /// untouched — this is the run's own copy — so what an operator wrote is still what a read of
+    /// the template answers.
+    #[must_use]
+    pub fn with_prompt(mut self, prompt: Prompt) -> Self {
+        self.0.prompt = prompt;
+        self
+    }
+
     /// Every tool it asks for.
     #[must_use]
     pub const fn tool_set(&self) -> &ToolSet {

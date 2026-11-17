@@ -62,7 +62,9 @@ all of their answers at once, and a generation really runs at once. A graph may 
 back, the one cycle permitted: a node unsatisfied with what it was given answers
 `{"loop_back": "survey", "notes": "the figures are for the wrong year"}`, and where the graph
 declares that loop and its own cap has something left, that node and everything after it runs
-again — the survey reading what the review made of its last answer, under `$again`.
+again — the survey reading what the review made of its last answer, under `$again`. A node that
+may double back is told so by the run itself, which names the steps it may send work back to and
+how often, so no template has to repeat the graph in prose.
 Where a deployment is a cluster, its nodes are spread over the live members — the one the caller asked included, since it
 is a machine with a gateway on it like the rest — and a node sent elsewhere streams back the same
 events a local one says, the member authenticating itself with a shared cluster secret and

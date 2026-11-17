@@ -127,6 +127,50 @@ pub const AGAIN_KEY: &str = "$again";
 /// with no node's name however a graph is written.
 pub const GRAPH_INPUT_KEY: &str = "$input";
 
+/// What a node that may send work back is told, beyond what its own template says.
+///
+/// Nothing, where the graph declares no loop back from it: a node that cannot double back is told
+/// nothing about doubling back, so a template written for one graph is not read differently by
+/// another.
+///
+/// **Why the engine writes this rather than the operator.** Judging whether an answer is good
+/// enough is a role instruction, so it belongs in the prompt; but *which* steps this node may send
+/// work back to, and how often, is in the graph, which the node never sees. An operator who wrote
+/// it by hand would be copying the graph into prose and would have to keep the two in step —
+/// renaming a node, or changing a cap, would leave a template confidently naming something that is
+/// refused. Here it is derived, so it cannot drift.
+///
+/// What is deliberately *not* here: how much of each cap is left. Every node of a run is prepared
+/// before the first one starts, so this text is written once and would be stale by the second
+/// attempt. A node that asks when the cap is spent is told no, the stream says `spent`, and its
+/// own answer stands — which costs a turn and breaks nothing.
+#[must_use]
+pub fn loop_advice(graph: &RunGraph, node: &NodeName) -> Option<String> {
+    let mut declared: Vec<&LoopBack> = graph
+        .loops()
+        .iter()
+        .filter(|back| &back.from == node)
+        .collect();
+    if declared.is_empty() {
+        return None;
+    }
+    declared.sort_by(|one, two| one.to.cmp(&two.to));
+    let steps = declared
+        .iter()
+        .map(|back| format!("{} (at most {} times)", back.to, back.cap.get()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "You may send this work back to an earlier step instead of answering, where what you were \
+         given is not good enough to answer well. To do that, answer with nothing but this json: \
+         {{\"{LOOP_BACK_KEY}\": \"<step>\", \"notes\": \"<what must change>\"}}. The notes are the \
+         point of sending it back: a step given none will do the same thing again. Anything else \
+         you put in that object reaches it too. The steps you may send it back to are: {steps}. \
+         Answer normally wherever you can — a step you may not name, or one already sent work back \
+         as often as it may be, is refused, and the answer you gave stands as it is."
+    ))
+}
+
 /// Whatever can say which nodes one node's answer reaches.
 ///
 /// A seam for the reason [`RunsNode`] and [`Stopping`] are seams, although what implements it here
@@ -1640,6 +1684,49 @@ mod tests {
             runner.runs()[0].1,
             "a ticket",
             "a node declared a loop back's target was told so before anything asked"
+        );
+    }
+
+    /// A node is told what it may ask for, and told it in terms of the graph it is in.
+    #[test]
+    fn a_node_that_may_send_work_back_is_told_which_steps_and_how_often() {
+        let graph = looping_graph(
+            &["survey", "draft", "review"],
+            &[("survey", "draft"), ("draft", "review")],
+            &[("review", "survey", 2), ("review", "draft", 1)],
+        );
+
+        let told = loop_advice(&graph, &name("review")).expect("the node declares two loop backs");
+
+        assert!(
+            told.contains(r#"{"loop_back": "<step>", "notes": "<what must change>"}"#),
+            "the shape to answer in was not spelled out: {told}"
+        );
+        assert!(
+            told.contains("draft (at most 1 times), survey (at most 2 times)"),
+            "the steps and their caps were not named, in name order: {told}"
+        );
+        assert!(
+            told.contains("notes are the point"),
+            "nothing told the node that a revision needs saying: {told}"
+        );
+    }
+
+    /// A node with nothing to ask for is told nothing, so one template reads the same in any graph.
+    #[test]
+    fn a_node_that_may_not_send_work_back_is_told_nothing() {
+        let looping = looping_graph(
+            &["intake", "reply"],
+            &[("intake", "reply")],
+            &[("reply", "intake", 2)],
+        );
+
+        assert_eq!(loop_advice(&looping, &name("intake")), None);
+        assert!(loop_advice(&looping, &name("reply")).is_some());
+        assert_eq!(
+            loop_advice(&graph(&["only"], &[]), &name("only")),
+            None,
+            "a graph with no loop back at all told a node about one"
         );
     }
 

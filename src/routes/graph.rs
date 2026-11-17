@@ -11,7 +11,7 @@ use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
-use ip_agents::{AgentConfig, AgentId};
+use ip_agents::{AgentConfig, AgentId, Prompt};
 use ip_auth::Authority;
 use ip_cluster::{ClusterClient, Dispatch, NodeEvent};
 use ip_core::route::ClusterAddress;
@@ -1001,6 +1001,10 @@ async fn prepare(
             }
             Err(error) => return Err(Box::new(store_refusal(error))),
         };
+        let config = match told_about_looping(&config, graph, &node.name) {
+            Ok(config) => config,
+            Err(refusal) => return Err(refusal),
+        };
         let pinned = Pinned::resolve(preparing.requested, &config).map_err(unprocessable)?;
         let target = match Target::aimed(
             preparing.state.upstreams(),
@@ -1036,6 +1040,37 @@ async fn prepare(
         );
     }
     Ok(prepared)
+}
+
+/// The node's configuration with what the graph lets it ask for added to its prompt.
+///
+/// The template as stored where the graph declares no loop back from this node, so a template is
+/// only ever told about a graph that gave it something to say.
+///
+/// A prompt that will not take the addition refuses the run rather than running a node that cannot
+/// be told what it may do: a graph declares the loop back, so a node silently unable to ask for it
+/// would be a feature that is there in the graph and missing in the run. It needs a stored prompt
+/// within a few hundred bytes of the 32 KiB ceiling to happen at all.
+fn told_about_looping(
+    config: &AgentConfig,
+    graph: &RunGraph,
+    node: &NodeName,
+) -> Result<AgentConfig, Refusal> {
+    let Some(advice) = ip_graph::loop_advice(graph, node) else {
+        return Ok(config.clone());
+    };
+    let told = Prompt::new(&format!("{}\n\n{advice}", config.prompt().as_str())).map_err(|_| {
+        Box::new(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "the node {node} declares a loop back, and its prompt has no room to be told so"
+                ),
+            )
+                .into_response(),
+        )
+    })?;
+    Ok(config.clone().with_prompt(told))
 }
 
 /// The same owner, as the template store spells it.
@@ -1170,8 +1205,9 @@ async fn start(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
+    use http_body_util::BodyExt;
     use ip_core::{Grant, TnKey, UserId};
     use ip_drsg::{Replies, SilentPlane, StubPlane};
     use ip_graph::{GRAPH_LABEL, GraphPlane, NODE_LABEL};
@@ -1415,6 +1451,103 @@ mod tests {
         assert_eq!(view["max_nodes"], 8);
         assert_eq!(view["edges"][0]["from"], "intake");
         assert_eq!(view["edges"][0]["to"], "reply");
+    }
+
+    /// A prompt with no room for the instruction refuses the run rather than losing the feature.
+    #[test]
+    fn a_node_whose_prompt_cannot_be_told_about_looping_refuses_the_run() {
+        use ip_agents::{AgentConfigParts, AgentRole, MaxTurns, ReqTimeout, TimeLimit, ToolSet};
+
+        let full = AgentConfig::new(AgentConfigParts {
+            role: AgentRole::System,
+            prompt: Prompt::new(&"a".repeat(32 * 1024)).expect("a prompt at the ceiling"),
+            tool_set: ToolSet::default(),
+            max_turns: MaxTurns::new(4).unwrap(),
+            time_limit: TimeLimit::new(60).unwrap(),
+            req_timeout: ReqTimeout::new(10).unwrap(),
+            best_effort: None,
+            model: None,
+            api: None,
+        })
+        .expect("a config whose parts agree");
+        let graph = RunGraph::checked(RunGraphParts {
+            id: GraphId::new("triage").unwrap(),
+            name: GraphName::new("Triage").unwrap(),
+            owner: GraphOwner::Tenant(tenant("acme")),
+            nodes: vec![
+                GraphNode {
+                    name: NodeName::new("intake").unwrap(),
+                    agent: ip_agents::AgentId::new("intake-agent").unwrap(),
+                },
+                GraphNode {
+                    name: NodeName::new("reply").unwrap(),
+                    agent: ip_agents::AgentId::new("reply-agent").unwrap(),
+                },
+            ],
+            edges: vec![GraphEdge {
+                from: NodeName::new("intake").unwrap(),
+                to: NodeName::new("reply").unwrap(),
+            }],
+            loops: vec![LoopBack {
+                from: NodeName::new("reply").unwrap(),
+                to: NodeName::new("intake").unwrap(),
+                cap: ip_graph::LoopCap::new(2).unwrap(),
+            }],
+            max_nodes: MaxNodes::new(8).unwrap(),
+        })
+        .expect("a graph that holds together");
+
+        let intake = NodeName::new("intake").unwrap();
+        let reply = NodeName::new("reply").unwrap();
+        assert!(
+            told_about_looping(&full, &graph, &intake).is_ok(),
+            "a node with nothing to be told was refused for a prompt that is long"
+        );
+        assert!(
+            told_about_looping(&full, &graph, &reply).is_err(),
+            "a prompt with no room for the instruction ran anyway"
+        );
+    }
+
+    /// The node that may double back is told so, and the one that may not is not.
+    ///
+    /// Read off what the upstream was actually sent, because that is the only place the two
+    /// prompts can be told apart: the template they share is stored once and unchanged.
+    #[tokio::test]
+    async fn a_node_that_may_double_back_is_told_what_it_may_ask_for() {
+        let (router, state, _plane, upstream) = recorded(
+            &["intake-agent", "reply-agent"],
+            looping_chain(sorted_chain()),
+        )
+        .await;
+
+        let answered = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/graph_run/triage?tenant=acme",
+        )
+        .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let _ = body_of(answered).await;
+
+        let sent = upstream.sent();
+        assert_eq!(sent.len(), 2, "a chain of two took other than two turns");
+        let said = |one: &serde_json::Value| one["system"].to_string();
+        assert!(
+            !said(&sent[0]).contains(ip_graph::LOOP_BACK_KEY),
+            "the first node, which declares no loop back, was told about one: {}",
+            said(&sent[0])
+        );
+        let told = said(&sent[1]);
+        assert!(
+            told.contains(ip_graph::LOOP_BACK_KEY) && told.contains("intake (at most 2 times)"),
+            "the node that may send work back was not told what it may ask for: {told}"
+        );
+        assert!(
+            told.contains("Be helpful."),
+            "the template's own prompt was replaced rather than added to: {told}"
+        );
     }
 
     #[tokio::test]
@@ -1878,6 +2011,50 @@ upstream_speaks = "anthropic"
         }
     }
 
+    /// The same, keeping every request body, so a test can read what the model was actually told.
+    struct Recording {
+        /// Each request the gateway sent on, in order.
+        seen: Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl Recording {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// What each request said, as json.
+        fn sent(&self) -> Vec<serde_json::Value> {
+            self.seen
+                .lock()
+                .expect("the record is not poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ip_gateway::upstream::Upstream for Recording {
+        async fn send(
+            &self,
+            request: axum::http::Request<ip_gateway::body::GatewayBody>,
+        ) -> Result<axum::http::Response<ip_gateway::body::GatewayBody>, ip_gateway::UpstreamError>
+        {
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            if let Ok(said) = serde_json::from_slice::<serde_json::Value>(&body) {
+                self.seen
+                    .lock()
+                    .expect("the record is not poisoned")
+                    .push(said);
+            }
+            Answering
+                .send(axum::http::Request::new(ip_gateway::from_bytes(
+                    Vec::new().into(),
+                )))
+                .await
+        }
+    }
+
     /// A template every node of the test graphs runs.
     fn template(id: &str) -> ip_agents::AgentTemplate {
         use ip_agents::{
@@ -1933,6 +2110,22 @@ upstream_speaks = "anthropic"
         (super::super::router(state.clone()), state, plane)
     }
 
+    /// A router whose upstream keeps what it was sent, over a plane answering as scripted.
+    async fn recorded(
+        named: &[&str],
+        replies: Replies,
+    ) -> (Router, AppState, StubPlane, Arc<Recording>) {
+        let plane = StubPlane::start(replies).await;
+        let upstream = Recording::new();
+        let state = super::super::harness::serving(
+            store_with_templates(named).await,
+            SERVING,
+            Arc::clone(&upstream) as Arc<dyn ip_gateway::upstream::Upstream>,
+        )
+        .with_graphs(Arc::new(GraphPlane::new(plane.client())));
+        (super::super::router(state.clone()), state, plane, upstream)
+    }
+
     /// Everything the plane is asked for when a chain of two is run, in the order it is asked.
     ///
     /// Six calls, not four: reading the graph is three queries and a statement for its loop backs,
@@ -1950,6 +2143,27 @@ upstream_speaks = "anthropic"
             nodes(),
             serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
             no_loops(),
+            order,
+            nodes(),
+        ])
+    }
+
+    /// The same script, for a graph whose second node may send the work back to the first.
+    fn looping_chain(order: serde_json::Value) -> Replies {
+        let nodes = || {
+            serde_json::json!([
+                node_row(2, "acme", "triage", "intake", "intake-agent"),
+                node_row(3, "acme", "triage", "reply", "reply-agent"),
+            ])
+        };
+        Replies::in_turn([
+            serde_json::json!([graph_row("acme", "triage")]),
+            nodes(),
+            serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
+            serde_json::json!({
+                "columns": ["from", "to", "cap"],
+                "rows": [["reply", "intake", 2]],
+            }),
             order,
             nodes(),
         ])
