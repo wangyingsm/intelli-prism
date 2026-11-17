@@ -70,6 +70,30 @@ pub enum GraphEvent {
         /// What it said.
         event: RunEvent,
     },
+    /// A node has asked for the work to go back to an earlier node, and it is going.
+    LoopBack {
+        /// The node that asked.
+        from: NodeName,
+        /// The node whose work is being done again.
+        to: NodeName,
+        /// How many times this loop back has been taken, this time included.
+        taken: u32,
+        /// How many times it may be.
+        cap: u32,
+    },
+    /// A node asked for the work to go back and it is not going.
+    ///
+    /// Said rather than swallowed, because a template asking for something it may not have is
+    /// exactly what an operator needs to see: the run carries on as though the node had simply
+    /// answered, and nothing else would say that it tried.
+    LoopRefused {
+        /// The node that asked.
+        from: NodeName,
+        /// What it named, as it named it — which may be no node's name at all.
+        asked: String,
+        /// Why the answer is no.
+        why: LoopRefusal,
+    },
     /// The graph is over, and this is all of it.
     Done {
         /// What it answered: every node nothing reads from, keyed by name.
@@ -93,6 +117,8 @@ impl GraphEvent {
             Self::Node { .. } => "node",
             Self::NodeDone { .. } => "node_done",
             Self::Turn { event, .. } => event.name(),
+            Self::LoopBack { .. } => "loop_back",
+            Self::LoopRefused { .. } => "loop_refused",
             Self::Done { .. } => "done",
         }
     }
@@ -122,6 +148,23 @@ impl GraphEvent {
                 }
                 body
             }
+            Self::LoopBack {
+                from,
+                to,
+                taken,
+                cap,
+            } => json!({
+                "node": from.as_str(),
+                "back_to": to.as_str(),
+                "taken": taken,
+                "cap": cap,
+            }),
+            Self::LoopRefused { from, asked, why } => json!({
+                "node": from.as_str(),
+                "back_to": asked,
+                "refusal": why.name(),
+                "why": why.to_string(),
+            }),
             Self::Done {
                 answer,
                 stopped_at,
@@ -133,6 +176,43 @@ impl GraphEvent {
                 "cost_micros": spend.cost.micros(),
             }),
         }
+    }
+}
+
+/// Why a loop back a node asked for is not being taken.
+///
+/// Not in this crate's `error.rs`, deliberately: none of these fails anything. A refused loop is a
+/// run carrying on with the answer the node gave, and this is what the stream says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopRefusal {
+    /// The graph holds no node under the name that was asked for.
+    Unknown,
+    /// The graph holds that node, and declares no loop back to it from the asking one.
+    Undeclared,
+    /// It is declared, and has been taken as often as its cap allows.
+    Spent,
+}
+
+impl LoopRefusal {
+    /// The one word this is reported under.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Undeclared => "undeclared",
+            Self::Spent => "spent",
+        }
+    }
+}
+
+impl std::fmt::Display for LoopRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let said = match self {
+            Self::Unknown => "the graph holds no node of that name",
+            Self::Undeclared => "the graph declares no loop back to it from here",
+            Self::Spent => "its loop back has been taken as often as it may be",
+        };
+        f.write_str(said)
     }
 }
 
@@ -218,6 +298,65 @@ mod tests {
                 "cost_micros": 330,
             })
         );
+    }
+
+    /// Both ends and the budget, because a reader watching a loop needs to know when it stops.
+    #[test]
+    fn a_loop_taken_says_which_way_it_went_and_how_much_of_the_cap_is_left() {
+        let taken = GraphEvent::LoopBack {
+            from: name("reply"),
+            to: name("intake"),
+            taken: 1,
+            cap: 2,
+        };
+
+        assert_eq!(taken.name(), "loop_back");
+        assert_eq!(
+            taken.body(),
+            json!({"node": "reply", "back_to": "intake", "taken": 1, "cap": 2})
+        );
+    }
+
+    /// Each reason in turn, since what the operator does about it differs: a name that is not a
+    /// node is a prompt to fix, and a cap that is spent is the graph working as it was written.
+    #[test]
+    fn a_loop_refused_says_what_was_asked_for_and_why_it_is_not_happening() {
+        for (why, word) in [
+            (LoopRefusal::Unknown, "unknown"),
+            (LoopRefusal::Undeclared, "undeclared"),
+            (LoopRefusal::Spent, "spent"),
+        ] {
+            let refused = GraphEvent::LoopRefused {
+                from: name("reply"),
+                asked: "survey".to_owned(),
+                why,
+            };
+
+            assert_eq!(refused.name(), "loop_refused");
+            assert_eq!(
+                refused.body(),
+                json!({
+                    "node": "reply",
+                    "back_to": "survey",
+                    "refusal": word,
+                    "why": why.to_string(),
+                })
+            );
+            assert_eq!(why.name(), word);
+            assert!(!why.to_string().is_empty(), "{word} explains itself to nobody");
+        }
+    }
+
+    /// What a node asked for is carried as it asked for it, which a node name could not hold.
+    #[test]
+    fn a_refusal_carries_a_name_that_is_not_one_at_all() {
+        let refused = GraphEvent::LoopRefused {
+            from: name("reply"),
+            asked: "two words".to_owned(),
+            why: LoopRefusal::Unknown,
+        };
+
+        assert_eq!(refused.body()["back_to"], "two words");
     }
 
     /// A reader that understands a template run's stream understands a graph's.
