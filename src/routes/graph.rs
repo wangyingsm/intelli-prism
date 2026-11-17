@@ -18,9 +18,9 @@ use ip_core::route::ClusterAddress;
 use ip_core::{Capability, CapabilityScope, Protocol, TenantId, UserId};
 use ip_gateway::Gateway;
 use ip_graph::{
-    ClusterMember, GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode, GraphOwner,
-    GraphPlane, GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, MaxNodes, NodeName,
-    NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode, Stopping,
+    ClusterMember, Downstream, GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode,
+    GraphOwner, GraphPlane, GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, MaxNodes,
+    NodeName, NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode, Stopping,
 };
 use ip_mcp::{McpServer, McpSettings};
 use ip_run::{
@@ -535,6 +535,13 @@ fn dispatching_for(state: &AppState, run: &Run<'_>) -> Option<Dispatching> {
 fn stopping_for(state: &AppState) -> Option<Arc<dyn Stopping>> {
     state.cluster_client()?;
     Some(Arc::new(Signalling::new(Arc::clone(state.shared_cache()))))
+}
+
+/// What says which nodes a taken loop back runs again, which is the plane the graphs are kept in.
+fn reaching(state: &AppState) -> Option<Arc<dyn Downstream>> {
+    state
+        .graphs()
+        .map(|plane| Arc::clone(plane) as Arc<dyn Downstream>)
 }
 
 /// Where this run's answers are kept, where anything else could ask for them.
@@ -1138,6 +1145,7 @@ async fn start(
         input: asked.input,
         reporting: Arc::new(sender),
         stopping: stopping_for(&state),
+        plane: reaching(&state),
     };
     tokio::spawn(async move {
         ip_graph::run(&graphing).await;

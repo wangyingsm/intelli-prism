@@ -15,10 +15,12 @@ use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::event::{GraphEvent, GraphReporting, GraphSaid};
-use crate::graph::{GraphNode, RunGraph};
-use crate::id::{GraphRunId, NodeName};
+use crate::error::GraphError;
+use crate::event::{GraphEvent, GraphReporting, GraphSaid, LoopRefusal};
+use crate::graph::{GraphNode, GraphOwner, LoopBack, RunGraph};
+use crate::id::{GraphId, GraphRunId, NodeName};
 use crate::order::RunOrder;
+use crate::plane::GraphPlane;
 
 /// What one node's run came to.
 ///
@@ -96,6 +98,53 @@ pub trait Stopping: Send + Sync {
     async fn stopped(&self, run: GraphRunId);
 }
 
+/// The key a node's answer asks to double back under.
+///
+/// A node unsatisfied with what a predecessor gave it answers `{"loop_back": "survey"}`. Whether
+/// the loop happens is not its decision alone: the graph must declare it, and the cap must have
+/// something left.
+pub const LOOP_BACK_KEY: &str = "loop_back";
+
+/// The key a graph's own input arrives under when a node nothing feeds runs again.
+///
+/// A node nothing feeds is given the graph's input as it stands, there being no parent to key it
+/// by. Once a loop back has been taken there *is* something to key by — the asking node — and its
+/// answer must not replace the question the run was asked, so the two arrive together and the
+/// input needs a key of its own. `$` is not a character a [`NodeName`] may hold, so this collides
+/// with no node's name however a graph is written.
+pub const GRAPH_INPUT_KEY: &str = "$input";
+
+/// Whatever can say which nodes one node's answer reaches.
+///
+/// A seam for the reason [`RunsNode`] and [`Stopping`] are seams, although what implements it here
+/// is in this crate: the rules below — which nodes a taken loop runs again, what the cap stops,
+/// what a refused ask says — are then tested without a store or a socket.
+///
+/// A graph run with none of this refuses every loop a node asks for and says so, rather than
+/// failing: a deployment that has not wired one has a graph it can still run.
+#[async_trait]
+pub trait Downstream: Send + Sync {
+    /// Every node the named one's answer reaches by feeding, itself included.
+    async fn downstream(
+        &self,
+        owner: &GraphOwner,
+        graph: &GraphId,
+        node: &NodeName,
+    ) -> Result<BTreeSet<NodeName>, GraphError>;
+}
+
+#[async_trait]
+impl Downstream for GraphPlane {
+    async fn downstream(
+        &self,
+        owner: &GraphOwner,
+        graph: &GraphId,
+        node: &NodeName,
+    ) -> Result<BTreeSet<NodeName>, GraphError> {
+        GraphPlane::downstream(self, owner, graph, node).await
+    }
+}
+
 /// A graph, the order it runs in, and whatever runs one node of it.
 pub struct Graphing {
     /// What this run is followed under.
@@ -112,6 +161,8 @@ pub struct Graphing {
     pub reporting: Arc<dyn GraphReporting>,
     /// What carries the stop to the nodes of this run that are running elsewhere, where any are.
     pub stopping: Option<Arc<dyn Stopping>>,
+    /// What says which nodes a taken loop back runs again, where a run has it.
+    pub plane: Option<Arc<dyn Downstream>>,
 }
 
 /// What running a whole graph came to.
@@ -136,6 +187,13 @@ pub struct GraphRan {
 /// What a node is given: its parents' answers, keyed by the name the graph calls each parent.
 ///
 /// A node nothing feeds is given the graph's own input, since there is no parent to key it by.
+///
+/// A node something has doubled back to is given one more answer, keyed the same way: the node
+/// that asked. That is the whole of what a loop is worth — a node runs again *knowing what the
+/// work downstream of it made of its last answer* — and it is why the asker's answer is kept
+/// rather than dropped with its place in the run. Where that node is also one nothing feeds, the
+/// graph's own input comes with it under [`GRAPH_INPUT_KEY`], because the question the run was
+/// asked is not the asker's to replace.
 fn input_for(
     graphing: &Graphing,
     name: &NodeName,
@@ -148,10 +206,119 @@ fn input_for(
             .map_or_else(String::new, |ran| ran.answer.clone());
         from.insert(parent.to_string(), Value::String(answer));
     }
+    let fed = !from.is_empty();
+    for back in graphing.graph.loops() {
+        if &back.to != name {
+            continue;
+        }
+        if let Some(ran) = answered.get(&back.from) {
+            from.insert(back.from.to_string(), Value::String(ran.answer.clone()));
+        }
+    }
     if from.is_empty() {
         return graphing.input.clone();
     }
+    if !fed {
+        from.insert(
+            GRAPH_INPUT_KEY.to_owned(),
+            Value::String(graphing.input.clone()),
+        );
+    }
     Value::Object(from).to_string()
+}
+
+/// The node an answer asks to send the work back to, where it asks for one.
+///
+/// An answer that is not json, or json carrying no [`LOOP_BACK_KEY`], asks for nothing and is not
+/// refused: most answers are prose and are meant to be, so this is read as a question that was
+/// never put rather than one answered badly.
+fn asked_for(answer: &str) -> Option<String> {
+    let said: Value = serde_json::from_str(answer).ok()?;
+    said.get(LOOP_BACK_KEY)?.as_str().map(str::to_owned)
+}
+
+/// The loop back an ask resolves to, or why it does not resolve to one.
+fn wanted<'a>(
+    graph: &'a RunGraph,
+    asker: &NodeName,
+    asked: &str,
+    taken: &BTreeMap<(NodeName, NodeName), u32>,
+) -> Result<&'a LoopBack, LoopRefusal> {
+    let target = NodeName::new(asked).map_err(|_| LoopRefusal::Unknown)?;
+    if !graph.nodes().iter().any(|node| node.name == target) {
+        return Err(LoopRefusal::Unknown);
+    }
+    let back = graph
+        .loop_back(asker, &target)
+        .ok_or(LoopRefusal::Undeclared)?;
+    let already = taken
+        .get(&(asker.clone(), target))
+        .copied()
+        .unwrap_or_default();
+    if already >= back.cap.get() {
+        return Err(LoopRefusal::Spent);
+    }
+    Ok(back)
+}
+
+/// Takes whatever loop backs the generation that just ran asked for, answering what runs again.
+///
+/// Asked once the generation is whole rather than as each node finishes, because a generation is
+/// what may run at once: taking a node out of the done set while its siblings are still in flight
+/// would have them finish into a set that no longer says they ran.
+///
+/// Every ask is answered in the stream, the refusals included. A run carries on either way — a
+/// loop that is refused leaves the answer the node gave standing, which is what a graph without
+/// loop backs would have done with it.
+async fn looped(
+    graphing: &Graphing,
+    just_ran: &[NodeName],
+    answered: &BTreeMap<NodeName, NodeRan>,
+    taken: &mut BTreeMap<(NodeName, NodeName), u32>,
+    say: &impl Fn(GraphEvent),
+) -> BTreeSet<NodeName> {
+    let mut again = BTreeSet::new();
+    for asker in just_ran {
+        let Some(asked) = answered.get(asker).and_then(|ran| asked_for(&ran.answer)) else {
+            continue;
+        };
+        let refused = |why| GraphEvent::LoopRefused {
+            from: asker.clone(),
+            asked: asked.clone(),
+            why,
+        };
+        let (to, cap) = match wanted(&graphing.graph, asker, &asked, taken) {
+            Ok(back) => (back.to.clone(), back.cap.get()),
+            Err(why) => {
+                say(refused(why));
+                continue;
+            }
+        };
+        let Some(plane) = graphing.plane.as_ref() else {
+            say(refused(LoopRefusal::Unreachable));
+            continue;
+        };
+        let reached = plane
+            .downstream(graphing.graph.owner(), graphing.graph.id(), &to)
+            .await;
+        match reached {
+            Ok(reached) => {
+                let count = taken.entry((asker.clone(), to.clone())).or_default();
+                *count += 1;
+                say(GraphEvent::LoopBack {
+                    from: asker.clone(),
+                    to,
+                    taken: *count,
+                    cap,
+                });
+                again.extend(reached);
+            }
+            // The store's own message is not carried into the stream: the event vocabulary has no
+            // room for one, and this crate has no logger to put it in.
+            Err(_) => say(refused(LoopRefusal::Unreachable)),
+        }
+    }
+    again
 }
 
 /// The nodes nothing reads from, which between them are what the graph answered.
@@ -178,6 +345,11 @@ fn answer_of(graph: &RunGraph, answered: &BTreeMap<NodeName, NodeRan>) -> Value 
 /// pay for turns nobody will read, so it is told. Between turns is where those two meet, and
 /// [`RunSignal`] is what carries it.
 ///
+/// A node that asked to double back where the graph declares it, and where the cap has something
+/// left, has the target and everything downstream of it run again — the asker included, since the
+/// asker is downstream of what it sent the work back to. **A node that stopped the graph does not
+/// also get to ask**: the stop is read first, and the asks of that generation are not looked at.
+///
 /// A sibling stopped that way comes back [`Stopped::CutShort`] and is never named as the cause:
 /// [`GraphRan::stopped_at`] is the node that broke, not the ones that were stopped because it did.
 /// The result carries everything spent up to that point — the shape `ip_run::Ran` has for the same
@@ -187,6 +359,7 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
     let mut done: BTreeSet<NodeName> = BTreeSet::new();
     let mut traces: Vec<TraceId> = Vec::new();
     let mut spend = Spend::NOTHING;
+    let mut taken: BTreeMap<(NodeName, NodeName), u32> = BTreeMap::new();
     let mut stopped_at = None;
     let (stop, listen) = watch::channel(RunSignal::Carry);
     let say = |event| {
@@ -234,6 +407,7 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
             running.spawn(async move { (name, runner.run(running_node).await) });
         }
 
+        let mut just_ran: Vec<NodeName> = Vec::new();
         // Every one of them is awaited, the stop included: a node already running is paid for.
         while let Some(finished) = running.join_next().await {
             let Ok((name, ran)) = finished else {
@@ -259,7 +433,17 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
                 }
             }
             done.insert(name.clone());
+            just_ran.push(name.clone());
             answered.insert(name, ran);
+        }
+
+        if stopped_at.is_none() {
+            // Name order, so two nodes of one generation asking are resolved in an order a test
+            // can state rather than the order the scheduler reaped them in.
+            just_ran.sort();
+            for again in looped(graphing, &just_ran, &answered, &mut taken, &say).await {
+                done.remove(&again);
+            }
         }
     }
 
@@ -290,7 +474,7 @@ mod tests {
     use ip_core::{Money, TenantId, TokenCount, Tokens};
 
     use super::*;
-    use crate::graph::{GraphEdge, GraphOwner, MaxNodes, RunGraphParts};
+    use crate::graph::{GraphEdge, GraphOwner, LoopCap, MaxNodes, RunGraphParts};
     use crate::id::{GraphId, GraphName};
     use crate::order::{Generation, Placed};
 
@@ -447,6 +631,7 @@ mod tests {
             input: "a ticket".to_owned(),
             reporting: Arc::new(()),
             stopping: None,
+            plane: None,
         }
     }
 
@@ -466,9 +651,223 @@ mod tests {
                 input: "a ticket".to_owned(),
                 reporting: Arc::new(sender),
                 stopping: None,
+                plane: None,
             },
             receiver,
         )
+    }
+
+    /// A run of a graph that declares loop backs, over whatever answers what they run again.
+    fn looping(
+        graph: RunGraph,
+        order: RunOrder,
+        runner: Arc<Doubling>,
+        plane: Option<Arc<dyn Downstream>>,
+    ) -> (Graphing, tokio::sync::mpsc::UnboundedReceiver<GraphSaid>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Graphing {
+                id: GraphRunId::generate().expect("a graph run id"),
+                graph,
+                order,
+                runner,
+                input: "a ticket".to_owned(),
+                reporting: Arc::new(sender),
+                stopping: None,
+                plane,
+            },
+            receiver,
+        )
+    }
+
+    /// A node that asks to double back a given number of times, then answers plainly.
+    ///
+    /// Every input it was handed is kept in the order it was handed them, which is what a test of
+    /// what a node runs *again* on reads.
+    struct Doubling {
+        /// How many more times each node asks, by its name.
+        asks: Mutex<BTreeMap<String, u32>>,
+        /// What they ask to go back to, as they spell it.
+        back_to: String,
+        /// Which of them stop the graph, asking as they do.
+        refuses: BTreeSet<String>,
+        /// Every node that ran and what it was given, in order.
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Doubling {
+        fn new(asks: &[(&str, u32)], back_to: &str, refuses: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                asks: Mutex::new(
+                    asks.iter()
+                        .map(|&(node, times)| (node.to_owned(), times))
+                        .collect(),
+                ),
+                back_to: back_to.to_owned(),
+                refuses: refuses.iter().map(|&node| node.to_owned()).collect(),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Every node that ran and what it was given, in order.
+        fn runs(&self) -> Vec<(String, String)> {
+            self.seen
+                .lock()
+                .expect("the record is not poisoned")
+                .clone()
+        }
+
+        /// The names alone, which is the run order.
+        fn order(&self) -> Vec<String> {
+            self.runs().into_iter().map(|(node, _)| node).collect()
+        }
+    }
+
+    #[async_trait]
+    impl RunsNode for Doubling {
+        async fn run(&self, running: RunningNode) -> NodeRan {
+            let node = running.node.name.to_string();
+            self.seen
+                .lock()
+                .expect("the record is not poisoned")
+                .push((node.clone(), running.input));
+            let asking = {
+                let mut asks = self.asks.lock().expect("the record is not poisoned");
+                let left = asks.entry(node.clone()).or_default();
+                let asking = *left > 0;
+                *left = left.saturating_sub(1);
+                asking
+            };
+            NodeRan {
+                answer: if asking {
+                    json!({LOOP_BACK_KEY: self.back_to}).to_string()
+                } else {
+                    format!("{node} is content")
+                },
+                stopped: if self.refuses.contains(&node) {
+                    Stopped::Refused {
+                        why: "the fixture refuses this node".to_owned(),
+                    }
+                } else {
+                    Stopped::Answered
+                },
+                spend: Spend::NOTHING,
+                traces: Vec::new(),
+            }
+        }
+    }
+
+    /// What a plane answers for a loop back's target, scripted per node.
+    struct Reaching {
+        /// What each node's answer reaches, itself included, by name.
+        reaches: BTreeMap<String, Vec<String>>,
+        /// Whether it answers at all.
+        answers: bool,
+        /// Which nodes it was asked about, in order.
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Reaching {
+        fn over(reaches: &[(&str, &[&str])]) -> Arc<Self> {
+            Arc::new(Self {
+                reaches: reaches
+                    .iter()
+                    .map(|&(node, reached)| {
+                        (
+                            node.to_owned(),
+                            reached.iter().map(|&name| name.to_owned()).collect(),
+                        )
+                    })
+                    .collect(),
+                answers: true,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// One that will not answer, which is a store that cannot be reached.
+        fn silent() -> Arc<Self> {
+            Arc::new(Self {
+                reaches: BTreeMap::new(),
+                answers: false,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked
+                .lock()
+                .expect("the record is not poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl Downstream for Reaching {
+        async fn downstream(
+            &self,
+            _: &GraphOwner,
+            _: &GraphId,
+            node: &NodeName,
+        ) -> Result<BTreeSet<NodeName>, GraphError> {
+            self.asked
+                .lock()
+                .expect("the record is not poisoned")
+                .push(node.to_string());
+            if !self.answers {
+                return Err(GraphError::Unreadable {
+                    detail: "a fixture that will not answer".to_owned(),
+                });
+            }
+            Ok(self
+                .reaches
+                .get(node.as_str())
+                .map(|reached| reached.iter().map(|raw| name(raw)).collect())
+                .unwrap_or_default())
+        }
+    }
+
+    /// A graph of two where the second may send the work back to the first.
+    fn doubling_back(cap: u32) -> RunGraph {
+        looping_graph(
+            &["intake", "reply"],
+            &[("intake", "reply")],
+            &[("reply", "intake", cap)],
+        )
+    }
+
+    /// A graph with loop backs declared on it.
+    fn looping_graph(
+        nodes: &[&str],
+        edges: &[(&str, &str)],
+        loops: &[(&str, &str, u32)],
+    ) -> RunGraph {
+        RunGraph::checked(RunGraphParts {
+            id: GraphId::new("triage").expect("a graph id"),
+            name: GraphName::new("Support triage").expect("a graph name"),
+            owner: GraphOwner::Tenant(TenantId::new("acme").expect("a tenant id")),
+            nodes: nodes.iter().map(|raw| node(raw)).collect(),
+            edges: edges.iter().map(|(from, to)| edge(from, to)).collect(),
+            loops: loops
+                .iter()
+                .map(|&(from, to, cap)| LoopBack {
+                    from: name(from),
+                    to: name(to),
+                    cap: LoopCap::new(cap).expect("a cap a loop back may carry"),
+                })
+                .collect(),
+            max_nodes: MaxNodes::new(8).expect("a ceiling"),
+        })
+        .expect("the fixture's own graph holds together")
+    }
+
+    /// Every loop event a run said, as the one word it is named by and what it carries.
+    ///
+    /// The event's own body rather than the stream's, which carries the run id a test cannot know.
+    fn loops_said(said: &[GraphSaid]) -> Vec<(String, Value)> {
+        said.iter()
+            .filter(|one| matches!(one.name(), "loop_back" | "loop_refused"))
+            .map(|one| (one.name().to_owned(), one.event.body()))
+            .collect()
     }
 
     /// Every event a run said, by name, in the order it said them.
@@ -851,6 +1250,7 @@ mod tests {
             input: "a ticket".to_owned(),
             reporting: Arc::new(()),
             stopping: None,
+            plane: None,
         })
         .await;
         assert_eq!(ran.spend.tokens.input.get(), 6);
@@ -896,6 +1296,244 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<NodeRan>(&written).expect("an answer reads back"),
             ran
+        );
+    }
+
+    /// The target and everything after it, the asker included, and the asker is after it.
+    #[tokio::test]
+    async fn a_node_that_asks_to_double_back_has_the_target_and_what_follows_run_again() {
+        let runner = Doubling::new(&[("reply", 1)], "intake", &[]);
+        let plane = Reaching::over(&[("intake", &["intake", "reply"])]);
+        let (graphing, events) = looping(
+            doubling_back(2),
+            order(&[("intake", 0), ("reply", 1)]),
+            Arc::clone(&runner),
+            Some(Arc::clone(&plane) as Arc<dyn Downstream>),
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(
+            runner.order(),
+            ["intake", "reply", "intake", "reply"],
+            "the loop back did not run the target and what follows it again"
+        );
+        assert_eq!(
+            plane.asked(),
+            ["intake"],
+            "the nodes to run again were not asked for once, about the target"
+        );
+        assert_eq!(
+            loops_said(&said(events)),
+            [(
+                "loop_back".to_owned(),
+                json!({"node": "reply", "back_to": "intake", "taken": 1, "cap": 2}),
+            )]
+        );
+        assert_eq!(ran.stopped_at, None);
+        assert_eq!(
+            ran.nodes[&name("reply")].answer,
+            "reply is content",
+            "ruling 4: what the run came to is the last attempt, not the first"
+        );
+    }
+
+    /// Ruling: a node that runs again is told what the work downstream made of its last answer.
+    #[tokio::test]
+    async fn a_node_run_again_is_given_the_askers_answer_and_the_question_as_well() {
+        let runner = Doubling::new(&[("reply", 1)], "intake", &[]);
+        let (graphing, _events) = looping(
+            doubling_back(2),
+            order(&[("intake", 0), ("reply", 1)]),
+            Arc::clone(&runner),
+            Some(Reaching::over(&[("intake", &["intake", "reply"])]) as Arc<dyn Downstream>),
+        );
+
+        run(&graphing).await;
+
+        let runs = runner.runs();
+        assert_eq!(runs[0], ("intake".to_owned(), "a ticket".to_owned()));
+        let again: Value =
+            serde_json::from_str(&runs[2].1).expect("a node run again is given json");
+        assert_eq!(
+            again,
+            json!({"reply": r#"{"loop_back":"intake"}"#, GRAPH_INPUT_KEY: "a ticket"}),
+            "a node nothing feeds lost the question the run was asked"
+        );
+        let after: Value = serde_json::from_str(&runs[3].1).expect("a fed node is given json");
+        assert_eq!(
+            after,
+            json!({"intake": "intake is content"}),
+            "the node after the target was not given the target's new answer"
+        );
+    }
+
+    /// The cap is what makes a loop terminate, so it is asserted by count and by what is said.
+    #[tokio::test]
+    async fn a_cap_stops_a_node_that_keeps_asking() {
+        let runner = Doubling::new(&[("reply", 9)], "intake", &[]);
+        let (graphing, events) = looping(
+            doubling_back(2),
+            order(&[("intake", 0), ("reply", 1)]),
+            Arc::clone(&runner),
+            Some(Reaching::over(&[("intake", &["intake", "reply"])]) as Arc<dyn Downstream>),
+        );
+
+        run(&graphing).await;
+
+        assert_eq!(
+            runner.order(),
+            ["intake", "reply", "intake", "reply", "intake", "reply"],
+            "a cap of two did not stop the loop after two"
+        );
+        let loops = loops_said(&said(events));
+        assert_eq!(loops.len(), 3, "{loops:?}");
+        assert_eq!(loops[0].1["taken"], 1);
+        assert_eq!(loops[1].1["taken"], 2);
+        assert_eq!(loops[2].0, "loop_refused");
+        assert_eq!(loops[2].1["refusal"], "spent");
+    }
+
+    /// A graph that declares no loop back refuses one, rather than taking a node's word for it.
+    #[tokio::test]
+    async fn an_undeclared_loop_back_is_refused_and_changes_nothing() {
+        let runner = Doubling::new(&[("reply", 1)], "intake", &[]);
+        let plane = Reaching::over(&[("intake", &["intake", "reply"])]);
+        let (graphing, events) = looping(
+            looping_graph(&["intake", "reply"], &[("intake", "reply")], &[]),
+            order(&[("intake", 0), ("reply", 1)]),
+            Arc::clone(&runner),
+            Some(Arc::clone(&plane) as Arc<dyn Downstream>),
+        );
+
+        run(&graphing).await;
+
+        assert_eq!(runner.order(), ["intake", "reply"]);
+        assert!(
+            plane.asked().is_empty(),
+            "an undeclared ask reached the store"
+        );
+        let loops = loops_said(&said(events));
+        assert_eq!(loops[0].1["refusal"], "undeclared");
+        assert_eq!(loops[0].1["back_to"], "intake");
+    }
+
+    /// Both ways a name can name no node: one the graph has not got, and one that is no name.
+    #[tokio::test]
+    async fn a_loop_back_to_something_that_is_not_a_node_of_the_graph_is_refused() {
+        for asked in ["survey", "two words"] {
+            let runner = Doubling::new(&[("reply", 1)], asked, &[]);
+            let (graphing, events) = looping(
+                doubling_back(2),
+                order(&[("intake", 0), ("reply", 1)]),
+                Arc::clone(&runner),
+                Some(Reaching::over(&[]) as Arc<dyn Downstream>),
+            );
+
+            run(&graphing).await;
+
+            assert_eq!(
+                runner.order(),
+                ["intake", "reply"],
+                "{asked} ran something again"
+            );
+            let loops = loops_said(&said(events));
+            assert_eq!(loops[0].1["refusal"], "unknown", "{asked}");
+            assert_eq!(loops[0].1["back_to"], asked);
+        }
+    }
+
+    /// A run with nothing to ask, and a store that will not answer, read the same from the stream.
+    #[tokio::test]
+    async fn a_loop_nothing_can_work_out_is_refused_rather_than_failing_the_run() {
+        for plane in [None, Some(Reaching::silent() as Arc<dyn Downstream>)] {
+            let runner = Doubling::new(&[("reply", 1)], "intake", &[]);
+            let (graphing, events) = looping(
+                doubling_back(2),
+                order(&[("intake", 0), ("reply", 1)]),
+                Arc::clone(&runner),
+                plane,
+            );
+
+            let ran = run(&graphing).await;
+
+            assert_eq!(runner.order(), ["intake", "reply"]);
+            assert_eq!(
+                ran.stopped_at, None,
+                "a loop that could not be worked out failed the run"
+            );
+            let loops = loops_said(&said(events));
+            assert_eq!(loops[0].1["refusal"], "unreachable");
+        }
+    }
+
+    /// Stop beats loop: the node that broke the graph does not get to ask for another pass.
+    #[tokio::test]
+    async fn a_node_that_stops_the_graph_does_not_also_double_back() {
+        let runner = Doubling::new(&[("reply", 1)], "intake", &["reply"]);
+        let plane = Reaching::over(&[("intake", &["intake", "reply"])]);
+        let (graphing, events) = looping(
+            doubling_back(2),
+            order(&[("intake", 0), ("reply", 1)]),
+            Arc::clone(&runner),
+            Some(Arc::clone(&plane) as Arc<dyn Downstream>),
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(ran.stopped_at, Some(name("reply")));
+        assert_eq!(
+            runner.order(),
+            ["intake", "reply"],
+            "a stopped graph ran a node again"
+        );
+        assert!(
+            plane.asked().is_empty(),
+            "a stopped graph asked about a loop back"
+        );
+        assert!(
+            loops_said(&said(events)).is_empty(),
+            "a stopped graph said it was looping"
+        );
+    }
+
+    /// Only what the target reaches: a branch beside it keeps the answer it had.
+    #[tokio::test]
+    async fn a_node_the_target_does_not_reach_is_not_run_again() {
+        let runner = Doubling::new(&[("review", 1)], "draft", &[]);
+        let (graphing, _events) = looping(
+            looping_graph(
+                &["survey", "draft", "review", "aside"],
+                &[
+                    ("survey", "draft"),
+                    ("draft", "review"),
+                    ("survey", "aside"),
+                ],
+                &[("review", "draft", 2)],
+            ),
+            order(&[("survey", 0), ("draft", 1), ("aside", 1), ("review", 2)]),
+            Arc::clone(&runner),
+            Some(Reaching::over(&[("draft", &["draft", "review"])]) as Arc<dyn Downstream>),
+        );
+
+        run(&graphing).await;
+
+        let order = runner.order();
+        assert_eq!(
+            order.iter().filter(|node| *node == "aside").count(),
+            1,
+            "a node the loop does not reach ran again: {order:?}"
+        );
+        assert_eq!(order.iter().filter(|node| *node == "draft").count(), 2);
+        assert_eq!(order.iter().filter(|node| *node == "review").count(), 2);
+    }
+
+    /// The claim [`GRAPH_INPUT_KEY`] rests on, which is why it is spelled with a `$`.
+    #[test]
+    fn the_key_the_question_arrives_under_can_be_no_nodes_name() {
+        assert!(
+            NodeName::new(GRAPH_INPUT_KEY).is_err(),
+            "the reserved key is a name a node could be given"
         );
     }
 }

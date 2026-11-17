@@ -189,6 +189,9 @@ pub enum LoopRefusal {
     Unknown,
     /// The graph holds that node, and declares no loop back to it from the asking one.
     Undeclared,
+    /// It is declared and within its cap, and what holds the graph could not say what would run
+    /// again — or this run has nothing to ask.
+    Unreachable,
     /// It is declared, and has been taken as often as its cap allows.
     Spent,
 }
@@ -200,6 +203,7 @@ impl LoopRefusal {
         match self {
             Self::Unknown => "unknown",
             Self::Undeclared => "undeclared",
+            Self::Unreachable => "unreachable",
             Self::Spent => "spent",
         }
     }
@@ -210,6 +214,7 @@ impl std::fmt::Display for LoopRefusal {
         let said = match self {
             Self::Unknown => "the graph holds no node of that name",
             Self::Undeclared => "the graph declares no loop back to it from here",
+            Self::Unreachable => "what holds the graph could not say which nodes would run again",
             Self::Spent => "its loop back has been taken as often as it may be",
         };
         f.write_str(said)
@@ -324,6 +329,7 @@ mod tests {
         for (why, word) in [
             (LoopRefusal::Unknown, "unknown"),
             (LoopRefusal::Undeclared, "undeclared"),
+            (LoopRefusal::Unreachable, "unreachable"),
             (LoopRefusal::Spent, "spent"),
         ] {
             let refused = GraphEvent::LoopRefused {
@@ -343,7 +349,10 @@ mod tests {
                 })
             );
             assert_eq!(why.name(), word);
-            assert!(!why.to_string().is_empty(), "{word} explains itself to nobody");
+            assert!(
+                !why.to_string().is_empty(),
+                "{word} explains itself to nobody"
+            );
         }
     }
 
