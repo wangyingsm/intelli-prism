@@ -180,6 +180,36 @@ impl DrsgClient {
         self.call("plane.algo", params).await
     }
 
+    /// Runs one openCypher-subset statement against the plane, with its parameters bound.
+    ///
+    /// What this answers that [`algo`](Self::algo) and [`query`](Self::query) cannot: a path of
+    /// more than one hop. The store's own traversal method expands a single hop, and its
+    /// algorithms are ranked or ordered answers rather than reachable sets, so *which nodes does
+    /// this one reach* is a pattern — `-[:TYPE*1..n]->` — and nothing else. The upper bound is not
+    /// optional: the store refuses an unbounded `*`.
+    ///
+    /// The store gates this behind write access even for a statement that only reads, which costs
+    /// this deployment nothing: writing a graph creates nodes and edges through the same token.
+    ///
+    /// A statement that *projects* — `RETURN b.name AS name` — answers a table, as
+    /// `{"columns": [...], "rows": [[...]]}`. One that returns a bound node answers the induced
+    /// subgraph instead, so a caller that wants rows projects.
+    pub async fn cypher(
+        &self,
+        query: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, DrsgError> {
+        self.call(
+            "plane.cypher",
+            serde_json::json!({
+                "plane": self.settings.plane.as_str(),
+                "query": query,
+                "params": params,
+            }),
+        )
+        .await
+    }
+
     /// Runs a read plan against the plane and answers what it returned.
     ///
     /// The plan is passed through rather than built here: this crate is the transport, and what a
@@ -482,6 +512,29 @@ mod tests {
         assert_eq!(seen.params["limit"], 1);
         assert_eq!(seen.params["dir"], "out");
         assert_eq!(seen.params["algo"], "cycles", "the extra overwrote a name");
+    }
+
+    /// The statement and its parameters travel apart, which is the point of binding them.
+    #[tokio::test]
+    async fn a_statement_carries_its_parameters_beside_it_rather_than_inside_it() {
+        let (client, record) = client(Answers::Echo).await;
+        client
+            .cypher(
+                "MATCH (a:Node {name: $name})-[:FEEDS*1..256]->(b:Node) RETURN b.name AS name",
+                serde_json::json!({"name": "intake"}),
+            )
+            .await
+            .expect("the stub answers");
+        let seen = only(&record);
+        assert_eq!(seen.method, "plane.cypher");
+        assert_eq!(seen.params["plane"], "graphs");
+        assert_eq!(seen.params["params"]["name"], "intake");
+        assert!(
+            seen.params["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("FEEDS*1..256")),
+            "the statement did not cross the wire as it was written"
+        );
     }
 
     /// What a graph's own tests will drive the stub with: one prepared answer per method, so a
