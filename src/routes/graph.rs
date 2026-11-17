@@ -1367,6 +1367,7 @@ mod tests {
                 node_row(3, "acme", "triage", "reply", "acme-triage"),
             ]),
             serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
+            no_loops(),
         ]))
         .await;
 
@@ -1789,9 +1790,9 @@ upstream_speaks = "anthropic"
 
     /// Everything the plane is asked for when a chain of two is run, in the order it is asked.
     ///
-    /// Five calls, not four: reading the graph is three queries, and reading the order is the
-    /// `toposort` and then the node read again, which is what turns the store's own ids into the
-    /// names the graph calls its nodes.
+    /// Six calls, not four: reading the graph is three queries and a statement for its loop backs,
+    /// and reading the order is the `toposort` and then the node read again, which is what turns
+    /// the store's own ids into the names the graph calls its nodes.
     fn chain_of_two(order: serde_json::Value) -> Replies {
         let nodes = || {
             serde_json::json!([
@@ -1803,9 +1804,15 @@ upstream_speaks = "anthropic"
             serde_json::json!([graph_row("acme", "triage")]),
             nodes(),
             serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
+            no_loops(),
             order,
             nodes(),
         ])
+    }
+
+    /// What a plane answers when a graph declares no loop back, which is every graph here.
+    fn no_loops() -> serde_json::Value {
+        serde_json::json!({"columns": ["from", "to", "cap"], "rows": []})
     }
 
     /// The order a plane answers for a chain of two, as `toposort` reports one.
@@ -2414,6 +2421,7 @@ upstream_speaks = "anthropic"
             serde_json::json!([graph_row("acme", "triage")]),
             nodes(),
             serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
+            no_loops(),
             sorted_chain(),
             nodes(),
             // intake: the members, its placement, and clearing it.
@@ -2441,6 +2449,7 @@ upstream_speaks = "anthropic"
             serde_json::json!([graph_row("acme", "triage")]),
             nodes(),
             serde_json::json!({"columns": ["from", "to"], "rows": []}),
+            no_loops(),
             serde_json::json!({
                 "algo": "toposort",
                 "count": 1,

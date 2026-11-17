@@ -10,12 +10,16 @@
 //! another's reads — which is why the plan each read sends is asserted, call by call, in the tests
 //! below rather than taken on trust.
 
+use std::collections::BTreeSet;
+
 use ip_agents::AgentId;
 use ip_drsg::DrsgClient;
 use serde_json::{Value, json};
 
 use crate::error::GraphError;
-use crate::graph::{GraphEdge, GraphNode, GraphOwner, MaxNodes, RunGraph, RunGraphParts};
+use crate::graph::{
+    GraphEdge, GraphNode, GraphOwner, LoopBack, LoopCap, MaxNodes, RunGraph, RunGraphParts,
+};
 use crate::id::{GraphId, GraphName, GraphRunId, NodeName};
 use crate::member::ClusterMember;
 use crate::order::{Generation, Placed, RunOrder};
@@ -31,6 +35,17 @@ pub const NODE_LABEL: &str = "GraphNode";
 
 /// The type of edge an answer travels along.
 pub const FEEDS: &str = "FEEDS";
+
+/// The type of edge a node's unfinished work may travel back along.
+///
+/// A second type beside [`FEEDS`] rather than a property on one, because that is what keeps every
+/// algorithm asked of the store answering over the feeding edges alone: a graph is a DAG in what
+/// it feeds, while its loop backs are expected to close cycles. Both `toposort` and `cycles` name
+/// [`FEEDS`] and are asserted to, so widening either to every edge type cannot pass the tests.
+pub const LOOPS_BACK: &str = "LOOPS_BACK";
+
+/// How many times one loop back may be taken, which is the one thing a loop back's edge carries.
+const CAP: &str = "cap";
 
 /// The label on every record of where a node is running.
 ///
@@ -228,6 +243,48 @@ fn edges_plan(owner: &GraphOwner, id: &GraphId) -> Value {
     })
 }
 
+/// The statement that reads one graph's loop backs: the two names each joins, and its cap.
+///
+/// A statement rather than the read plan [`edges_plan`] is, and **measured rather than chosen**: a
+/// plan projecting the hop's own property — `{"binding": {"Edge": 0}}` — answers `null` against a
+/// real plane, at that index and at every other, while the property is there and a relationship
+/// variable reads it. An edge's property is a statement's to read.
+///
+/// Both ends are filtered, as the plan filters twice, because a loop back is only this graph's if
+/// the node it leaves and the node it reaches both are.
+fn stored_loops() -> String {
+    format!(
+        "MATCH (a:{NODE_LABEL})-[r:{LOOPS_BACK}]->(b:{NODE_LABEL}) \
+         WHERE a.{GRAPH} = $graph AND a.{OWNER} = $owner \
+         AND b.{GRAPH} = $graph AND b.{OWNER} = $owner \
+         RETURN DISTINCT a.{NAME} AS from, b.{NAME} AS to, r.{CAP} AS {CAP}"
+    )
+}
+
+/// The statement that answers every node one node's work reaches by feeding.
+///
+/// The one question in this file a read plan cannot ask, and the reason [`DrsgClient::cypher`]
+/// exists: a plan expands one hop per step, and what a loop back needs is every hop. The bound is
+/// the graph's own node ceiling, since a path that visits no node twice cannot be longer, and the
+/// store refuses an unbounded `*` anyway.
+///
+/// **Nothing is interpolated but the two labels and the bound**, none of which a caller can reach:
+/// the node's key and the owner travel as parameters, which is the injection-safe way to pass a
+/// value. The start is found by its external key, which the store seeks rather than scans.
+///
+/// The far end is filtered on the graph and the owner, so a name belonging to another graph cannot
+/// come back even from a plane somebody else has edited. The hops *between* are not filtered,
+/// because a plan cannot filter them and because no write here makes an edge that leaves one
+/// graph: both ends of every edge are written by the same call.
+fn reaching() -> String {
+    format!(
+        "MATCH (a:{NODE_LABEL})-[:{FEEDS}*1..{bound}]->(b:{NODE_LABEL}) \
+         WHERE key(a) = $key AND b.{GRAPH} = $graph AND b.{OWNER} = $owner \
+         RETURN DISTINCT b.{NAME} AS {NAME}",
+        bound = MaxNodes::MOST
+    )
+}
+
 /// The plan that reads what one owner's run is running.
 fn placements_plan(owner: &GraphOwner, run: &GraphRunId) -> Value {
     json!({
@@ -314,6 +371,52 @@ fn placement_from(row: &Value, owner: &GraphOwner) -> Result<Placement, GraphErr
         return Err(GraphError::Foreign { property: OWNER });
     }
     Ok(placed)
+}
+
+/// What one loop back carries: whose it is, and how often it may be taken.
+///
+/// The names it joins are the nodes it joins, as with [`edge_properties`]; the cap is the one
+/// thing about it that is not in its ends.
+fn loop_properties(graph: &RunGraph, back: &LoopBack) -> Value {
+    json!({
+        GRAPH: graph.id().as_str(),
+        OWNER: graph.owner().written(),
+        CAP: back.cap.get(),
+    })
+}
+
+/// One graph's loop backs, rebuilt from the table the store answered with.
+fn loops_from(table: &Value) -> Result<Vec<LoopBack>, GraphError> {
+    let rows = table["rows"]
+        .as_array()
+        .ok_or_else(|| GraphError::Unreadable {
+            detail: "a loop back read answered with something that is not a table".to_owned(),
+        })?;
+    rows.iter()
+        .map(|row| {
+            let cells = row
+                .as_array()
+                .filter(|cells| cells.len() == 3)
+                .ok_or_else(|| GraphError::Unreadable {
+                    detail: "a loop back row is not the two names and the cap it was asked for"
+                        .to_owned(),
+                })?;
+            let name = |cell: &Value| {
+                cell.as_str()
+                    .ok_or(GraphError::PropertyKind { property: NAME })
+                    .and_then(NodeName::new)
+            };
+            let stored = cells[2]
+                .as_u64()
+                .and_then(|cap| u32::try_from(cap).ok())
+                .ok_or(GraphError::PropertyKind { property: CAP })?;
+            Ok(LoopBack {
+                from: name(&cells[0])?,
+                to: name(&cells[1])?,
+                cap: LoopCap::new(stored)?,
+            })
+        })
+        .collect()
 }
 
 /// What a graph's own node carries.
@@ -528,11 +631,124 @@ impl GraphPlane {
                 )
                 .await?;
         }
+        for back in graph.loops() {
+            self.drsg
+                .edge_create(
+                    &node_key(owner, id, &back.from),
+                    &node_key(owner, id, &back.to),
+                    LOOPS_BACK,
+                    loop_properties(graph, back),
+                )
+                .await?;
+        }
         if let Some(cycle) = self.cycle(&scope, &written).await? {
             self.clear(owner, id).await?;
             return Err(GraphError::Cyclic { cycle });
         }
+        if let Some((from, to)) = self.forwards(&scope, &written, graph.loops()).await? {
+            self.clear(owner, id).await?;
+            return Err(GraphError::LoopNotBackwards { from, to });
+        }
         Ok(())
+    }
+
+    /// The first loop back whose asking node does not descend from its target, where there is one.
+    ///
+    /// Asked of the store, one path search per declared loop back, so a graph that doubles back
+    /// *sideways* or *forwards* is refused when it is written rather than when it is run: a node
+    /// sending work to somewhere its own answer never came from would be re-running a node whose
+    /// output it had not read.
+    ///
+    /// After the cycle check rather than before it, because a cyclic graph has no ancestry worth
+    /// reporting on and `Cyclic` is the more fundamental answer. A node's loop back **on itself**
+    /// is not asked about at all: there is no feeding path from a node to itself in a graph that
+    /// passed the cycle check, and that loop is permitted.
+    async fn forwards(
+        &self,
+        scope: &str,
+        written: &[(Option<u64>, NodeName)],
+        loops: &[LoopBack],
+    ) -> Result<Option<(NodeName, NodeName)>, GraphError> {
+        let stored = |name: &NodeName| {
+            written
+                .iter()
+                .find(|(_, written)| written == name)
+                .and_then(|(id, _)| *id)
+                .ok_or_else(|| GraphError::Unreadable {
+                    detail: "a node the store took and then gave no id for".to_owned(),
+                })
+        };
+        for back in loops {
+            if back.from == back.to {
+                continue;
+            }
+            let answered = self
+                .drsg
+                .algo(
+                    "shortest_path",
+                    scope,
+                    FEEDS,
+                    json!({
+                        "src": stored(&back.to)?,
+                        "dst": stored(&back.from)?,
+                        "dir": "out",
+                    }),
+                )
+                .await?;
+            let found = answered["found"]
+                .as_bool()
+                .ok_or_else(|| GraphError::Unreadable {
+                    detail: "a path search that did not say whether it found one".to_owned(),
+                })?;
+            if !found {
+                return Ok(Some((back.from.clone(), back.to.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every node one node's answer reaches by feeding, the node itself among them.
+    ///
+    /// What a run asks when a loop back is taken: these are the nodes whose work the target's
+    /// second pass invalidates, and so the ones that run again. Itself is included because the
+    /// target is the node being re-run, which saves every caller remembering to add it.
+    ///
+    /// One read, however deep the graph, because the statement walks the hops rather than this
+    /// code walking them a call at a time — see [`reaching`].
+    pub async fn downstream(
+        &self,
+        owner: &GraphOwner,
+        id: &GraphId,
+        node: &NodeName,
+    ) -> Result<BTreeSet<NodeName>, GraphError> {
+        let answered = self
+            .drsg
+            .cypher(
+                &reaching(),
+                json!({
+                    "key": node_key(owner, id, node),
+                    "graph": id.as_str(),
+                    "owner": owner.written(),
+                }),
+            )
+            .await?;
+        let rows = answered["rows"]
+            .as_array()
+            .ok_or_else(|| GraphError::Unreadable {
+                detail: "a walk of the feeding edges answered with something that is not a table"
+                    .to_owned(),
+            })?;
+        let mut reached = BTreeSet::new();
+        reached.insert(node.clone());
+        for row in rows {
+            let named = row
+                .as_array()
+                .and_then(|cells| cells.first())
+                .and_then(Value::as_str)
+                .ok_or(GraphError::PropertyKind { property: NAME })?;
+            reached.insert(NodeName::new(named)?);
+        }
+        Ok(reached)
     }
 
     /// Records that one node of one run is running, and where.
@@ -772,10 +988,12 @@ impl GraphPlane {
 
     /// One owner's graph, or nothing where that owner has none under the id.
     ///
-    /// Three reads, each filtered on the owner, and the answer goes through
-    /// [`RunGraph::checked`]: a graph that comes back from the plane is checked exactly as one
-    /// arriving from a caller is, because rows can be edited in the store by something that is not
-    /// this code.
+    /// Four reads — the graph, its nodes, its edges, its loop backs — each filtered on the owner,
+    /// and the answer goes through [`RunGraph::checked`]: a graph that comes back from the plane is
+    /// checked exactly as one arriving from a caller is, because rows can be edited in the store by
+    /// something that is not this code.
+    ///
+    /// The fourth is a statement rather than a plan, for the reason [`stored_loops`] records.
     pub async fn get(
         &self,
         owner: &GraphOwner,
@@ -807,13 +1025,22 @@ impl GraphPlane {
             })?)?;
         let nodes = nodes_from(&self.drsg.query(nodes_plan(owner, id)).await?, owner, id)?;
         let edges = edges_from(&self.drsg.query(edges_plan(owner, id)).await?)?;
+        let loops = loops_from(
+            &self
+                .drsg
+                .cypher(
+                    &stored_loops(),
+                    json!({"graph": id.as_str(), "owner": owner.written()}),
+                )
+                .await?,
+        )?;
         RunGraph::checked(RunGraphParts {
             id: id.clone(),
             name,
             owner: owner.clone(),
             nodes,
             edges,
-            loops: Vec::new(),
+            loops,
             max_nodes,
         })
         .map(Some)
@@ -946,6 +1173,37 @@ mod tests {
                 .map(|edge| json!([edge.from.as_str(), edge.to.as_str()]))
                 .collect::<Vec<_>>(),
         })
+    }
+
+    /// The table a plane answers a loop back read with, empty for a graph that declares none.
+    fn loop_table(graph: &RunGraph) -> Value {
+        json!({
+            "columns": ["from", "to", CAP],
+            "rows": graph
+                .loops()
+                .iter()
+                .map(|back| json!([back.from.as_str(), back.to.as_str(), back.cap.get()]))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The fixture's chain of two, with the second node able to send the work back.
+    fn looping_graph() -> RunGraph {
+        let stored = graph();
+        RunGraph::checked(RunGraphParts {
+            id: stored.id().clone(),
+            name: stored.name().clone(),
+            owner: stored.owner().clone(),
+            nodes: stored.nodes().to_vec(),
+            edges: stored.edges().to_vec(),
+            loops: vec![LoopBack {
+                from: name("reply"),
+                to: name("intake"),
+                cap: LoopCap::new(2).expect("a cap"),
+            }],
+            max_nodes: stored.max_nodes(),
+        })
+        .expect("a chain that may double back holds together")
     }
 
     /// A plane holding nothing, which takes a write and finds no cycle in it.
@@ -1255,6 +1513,186 @@ mod tests {
         assert_eq!(asked[0]["limit"], 1);
     }
 
+    /// A plane that takes a write of a graph with a loop back in it.
+    ///
+    /// One answer covers both algorithm calls a looping write makes — the cycle check reads
+    /// `count`, the ancestry check reads `found` — because a script answers per method and a write
+    /// asks `plane.algo` twice.
+    async fn looping_plane() -> StubPlane {
+        StubPlane::start(Replies::scripted([
+            ("plane.query", json!([])),
+            ("node.create", json!({"id": 7})),
+            (
+                "plane.algo",
+                json!({"count": 0, "results": [], "found": true}),
+            ),
+        ]))
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_loop_back_is_written_as_its_own_kind_of_edge_carrying_its_cap() {
+        let stub = looping_plane().await;
+        GraphPlane::new(stub.client())
+            .put(&looping_graph())
+            .await
+            .expect("the stub takes the write");
+
+        let edges = stub.calls("edge.create");
+        assert_eq!(edges.len(), 2, "a loop back is an edge beside the feeding one");
+        assert_eq!(edges[0]["type"], FEEDS);
+        assert_eq!(edges[1]["type"], LOOPS_BACK);
+        assert_eq!(
+            edges[1]["src"], "GraphNode/acme/triage/reply",
+            "the loop back left the wrong end"
+        );
+        assert_eq!(edges[1]["dst"], "GraphNode/acme/triage/intake");
+        assert_eq!(edges[1]["properties"][CAP], 2);
+        assert_eq!(edges[1]["properties"][OWNER], "acme");
+    }
+
+    /// The invariant the whole milestone rests on: a loop back is invisible to both algorithms.
+    #[tokio::test]
+    async fn neither_algorithm_a_write_asks_for_follows_a_loop_back() {
+        let stub = looping_plane().await;
+        GraphPlane::new(stub.client())
+            .put(&looping_graph())
+            .await
+            .expect("the stub takes the write");
+
+        let asked = stub.calls("plane.algo");
+        assert_eq!(asked.len(), 2, "a looping write asks for the cycle and the ancestry");
+        for one in &asked {
+            assert_eq!(
+                one["edge_type"], FEEDS,
+                "{} followed an edge that does not feed",
+                one["algo"]
+            );
+        }
+        assert_eq!(asked[0]["algo"], "cycles");
+        assert_eq!(asked[1]["algo"], "shortest_path");
+        assert_eq!(
+            (&asked[1]["src"], &asked[1]["dst"]),
+            (&json!(7), &json!(7)),
+            "the search did not run from the target towards the asker"
+        );
+        assert_eq!(asked[1]["dir"], "out");
+    }
+
+    /// Refused at the write, which is the roadmap's own requirement: a person reading the graph
+    /// can see where it may double back, so a graph that cannot must not be stored.
+    #[tokio::test]
+    async fn a_loop_back_to_a_node_that_does_not_feed_the_asker_is_refused() {
+        let stub = StubPlane::start(Replies::scripted([
+            ("plane.query", json!([])),
+            ("node.create", json!({"id": 7})),
+            (
+                "plane.algo",
+                json!({"count": 0, "results": [], "found": false}),
+            ),
+        ]))
+        .await;
+
+        let refusal = GraphPlane::new(stub.client()).put(&looping_graph()).await;
+
+        assert_eq!(
+            refusal,
+            Err(GraphError::LoopNotBackwards {
+                from: name("reply"),
+                to: name("intake"),
+            })
+        );
+        assert!(
+            !stub.calls("node.delete").is_empty(),
+            "a refused write left its rows behind"
+        );
+    }
+
+    /// A node asking its own work again, which needs no path and is never asked about.
+    #[tokio::test]
+    async fn a_loop_back_a_node_declares_on_itself_is_not_asked_about() {
+        let stored = graph();
+        let itself = RunGraph::checked(RunGraphParts {
+            id: stored.id().clone(),
+            name: stored.name().clone(),
+            owner: stored.owner().clone(),
+            nodes: stored.nodes().to_vec(),
+            edges: stored.edges().to_vec(),
+            loops: vec![LoopBack {
+                from: name("reply"),
+                to: name("reply"),
+                cap: LoopCap::new(1).expect("a cap"),
+            }],
+            max_nodes: stored.max_nodes(),
+        })
+        .expect("a node may think again");
+        let stub = empty_plane().await;
+
+        GraphPlane::new(stub.client())
+            .put(&itself)
+            .await
+            .expect("a self loop needs no ancestry");
+
+        let asked = stub.calls("plane.algo");
+        assert_eq!(asked.len(), 1, "the ancestry of a node to itself was asked for");
+        assert_eq!(asked[0]["algo"], "cycles");
+    }
+
+    #[tokio::test]
+    async fn the_nodes_a_loop_back_sends_back_to_work_are_asked_for_in_one_walk() {
+        let stub = StubPlane::start(Replies::scripted([(
+            "plane.cypher",
+            json!({"columns": ["name"], "rows": [["triage"], ["reply"]]}),
+        )]))
+        .await;
+
+        let reached = GraphPlane::new(stub.client())
+            .downstream(&tenant(), &id(), &name("intake"))
+            .await
+            .expect("the walk answers");
+
+        assert_eq!(
+            reached,
+            ["intake", "reply", "triage"]
+                .into_iter()
+                .map(name)
+                .collect::<BTreeSet<_>>(),
+            "the node whose work is redone was left out of what runs again"
+        );
+        let asked = stub.calls("plane.cypher");
+        assert_eq!(asked.len(), 1, "a walk of the graph took more than one read");
+        assert_eq!(asked[0]["params"]["key"], "GraphNode/acme/triage/intake");
+        assert_eq!(asked[0]["params"][GRAPH], "triage");
+        assert_eq!(asked[0]["params"][OWNER], "acme");
+        let statement = asked[0]["query"].as_str().expect("a statement crossed");
+        assert!(
+            statement.contains(&format!("{FEEDS}*1..{}", MaxNodes::MOST)),
+            "the walk followed something other than a bounded run of feeding edges: {statement}"
+        );
+        assert!(
+            !statement.contains(LOOPS_BACK),
+            "the walk followed the loop backs it is answering about: {statement}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_walk_the_store_answers_unusably_is_refused() {
+        for answer in [
+            json!({"rows": "not a table"}),
+            json!({"columns": ["name"], "rows": [[7]]}),
+            json!({"columns": ["name"], "rows": [["two words"]]}),
+        ] {
+            let stub = StubPlane::start(Replies::scripted([("plane.cypher", answer.clone())])).await;
+            let refusal = GraphPlane::new(stub.client())
+                .downstream(&tenant(), &id(), &name("intake"))
+                .await;
+            assert!(
+                refusal.is_err(),
+                "{answer} was read as the nodes to run again"
+            );
+        }
+    }
+
     /// A cycle cannot be looked for until the rows exist, so the rows go in and come back out.
     #[tokio::test]
     async fn a_graph_that_feeds_itself_is_refused_and_taken_back_out() {
@@ -1433,30 +1871,99 @@ mod tests {
         );
     }
 
-    /// The round trip the mapping exists for, over a socket: a plane answers the three reads of
+    /// The round trip the mapping exists for, over a socket: a plane answers the four reads of
     /// `get` with exactly what a write sent it, and the graph that comes back is the one that went
-    /// in — id, name, owner, ceiling, nodes and edge alike.
+    /// in — id, name, owner, ceiling, nodes, edge and loop back alike.
     #[tokio::test]
     async fn a_graph_read_back_is_the_graph_that_was_stored() {
+        for stored in [graph(), looping_graph()] {
+            let stub = StubPlane::start(Replies::in_turn([
+                graph_rows(&stored),
+                node_rows(&stored),
+                edge_table(&stored),
+                loop_table(&stored),
+            ]))
+            .await;
+            assert_eq!(
+                GraphPlane::new(stub.client())
+                    .get(&tenant(), &id())
+                    .await
+                    .expect("a plane holding the graph answers with it"),
+                Some(stored.clone())
+            );
+            assert_eq!(
+                stub.calls("plane.query").len(),
+                3,
+                "a graph's own row, its nodes and its edges are three plans"
+            );
+            assert_eq!(
+                stub.calls("plane.cypher").len(),
+                1,
+                "its loop backs are the one read a plan cannot answer"
+            );
+        }
+    }
+
+    /// The cap is read off the hop, which is the one thing a read plan could not do.
+    ///
+    /// Asserted on the statement because a stub answers whatever it is scripted: what went wrong
+    /// here once was a plan that asked for an edge's property and was answered `null`, with every
+    /// test passing. The statement is the fix, so the statement is what is pinned.
+    #[tokio::test]
+    async fn the_loop_backs_of_a_graph_are_read_with_the_cap_off_the_hop_itself() {
+        let stored = looping_graph();
+        let stub = StubPlane::start(Replies::in_turn([
+            graph_rows(&stored),
+            node_rows(&stored),
+            edge_table(&stored),
+            loop_table(&stored),
+        ]))
+        .await;
+
+        let read = GraphPlane::new(stub.client())
+            .get(&tenant(), &id())
+            .await
+            .expect("a plane holding the graph answers with it")
+            .expect("the graph is there");
+
+        assert_eq!(read.loops()[0].cap.get(), 2, "the stored cap did not come back");
+        let asked = stub.calls("plane.cypher");
+        let statement = asked[0]["query"].as_str().expect("a statement crossed");
+        assert!(
+            statement.contains(&format!("[r:{LOOPS_BACK}]")),
+            "the read did not follow the loop backs: {statement}"
+        );
+        assert!(
+            statement.contains(&format!("r.{CAP}")),
+            "the cap was not read off the hop: {statement}"
+        );
+        assert_eq!(asked[0]["params"][GRAPH], "triage");
+        assert_eq!(asked[0]["params"][OWNER], "acme");
+    }
+
+    /// A graph stored before loop backs existed carries no such rows, and must still read back.
+    ///
+    /// The whole of the migration story for this milestone: the plane holds no loop back edges for
+    /// it, the read asks anyway, and an empty table is a graph that declares none.
+    #[tokio::test]
+    async fn a_graph_stored_before_loop_backs_existed_reads_back_without_any() {
         let stored = graph();
         let stub = StubPlane::start(Replies::in_turn([
             graph_rows(&stored),
             node_rows(&stored),
             edge_table(&stored),
+            json!({"columns": ["from", "to", CAP], "rows": []}),
         ]))
         .await;
-        assert_eq!(
-            GraphPlane::new(stub.client())
-                .get(&tenant(), &id())
-                .await
-                .expect("a plane holding the graph answers with it"),
-            Some(stored)
-        );
-        assert_eq!(
-            stub.calls("plane.query").len(),
-            3,
-            "a graph is read in three queries: itself, its nodes, its edges"
-        );
+
+        let read = GraphPlane::new(stub.client())
+            .get(&tenant(), &id())
+            .await
+            .expect("a plane holding the old graph answers with it")
+            .expect("the graph is there");
+
+        assert!(read.loops().is_empty());
+        assert_eq!(read, stored);
     }
 
     /// What the filter in the plan is there to prevent, were it ever lost: rows arrive that were
@@ -1629,11 +2136,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_graph_read_refuses_at_whichever_of_its_three_reads_cannot_be_used() {
-        let graph = graph();
+    async fn a_graph_read_refuses_at_whichever_of_its_four_reads_cannot_be_used() {
+        let graph = looping_graph();
         refused_at_each_read(
-            &[graph_rows(&graph), node_rows(&graph), edge_table(&graph)],
-            3,
+            &[
+                graph_rows(&graph),
+                node_rows(&graph),
+                edge_table(&graph),
+                loop_table(&graph),
+            ],
+            4,
             |plane| async move { plane.get(&tenant(), &id()).await },
         )
         .await;

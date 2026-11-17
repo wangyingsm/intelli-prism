@@ -137,6 +137,18 @@ pub enum GraphError {
         cycle: String,
     },
 
+    /// A loop back pointing somewhere the asking node's own work never came from.
+    ///
+    /// Found by the store, as a cycle is, and for the same reason: whether one node's answer
+    /// reaches another is reachability, which this crate does not walk.
+    #[error("the node {from} cannot send work back to {to}, which does not feed it")]
+    LoopNotBackwards {
+        /// The node that would have asked.
+        from: NodeName,
+        /// The node it named.
+        to: NodeName,
+    },
+
     /// The store answered with fewer places in the order than it said the graph has.
     ///
     /// Its own answers are capped, and a truncated order reads exactly like a complete one, so it
