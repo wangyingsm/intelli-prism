@@ -58,8 +58,11 @@ which of the three ran out, and when to come back. A money cap counts only what 
 is as complete as the prices are.
 - **Run graphs, across machines.** `POST /_ip/graph_run/{id}` runs a DAG of agent templates and
 streams it as it happens: a node's answer feeds its children, a node with several parents is given
-all of their answers at once, and a generation really runs at once. Where a deployment is a
-cluster, its nodes are spread over the live members — the one the caller asked included, since it
+all of their answers at once, and a generation really runs at once. A graph may declare a loop
+back, the one cycle permitted: a node unsatisfied with what it was given answers
+`{"loop_back": "survey"}`, and where the graph declares that loop and its own cap has something
+left, that node and everything after it runs again knowing what the work downstream made of it.
+Where a deployment is a cluster, its nodes are spread over the live members — the one the caller asked included, since it
 is a machine with a gateway on it like the rest — and a node sent elsewhere streams back the same
 events a local one says, the member authenticating itself with a shared cluster secret and
 building the caller's authority from its own reads, so a dispatch buys the right to say which run

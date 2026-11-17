@@ -567,6 +567,25 @@ it. Both that and the acyclicity check are dr-strange's, from
 the graph answers with every node nothing reads from, keyed by name.
 - **Fan-in is a json object keyed by parent node name.** One parent is an object with one key, so
 there is no special case to get wrong.
+- **A capped loop back is the one cycle permitted, and it is declared rather than asked for.** A
+node unsatisfied with what a predecessor gave it answers `{"loop_back": "survey"}`; where the graph
+declares that loop back and its cap has something left, the target and everything downstream of it
+runs again, the asking node included. The declaration is an edge of its own kind, `LOOPS_BACK`,
+carrying the cap, so a person reading the graph can see where it may double back and a graph naming
+a node it has not got is refused when it is written. Both the run order and the acyclicity check
+are asked for over `FEEDS` alone: a graph is a DAG in what it feeds while its loop backs are
+expected to close cycles. A loop back pointing sideways or forwards is refused at write time too,
+by asking the plane for a feeding path from the target back to the asker.
+- **Each loop back carries its own cap**, so a cheap critique loop and an expensive re-survey get
+their own budgets. What follows, and is the cost of the choice: a graph with several loop backs has
+several caps, and what bounds a whole run is their sum, so no one number says what a run may come
+to. A node run again is given the asking node's answer keyed by the asker's name — that is the
+whole value of a loop, a node running once more knowing what the work downstream made of its last
+answer — with the run's own question beside it under `$input` where that node is one nothing feeds.
+What the run comes to holds the last attempt of each node, while every attempt is in the stream.
+Every ask is answered there, the refused ones too (`unknown`, `undeclared`, `spent`,
+`unreachable`), and a refusal leaves the answer the node gave standing rather than failing the run.
+A node that stopped the graph does not also get to ask.
 - **A node that does not answer stops the graph, and its siblings are told to stop.** They end
 `cut_short`, and they are told *between turns* and never interrupted mid-turn: aborting a request
 in flight leaves the provider billing tokens this process then never records, so a dropped turn is
@@ -689,9 +708,9 @@ and nothing reconciles the two.
 transaction, and a graph's change lands in a store that transaction cannot reach; ordering them
 either way leaves a row without a change or a change without a row. `plane.history` is a graph's
 trail instead, which is a different place to look and a different format to read.
-- **A graph composes templates and nothing else.** An agent calling another agent, a template
-naming a sub-agent, a node that loops back — none of that exists; a node is a template, and the
-edges are declared when the graph is written.
+- **A graph composes templates and nothing else.** An agent calling another agent, or a template
+naming a sub-agent — neither exists; a node is a template, and every edge, the feeding ones and the
+loop backs alike, is declared when the graph is written.
 - **Nothing rate-limits a run as a run.** Each turn is counted and capped like any other request,
 so a run is limited turn by turn; the run itself is not. A template with a high turn ceiling is a
 loop that may make many requests before a per-request limit notices.
@@ -972,16 +991,6 @@ a score of this shape per endpoint, which is the model and not the mechanism: th
 one process's memory and is never read by another machine. Weighting is the same gap from the
 other side, and is not planned for the same reason — members register themselves, so there is
 nowhere for an operator to declare a share.
-- A capped loop-back in a run graph, which is the one cycle worth permitting. A node unsatisfied
-with what a predecessor gave it answers something like `{"loop_back": "survey"}`, the flow reruns
-that node with the extra context, and a predefined loop count stops it. The loop target is
-*declared*, as an edge of its own kind, so a graph that names a node it has not got is refused when
-it is written rather than when it is run, and a person reading the graph can see where it may
-double back; whether the loop is taken is still the answering node's decision, and only up to the
-cap. Two things follow for the ordinary edges: they are labelled `FEEDS` from the first version, so
-a later loop-back label is a new label and not a migration of every plane, and both the run order
-and the acyclicity check are asked for over `FEEDS` alone — a graph is a DAG in its feeding edges
-while its loop-back edges are expected to close cycles.
 
 ### Persistence beyond configuration
 
