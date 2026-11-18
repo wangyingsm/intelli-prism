@@ -1431,6 +1431,7 @@ mod tests {
             ]),
             serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
             no_loops(),
+            no_branches(),
         ]))
         .await;
 
@@ -1648,6 +1649,7 @@ mod tests {
                 "columns": ["from", "to", "cap"],
                 "rows": [["reply", "intake", 3]],
             }),
+            no_branches(),
         ]))
         .await;
 
@@ -2129,9 +2131,9 @@ upstream_speaks = "anthropic"
 
     /// Everything the plane is asked for when a chain of two is run, in the order it is asked.
     ///
-    /// Six calls, not four: reading the graph is three queries and a statement for its loop backs,
-    /// and reading the order is the `toposort` and then the node read again, which is what turns
-    /// the store's own ids into the names the graph calls its nodes.
+    /// Seven calls, not four: reading the graph is three queries and then a statement each for its
+    /// loop backs and its branches, and reading the order is the `toposort` and then the node read
+    /// again, which is what turns the store's own ids into the names the graph calls its nodes.
     fn chain_of_two(order: serde_json::Value) -> Replies {
         let nodes = || {
             serde_json::json!([
@@ -2144,6 +2146,7 @@ upstream_speaks = "anthropic"
             nodes(),
             serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
             no_loops(),
+            no_branches(),
             order,
             nodes(),
         ])
@@ -2165,6 +2168,7 @@ upstream_speaks = "anthropic"
                 "columns": ["from", "to", "cap"],
                 "rows": [["reply", "intake", 2]],
             }),
+            no_branches(),
             order,
             nodes(),
         ])
@@ -2173,6 +2177,11 @@ upstream_speaks = "anthropic"
     /// What a plane answers when a graph declares no loop back, which is every graph here.
     fn no_loops() -> serde_json::Value {
         serde_json::json!({"columns": ["from", "to", "cap"], "rows": []})
+    }
+
+    /// What a plane answers when every edge of a graph delivers, which is every graph here.
+    fn no_branches() -> serde_json::Value {
+        serde_json::json!({"columns": ["from", "to", "condition"], "rows": []})
     }
 
     /// The order a plane answers for a chain of two, as `toposort` reports one.
@@ -2782,6 +2791,7 @@ upstream_speaks = "anthropic"
             nodes(),
             serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
             no_loops(),
+            no_branches(),
             sorted_chain(),
             nodes(),
             // intake: the members, its placement, and clearing it.
@@ -2810,6 +2820,7 @@ upstream_speaks = "anthropic"
             nodes(),
             serde_json::json!({"columns": ["from", "to"], "rows": []}),
             no_loops(),
+            no_branches(),
             serde_json::json!({
                 "algo": "toposort",
                 "count": 1,

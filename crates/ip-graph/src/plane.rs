@@ -20,7 +20,7 @@ use crate::error::GraphError;
 use crate::graph::{
     GraphEdge, GraphNode, GraphOwner, LoopBack, LoopCap, MaxNodes, RunGraph, RunGraphParts,
 };
-use crate::id::{GraphId, GraphName, GraphRunId, NodeName};
+use crate::id::{Condition, GraphId, GraphName, GraphRunId, NodeName};
 use crate::member::ClusterMember;
 use crate::order::{Generation, Placed, RunOrder};
 use crate::placement::Placement;
@@ -46,6 +46,20 @@ pub const LOOPS_BACK: &str = "LOOPS_BACK";
 
 /// How many times one loop back may be taken, which is the one thing a loop back's edge carries.
 const CAP: &str = "cap";
+
+/// The type of edge a conditional one is written as a second time, beside its [`FEEDS`] row.
+///
+/// The exact inverse of the reasoning on [`LOOPS_BACK`], and for the same cause. A branch **is** a
+/// feeding edge — it delivers its source's answer to its target whenever it is taken — so its
+/// `FEEDS` row is written like any other edge's and both algorithms walk it, which is what places a
+/// branch's target in a later generation than its source and refuses a branch that closes a cycle.
+/// This second row exists because the condition has to hang on a hop a read can ask about, and
+/// because a branch is what a person reading the plane should see. Both rows are written, every
+/// time; neither is enough on its own.
+pub const BRANCH_FEEDS: &str = "BRANCH_FEEDS";
+
+/// When a branch is worth taking, which is the one thing a branch's edge carries.
+const CONDITION: &str = "condition";
 
 /// The label on every record of where a node is running.
 ///
@@ -261,6 +275,19 @@ fn stored_loops() -> String {
     )
 }
 
+/// The statement that reads one graph's branches: the two names each joins, and its condition.
+///
+/// A statement for the reason [`stored_loops`] records and measured the same way: what a branch
+/// adds to an edge is a property of the hop, and a read plan asking for one is answered `null`.
+fn stored_branches() -> String {
+    format!(
+        "MATCH (a:{NODE_LABEL})-[r:{BRANCH_FEEDS}]->(b:{NODE_LABEL}) \
+         WHERE a.{GRAPH} = $graph AND a.{OWNER} = $owner \
+         AND b.{GRAPH} = $graph AND b.{OWNER} = $owner \
+         RETURN DISTINCT a.{NAME} AS from, b.{NAME} AS to, r.{CONDITION} AS {CONDITION}"
+    )
+}
+
 /// The statement that answers every node one node's work reaches by feeding.
 ///
 /// The one question in this file a read plan cannot ask, and the reason [`DrsgClient::cypher`]
@@ -417,6 +444,76 @@ fn loops_from(table: &Value) -> Result<Vec<LoopBack>, GraphError> {
             })
         })
         .collect()
+}
+
+/// What one branch carries: whose it is, and when it is worth taking.
+fn branch_properties(graph: &RunGraph, condition: &Condition) -> Value {
+    json!({
+        GRAPH: graph.id().as_str(),
+        OWNER: graph.owner().written(),
+        CONDITION: condition.as_str(),
+    })
+}
+
+/// One graph's branches, rebuilt from the table the store answered with.
+///
+/// Each comes back as the edge it is rather than as a pair and a condition, so what reattaches it
+/// to the graph's own edges is the two names it joins.
+fn branches_from(table: &Value) -> Result<Vec<GraphEdge>, GraphError> {
+    let rows = table["rows"]
+        .as_array()
+        .ok_or_else(|| GraphError::Unreadable {
+            detail: "a branch read answered with something that is not a table".to_owned(),
+        })?;
+    rows.iter()
+        .map(|row| {
+            let cells = row
+                .as_array()
+                .filter(|cells| cells.len() == 3)
+                .ok_or_else(|| GraphError::Unreadable {
+                    detail: "a branch row is not the two names and the condition it was asked for"
+                        .to_owned(),
+                })?;
+            let name = |cell: &Value| {
+                cell.as_str()
+                    .ok_or(GraphError::PropertyKind { property: NAME })
+                    .and_then(NodeName::new)
+            };
+            let said = cells[2].as_str().ok_or(GraphError::PropertyKind {
+                property: CONDITION,
+            })?;
+            Ok(GraphEdge {
+                from: name(&cells[0])?,
+                to: name(&cells[1])?,
+                condition: Some(Condition::new(said)?),
+            })
+        })
+        .collect()
+}
+
+/// A graph's edges with each branch's condition back on the edge it belongs to.
+///
+/// The two are read apart because an edge's property is a statement's to read, and what joins them
+/// again is the pair of names. A branch naming a pair no edge feeds is **refused rather than
+/// dropped**: a condition that went missing turns a branch into an edge that always delivers, which
+/// is a graph that runs differently rather than one that fails to read.
+fn with_conditions(
+    mut edges: Vec<GraphEdge>,
+    branches: Vec<GraphEdge>,
+) -> Result<Vec<GraphEdge>, GraphError> {
+    for branch in branches {
+        let fed = edges
+            .iter_mut()
+            .find(|edge| edge.from == branch.from && edge.to == branch.to)
+            .ok_or_else(|| GraphError::Unreadable {
+                detail: format!(
+                    "a branch from {} to {}, which no edge feeds",
+                    branch.from, branch.to
+                ),
+            })?;
+        fed.condition = branch.condition;
+    }
+    Ok(edges)
 }
 
 /// What a graph's own node carries.
@@ -600,6 +697,9 @@ impl GraphPlane {
     /// route reports it rather than retrying.
     ///
     /// Deleting a node takes its edges with it, so the `FEEDS` edges need no pass of their own.
+    ///
+    /// An edge that carries a condition is written twice, its [`FEEDS`] row and then its
+    /// [`BRANCH_FEEDS`] twin, for the reason that const records.
     pub async fn put(&self, graph: &RunGraph) -> Result<(), GraphError> {
         let (owner, id) = (graph.owner(), graph.id());
         self.clear(owner, id).await?;
@@ -633,6 +733,16 @@ impl GraphPlane {
                     edge_properties(graph),
                 )
                 .await?;
+            if let Some(condition) = edge.condition.as_ref() {
+                self.drsg
+                    .edge_create(
+                        &node_key(owner, id, &edge.from),
+                        &node_key(owner, id, &edge.to),
+                        BRANCH_FEEDS,
+                        branch_properties(graph, condition),
+                    )
+                    .await?;
+            }
         }
         for back in graph.loops() {
             self.drsg
@@ -992,7 +1102,7 @@ impl GraphPlane {
     /// One graph's loop backs, without reading the rest of it.
     ///
     /// A read of its own because a member running one node of somebody else's graph needs this and
-    /// nothing else of the graph: it is one statement where [`get`](Self::get) is four reads, and
+    /// nothing else of the graph: it is one statement where [`get`](Self::get) is five reads, and
     /// what it answers is what says whether that node may send its work back.
     ///
     /// Nothing distinguishes a graph that is not there from one that declares no loop back. Both
@@ -1013,14 +1123,38 @@ impl GraphPlane {
         )
     }
 
+    /// One graph's branches, without reading the rest of it.
+    ///
+    /// A read of its own for [`loops`](Self::loops)' reason: a member running one node of somebody
+    /// else's graph needs the branches that leave that node and nothing else of the graph, and what
+    /// they answer is what that node may choose between.
+    ///
+    /// Each answers as the edge it is, condition and all, so a caller reads a branch's ends the way
+    /// it reads any other edge's.
+    pub async fn branches(
+        &self,
+        owner: &GraphOwner,
+        id: &GraphId,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        branches_from(
+            &self
+                .drsg
+                .cypher(
+                    &stored_branches(),
+                    json!({"graph": id.as_str(), "owner": owner.written()}),
+                )
+                .await?,
+        )
+    }
+
     /// One owner's graph, or nothing where that owner has none under the id.
     ///
-    /// Four reads — the graph, its nodes, its edges, its loop backs — each filtered on the owner,
-    /// and the answer goes through [`RunGraph::checked`]: a graph that comes back from the plane is
-    /// checked exactly as one arriving from a caller is, because rows can be edited in the store by
-    /// something that is not this code.
+    /// Five reads — the graph, its nodes, its edges, its loop backs, its branches — each filtered
+    /// on the owner, and the answer goes through [`RunGraph::checked`]: a graph that comes back from
+    /// the plane is checked exactly as one arriving from a caller is, because rows can be edited in
+    /// the store by something that is not this code.
     ///
-    /// The fourth is a statement rather than a plan, for the reason [`stored_loops`] records.
+    /// The last two are statements rather than plans, for the reason [`stored_loops`] records.
     pub async fn get(
         &self,
         owner: &GraphOwner,
@@ -1053,6 +1187,7 @@ impl GraphPlane {
         let nodes = nodes_from(&self.drsg.query(nodes_plan(owner, id)).await?, owner, id)?;
         let edges = edges_from(&self.drsg.query(edges_plan(owner, id)).await?)?;
         let loops = self.loops(owner, id).await?;
+        let edges = with_conditions(edges, self.branches(owner, id).await?)?;
         RunGraph::checked(RunGraphParts {
             id: id.clone(),
             name,
@@ -1207,6 +1342,17 @@ mod tests {
         })
     }
 
+    /// The table a plane answers a branch read with, empty for a graph that declares none.
+    fn branch_table(graph: &RunGraph) -> Value {
+        json!({
+            "columns": ["from", "to", CONDITION],
+            "rows": graph
+                .branches()
+                .map(|(edge, when)| json!([edge.from.as_str(), edge.to.as_str(), when.as_str()]))
+                .collect::<Vec<_>>(),
+        })
+    }
+
     /// The fixture's chain of two, with the second node able to send the work back.
     fn looping_graph() -> RunGraph {
         let stored = graph();
@@ -1224,6 +1370,27 @@ mod tests {
             max_nodes: stored.max_nodes(),
         })
         .expect("a chain that may double back holds together")
+    }
+
+    /// The fixture's chain of two, where whether the second node runs is the first node's to say.
+    fn branching_graph() -> RunGraph {
+        let stored = graph();
+        RunGraph::checked(RunGraphParts {
+            id: stored.id().clone(),
+            name: stored.name().clone(),
+            owner: stored.owner().clone(),
+            nodes: stored.nodes().to_vec(),
+            edges: vec![GraphEdge {
+                from: name("intake"),
+                to: name("reply"),
+                condition: Some(
+                    Condition::new("the complaint needs an answer").expect("a condition"),
+                ),
+            }],
+            loops: Vec::new(),
+            max_nodes: stored.max_nodes(),
+        })
+        .expect("a chain whose edge carries a condition holds together")
     }
 
     /// A plane holding nothing, which takes a write and finds no cycle in it.
@@ -1575,6 +1742,56 @@ mod tests {
         assert_eq!(edges[1]["properties"][OWNER], "acme");
     }
 
+    /// The duplication the whole shape rests on, and the reason it is asserted rather than trusted:
+    /// a conditional edge is **two rows over the same pair**, and reads as a bug to anyone who meets
+    /// it without [`BRANCH_FEEDS`]' own doc. Lose the `FEEDS` row and the ordering stops seeing the
+    /// edge; lose the twin and the condition has nowhere to live.
+    #[tokio::test]
+    async fn a_branch_is_written_as_both_a_feeding_edge_and_a_branch_carrying_its_condition() {
+        let stub = empty_plane().await;
+        GraphPlane::new(stub.client())
+            .put(&branching_graph())
+            .await
+            .expect("the stub takes the write");
+
+        let edges = stub.calls("edge.create");
+        assert_eq!(edges.len(), 2, "a branch is written as one row, not two");
+        for row in &edges {
+            assert_eq!(row["src"], "GraphNode/acme/triage/intake");
+            assert_eq!(row["dst"], "GraphNode/acme/triage/reply");
+            assert_eq!(row["properties"][OWNER], "acme");
+        }
+        assert_eq!(edges[0]["type"], FEEDS);
+        assert_eq!(
+            edges[0]["properties"][CONDITION],
+            Value::Null,
+            "the feeding row carried the condition, where no algorithm reads it"
+        );
+        assert_eq!(edges[1]["type"], BRANCH_FEEDS);
+        assert_eq!(
+            edges[1]["properties"][CONDITION],
+            "the complaint needs an answer"
+        );
+    }
+
+    /// A branch is a feeding edge, so the cycle check must see it — by the `FEEDS` row, not the twin.
+    #[tokio::test]
+    async fn the_cycle_check_of_a_branching_write_still_follows_only_what_feeds() {
+        let stub = empty_plane().await;
+        GraphPlane::new(stub.client())
+            .put(&branching_graph())
+            .await
+            .expect("the stub takes the write");
+
+        let asked = stub.calls("plane.algo");
+        assert_eq!(asked.len(), 1, "a branching write asks for the cycle alone");
+        assert_eq!(asked[0]["algo"], "cycles");
+        assert_eq!(
+            asked[0]["edge_type"], FEEDS,
+            "the check followed the branch twin as well as the edge it duplicates"
+        );
+    }
+
     /// The invariant the whole milestone rests on: a loop back is invisible to both algorithms.
     #[tokio::test]
     async fn neither_algorithm_a_write_asks_for_follows_a_loop_back() {
@@ -1913,12 +2130,13 @@ mod tests {
     /// in — id, name, owner, ceiling, nodes, edge and loop back alike.
     #[tokio::test]
     async fn a_graph_read_back_is_the_graph_that_was_stored() {
-        for stored in [graph(), looping_graph()] {
+        for stored in [graph(), looping_graph(), branching_graph()] {
             let stub = StubPlane::start(Replies::in_turn([
                 graph_rows(&stored),
                 node_rows(&stored),
                 edge_table(&stored),
                 loop_table(&stored),
+                branch_table(&stored),
             ]))
             .await;
             assert_eq!(
@@ -1935,8 +2153,8 @@ mod tests {
             );
             assert_eq!(
                 stub.calls("plane.cypher").len(),
-                1,
-                "its loop backs are the one read a plan cannot answer"
+                2,
+                "its loop backs and its branches are the two reads a plan cannot answer"
             );
         }
     }
@@ -1954,6 +2172,7 @@ mod tests {
             node_rows(&stored),
             edge_table(&stored),
             loop_table(&stored),
+            branch_table(&stored),
         ]))
         .await;
 
@@ -1994,6 +2213,7 @@ mod tests {
             node_rows(&stored),
             edge_table(&stored),
             json!({"columns": ["from", "to", CAP], "rows": []}),
+            branch_table(&stored),
         ]))
         .await;
 
@@ -2005,6 +2225,150 @@ mod tests {
 
         assert!(read.loops().is_empty());
         assert_eq!(read, stored);
+    }
+
+    /// A graph stored before branches existed carries no such rows, and must still read back.
+    ///
+    /// The migration story again, one milestone on: the plane holds no `BRANCH_FEEDS` row for it,
+    /// the read asks anyway, and an empty table is a graph whose edges all deliver.
+    #[tokio::test]
+    async fn a_graph_stored_before_branches_existed_reads_back_without_any() {
+        let stored = graph();
+        let stub = StubPlane::start(Replies::in_turn([
+            graph_rows(&stored),
+            node_rows(&stored),
+            edge_table(&stored),
+            loop_table(&stored),
+            json!({"columns": ["from", "to", CONDITION], "rows": []}),
+        ]))
+        .await;
+
+        let read = GraphPlane::new(stub.client())
+            .get(&tenant(), &id())
+            .await
+            .expect("a plane holding the old graph answers with it")
+            .expect("the graph is there");
+
+        assert_eq!(read.branches().count(), 0);
+        assert_eq!(read, stored);
+    }
+
+    /// The condition is read off the hop, for the reason the cap is, and the statement is pinned.
+    ///
+    /// The M28 defect this guards against passed 125 tests: a stub answers whatever it is scripted,
+    /// so a plan asking a *real* plane for an edge's property is answered `null` while every test
+    /// goes green. Nothing but the statement itself can hold that line in process.
+    #[tokio::test]
+    async fn the_branches_of_a_graph_are_read_with_the_condition_off_the_hop_itself() {
+        let stored = branching_graph();
+        let stub = StubPlane::start(Replies::in_turn([
+            graph_rows(&stored),
+            node_rows(&stored),
+            edge_table(&stored),
+            loop_table(&stored),
+            branch_table(&stored),
+        ]))
+        .await;
+
+        let read = GraphPlane::new(stub.client())
+            .get(&tenant(), &id())
+            .await
+            .expect("a plane holding the graph answers with it")
+            .expect("the graph is there");
+
+        assert_eq!(
+            read.branch(&name("intake"), &name("reply"))
+                .expect("the stored condition came back")
+                .as_str(),
+            "the complaint needs an answer"
+        );
+        let statement = stub.calls("plane.cypher")[1]["query"]
+            .as_str()
+            .expect("a statement crossed")
+            .to_owned();
+        assert!(
+            statement.contains(&format!("[r:{BRANCH_FEEDS}]")),
+            "the read did not follow the branches: {statement}"
+        );
+        assert!(
+            statement.contains(&format!("r.{CONDITION}")),
+            "the condition was not read off the hop: {statement}"
+        );
+    }
+
+    /// One statement, and not the four reads of a whole graph: what a member running one node needs.
+    #[tokio::test]
+    async fn the_branches_of_a_graph_are_answered_without_reading_the_rest_of_it() {
+        let stored = branching_graph();
+        let stub = StubPlane::start(Replies::in_turn([branch_table(&stored)])).await;
+
+        let branches = GraphPlane::new(stub.client())
+            .branches(&tenant(), &id())
+            .await
+            .expect("a plane holding the graph answers with its branches");
+
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].from.as_str(), "intake");
+        assert_eq!(branches[0].to.as_str(), "reply");
+        assert_eq!(
+            branches[0].condition.as_ref().map(Condition::as_str),
+            Some("the complaint needs an answer")
+        );
+        assert!(
+            stub.calls("plane.query").is_empty(),
+            "the branches were read by reading the graph"
+        );
+        let asked = stub.calls("plane.cypher");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0]["params"][GRAPH], "triage");
+        assert_eq!(asked[0]["params"][OWNER], "acme");
+    }
+
+    /// A condition the plane answers with as anything but text is refused, not dropped.
+    #[tokio::test]
+    async fn a_stored_condition_that_is_not_text_is_refused() {
+        for answered in [
+            json!({"columns": ["from", "to", CONDITION], "rows": [["intake", "reply", 7]]}),
+            json!({"columns": ["from", "to", CONDITION], "rows": [["intake", "reply", null]]}),
+            json!({"columns": ["from", "to", CONDITION], "rows": [["intake", "reply"]]}),
+            json!({"columns": ["from", "to", CONDITION], "rows": "no"}),
+        ] {
+            let stub = StubPlane::start(Replies::in_turn([answered.clone()])).await;
+            assert!(
+                GraphPlane::new(stub.client())
+                    .branches(&tenant(), &id())
+                    .await
+                    .is_err(),
+                "a branch read took {answered}"
+            );
+        }
+    }
+
+    /// A condition the plane holds against a pair no edge feeds is refused rather than lost.
+    ///
+    /// Reachable only where the store was edited by something that is not this code, which is why
+    /// it is refused: dropping it would turn a branch into an edge that always delivers, and the
+    /// graph would run differently rather than fail to read.
+    #[tokio::test]
+    async fn a_stored_branch_no_edge_feeds_is_refused_rather_than_dropped() {
+        let stored = graph();
+        let stub = StubPlane::start(Replies::in_turn([
+            graph_rows(&stored),
+            node_rows(&stored),
+            edge_table(&stored),
+            loop_table(&stored),
+            json!({
+                "columns": ["from", "to", CONDITION],
+                "rows": [["reply", "intake", "whenever"]],
+            }),
+        ]))
+        .await;
+
+        let refusal = GraphPlane::new(stub.client()).get(&tenant(), &id()).await;
+        assert!(
+            matches!(refusal, Err(GraphError::Unreadable { .. })),
+            "a branch over a pair the graph does not feed was taken: {refusal:?}"
+        );
     }
 
     /// What the filter in the plan is there to prevent, were it ever lost: rows arrive that were
@@ -2177,7 +2541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_graph_read_refuses_at_whichever_of_its_four_reads_cannot_be_used() {
+    async fn a_graph_read_refuses_at_whichever_of_its_five_reads_cannot_be_used() {
         let graph = looping_graph();
         refused_at_each_read(
             &[
@@ -2185,8 +2549,9 @@ mod tests {
                 node_rows(&graph),
                 edge_table(&graph),
                 loop_table(&graph),
+                branch_table(&graph),
             ],
-            4,
+            5,
             |plane| async move { plane.get(&tenant(), &id()).await },
         )
         .await;

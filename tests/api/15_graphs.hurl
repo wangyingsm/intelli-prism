@@ -187,6 +187,89 @@ DELETE {{host}}/_ip/graphs/looping?tenant=graphers
 x-ip-csrf: 1
 HTTP 204
 
+# A branch, written and read back out of the plane with the condition it was given.
+#
+# Here for the cap's reason, one milestone on: the condition is a property of the *edge*, so what
+# proves it crossed the wire is a real plane handing it back. A conditional edge is written twice —
+# `FEEDS` for the ordering, `BRANCH_FEEDS` for the condition — and reading the graph joins the two
+# again by the pair of names, which no stub can prove either.
+PUT {{host}}/_ip/graphs/branching?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "Branches",
+  "max_nodes": 8,
+  "nodes": [
+    {"name": "intake", "agent": "intake"},
+    {"name": "reply", "agent": "reply"}
+  ],
+  "edges": [{"from": "intake", "to": "reply", "condition": "the complaint needs an answer"}]
+}
+HTTP 201
+[Asserts]
+jsonpath "$.edges" count == 1
+jsonpath "$.edges[0].condition" == "the complaint needs an answer"
+
+GET {{host}}/_ip/graphs/branching?tenant=graphers
+HTTP 200
+[Asserts]
+jsonpath "$.edges" count == 1
+jsonpath "$.edges[0].from" == "intake"
+jsonpath "$.edges[0].to" == "reply"
+jsonpath "$.edges[0].condition" == "the complaint needs an answer"
+
+DELETE {{host}}/_ip/graphs/branching?tenant=graphers
+x-ip-csrf: 1
+HTTP 204
+
+# An edge that carries no condition carries none back: a graph written before branches existed, and
+# the one case a read could have grown a `null` where there was nothing.
+PUT {{host}}/_ip/graphs/unconditional?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "Always delivers",
+  "max_nodes": 4,
+  "nodes": [
+    {"name": "intake", "agent": "intake"},
+    {"name": "reply", "agent": "reply"}
+  ],
+  "edges": [{"from": "intake", "to": "reply"}]
+}
+HTTP 201
+
+GET {{host}}/_ip/graphs/unconditional?tenant=graphers
+HTTP 200
+[Asserts]
+jsonpath "$.edges[0].condition" not exists
+
+DELETE {{host}}/_ip/graphs/unconditional?tenant=graphers
+x-ip-csrf: 1
+HTTP 204
+
+# A condition of nothing, which would say a branch is worth taking under no circumstances at all.
+PUT {{host}}/_ip/graphs/blank-condition?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "A branch with nothing on it",
+  "max_nodes": 4,
+  "nodes": [
+    {"name": "intake", "agent": "intake"},
+    {"name": "reply", "agent": "reply"}
+  ],
+  "edges": [{"from": "intake", "to": "reply", "condition": "   "}]
+}
+HTTP 422
+
+# A branch naming a node the graph has not got, refused by the check every edge goes through.
+PUT {{host}}/_ip/graphs/branch-to-nowhere?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "A branch to nowhere",
+  "max_nodes": 4,
+  "nodes": [{"name": "intake", "agent": "intake"}],
+  "edges": [{"from": "intake", "to": "nowhere", "condition": "it is worth doing"}]
+}
+HTTP 422
+
 # A loop back a node declares on itself is taken: a node may always ask for its own work again,
 # and a self loop closes no cycle in the feeding edges, which is what the plane is asked about.
 PUT {{host}}/_ip/graphs/self-loop?tenant=graphers
