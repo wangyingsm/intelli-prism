@@ -1,10 +1,12 @@
 # Running a graph, over a live server and a real socket. What is checked here is the door —
-# who may start a run and what is refused before any stream opens — and then one graph carried
-# to its end as an event stream, against the stub upstream `run.sh` starts.
+# who may start a run and what is refused before any stream opens — and then two graphs carried
+# to their end as an event stream, against the stub upstream `run.sh` starts: a diamond, where
+# every node runs, and a triage, where what a node answers decides which of them do.
 #
 # The order of the cases is the order the handler settles things in: the administrator writes
 # every graph here and can start no run, because a run is charged to a tenant and it is a member
-# of none. A real model and real benchmarks are a separate thing, in `examples/graph-run`.
+# of none. A real model and real benchmarks are a separate thing, in `examples/graph-run` and
+# `examples/branch`.
 
 POST {{host}}/_ip/login
 {"user": "root", "passphrase": "{{passphrase}}"}
@@ -122,3 +124,48 @@ body contains "\"answer\":{\"join\""
 # Nothing stopped it, and the run it belongs to is named on its events.
 body contains "\"stopped_at\":null"
 body contains "\"run\":"
+
+# And a graph that branches, which is the only place in this suite where what a node answers
+# decides what runs. `triage` declares two branches, is told so in a prompt the engine writes
+# rather than the operator, and the stub plays a node that names `answer`: so one branch is taken,
+# `escalate` is skipped without ever reaching the upstream, and the graph answers with the path it
+# actually took. Whether a *model* judges a condition well is `examples/branch`'s question.
+PUT {{host}}/_ip/graphs/triage?tenant=runs
+x-ip-csrf: 1
+{
+  "name": "Triage",
+  "max_nodes": 8,
+  "nodes": [
+    {"name": "triage", "agent": "first"},
+    {"name": "answer", "agent": "second"},
+    {"name": "escalate", "agent": "second"}
+  ],
+  "edges": [
+    {"from": "triage", "to": "answer", "condition": "the complaint can be answered as it stands"},
+    {"from": "triage", "to": "escalate", "condition": "the complaint names a loss"}
+  ]
+}
+HTTP 201
+
+POST {{host}}/_ip/graph_run/triage?tenant=runs
+x-ip-csrf: 1
+{"input": "how many are left?"}
+HTTP 200
+[Asserts]
+header "content-type" startsWith "text/event-stream"
+# The branch it took, the branch it passed over, and the node that therefore never ran.
+body contains "event: branch_taken"
+body contains "event: branch_not_taken"
+body contains "event: node_skipped"
+body contains "\"next\":\"answer\""
+body contains "\"next\":\"escalate\""
+# The node that was named took a turn; the one that was not never reached the upstream at all,
+# which a turn event is what would say. This is the assertion the whole milestone is for.
+body contains "\"node\":\"answer\",\"number\":1"
+body not contains "\"node\":\"escalate\",\"number\""
+# It ran on what arrived, keyed by the node that chose to send it.
+body contains "\"node\":\"answer\",\"run\""
+body contains "{\\\"triage\\\":"
+# And the graph answered with the realized run's leaf, alone.
+body contains "\"answer\":{\"answer\":\"four crates are left\"}"
+body contains "\"stopped_at\":null"
