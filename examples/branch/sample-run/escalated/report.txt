@@ -1,0 +1,19 @@
+  triage    begins on    218 characters
+  triage    answered  in   407/   84 tokens,    365 characters out
+  - triage passes over close
+  > triage sends the work on to escalate
+    notes: Checkout has been returning 503 for roughly 40% of requests since 02:10 UTC, and this is ongo...
+  - triage passes over shelve
+  . close does not run: nothing reached it
+  . shelve does not run: nothing reached it
+  escalate  begins on    386 characters
+  escalate  answered  in   236/  152 tokens,    727 characters out
+
+  branches taken:   escalate
+  branches passed:  close, shelve
+  nodes skipped:    close, shelve
+  answered with:    escalate
+  stopped at:       nothing — every node that ran answered
+  spent:            643/236 tokens, 0 micros
+  run id:           8c3072fdf663a134f9211b489d29714d
+  nodes, in the order they finished: triage -> escalate

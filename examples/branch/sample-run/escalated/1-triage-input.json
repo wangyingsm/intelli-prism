@@ -1,0 +1,1 @@
+Checkout has been returning 503 for roughly 40% of requests since 02:10 UTC. Restarting the payment gateway pods changed nothing. We do not know what is wrong. Support has seven tickets open in the last twenty minutes.

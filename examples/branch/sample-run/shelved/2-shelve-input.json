@@ -1,0 +1,3 @@
+{
+  "triage": "{\"branch\": [\"shelve\"], \"notes\": \"A background reindex job has been failing every ten minutes since 08:00 UTC after its service account lost permission during last night's key rotation. It is still failing now. No user-facing page reads that index yet, so no users are affected. The cause is understood: the key rotation removed the service account's permission.\"}"
+}

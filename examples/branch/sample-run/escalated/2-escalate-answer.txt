@@ -1,0 +1,3 @@
+Production checkout is failing about 40% of requests — escalate to payments on-call now.
+
+Customers cannot complete purchases. The 503s began around 02:10 UTC and are still ongoing; support has opened seven tickets in the last twenty minutes. The cause is unknown. Restarting the payment gateway pods changed nothing, so the gateway itself may not be the source, but nothing here confirms what is. It is also unconfirmed whether failures are concentrated in one region, one payment method, or all traffic, or whether any deploys or config changes landed just before 02:10. First check: error rate by region and payment method on the checkout dashboards, then recent deploy and config history in the thirty minutes before 02:10.

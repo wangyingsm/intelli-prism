@@ -1,0 +1,1 @@
+{"branch": ["escalate"], "notes": "Checkout has been returning 503 for roughly 40% of requests since 02:10 UTC, and this is ongoing. Users are affected: support has seven tickets open in the last twenty minutes. The cause is not understood; restarting the payment gateway pods changed nothing and the report does not state a known cause. The incident is not over."}

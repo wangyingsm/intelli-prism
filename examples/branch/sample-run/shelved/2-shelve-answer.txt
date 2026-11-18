@@ -1,0 +1,9 @@
+Reindex job failing every ten minutes since key rotation
+
+What is broken: the background reindex job has failed on every scheduled run since 08:00 UTC and is still failing.
+
+Known cause: last night's key rotation stripped the job's service account of its permission.
+
+Why it is not urgent: no user-facing page reads that index yet, so nobody is affected; only the index stays stale.
+
+Before it can be closed: the service account's permission must be restored, one scheduled run must complete cleanly, and the index must confirm it is caught up.

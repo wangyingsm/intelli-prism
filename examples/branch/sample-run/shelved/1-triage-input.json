@@ -1,0 +1,1 @@
+A background reindex job has been failing every ten minutes since 08:00 UTC, because its service account lost permission in last night key rotation. It is still failing now. No user-facing page reads that index yet, so nobody is affected and nobody has complained.

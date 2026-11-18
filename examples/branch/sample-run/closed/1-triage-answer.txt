@@ -1,0 +1,1 @@
+{"branch": ["close"], "notes": "Image uploads failed from 14:02 to 14:20 UTC (18 minutes). A deploy at 14:01 shipped a config with the wrong S3 bucket name as the cause. Rolling back the deploy fixed uploads immediately, and every upload since has succeeded. About 300 users saw an error toast; no users are currently affected."}

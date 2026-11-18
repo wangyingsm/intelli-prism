@@ -1,0 +1,27 @@
+{
+  "name": "Incident triage, with three ways out",
+  "max_nodes": 6,
+  "nodes": [
+    {"name": "triage",   "agent": "triage"},
+    {"name": "escalate", "agent": "escalate"},
+    {"name": "close",    "agent": "close"},
+    {"name": "shelve",   "agent": "shelve"}
+  ],
+  "edges": [
+    {
+      "from": "triage",
+      "to": "escalate",
+      "condition": "users are still affected, or the cause of the incident is not understood"
+    },
+    {
+      "from": "triage",
+      "to": "close",
+      "condition": "the incident is over and its cause is understood"
+    },
+    {
+      "from": "triage",
+      "to": "shelve",
+      "condition": "the incident is still going on, but nobody is affected and its cause is understood"
+    }
+  ]
+}

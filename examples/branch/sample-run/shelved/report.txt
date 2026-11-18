@@ -1,0 +1,19 @@
+  triage    begins on    264 characters
+  triage    answered  in   411/   79 tokens,    363 characters out
+  - triage passes over close
+  - triage passes over escalate
+  > triage sends the work on to shelve
+    notes: A background reindex job has been failing every ten minutes since 08:00 UTC after its service...
+  . escalate does not run: nothing reached it
+  . close does not run: nothing reached it
+  shelve    begins on    384 characters
+  shelve    answered  in   226/  114 tokens,    544 characters out
+
+  branches taken:   shelve
+  branches passed:  close, escalate
+  nodes skipped:    escalate, close
+  answered with:    shelve
+  stopped at:       nothing — every node that ran answered
+  spent:            637/193 tokens, 0 micros
+  run id:           861637ff85ec270adf20555fe637061b
+  nodes, in the order they finished: triage -> shelve

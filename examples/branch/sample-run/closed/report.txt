@@ -1,0 +1,19 @@
+  triage    begins on    242 characters
+  triage    answered  in   418/   82 tokens,    329 characters out
+  > triage sends the work on to close
+    notes: Image uploads failed from 14:02 to 14:20 UTC (18 minutes). A deploy at 14:01 shipped a config...
+  - triage passes over escalate
+  - triage passes over shelve
+  . escalate does not run: nothing reached it
+  . shelve does not run: nothing reached it
+  close     begins on    350 characters
+  close     answered  in   216/  109 tokens,    502 characters out
+
+  branches taken:   close
+  branches passed:  escalate, shelve
+  nodes skipped:    escalate, shelve
+  answered with:    close
+  stopped at:       nothing — every node that ran answered
+  spent:            634/191 tokens, 0 micros
+  run id:           9c262166a78b624da7d0821339228265
+  nodes, in the order they finished: triage -> close
