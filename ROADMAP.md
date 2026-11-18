@@ -749,14 +749,11 @@ needs a key the deployment manages, which is not built.
 - **A run is not resumable and nothing lists one.** It lives as long as its stream: a client that
 hangs up loses it, nothing records that it happened beyond the usage rows its turns wrote, and
 there is no handle to ask after one. The run id is generated, streamed, and stored nowhere.
-- **A run graph's answers live only in the coordinator's memory.** Each node's answer is held by
-the process that took the request, so a coordinator lost halfway through a graph loses every answer
-already paid for: the spend is durable, because each turn writes a usage row, and the work is not.
-Nothing resumes a graph and nothing lists a run of one.
-- **Every node of a graph runs in the coordinator's own process.** The dispatch payload is shaped
-so a node needs nothing but its input — not the graph, not its order, not what its siblings
-answered — but nothing yet sends one to another machine, and nothing records where a node is
-running.
+- **A coordinator lost halfway through a graph loses the run.** Each node's answer is held by the
+process that took the request; in a cluster what a node spent something to answer is kept in the
+shared cache for a day as well, so a coordinator can see what has already been paid for, but
+nothing picks a graph up where another left it and nothing lists a run of one. The spend is
+durable, because each turn writes a usage row, and the work is not.
 - **A graph is backed up separately from everything else.** It lives in a dr-strange plane, so a
 deployment's state is no longer one database: the plane is backed up beside postgres or it is lost
 on its own. A plane restored from a different moment than the audit trail will disagree with it,
