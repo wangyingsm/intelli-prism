@@ -136,6 +136,22 @@ pub enum RunError {
         number: u32,
     },
 
+    /// A search declared to a model that this deployment could not answer.
+    ///
+    /// **Refused before the first turn rather than when the model calls it.** A template that
+    /// asks to search is asking for the one tool this gateway answers itself, and only the
+    /// deployment's own encoder may: a run that declared it and then failed every call would
+    /// cost paid turns to discover what a status code says at once. The four tools that walk
+    /// edges need no encoder and are not refused here.
+    #[error(
+        "{tool:?} searches by meaning, and this deployment embeds nothing; configure a \
+         `[semantic]` artefact, or ask for a tool that walks edges"
+    )]
+    NothingEmbeds {
+        /// The tool, by the name the model would have been told.
+        tool: String,
+    },
+
     /// A name before the dot that both a registered server and a retriever answer to.
     ///
     /// Refused rather than resolved to either: the two readings call different things, and a

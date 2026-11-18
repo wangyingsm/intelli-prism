@@ -5,14 +5,15 @@
 //! split is the one [`ip_gateway::Embedder`] already makes: the crates carry the wire, and the
 //! binary is where a stored row becomes a client.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ip_config::Secret;
-use ip_drsg::{DrsgClient, DrsgEndpoint, DrsgError, DrsgSettings};
-use ip_qdrant::{QdrantClient, QdrantError, QdrantSettings};
-use ip_retrieve::{
-    CollectionName, NodeLabel, Retriever, RetrieverAuth, Source, VectorName, VectorProperty,
-};
+use ip_drsg::{DrsgClient, DrsgEndpoint, DrsgError, DrsgSettings, PlaneSource};
+use ip_qdrant::{CollectionSource, QdrantClient, QdrantError, QdrantSettings};
+use ip_retrieve::{Retrieval, Retriever, RetrieverAuth, Source};
+use ip_run::Held;
+use ip_storage::{AgentOwner, RetrieverOwner};
 
 use crate::error::Unanswered;
 
@@ -25,29 +26,15 @@ const BACKEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A client for whichever backend a retriever names, holding what a look-up of it needs.
 ///
-/// The parts beside the client are the retriever's own: which label and property a plane is
-/// searched by, which collection and named vector a store is. They are read once here so that
-/// nothing downstream has to match on [`Source`] again.
+/// Each variant is the crate's own source type — the client with the retriever's scope beside it,
+/// which is what [`Retrieval`] is implemented on — so nothing downstream has to match on
+/// [`Source`] again, and what a run dispatches through is built here and nowhere else.
 #[derive(Debug)]
 pub enum Backend {
     /// A `dr-strange` plane.
-    Drsg {
-        /// What speaks to it.
-        client: DrsgClient,
-        /// Which label a look-up is scoped to, and every label where it is scoped to none.
-        label: Option<NodeLabel>,
-        /// Which property holds the embeddings.
-        property: VectorProperty,
-    },
+    Drsg(PlaneSource),
     /// A `qdrant` collection.
-    Qdrant {
-        /// What speaks to it.
-        client: QdrantClient,
-        /// Which collection a look-up reads.
-        collection: CollectionName,
-        /// Which of its named vectors, and its only one where it names none.
-        vector: Option<VectorName>,
-    },
+    Qdrant(CollectionSource),
 }
 
 impl Backend {
@@ -75,8 +62,8 @@ impl Backend {
                     .map_err(|error| Unanswered::Refused(error.to_string()))?;
                 let plane = ip_drsg::PlaneName::new(plane.as_str())
                     .map_err(|error| Unanswered::Refused(error.to_string()))?;
-                Ok(Self::Drsg {
-                    client: DrsgClient::new(DrsgSettings {
+                Ok(Self::Drsg(PlaneSource::new(
+                    DrsgClient::new(DrsgSettings {
                         endpoint,
                         // A plane behind no token takes the empty one it is presented and ignores
                         // it, which is what a retriever written with no auth asks for.
@@ -84,19 +71,19 @@ impl Backend {
                         plane,
                         timeout: BACKEND_TIMEOUT,
                     }),
-                    label: label.clone(),
-                    property: property.clone(),
-                })
+                    label.clone(),
+                    property.clone(),
+                )))
             }
-            Source::Qdrant { collection, vector } => Ok(Self::Qdrant {
-                client: QdrantClient::new(QdrantSettings {
+            Source::Qdrant { collection, vector } => Ok(Self::Qdrant(CollectionSource::new(
+                QdrantClient::new(QdrantSettings {
                     endpoint: retriever.endpoint().clone(),
                     key,
                     timeout: BACKEND_TIMEOUT,
                 }),
-                collection: collection.clone(),
-                vector: vector.clone(),
-            }),
+                collection.clone(),
+                vector.clone(),
+            ))),
         }
     }
 
@@ -109,25 +96,58 @@ impl Backend {
     /// the property named is the one case that is neither a width nor a failure.
     pub async fn width(&self) -> Result<Option<u32>, Unanswered> {
         match self {
-            Self::Drsg {
-                client,
-                label,
-                property,
-            } => client
-                .width(label.as_ref(), property)
-                .await
-                .map_err(plane_said),
-            Self::Qdrant {
-                client,
-                collection,
-                vector,
-            } => client
-                .collection(collection, vector.as_ref())
+            Self::Drsg(plane) => plane.width().await.map_err(plane_said),
+            Self::Qdrant(collection) => collection
+                .described()
                 .await
                 .map(|held| Some(held.width))
                 .map_err(store_said),
         }
     }
+
+    /// What a run looks something up through.
+    ///
+    /// Shared rather than owned, because one run holds a look-up per retriever its template
+    /// names and a tool may be called on every turn: the connection pool inside the client is
+    /// what is being kept.
+    #[must_use]
+    pub fn retrieval(self) -> Arc<dyn Retrieval> {
+        match self {
+            Self::Drsg(plane) => Arc::new(plane),
+            Self::Qdrant(collection) => Arc::new(collection),
+        }
+    }
+}
+
+/// Whose retrievers a run reads, which is whose template it is running.
+///
+/// The deployment's own template runs with the deployment's own retrievers and a tenant's with
+/// that tenant's — [`templates_of`](crate::routes::graph::templates_of) applied once more, and
+/// for its reason: a tenant's run must not reach another tenant's documents by naming an id, and
+/// a global template is the deployment's own work.
+#[must_use]
+pub fn retrievers_of(owner: &AgentOwner) -> RetrieverOwner {
+    match owner {
+        AgentOwner::Global => RetrieverOwner::Global,
+        AgentOwner::Tenant(tenant) => RetrieverOwner::Tenant(tenant.clone()),
+    }
+}
+
+/// Opens every stored retriever against its backend, so a run can address it.
+///
+/// Refused rather than skipped where one will not open: a retriever a template names and this
+/// could not open would otherwise read to the run as a retriever that is not registered, which
+/// names the wrong thing to fix. Nothing is reached here — see [`Backend::open`].
+pub fn held(stored: Vec<Retriever>) -> Result<Vec<Held>, Unanswered> {
+    stored
+        .into_iter()
+        .map(|retriever| {
+            Ok(Held {
+                lookup: Backend::open(&retriever)?.retrieval(),
+                retriever,
+            })
+        })
+        .collect()
 }
 
 /// What a plane's refusal means to a caller.
@@ -158,8 +178,8 @@ mod tests {
     use ip_qdrant::testing::STUB_KEY;
     use ip_qdrant::{Answers, StubQdrant};
     use ip_retrieve::{
-        MaxHits, MetaSchema, RetrieverEndpoint, RetrieverId, RetrieverName, RetrieverParts,
-        RetrieverTool, RetrieverTools,
+        CollectionName, MaxHits, MetaSchema, NodeLabel, RetrieverEndpoint, RetrieverId,
+        RetrieverName, RetrieverParts, RetrieverTool, RetrieverTools, VectorProperty,
     };
 
     use super::*;
@@ -269,20 +289,16 @@ mod tests {
     #[test]
     fn each_kind_holds_what_a_look_up_of_it_needs() {
         match Backend::open(&plane("http://127.0.0.1:44453/rpc")).expect("opens") {
-            Backend::Drsg {
-                label, property, ..
-            } => {
-                assert_eq!(label.as_ref().map(NodeLabel::as_str), Some("Document"));
-                assert_eq!(property.as_str(), "embedding");
+            Backend::Drsg(held) => {
+                assert_eq!(held.label().map(NodeLabel::as_str), Some("Document"));
+                assert_eq!(held.property().as_str(), "embedding");
             }
             other => panic!("a plane was opened as {other:?}"),
         }
         match Backend::open(&collection("http://127.0.0.1:6333", None)).expect("opens") {
-            Backend::Qdrant {
-                collection, vector, ..
-            } => {
-                assert_eq!(collection.as_str(), "handbook");
-                assert_eq!(vector, None);
+            Backend::Qdrant(held) => {
+                assert_eq!(held.collection().as_str(), "handbook");
+                assert_eq!(held.vector(), None);
             }
             other => panic!("a collection was opened as {other:?}"),
         }

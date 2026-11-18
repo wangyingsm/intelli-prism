@@ -32,17 +32,16 @@ use ip_core::Protocol;
 use ip_graph::{GraphRunId, NodeRan};
 use ip_run::{
     AsWhom, Pinned, Reporting, RunEvent, RunId, RunSignal, Running, Spend, Stopped, Target,
-    Toolshed,
 };
-use ip_storage::Page;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use super::graph::{MCP_SETTINGS, REGISTRY_LIMIT, templates_of};
+use super::graph::templates_of;
 use crate::cluster::{already_stopped, signal_topic};
 use crate::manage::authority_of;
+use crate::opening::toolshed;
 use crate::state::AppState;
 
 /// Takes one node's work from another member and streams what the node does with it.
@@ -304,14 +303,7 @@ async fn dispatched(state: AppState, work: Dispatch, say: UnboundedSender<NodeEv
         Ok(target) => target,
         Err(error) => return refuse(error.to_string()),
     };
-    let registry = match store.mcps(Page::new(REGISTRY_LIMIT, 0, None)).await {
-        Ok(held) => held
-            .into_iter()
-            .map(|stored| stored.server)
-            .collect::<Vec<_>>(),
-        Err(error) => return refuse(format!("the mcp registry could not be read: {error}")),
-    };
-    let shed = match Toolshed::open(config.tool_set(), &registry, MCP_SETTINGS).await {
+    let shed = match toolshed(&state, &templates_of(&work.owner), config.tool_set()).await {
         Ok(shed) => shed,
         Err(error) => return refuse(error.to_string()),
     };

@@ -165,6 +165,26 @@ pub enum Unanswered {
     Refused(String),
 }
 
+/// Every way the things a run may call can fail to open.
+///
+/// Three kinds because the three answer differently: a store that cannot say what is registered
+/// is the server's own failure, while a retriever this cannot speak to and a template naming a
+/// tool that is not there are the caller's to fix.
+#[derive(Debug, thiserror::Error)]
+pub enum Unopened {
+    /// The store could not say what is registered.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+
+    /// A stored retriever is one this cannot open.
+    #[error(transparent)]
+    Backend(#[from] Unanswered),
+
+    /// The template's tools do not resolve against what is registered.
+    #[error(transparent)]
+    Tools(#[from] ip_run::RunError),
+}
+
 /// Every way publishing the rules for the other nodes can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum FeedError {

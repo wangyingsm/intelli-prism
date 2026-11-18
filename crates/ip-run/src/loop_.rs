@@ -302,7 +302,7 @@ mod tests {
 
     use super::*;
     use crate::fixtures::{
-        Fake, Serving, gateway, registered, said, settings, stub, target, template, wants,
+        Fake, Serving, gateway, holding, registered, said, stub, target, template, wants,
     };
     use crate::shed::Toolshed;
     use std::sync::Arc;
@@ -312,11 +312,10 @@ mod tests {
         serving: Serving,
     ) -> (Toolshed, crate::fixtures::Called) {
         let (address, called) = stub(serving).await;
-        let shed = Toolshed::open(
+        let shed = Toolshed::open(holding(
             &crate::fixtures::asking(tools),
             &[registered("warehouse", address)],
-            settings(),
-        )
+        ))
         .await
         .unwrap();
         (shed, called)
@@ -668,7 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_template_with_no_tools_still_runs() {
-        let shed = Toolshed::open(&ToolSet::default(), &[], settings())
+        let shed = Toolshed::open(holding(&ToolSet::default(), &[]))
             .await
             .unwrap();
         let upstream = Fake::answering(&said("four"));

@@ -1,11 +1,12 @@
 //! Which tools a run may call, and what the model is told they are called.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use ip_agents::ToolSet;
 use ip_mcp::{McpId, McpToolName, Offering};
 use ip_protocol::{Tool, ToolName};
-use ip_retrieve::{Retriever, RetrieverId, RetrieverTool};
+use ip_retrieve::{Retrieval, Retriever, RetrieverId, RetrieverTool};
 
 use crate::error::RunError;
 
@@ -62,6 +63,29 @@ impl Addressed {
     }
 }
 
+/// One retriever a run may address: what it is, and what looks something up in it.
+///
+/// The two are carried together because a run needs both and neither is derivable from the
+/// other: the row says which tools are offered, what a filter may name and how many hits are
+/// allowed, while the implementation is the backend it was opened against. The binary pairs
+/// them, which is what keeps this crate off both backends.
+#[derive(Clone)]
+pub struct Held {
+    /// What the operator registered.
+    pub retriever: Retriever,
+    /// What looks something up in it.
+    pub lookup: Arc<dyn Retrieval>,
+}
+
+impl std::fmt::Debug for Held {
+    /// Names the retriever rather than the client behind it, which holds a credential.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Held")
+            .field("retriever", &self.retriever.id().as_str())
+            .finish()
+    }
+}
+
 /// What a run may address, read before anything is opened.
 ///
 /// Both halves, because the name before the dot is looked up in each: that is what tells a
@@ -72,7 +96,7 @@ pub struct Registries<'a> {
     /// Every MCP server this deployment has registered.
     pub servers: &'a [McpId],
     /// Every retriever the run's owner holds.
-    pub retrievers: &'a [Retriever],
+    pub retrievers: &'a [Held],
 }
 
 impl<'a> Registries<'a> {
@@ -80,10 +104,10 @@ impl<'a> Registries<'a> {
     ///
     /// Taken by value so what comes back outlives the copy it was read through, which is what
     /// lets one pass carry the row it resolved.
-    fn retriever(self, named: &str) -> Option<&'a Retriever> {
+    fn retriever(self, named: &str) -> Option<&'a Held> {
         self.retrievers
             .iter()
-            .find(|held| held.id().as_str() == named)
+            .find(|held| held.retriever.id().as_str() == named)
     }
 }
 
@@ -153,7 +177,7 @@ impl Toolbox {
                     }
                 }
                 Resolved::Retriever { held, tool, .. } => {
-                    let declared = held.declare(*tool);
+                    let declared = held.retriever.declare(*tool);
                     Declaration {
                         description: Some(declared.description),
                         schema: declared.schema,
@@ -197,6 +221,27 @@ impl Toolbox {
         });
         self.by_wire.insert(wire, addressed);
         Ok(())
+    }
+
+    /// The first tool here that searches by meaning, and none where nothing does.
+    ///
+    /// What the up-front embedder check is made of: the four tools that walk edges compare
+    /// nothing of ours, so a deployment that embeds nothing may still hold a retriever and run
+    /// a template that walks one. Only a search needs the encoder.
+    #[must_use]
+    pub fn searching(&self) -> Option<String> {
+        self.by_wire
+            .iter()
+            .find(|(_, addressed)| {
+                matches!(
+                    addressed,
+                    Addressed::Retriever {
+                        tool: RetrieverTool::Search,
+                        ..
+                    }
+                )
+            })
+            .map(|(wire, _)| wire.clone())
     }
 
     /// Every tool, as the model is told about them.
@@ -245,8 +290,8 @@ enum Resolved<'a> {
         retriever: RetrieverId,
         /// Which of the five.
         tool: RetrieverTool,
-        /// The row that answers it.
-        held: &'a Retriever,
+        /// The row that answers it, and what looks something up in it.
+        held: &'a Held,
     },
 }
 
@@ -300,7 +345,7 @@ fn resolved<'a>(asked: &str, held: Registries<'a>) -> Result<Resolved<'a>, RunEr
         }),
         (Some(one), false) => Ok(Resolved::Retriever {
             retriever: RetrieverId::new(source).map_err(|error| halves(&error))?,
-            tool: named(one, tool, asked)?,
+            tool: named(&one.retriever, tool, asked)?,
             held: one,
         }),
         (None, _) => Ok(Resolved::Mcp {
@@ -414,61 +459,28 @@ mod tests {
         Toolbox::assemble(&set(asked), &[Offered { server, offering }], mcp_only()).unwrap_err()
     }
 
-    /// A retriever of that id over a plane, which is the kind that may offer any of the five.
-    fn retriever(id: &str, tools: &[RetrieverTool]) -> Retriever {
-        use ip_retrieve::{PlaneName, Source, VectorProperty};
-
-        built(
-            id,
-            tools,
-            Source::Drsg {
-                plane: PlaneName::new("handbook").unwrap(),
-                label: None,
-                property: VectorProperty::new("embedding").unwrap(),
-            },
-        )
+    /// A retriever of that id, offering `tools`, with a backend that answers nothing.
+    ///
+    /// What is resolved is the row, so the backend behind it is never asked here.
+    fn held(id: &str, tools: &[RetrieverTool]) -> Held {
+        Held {
+            retriever: crate::fixtures::retriever(id, tools),
+            lookup: Arc::new(Nothing),
+        }
     }
 
-    /// A retriever over a collection, which is the kind a filter is declared for.
-    fn collection(id: &str) -> Retriever {
-        use ip_retrieve::{CollectionName, Source};
+    /// A backend nothing in this module calls.
+    #[derive(Debug)]
+    struct Nothing;
 
-        built(
-            id,
-            &[RetrieverTool::Search],
-            Source::Qdrant {
-                collection: CollectionName::new("handbook").unwrap(),
-                vector: None,
-            },
-        )
-    }
-
-    /// One retriever, with one field a filter may name and a ceiling of its own.
-    fn built(id: &str, tools: &[RetrieverTool], source: ip_retrieve::Source) -> Retriever {
-        use ip_retrieve::{
-            MaxHits, MetaField, MetaNote, MetaSchema, RetrieverAuth, RetrieverEndpoint,
-            RetrieverName, RetrieverParts, RetrieverTools,
-        };
-
-        Retriever::new(RetrieverParts {
-            id: RetrieverId::new(id).unwrap(),
-            name: RetrieverName::new("the handbook").unwrap(),
-            endpoint: RetrieverEndpoint::new("https://store.acme.test:6333").unwrap(),
-            auth: RetrieverAuth::None,
-            source,
-            tools: RetrieverTools::new(tools.to_vec()).unwrap(),
-            meta: MetaSchema::new(
-                [(
-                    MetaField::new("team").unwrap(),
-                    MetaNote::new("Which team the page belongs to").unwrap(),
-                )]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap(),
-            max_hits: MaxHits::new(6).unwrap(),
-        })
-        .unwrap()
+    #[async_trait::async_trait]
+    impl ip_retrieve::Retrieval for Nothing {
+        async fn look(
+            &self,
+            _asked: &ip_retrieve::LookUp,
+        ) -> Result<Vec<ip_retrieve::Looked>, String> {
+            Ok(Vec::new())
+        }
     }
 
     /// Both kinds in one tool set, which is the point of the second source: a template may name
@@ -476,10 +488,10 @@ mod tests {
     #[test]
     fn a_tool_set_naming_both_kinds_resolves_to_both() {
         let warehouse = id("warehouse");
-        let held = [retriever("kb", &[RetrieverTool::Search])];
+        let kept = [held("kb", &[RetrieverTool::Search])];
         let registries = Registries {
             servers: std::slice::from_ref(&warehouse),
-            retrievers: &held,
+            retrievers: &kept,
         };
         let asked = set(&["warehouse.get_stock", "kb.search"]);
 
@@ -525,13 +537,16 @@ mod tests {
     /// declaration an MCP tool's description travels in.
     #[test]
     fn a_retrievers_own_words_are_what_the_model_is_told() {
-        let held = [collection("kb")];
+        let kept = [Held {
+            retriever: crate::fixtures::collection("kb"),
+            lookup: Arc::new(Nothing),
+        }];
         let box_of = Toolbox::assemble(
             &set(&["kb.search"]),
             &[],
             Registries {
                 servers: &[],
-                retrievers: &held,
+                retrievers: &kept,
             },
         )
         .unwrap();
@@ -550,13 +565,10 @@ mod tests {
     /// the answer says what it does offer, which an MCP server's cannot.
     #[test]
     fn a_tool_a_retriever_does_not_offer_refuses_the_run() {
-        let held = [retriever(
-            "kb",
-            &[RetrieverTool::Search, RetrieverTool::Rank],
-        )];
+        let kept = [held("kb", &[RetrieverTool::Search, RetrieverTool::Rank])];
         let registries = Registries {
             servers: &[],
-            retrievers: &held,
+            retrievers: &kept,
         };
         for asked in ["kb.cluster", "kb.sql"] {
             assert_eq!(
@@ -575,10 +587,10 @@ mod tests {
     #[test]
     fn a_name_both_registries_answer_to_refuses_the_run() {
         let kb = id("kb");
-        let held = [retriever("kb", &[RetrieverTool::Search])];
+        let kept = [held("kb", &[RetrieverTool::Search])];
         let registries = Registries {
             servers: std::slice::from_ref(&kb),
-            retrievers: &held,
+            retrievers: &kept,
         };
 
         assert_eq!(
@@ -609,7 +621,7 @@ mod tests {
     #[test]
     fn a_retriever_whose_declared_name_is_too_long_refuses_the_run() {
         let id = "k".repeat(60);
-        let held = [retriever(&id, &[RetrieverTool::Search])];
+        let kept = [held(&id, &[RetrieverTool::Search])];
         let asked = format!("{id}.search");
 
         assert_eq!(
@@ -618,7 +630,7 @@ mod tests {
                 &[],
                 Registries {
                     servers: &[],
-                    retrievers: &held,
+                    retrievers: &kept,
                 },
             ),
             Err(RunError::ToolNameTooLong {

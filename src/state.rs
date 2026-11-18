@@ -101,6 +101,12 @@ pub struct AppState {
     failing_cache: Option<Arc<ip_cache::FailingCache>>,
     /// The revision this node's rules were built from, which is where following starts.
     started_at: RuleRevision,
+    /// What turns a question into a vector, where this deployment has an artefact.
+    ///
+    /// Held beside the gateway rather than asked of it: the gateway embeds a request's own
+    /// question on its way through, and a run's look-up is a different caller of the same
+    /// encoder.
+    embedder: Option<Arc<dyn ip_gateway::Embedder>>,
     /// How wide the vectors this deployment's embedder makes are, where it has one.
     ///
     /// Absent is a deployment that cannot turn a query into a vector at all, which is why a
@@ -162,13 +168,20 @@ impl AppState {
             });
         }
         // Read here rather than from the gateway, which the encoder is moved into below: a
-        // retriever is registered against the width of the one embedder this process holds.
+        // retriever is registered against the width of the one embedder this process holds, and
+        // a run's look-up is answered by it.
         #[cfg(feature = "semantic")]
         let embedder_width = encoder
             .as_ref()
             .and_then(|encoder| u32::try_from(encoder.width().get()).ok());
         #[cfg(not(feature = "semantic"))]
         let embedder_width: Option<u32> = None;
+        #[cfg(feature = "semantic")]
+        let embedder: Option<Arc<dyn ip_gateway::Embedder>> = encoder
+            .as_ref()
+            .map(|encoder| Arc::clone(encoder) as Arc<dyn ip_gateway::Embedder>);
+        #[cfg(not(feature = "semantic"))]
+        let embedder: Option<Arc<dyn ip_gateway::Embedder>> = None;
         let graphs = open_graphs(config)?;
         let cluster = cluster_address(config)?;
         let cluster_secret = cluster_secret(config, cluster.as_ref())?;
@@ -340,6 +353,7 @@ impl AppState {
             feed,
             reloader,
             started_at,
+            embedder,
             embedder_width,
             graphs,
             cluster,
@@ -403,6 +417,7 @@ impl AppState {
             feed,
             reloader,
             started_at: RuleRevision::new(0),
+            embedder: None,
             embedder_width: None,
             graphs: None,
             cluster: None,
@@ -458,6 +473,12 @@ impl AppState {
     /// How wide a vector this deployment embeds a query into, where it embeds one at all.
     pub fn embedder_width(&self) -> Option<u32> {
         self.embedder_width
+    }
+
+    /// What a run's look-up embeds its query with, and none where this deployment embeds nothing.
+    #[must_use]
+    pub fn embedder(&self) -> Option<&Arc<dyn ip_gateway::Embedder>> {
+        self.embedder.as_ref()
     }
 
     /// The same state over an embedder of that width, for a test that works on one.

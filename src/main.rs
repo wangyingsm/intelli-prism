@@ -11,6 +11,7 @@ mod error;
 mod manage;
 #[cfg(feature = "classifier")]
 mod model;
+mod opening;
 mod retrieve;
 mod routes;
 mod rules;

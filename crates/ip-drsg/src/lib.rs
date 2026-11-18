@@ -20,6 +20,7 @@ mod client;
 mod error;
 mod look;
 mod plane;
+mod retrieval;
 mod rpc;
 #[cfg(any(feature = "testing", test))]
 pub mod testing;
@@ -30,6 +31,7 @@ pub use look::{
     Across, Apart, Around, Direction, Edge, Grouped, Hit, Hop, Metric, Nearest, Path, Placed,
 };
 pub use plane::{DrsgEndpoint, PlaneName};
+pub use retrieval::PlaneSource;
 pub use rpc::{RpcFailure, RpcRequest, RpcResponse, VERSION};
 #[cfg(any(feature = "testing", test))]
 pub use testing::{Replies, Seen, SilentPlane, StubPlane};

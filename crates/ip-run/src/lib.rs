@@ -20,6 +20,7 @@ mod event;
 #[cfg(test)]
 mod fixtures;
 mod id;
+mod lookup;
 #[path = "loop_.rs"]
 mod running;
 mod shed;
@@ -32,6 +33,6 @@ pub use error::RunError;
 pub use event::RunEvent;
 pub use id::RunId;
 pub use running::{Ran, Reporting, RunSignal, Running, run};
-pub use shed::Toolshed;
-pub use tools::{Addressed, Offered, Registries, Sources, Toolbox, sources_named};
+pub use shed::{Opening, Toolshed};
+pub use tools::{Addressed, Held, Offered, Registries, Sources, Toolbox, sources_named};
 pub use turn::{Spend, Stopped, Turn, TurnNumber};

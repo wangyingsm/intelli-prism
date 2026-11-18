@@ -25,9 +25,16 @@ use ip_gateway::{
     Gateway, GatewayBody, ProcessorChain, RoutingTable, Upstream, UpstreamError, from_bytes,
 };
 use ip_mcp::{McpAuth, McpEndpoint, McpId, McpName, McpServer, McpSettings};
+use ip_retrieve::{
+    CollectionName, MaxHits, MetaField, MetaNote, MetaSchema, PlaneName, Retrieval, Retriever,
+    RetrieverAuth, RetrieverEndpoint, RetrieverId, RetrieverName, RetrieverParts, RetrieverTool,
+    RetrieverTools, Source, VectorProperty,
+};
 use tokio::net::TcpListener;
 
 use crate::ask::Target;
+use crate::shed::Opening;
+use crate::tools::Held;
 
 /// A deployment that routes `/anthropic` to one upstream and holds a credential for it, which
 /// is what makes a turn the deployment's own request rather than a proxied one.
@@ -364,5 +371,76 @@ pub(crate) fn settings() -> McpSettings {
         connect_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(2),
         max_answer_bytes: 64 * 1024,
+    }
+}
+
+/// A retriever of that id over a plane, offering `tools`, with one field a filter may name.
+///
+/// A plane rather than a collection because that is the kind that may offer any of the five:
+/// [`Retriever`] refuses a collection offering a tool that walks edges.
+pub(crate) fn retriever(id: &str, tools: &[RetrieverTool]) -> Retriever {
+    Retriever::new(RetrieverParts {
+        tools: RetrieverTools::new(tools.to_vec()).unwrap(),
+        ..parts(id)
+    })
+    .unwrap()
+}
+
+/// What every retriever in a test is made of, over a plane and offering every tool.
+fn parts(id: &str) -> RetrieverParts {
+    RetrieverParts {
+        id: RetrieverId::new(id).unwrap(),
+        name: RetrieverName::new("the handbook").unwrap(),
+        endpoint: RetrieverEndpoint::new("https://store.acme.test:6333").unwrap(),
+        auth: RetrieverAuth::None,
+        source: Source::Drsg {
+            plane: PlaneName::new("handbook").unwrap(),
+            label: None,
+            property: VectorProperty::new("embedding").unwrap(),
+        },
+        tools: RetrieverTools::new(vec![RetrieverTool::Search]).unwrap(),
+        meta: MetaSchema::new(
+            [(
+                MetaField::new("team").unwrap(),
+                MetaNote::new("Which team the page belongs to").unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap(),
+        max_hits: MaxHits::new(6).unwrap(),
+    }
+}
+
+/// A retriever over a collection, which is the kind a filter is declared for and the kind that
+/// may offer `search` alone.
+pub(crate) fn collection(id: &str) -> Retriever {
+    Retriever::new(RetrieverParts {
+        source: Source::Qdrant {
+            collection: CollectionName::new("handbook").unwrap(),
+            vector: None,
+        },
+        tools: RetrieverTools::new(vec![RetrieverTool::Search]).unwrap(),
+        ..parts(id)
+    })
+    .unwrap()
+}
+
+/// That retriever, paired with a backend of the test's own.
+pub(crate) fn retrieving<T: Retrieval + 'static>(id: &str, lookup: T) -> Held {
+    Held {
+        retriever: retriever(id, &[RetrieverTool::Search, RetrieverTool::Neighbors]),
+        lookup: Arc::new(lookup),
+    }
+}
+
+/// A run holding `servers` and no retriever, which is what every test of the MCP half opens.
+pub(crate) fn holding<'a>(set: &'a ToolSet, servers: &'a [McpServer]) -> Opening<'a> {
+    Opening {
+        set,
+        servers,
+        retrievers: &[],
+        embedder: None,
+        settings: settings(),
     }
 }

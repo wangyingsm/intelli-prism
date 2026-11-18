@@ -30,11 +30,13 @@
 mod client;
 mod error;
 mod look;
+mod retrieval;
 #[cfg(any(feature = "testing", test))]
 pub mod testing;
 
 pub use client::{QdrantClient, QdrantSettings};
 pub use error::QdrantError;
 pub use look::{Collection, Distance, Filter, Found, PointId, Query};
+pub use retrieval::CollectionSource;
 #[cfg(any(feature = "testing", test))]
 pub use testing::{Answers, SilentQdrant, StubQdrant};

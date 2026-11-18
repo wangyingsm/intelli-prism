@@ -12,14 +12,13 @@ use ip_storage::{AgentOwner, By, NewAgent, StoredAgent};
 use axum::response::sse::{Event as SseEvent, Sse};
 use futures_util::StreamExt;
 use ip_core::Protocol;
-use ip_mcp::McpSettings;
-use ip_run::{AsWhom, Pinned, Requested, RunError, RunId, RunSignal, Running, Target, Toolshed};
-use ip_storage::Page;
-use std::time::Duration;
+use ip_run::{AsWhom, Pinned, Requested, RunError, RunId, RunSignal, Running, Target};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{Paged, store_refusal};
+use crate::error::Unopened;
 use crate::manage::Manager;
+use crate::opening::toolshed;
 use crate::state::AppState;
 
 /// A refusal, boxed so the ordinary answer is not paid for by every caller.
@@ -187,16 +186,6 @@ async fn remove(
     }
 }
 
-/// How long a run's tool calls wait on an MCP server.
-const MCP_SETTINGS: McpSettings = McpSettings {
-    connect_timeout: Duration::from_secs(10),
-    request_timeout: Duration::from_secs(30),
-    max_answer_bytes: 4 * 1024 * 1024,
-};
-
-/// How many registered servers a run may choose its tools from.
-const REGISTRY_LIMIT: u32 = 1_000;
-
 /// What starting a run is asked for.
 #[derive(Debug, serde::Deserialize)]
 struct Start {
@@ -274,15 +263,9 @@ async fn start(
         }
         Err(error) => return *unprocessable(error),
     };
-    let registry = match state.store().mcps(Page::new(REGISTRY_LIMIT, 0, None)).await {
-        Ok(held) => held
-            .into_iter()
-            .map(|stored| stored.server)
-            .collect::<Vec<_>>(),
-        Err(error) => return store_refusal(error),
-    };
-    let shed = match Toolshed::open(config.tool_set(), &registry, MCP_SETTINGS).await {
+    let shed = match toolshed(&state, &owner, config.tool_set()).await {
         Ok(shed) => shed,
+        Err(Unopened::Storage(error)) => return store_refusal(error),
         Err(error) => return *unprocessable(error),
     };
     let run_id = match RunId::generate() {
@@ -1305,7 +1288,8 @@ upstream_speaks = "anthropic"
                 "POST",
                 "/_ip/agents/acme-triage/run?tenant=acme",
                 Some(r#"{"input":"how many?"}"#),
-                7,
+                // Eight since M30: the retrievers a run may address are read beside the mcps.
+                8,
             ),
         ] {
             let (router, state) = running_fixture().await;

@@ -23,17 +23,19 @@ use ip_graph::{
     MaxNodes, NodeName, NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode,
     Stopping,
 };
-use ip_mcp::{McpServer, McpSettings};
+use ip_mcp::McpServer;
 use ip_run::{
-    AsWhom, Pinned, Reporting, Requested, RunError, RunEvent, RunId, Running, Spend, Stopped,
-    Target, Toolshed,
+    AsWhom, Held, Opening, Pinned, Reporting, Requested, RunError, RunEvent, RunId, Running, Spend,
+    Stopped, Target, Toolshed,
 };
-use ip_storage::{AgentOwner, Page};
+use ip_storage::AgentOwner;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{Paged, store_refusal};
 use crate::cluster::{Kept, Signalling, Spreading};
+use crate::error::Unopened;
 use crate::manage::Manager;
+use crate::opening::{MCP_SETTINGS, sources};
 use crate::state::AppState;
 
 /// A refusal, boxed so the ordinary answer is not paid for by every caller.
@@ -358,18 +360,16 @@ fn unprocessable<E: std::fmt::Display>(error: E) -> Refusal {
     Box::new((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response())
 }
 
-/// How long a graph run's tool calls wait on an MCP server.
+/// What could not be opened, as a caller is answered.
 ///
-/// Shared with the dispatch route rather than written twice: a node runs the same way whichever
-/// machine it runs on, and two sets of timeouts for one node would be a difference nobody chose.
-pub(super) const MCP_SETTINGS: McpSettings = McpSettings {
-    connect_timeout: Duration::from_secs(10),
-    request_timeout: Duration::from_secs(30),
-    max_answer_bytes: 4 * 1024 * 1024,
-};
-
-/// How many registered servers a graph's nodes may choose their tools from.
-pub(super) const REGISTRY_LIMIT: u32 = 1_000;
+/// A store that cannot say what is registered is the server's own failure; a retriever this
+/// cannot speak to and a template naming a tool that is not there are the caller's to fix.
+fn unopened(error: Unopened) -> Refusal {
+    match error {
+        Unopened::Storage(error) => Box::new(store_refusal(error)),
+        error => unprocessable(error),
+    }
+}
 
 /// Running one graph, under the prefix the router nests it at.
 pub fn run_router() -> Router<AppState> {
@@ -966,6 +966,8 @@ struct Preparing<'a> {
     authority: &'a Authority,
     /// The servers the nodes may choose their tools from.
     registry: &'a [McpServer],
+    /// The retrievers the nodes may look something up in.
+    retrievers: &'a [Held],
     /// Whose templates the nodes name.
     templates: AgentOwner,
 }
@@ -1025,9 +1027,15 @@ async fn prepare(
             }
             Err(error) => return Err(unprocessable(error)),
         };
-        let shed = Toolshed::open(config.tool_set(), preparing.registry, MCP_SETTINGS)
-            .await
-            .map_err(unprocessable)?;
+        let shed = Toolshed::open(Opening {
+            set: config.tool_set(),
+            servers: preparing.registry,
+            retrievers: preparing.retrievers,
+            embedder: preparing.state.embedder(),
+            settings: MCP_SETTINGS,
+        })
+        .await
+        .map_err(unprocessable)?;
         prepared.insert(
             node.name.clone(),
             Prepared {
@@ -1141,12 +1149,12 @@ async fn start(
         Ok(None) => return StatusCode::FORBIDDEN.into_response(),
         Err(error) => return store_refusal(error),
     };
-    let registry = match state.store().mcps(Page::new(REGISTRY_LIMIT, 0, None)).await {
-        Ok(held) => held
-            .into_iter()
-            .map(|stored| stored.server)
-            .collect::<Vec<_>>(),
-        Err(error) => return store_refusal(error),
+    let templates = templates_of(&owner);
+    // Once for the whole graph, not once per node: every node resolves its tools against the
+    // same registry and the same retrievers.
+    let (registry, retrievers) = match sources(&state, &templates).await {
+        Ok(both) => both,
+        Err(error) => return *unopened(error),
     };
     let prepared = match prepare(
         &Preparing {
@@ -1154,7 +1162,8 @@ async fn start(
             requested: &asked.requested,
             authority: &authority,
             registry: &registry,
-            templates: templates_of(&owner),
+            retrievers: &retrievers,
+            templates,
         },
         &graph,
     )
@@ -2716,7 +2725,8 @@ upstream_speaks = "anthropic"
             assert!(refused <= 12, "a run refuses whatever it is given");
         }
 
-        assert_eq!(refused, 8, "a run's own reads");
+        // Nine since M30: the retrievers the nodes may address are read beside the mcps.
+        assert_eq!(refused, 9, "a run's own reads");
     }
 
     /// Where a test's own deployment answers its cluster.

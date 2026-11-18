@@ -318,6 +318,143 @@ fn direction() -> serde_json::Value {
     })
 }
 
+/// A model's arguments, read into what the tool takes.
+///
+/// Two cases rather than one, because the query is the only part a backend cannot be handed as
+/// the model wrote it: the words have to be embedded by this deployment first, and only this
+/// deployment may. Everything else is ready as read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Parsed {
+    /// Ready to look up.
+    Ready(LookUp),
+    /// A search, whose words still need embedding.
+    Searching {
+        /// What the model asked, in its own words.
+        words: String,
+        /// How many to answer with, already clamped to the retriever's ceiling.
+        hits: u32,
+        /// What to narrow by, as the model wrote it.
+        filter: Option<serde_json::Value>,
+    },
+}
+
+impl Retriever {
+    /// Reads what a model passed into what the tool takes, or says why it will not read.
+    ///
+    /// **The refusal is a sentence rather than a type**, for the reason [`Retrieval::look`]'s is:
+    /// a tool called wrongly is an answer the model is shown and may correct, not something that
+    /// ends a run — so what matters is that it reads as a reason. A model is told the parameter
+    /// it got wrong, having been told the schema that declared it.
+    ///
+    /// **The ceiling is applied here and nowhere else.** A model asking for more than the
+    /// operator allowed is clamped rather than refused: it asked for a number it was told the
+    /// maximum of, and answering fewer is what it would have asked for had it read the schema.
+    pub fn parse(
+        &self,
+        tool: RetrieverTool,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Parsed, String> {
+        let most = self.max_hits().get();
+        let hits = counted(arguments, most)?;
+        match tool {
+            RetrieverTool::Search => Ok(Parsed::Searching {
+                words: words(arguments)?,
+                hits,
+                filter: match arguments.get("filter") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(filter) if !filters(self.source()) => {
+                        return Err(format!(
+                            "this search takes no filter, and one was passed: {filter}"
+                        ));
+                    }
+                    Some(filter) => Some(filter.clone()),
+                },
+            }),
+            RetrieverTool::Neighbors => Ok(Parsed::Ready(LookUp::Neighbors {
+                node: addressed(arguments, "node")?,
+                direction: whichever(arguments)?,
+                edge_type: match arguments.get("edge_type") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(kind)) => Some(kind.clone()),
+                    Some(other) => {
+                        return Err(format!("`edge_type` is a word, and this is {other}"));
+                    }
+                },
+            })),
+            RetrieverTool::Rank => Ok(Parsed::Ready(LookUp::Rank { hits })),
+            RetrieverTool::Relate => Ok(Parsed::Ready(LookUp::Relate {
+                from: addressed(arguments, "from")?,
+                to: addressed(arguments, "to")?,
+                direction: whichever(arguments)?,
+            })),
+            RetrieverTool::Cluster => Ok(Parsed::Ready(LookUp::Cluster { hits })),
+        }
+    }
+}
+
+/// The words a search looks for, which it cannot run without.
+fn words(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<String, String> {
+    match arguments.get("query") {
+        Some(serde_json::Value::String(words)) if !words.trim().is_empty() => Ok(words.clone()),
+        Some(serde_json::Value::String(_)) | None => {
+            Err("say what to look for in `query`".to_owned())
+        }
+        Some(other) => Err(format!("`query` is what to look for in words, not {other}")),
+    }
+}
+
+/// How many hits were asked for, clamped to the ceiling, and the ceiling itself where none was.
+fn counted(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    most: u32,
+) -> Result<u32, String> {
+    match arguments.get("hits") {
+        None | Some(serde_json::Value::Null) => Ok(most),
+        Some(serde_json::Value::Number(asked)) => match asked.as_u64() {
+            Some(0) | None => Err(format!(
+                "`hits` is a whole number of at least 1, not {asked}"
+            )),
+            Some(asked) => Ok(u32::try_from(asked).unwrap_or(most).min(most)),
+        },
+        Some(other) => Err(format!("`hits` is how many to answer with, not {other}")),
+    }
+}
+
+/// The node a walk names under `field`, which it cannot walk without.
+fn addressed(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u64, String> {
+    match arguments.get(field) {
+        Some(serde_json::Value::Number(id)) => id
+            .as_u64()
+            .ok_or_else(|| format!("`{field}` is an id a look-up answered with, not {id}")),
+        None => Err(format!("name which one in `{field}`")),
+        Some(other) => Err(format!(
+            "`{field}` is an id a look-up answered with, not {other}"
+        )),
+    }
+}
+
+/// Which way the walk goes, and outward where the model did not say.
+fn whichever(arguments: &serde_json::Map<String, serde_json::Value>) -> Result<Direction, String> {
+    let Some(said) = arguments.get("direction") else {
+        return Ok(Direction::default());
+    };
+    match said {
+        serde_json::Value::Null => Ok(Direction::default()),
+        serde_json::Value::String(word) if word == Direction::Out.as_str() => Ok(Direction::Out),
+        serde_json::Value::String(word) if word == Direction::In.as_str() => Ok(Direction::In),
+        serde_json::Value::String(word) if word == Direction::Both.as_str() => Ok(Direction::Both),
+        other => Err(format!(
+            "`direction` is `{}`, `{}` or `{}`, not {other}",
+            Direction::Out.as_str(),
+            Direction::In.as_str(),
+            Direction::Both.as_str()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -546,6 +683,152 @@ mod tests {
                 tool.name()
             );
         }
+    }
+
+    /// Which arguments reach a backend, which the schema above declared.
+    #[test]
+    fn what_a_model_passes_is_read_into_what_the_tool_takes() {
+        let held = plane(MetaSchema::default());
+        let asked =
+            |tool, raw: serde_json::Value| held.parse(tool, raw.as_object().expect("an object"));
+
+        assert_eq!(
+            asked(
+                RetrieverTool::Neighbors,
+                serde_json::json!({"node": 7, "direction": "in", "edge_type": "CITES"})
+            ),
+            Ok(Parsed::Ready(LookUp::Neighbors {
+                node: 7,
+                direction: Direction::In,
+                edge_type: Some("CITES".to_owned()),
+            }))
+        );
+        assert_eq!(
+            asked(
+                RetrieverTool::Relate,
+                serde_json::json!({"from": 1, "to": 2})
+            ),
+            Ok(Parsed::Ready(LookUp::Relate {
+                from: 1,
+                to: 2,
+                direction: Direction::Out,
+            })),
+            "a direction nobody named is outward, as the schema says"
+        );
+        assert_eq!(
+            asked(
+                RetrieverTool::Search,
+                serde_json::json!({"query": "leave policy"})
+            ),
+            Ok(Parsed::Searching {
+                words: "leave policy".to_owned(),
+                hits: 12,
+                filter: None,
+            }),
+            "a search is answered as words to embed, never as a vector this crate made up"
+        );
+    }
+
+    /// The ceiling is the operator's, and a model asking past it is answered rather than
+    /// refused: it asked for a number it was told the maximum of.
+    #[test]
+    fn a_model_asking_for_more_than_the_ceiling_is_given_the_ceiling() {
+        let held = plane(MetaSchema::default());
+        for (asked, given) in [
+            (1_u64, 1_u32),
+            (12, 12),
+            (13, 12),
+            (9_999, 12),
+            (u64::MAX, 12),
+        ] {
+            let raw = serde_json::json!({"query": "leave", "hits": asked});
+            assert_eq!(
+                held.parse(RetrieverTool::Search, raw.as_object().expect("an object")),
+                Ok(Parsed::Searching {
+                    words: "leave".to_owned(),
+                    hits: given,
+                    filter: None,
+                }),
+                "{asked} hits were not clamped to 12"
+            );
+        }
+        assert_eq!(
+            held.parse(
+                RetrieverTool::Rank,
+                serde_json::json!({}).as_object().expect("an object")
+            ),
+            Ok(Parsed::Ready(LookUp::Rank { hits: 12 })),
+            "a count nobody named is the ceiling"
+        );
+    }
+
+    /// Every way a model can call a tool wrongly, each answered with the parameter to fix.
+    #[test]
+    fn a_tool_called_wrongly_says_which_parameter_to_fix() {
+        let held = plane(MetaSchema::default());
+        let said = |tool, raw: serde_json::Value| {
+            held.parse(tool, raw.as_object().expect("an object"))
+                .expect_err("it was read")
+        };
+
+        assert!(said(RetrieverTool::Search, serde_json::json!({})).contains("`query`"));
+        assert!(
+            said(RetrieverTool::Search, serde_json::json!({"query": "  "})).contains("`query`")
+        );
+        assert!(said(RetrieverTool::Search, serde_json::json!({"query": 7})).contains("`query`"));
+        assert!(
+            said(
+                RetrieverTool::Search,
+                serde_json::json!({"query": "a", "hits": 0})
+            )
+            .contains("`hits`")
+        );
+        assert!(
+            said(
+                RetrieverTool::Search,
+                serde_json::json!({"query": "a", "hits": "many"})
+            )
+            .contains("`hits`")
+        );
+        assert!(said(RetrieverTool::Neighbors, serde_json::json!({})).contains("`node`"));
+        assert!(said(RetrieverTool::Neighbors, serde_json::json!({"node": -1})).contains("`node`"));
+        assert!(
+            said(
+                RetrieverTool::Neighbors,
+                serde_json::json!({"node": 1, "direction": "sideways"})
+            )
+            .contains("`direction`")
+        );
+        assert!(
+            said(
+                RetrieverTool::Neighbors,
+                serde_json::json!({"node": 1, "edge_type": 4})
+            )
+            .contains("`edge_type`")
+        );
+        assert!(said(RetrieverTool::Relate, serde_json::json!({"from": 1})).contains("`to`"));
+    }
+
+    /// A filter is read where the backend takes one, and refused where the schema declared none
+    /// — so a model is never silently obeyed in a way the backend would ignore.
+    #[test]
+    fn a_filter_reaches_a_store_and_is_refused_by_a_plane() {
+        let raw = serde_json::json!({
+            "query": "leave",
+            "filter": {"must": [{"key": "team", "match": {"value": "ops"}}]},
+        });
+        let arguments = raw.as_object().expect("an object");
+
+        match collection(MetaSchema::default()).parse(RetrieverTool::Search, arguments) {
+            Ok(Parsed::Searching { filter, .. }) => {
+                assert_eq!(filter, Some(raw["filter"].clone()));
+            }
+            other => panic!("a store's filter was read as {other:?}"),
+        }
+        let said = plane(MetaSchema::default())
+            .parse(RetrieverTool::Search, arguments)
+            .expect_err("a plane takes no filter");
+        assert!(said.contains("no filter"), "{said}");
     }
 
     /// The two halves of this module are one set of five, and a tool added to the enum has to

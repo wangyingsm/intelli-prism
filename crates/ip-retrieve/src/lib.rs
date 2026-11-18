@@ -35,7 +35,7 @@ mod source;
 mod spelling;
 mod tool;
 
-pub use declare::{Declared, Direction, LookUp, Looked, Retrieval};
+pub use declare::{Declared, Direction, LookUp, Looked, Parsed, Retrieval};
 pub use error::RetrieveError;
 pub use id::RetrieverId;
 pub use meta::{MetaField, MetaNote, MetaSchema};
