@@ -530,6 +530,9 @@ fn edges_from(table: &Value) -> Result<Vec<GraphEdge>, GraphError> {
             Ok(GraphEdge {
                 from: name(&pair[0])?,
                 to: name(&pair[1])?,
+                // The conditions are a read of their own, for the reason the caps are: an edge's
+                // property is a statement's to read and this plan cannot project one.
+                condition: None,
             })
         })
         .collect()
@@ -1144,6 +1147,7 @@ mod tests {
             edges: vec![GraphEdge {
                 from: name("intake"),
                 to: name("reply"),
+                condition: None,
             }],
             max_nodes: MaxNodes::new(8).expect("a ceiling"),
         })

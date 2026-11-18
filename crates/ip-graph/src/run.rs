@@ -684,6 +684,7 @@ mod tests {
         GraphEdge {
             from: name(from),
             to: name(to),
+            condition: None,
         }
     }
 

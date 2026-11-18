@@ -1487,6 +1487,7 @@ mod tests {
             edges: vec![GraphEdge {
                 from: NodeName::new("intake").unwrap(),
                 to: NodeName::new("reply").unwrap(),
+                condition: None,
             }],
             loops: vec![LoopBack {
                 from: NodeName::new("reply").unwrap(),

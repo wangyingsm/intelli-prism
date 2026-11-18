@@ -6,7 +6,7 @@ use ip_agents::AgentId;
 use ip_core::TenantId;
 
 use crate::error::GraphError;
-use crate::id::{GraphId, GraphName, NodeName};
+use crate::id::{Condition, GraphId, GraphName, NodeName};
 
 /// The most nodes a graph's own ceiling may allow.
 const NODES_MOST: u32 = MaxNodes::MOST;
@@ -144,13 +144,24 @@ pub struct GraphNode {
     pub agent: AgentId,
 }
 
-/// One edge: whose answer feeds which node.
+/// One edge: whose answer feeds which node, and when it does.
+///
+/// A condition makes it a *branch*: the edge still feeds its target and still orders the two nodes,
+/// and the condition decides only whether it delivers on a given run. That is why the condition
+/// lives here and not in a list of its own — **the exact inverse of the reasoning on [`LoopBack`]
+/// below, for the exact same reason.** Every reader of the edges is over feeding edges, and a
+/// branch is one, so all of them — the keying of a node's input, what the graph answers with, the
+/// plane's topological sort and its cycle check — go on being right with nothing added to them. A
+/// separate list would have made each of them a place that can forget to take the union.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphEdge {
     /// The node whose answer travels.
     pub from: NodeName,
     /// The node that receives it, under the sender's own name.
     pub to: NodeName,
+    /// When this edge is worth taking, where taking it is the sender's choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<Condition>,
 }
 
 /// One declared loop back: who may ask for it, which node it sends work back to, and how often.
@@ -322,6 +333,24 @@ impl RunGraph {
         &self.loops
     }
 
+    /// The edges that carry a condition, which are the branches one node chooses between.
+    pub fn branches(&self) -> impl Iterator<Item = (&GraphEdge, &Condition)> {
+        self.edges
+            .iter()
+            .filter_map(|edge| edge.condition.as_ref().map(|when| (edge, when)))
+    }
+
+    /// The condition on the edge from one node to another, where that edge carries one.
+    ///
+    /// This is the question a run asks of a node that has named a branch: an edge the graph did not
+    /// declare conditional is not a branch, however the node phrased it.
+    pub fn branch(&self, from: &NodeName, to: &NodeName) -> Option<&Condition> {
+        self.edges
+            .iter()
+            .find(|edge| &edge.from == from && &edge.to == to)
+            .and_then(|edge| edge.condition.as_ref())
+    }
+
     /// The loop back one node declares to another, where it declares one.
     ///
     /// This is the question a run asks of a node that has asked to double back: a graph that did
@@ -368,6 +397,16 @@ mod tests {
         GraphEdge {
             from: name(from),
             to: name(to),
+            condition: None,
+        }
+    }
+
+    /// An edge that is a branch, carrying the words the model judges it by.
+    fn branch(from: &str, to: &str, when: &str) -> GraphEdge {
+        GraphEdge {
+            from: name(from),
+            to: name(to),
+            condition: Some(Condition::new(when).expect("a condition an edge may carry")),
         }
     }
 
@@ -477,6 +516,116 @@ mod tests {
         assert!(
             RunGraph::checked(parts(vec![node("a")], vec![edge("a", "a")])).is_ok(),
             "the shape check started looking for cycles"
+        );
+    }
+
+    /// Both directions of the wire, because this field is what the management api gained and a
+    /// graph written before M29 has to go on reading.
+    #[test]
+    fn an_edge_crosses_the_wire_with_a_condition_only_when_it_has_one() {
+        let plain: GraphEdge = serde_json::from_str(r#"{"from":"intake","to":"reply"}"#)
+            .expect("an edge written before conditions existed");
+        assert_eq!(plain.condition, None);
+        assert_eq!(
+            serde_json::to_string(&plain).expect("an edge serializes"),
+            r#"{"from":"intake","to":"reply"}"#,
+            "an edge with no condition grew a null"
+        );
+
+        let conditional: GraphEdge =
+            serde_json::from_str(r#"{"from":"triage","to":"escalate","condition":"it is urgent"}"#)
+                .expect("a branch");
+        assert_eq!(
+            conditional.condition.as_ref().map(Condition::as_str),
+            Some("it is urgent")
+        );
+        assert_eq!(
+            serde_json::to_string(&conditional).expect("a branch serializes"),
+            r#"{"from":"triage","to":"escalate","condition":"it is urgent"}"#
+        );
+
+        assert!(
+            serde_json::from_str::<GraphEdge>(r#"{"from":"a","to":"b","condition":" padded"}"#)
+                .is_err(),
+            "json got past the rule the constructor applies"
+        );
+    }
+
+    #[test]
+    fn a_conditional_edge_is_a_branch_and_can_be_looked_up() {
+        let graph = RunGraph::checked(parts(
+            vec![node("triage"), node("escalate"), node("close")],
+            vec![
+                branch("triage", "escalate", "the report names an outage"),
+                branch("triage", "close", "nothing is wrong"),
+            ],
+        ))
+        .expect("a graph that branches");
+
+        let branches: Vec<_> = graph
+            .branches()
+            .map(|(edge, when)| (edge.to.as_str().to_owned(), when.as_str().to_owned()))
+            .collect();
+        assert_eq!(
+            branches,
+            vec![
+                (
+                    "escalate".to_owned(),
+                    "the report names an outage".to_owned()
+                ),
+                ("close".to_owned(), "nothing is wrong".to_owned()),
+            ],
+            "the branches did not come back in the order they were declared"
+        );
+        assert_eq!(
+            graph
+                .branch(&name("triage"), &name("escalate"))
+                .map(Condition::as_str),
+            Some("the report names an outage")
+        );
+    }
+
+    /// The question a run asks: an edge the graph did not declare conditional is not a branch,
+    /// and neither is a pair the graph has no edge for.
+    #[test]
+    fn an_edge_without_a_condition_is_not_a_branch() {
+        let graph = RunGraph::checked(parts(
+            vec![node("intake"), node("reply"), node("log")],
+            vec![
+                edge("intake", "reply"),
+                branch("intake", "log", "the reply needed a human"),
+            ],
+        ))
+        .expect("a graph with one branch of two edges");
+
+        assert_eq!(graph.branches().count(), 1);
+        assert_eq!(graph.branch(&name("intake"), &name("reply")), None);
+        assert_eq!(graph.branch(&name("reply"), &name("log")), None);
+    }
+
+    /// The point of carrying the condition on the edge: every refusal that applies to an edge
+    /// applies to a branch, with nothing added to the shape check to make it so.
+    #[test]
+    fn a_branch_is_refused_exactly_as_the_edge_it_is() {
+        assert_eq!(
+            RunGraph::checked(parts(
+                vec![node("a")],
+                vec![branch("a", "z", "z is worth running")]
+            )),
+            Err(GraphError::UnknownNode { name: name("z") })
+        );
+        assert_eq!(
+            RunGraph::checked(parts(
+                vec![node("a"), node("b")],
+                vec![
+                    edge("a", "b"),
+                    branch("a", "b", "the first edge was not enough")
+                ]
+            )),
+            Err(GraphError::DuplicateEdge {
+                from: name("a"),
+                to: name("b"),
+            })
         );
     }
 
