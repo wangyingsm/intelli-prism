@@ -33,5 +33,5 @@ pub use event::RunEvent;
 pub use id::RunId;
 pub use running::{Ran, Reporting, RunSignal, Running, run};
 pub use shed::Toolshed;
-pub use tools::{Addressed, Offered, Toolbox, servers_named};
+pub use tools::{Addressed, Offered, Registries, Sources, Toolbox, sources_named};
 pub use turn::{Spend, Stopped, Turn, TurnNumber};

@@ -136,6 +136,34 @@ pub enum RunError {
         number: u32,
     },
 
+    /// A name before the dot that both a registered server and a retriever answer to.
+    ///
+    /// Refused rather than resolved to either: the two readings call different things, and a
+    /// template silently reaching the wrong one is the kind of mistake that costs paid turns to
+    /// notice. The operator renames one of them.
+    #[error("{tool:?} could be the server {named:?} or the retriever {named:?} — rename one")]
+    ToolSourceAmbiguous {
+        /// What the template asked for.
+        tool: String,
+        /// The name both answer to.
+        named: String,
+    },
+
+    /// A retriever asked for a tool it does not offer.
+    ///
+    /// Its own refusal rather than [`RunError::NoSuchTool`], because a retriever's tools are a
+    /// closed set this gateway writes: there is nothing to discover and no server to blame, so
+    /// the answer can say what it does offer.
+    #[error("the retriever {retriever:?} does not offer {tool:?}; it offers {offered}")]
+    NoSuchRetrieverTool {
+        /// What the template asked for.
+        tool: String,
+        /// The retriever it named.
+        retriever: String,
+        /// What that retriever offers instead.
+        offered: String,
+    },
+
     /// Two tools a model could not tell apart once both are named for it.
     #[error("{first:?} and {second:?} are both declared as {wire:?}")]
     ToolNameCollides {

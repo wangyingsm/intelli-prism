@@ -7,7 +7,7 @@ use ip_mcp::{McpClient, McpId, McpServer, McpSettings, Produced};
 use ip_protocol::{Tool, ToolName};
 
 use crate::error::RunError;
-use crate::tools::{Offered, Toolbox, servers_named};
+use crate::tools::{Addressed, Offered, Registries, Toolbox, sources_named};
 
 /// Every server one run needs, opened once and held for as long as the run lasts.
 ///
@@ -43,7 +43,14 @@ impl Toolshed {
     ) -> Result<Self, RunError> {
         let mut clients = BTreeMap::new();
         let mut offerings = Vec::new();
-        for id in servers_named(set)? {
+        // No retriever is addressable from here yet: what a run holds is threaded in where the
+        // look-up is run, and until then every name resolves the way it always has.
+        let registered: Vec<McpId> = registry.iter().map(|known| known.id.clone()).collect();
+        let held = Registries {
+            servers: &registered,
+            retrievers: &[],
+        };
+        for id in sources_named(set, held)?.servers {
             let server = registry
                 .iter()
                 .find(|known| known.id == id)
@@ -78,7 +85,7 @@ impl Toolshed {
                 offering,
             })
             .collect();
-        let toolbox = Toolbox::assemble(set, &offered)?;
+        let toolbox = Toolbox::assemble(set, &offered, held)?;
         Ok(Self { clients, toolbox })
     }
 
@@ -111,18 +118,24 @@ impl Toolshed {
                 failed: true,
             };
         };
-        let Some(client) = self.clients.get(&addressed.server) else {
+        let Addressed::Mcp { server, tool } = addressed else {
             return Produced {
-                text: format!("the server {:?} is not open", addressed.server.as_str()),
+                text: format!("the tool {:?} is not open", called.as_str()),
                 failed: true,
             };
         };
-        match client.run(&addressed.tool, arguments).await {
+        let Some(client) = self.clients.get(server) else {
+            return Produced {
+                text: format!("the server {:?} is not open", server.as_str()),
+                failed: true,
+            };
+        };
+        match client.run(tool, arguments).await {
             Ok(produced) => produced,
             Err(error) => {
                 tracing::warn!(
-                    server = addressed.server.as_str(),
-                    tool = addressed.tool.as_str(),
+                    server = server.as_str(),
+                    tool = tool.as_str(),
                     %error,
                     "a tool failed; the model is told and the run goes on"
                 );

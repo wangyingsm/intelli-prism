@@ -5,7 +5,7 @@
 //! backend answers, the credential it requires, which of the five tools it offers, and what a
 //! look-up may filter on — and nothing about how to reach one. The backends live where the wire
 //! formats already do: `ip-drsg` speaks to a plane, `ip-qdrant` to a collection, and each
-//! implements the trait this crate will declare.
+//! implements [`Retrieval`], which is declared here for that reason.
 //!
 //! It is this crate rather than either of those because of who needs these types:
 //! `ip-storage` stores a retriever and depends on neither backend, and `ip-run` declares a
@@ -26,6 +26,7 @@
 
 #![forbid(unsafe_code)]
 
+mod declare;
 mod error;
 mod id;
 mod meta;
@@ -34,11 +35,12 @@ mod source;
 mod spelling;
 mod tool;
 
+pub use declare::{Declared, Direction, LookUp, Looked, Retrieval};
 pub use error::RetrieveError;
 pub use id::RetrieverId;
 pub use meta::{MetaField, MetaNote, MetaSchema};
 pub use retriever::{
-    Asked, MaxHits, Retriever, RetrieverAuth, RetrieverEndpoint, RetrieverKey, RetrieverName,
+    MaxHits, Retriever, RetrieverAuth, RetrieverEndpoint, RetrieverKey, RetrieverName,
     RetrieverParts,
 };
 pub use source::{CollectionName, NodeLabel, PlaneName, Source, VectorName, VectorProperty};

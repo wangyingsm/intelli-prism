@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ip_agents::ToolSet;
 use ip_mcp::{McpId, McpToolName, Offering};
 use ip_protocol::{Tool, ToolName};
+use ip_retrieve::{Retriever, RetrieverId, RetrieverTool};
 
 use crate::error::RunError;
 
@@ -19,12 +20,80 @@ const WIRE_MAX_BYTES: usize = 64;
 const WIRE_JOIN: &str = "__";
 
 /// Where one tool actually lives.
+///
+/// **The kind is the variant and not a field beside it**, for the reason
+/// [`ip_retrieve::Source`] gives: a pair of fields saying "a server" and "a retriever's tool"
+/// is a contradiction something has to remember to check, while this is a shape that cannot be
+/// built. The two halves of each are the ones that kind addresses by, and nothing carries the
+/// other's.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Addressed {
-    /// The server that offers it.
-    pub server: McpId,
-    /// What that server calls it.
-    pub tool: McpToolName,
+pub enum Addressed {
+    /// A tool an MCP server offers, discovered by asking it.
+    Mcp {
+        /// The server that offers it.
+        server: McpId,
+        /// What that server calls it.
+        tool: McpToolName,
+    },
+    /// A tool a retriever offers, which is one of the five and known without asking.
+    Retriever {
+        /// The retriever that answers it.
+        retriever: RetrieverId,
+        /// Which of the five.
+        tool: RetrieverTool,
+    },
+}
+
+impl Addressed {
+    /// The name the caller wrote before the dot, whichever kind it named.
+    fn source(&self) -> &str {
+        match self {
+            Self::Mcp { server, .. } => server.as_str(),
+            Self::Retriever { retriever, .. } => retriever.as_str(),
+        }
+    }
+
+    /// The name the caller wrote after the dot, whichever kind it named.
+    fn tool(&self) -> &str {
+        match self {
+            Self::Mcp { tool, .. } => tool.as_str(),
+            Self::Retriever { tool, .. } => tool.name(),
+        }
+    }
+}
+
+/// What a run may address, read before anything is opened.
+///
+/// Both halves, because the name before the dot is looked up in each: that is what tells a
+/// retriever's tool from a server's, and what makes a name held by both an ambiguity rather than
+/// whichever this code happened to look in first.
+#[derive(Debug, Clone, Copy)]
+pub struct Registries<'a> {
+    /// Every MCP server this deployment has registered.
+    pub servers: &'a [McpId],
+    /// Every retriever the run's owner holds.
+    pub retrievers: &'a [Retriever],
+}
+
+impl<'a> Registries<'a> {
+    /// The retriever of that id, where the owner holds one.
+    ///
+    /// Taken by value so what comes back outlives the copy it was read through, which is what
+    /// lets one pass carry the row it resolved.
+    fn retriever(self, named: &str) -> Option<&'a Retriever> {
+        self.retrievers
+            .iter()
+            .find(|held| held.id().as_str() == named)
+    }
+}
+
+/// What a tool set names, split by where each name lives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sources {
+    /// Every MCP server named, each once however many of its tools are asked for.
+    pub servers: BTreeSet<McpId>,
+    /// Every retriever named, the same way.
+    pub retrievers: BTreeSet<RetrieverId>,
 }
 
 /// Everything a run may call, by the name the model will call it under.
@@ -39,15 +108,19 @@ pub struct Toolbox {
     declared: Vec<Tool>,
 }
 
-/// Every server a tool set names, each once however many of its tools are asked for.
+/// What a tool set names, split by kind, each named thing once.
 ///
 /// Read before anything is opened, so a template naming a server this deployment does not
 /// have is refused without a connection being made.
-pub fn servers_named(set: &ToolSet) -> Result<BTreeSet<McpId>, RunError> {
-    set.tools()
-        .iter()
-        .map(|asked| addressed(asked.as_str()).map(|one| one.server))
-        .collect()
+pub fn sources_named(set: &ToolSet, held: Registries<'_>) -> Result<Sources, RunError> {
+    let mut named = Sources::default();
+    for asked in set.tools() {
+        match resolved(asked.as_str(), held)?.addressed() {
+            Addressed::Mcp { server, .. } => named.servers.insert(server),
+            Addressed::Retriever { retriever, .. } => named.retrievers.insert(retriever),
+        };
+    }
+    Ok(named)
 }
 
 impl Toolbox {
@@ -56,19 +129,38 @@ impl Toolbox {
     /// Every refusal here happens before a run's first turn, which is the point of doing it in
     /// one pass: a tool that resolves to nothing would otherwise be found only once a model
     /// asked for it, several paid turns in.
-    pub fn assemble(set: &ToolSet, offered: &[Offered<'_>]) -> Result<Self, RunError> {
+    pub fn assemble(
+        set: &ToolSet,
+        offered: &[Offered<'_>],
+        held: Registries<'_>,
+    ) -> Result<Self, RunError> {
         let mut box_of = Self::default();
         for asked in set.tools() {
-            let addressed = addressed(asked.as_str())?;
-            let offering = offered
-                .iter()
-                .find(|one| *one.server == addressed.server)
-                .ok_or_else(|| RunError::NoSuchServer {
-                    tool: asked.as_str().to_owned(),
-                    server: addressed.server.as_str().to_owned(),
-                })?;
-            let tool = found(offering, &addressed)?;
-            box_of.insert(asked.as_str(), addressed, tool)?;
+            let resolved = resolved(asked.as_str(), held)?;
+            let declared = match &resolved {
+                Resolved::Mcp { server, tool } => {
+                    let offering = offered
+                        .iter()
+                        .find(|one| *one.server == *server)
+                        .ok_or_else(|| RunError::NoSuchServer {
+                            tool: asked.as_str().to_owned(),
+                            server: server.as_str().to_owned(),
+                        })?;
+                    let found = found(offering, tool)?;
+                    Declaration {
+                        description: found.description.clone(),
+                        schema: found.schema.clone(),
+                    }
+                }
+                Resolved::Retriever { held, tool, .. } => {
+                    let declared = held.declare(*tool);
+                    Declaration {
+                        description: Some(declared.description),
+                        schema: declared.schema,
+                    }
+                }
+            };
+            box_of.insert(asked.as_str(), resolved.addressed(), declared)?;
         }
         Ok(box_of)
     }
@@ -78,7 +170,7 @@ impl Toolbox {
         &mut self,
         asked: &str,
         addressed: Addressed,
-        tool: &ip_mcp::McpTool,
+        declared: Declaration,
     ) -> Result<(), RunError> {
         let wire = wired(&addressed);
         if wire.len() > WIRE_MAX_BYTES {
@@ -91,7 +183,7 @@ impl Toolbox {
         if let Some(taken) = self.by_wire.get(&wire) {
             return Err(RunError::ToolNameCollides {
                 wire,
-                first: format!("{}.{}", taken.server.as_str(), taken.tool.as_str()),
+                first: format!("{}.{}", taken.source(), taken.tool()),
                 second: asked.to_owned(),
             });
         }
@@ -100,8 +192,8 @@ impl Toolbox {
                 tool: asked.to_owned(),
                 why: error.to_string(),
             })?,
-            description: tool.description.clone(),
-            schema: tool.schema.clone(),
+            description: declared.description,
+            schema: declared.schema,
         });
         self.by_wire.insert(wire, addressed);
         Ok(())
@@ -135,24 +227,117 @@ pub struct Offered<'a> {
     pub offering: &'a Offering,
 }
 
-/// Splits a template's `server.tool` into the two halves it names.
+/// One resolved tool address, with the retriever row behind a retriever's.
 ///
-/// On the first dot, so a tool whose own name holds one still resolves; a server id holding one
+/// The row is carried out of the pass that found it rather than looked up again, so the one
+/// place that reads the registries is the one place that refuses a name they do not hold.
+enum Resolved<'a> {
+    /// A tool addressed to an MCP server.
+    Mcp {
+        /// The server named.
+        server: McpId,
+        /// What that server calls it.
+        tool: McpToolName,
+    },
+    /// A tool addressed to a retriever, and the retriever itself.
+    Retriever {
+        /// The retriever named.
+        retriever: RetrieverId,
+        /// Which of the five.
+        tool: RetrieverTool,
+        /// The row that answers it.
+        held: &'a Retriever,
+    },
+}
+
+impl Resolved<'_> {
+    /// The address alone, as a toolbox stores it.
+    fn addressed(&self) -> Addressed {
+        match self {
+            Self::Mcp { server, tool } => Addressed::Mcp {
+                server: server.clone(),
+                tool: tool.clone(),
+            },
+            Self::Retriever {
+                retriever, tool, ..
+            } => Addressed::Retriever {
+                retriever: retriever.clone(),
+                tool: *tool,
+            },
+        }
+    }
+}
+
+/// Splits a template's `source.tool` into the two halves it names, and says which kind of source
+/// it named.
+///
+/// On the first dot, so a tool whose own name holds one still resolves; a source id holding one
 /// cannot be addressed, which is the trade and is why the halves are checked by their own types.
-fn addressed(asked: &str) -> Result<Addressed, RunError> {
+///
+/// **A name held by both registries is refused rather than resolved.** `kb.search` where `kb` is
+/// both a registered server and a retriever has two readings, and picking either would mean a
+/// template silently calling the wrong one — so it is the operator's to rename, and they are
+/// told before the first turn.
+///
+/// A name held by neither is taken as a server, which is what it has always been: a typo then
+/// reads as the server that is not registered, and that refusal has not moved.
+fn resolved<'a>(asked: &str, held: Registries<'a>) -> Result<Resolved<'a>, RunError> {
     let halves = |why: &dyn std::fmt::Display| RunError::NotAToolAddress {
         tool: asked.to_owned(),
         why: why.to_string(),
     };
-    let (server, tool) = asked
+    let (source, tool) = asked
         .split_once('.')
         .ok_or_else(|| RunError::UnqualifiedTool {
             tool: asked.to_owned(),
         })?;
-    Ok(Addressed {
-        server: McpId::new(server).map_err(|error| halves(&error))?,
-        tool: McpToolName::new(tool).map_err(|error| halves(&error))?,
-    })
+    let retriever = held.retriever(source);
+    let server = held.servers.iter().any(|known| known.as_str() == source);
+    match (retriever, server) {
+        (Some(_), true) => Err(RunError::ToolSourceAmbiguous {
+            tool: asked.to_owned(),
+            named: source.to_owned(),
+        }),
+        (Some(one), false) => Ok(Resolved::Retriever {
+            retriever: RetrieverId::new(source).map_err(|error| halves(&error))?,
+            tool: named(one, tool, asked)?,
+            held: one,
+        }),
+        (None, _) => Ok(Resolved::Mcp {
+            server: McpId::new(source).map_err(|error| halves(&error))?,
+            tool: McpToolName::new(tool).map_err(|error| halves(&error))?,
+        }),
+    }
+}
+
+/// The one of the five a name spells, or that a retriever offers nothing under it.
+///
+/// A retriever's tools are a closed set known without asking, which is the whole difference from
+/// a server: a word that is not one of the five and one of the five this retriever does not offer
+/// are the same mistake, and the answer names what it does offer either way.
+fn named(held: &Retriever, tool: &str, asked: &str) -> Result<RetrieverTool, RunError> {
+    held.tools()
+        .offered()
+        .find(|one| one.name() == tool)
+        .ok_or_else(|| RunError::NoSuchRetrieverTool {
+            tool: asked.to_owned(),
+            retriever: held.id().as_str().to_owned(),
+            offered: held
+                .tools()
+                .offered()
+                .map(RetrieverTool::name)
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+}
+
+/// What a model is told one tool is, whichever kind of source answers it.
+///
+/// A description is optional for an MCP tool, which may answer `tools/list` without one, and
+/// never absent for a retriever's, which this crate writes itself.
+struct Declaration {
+    description: Option<String>,
+    schema: serde_json::Value,
 }
 
 /// The tool a server offers under that name, or that it offers none.
@@ -160,18 +345,15 @@ fn addressed(asked: &str) -> Result<Addressed, RunError> {
 /// A tool the offering dropped is not looked for here and needs no word of its own: it was
 /// dropped because its name is one [`McpToolName`] refuses, and a template that reached this
 /// far is holding a name that type accepted, so the two can never be the same name.
-fn found<'a>(
-    offered: &Offered<'a>,
-    addressed: &Addressed,
-) -> Result<&'a ip_mcp::McpTool, RunError> {
+fn found<'a>(offered: &Offered<'a>, named: &McpToolName) -> Result<&'a ip_mcp::McpTool, RunError> {
     offered
         .offering
         .tools
         .iter()
-        .find(|one| one.name == addressed.tool)
+        .find(|one| one.name == *named)
         .ok_or_else(|| RunError::NoSuchTool {
-            server: addressed.server.as_str().to_owned(),
-            tool: addressed.tool.as_str().to_owned(),
+            server: offered.server.as_str().to_owned(),
+            tool: named.as_str().to_owned(),
         })
 }
 
@@ -182,11 +364,7 @@ fn found<'a>(
 /// the set every provider allows. Two different pairs can still meet in the middle, as
 /// `a` and `_b` do with `a_` and `b`, which is why the result is checked for having been taken.
 fn wired(addressed: &Addressed) -> String {
-    format!(
-        "{}{WIRE_JOIN}{}",
-        addressed.server.as_str(),
-        addressed.tool.as_str()
-    )
+    format!("{}{WIRE_JOIN}{}", addressed.source(), addressed.tool())
 }
 
 #[cfg(test)]
@@ -219,12 +397,238 @@ mod tests {
         McpId::new(raw).unwrap()
     }
 
+    /// A deployment that holds no retriever, which is what every test of the MCP half resolves
+    /// against: a name held by neither registry is a server, as it always was.
+    const fn mcp_only() -> Registries<'static> {
+        Registries {
+            servers: &[],
+            retrievers: &[],
+        }
+    }
+
     fn assembled(asked: &[&str], server: &McpId, offering: &Offering) -> Toolbox {
-        Toolbox::assemble(&set(asked), &[Offered { server, offering }]).unwrap()
+        Toolbox::assemble(&set(asked), &[Offered { server, offering }], mcp_only()).unwrap()
     }
 
     fn refused(asked: &[&str], server: &McpId, offering: &Offering) -> RunError {
-        Toolbox::assemble(&set(asked), &[Offered { server, offering }]).unwrap_err()
+        Toolbox::assemble(&set(asked), &[Offered { server, offering }], mcp_only()).unwrap_err()
+    }
+
+    /// A retriever of that id over a plane, which is the kind that may offer any of the five.
+    fn retriever(id: &str, tools: &[RetrieverTool]) -> Retriever {
+        use ip_retrieve::{PlaneName, Source, VectorProperty};
+
+        built(
+            id,
+            tools,
+            Source::Drsg {
+                plane: PlaneName::new("handbook").unwrap(),
+                label: None,
+                property: VectorProperty::new("embedding").unwrap(),
+            },
+        )
+    }
+
+    /// A retriever over a collection, which is the kind a filter is declared for.
+    fn collection(id: &str) -> Retriever {
+        use ip_retrieve::{CollectionName, Source};
+
+        built(
+            id,
+            &[RetrieverTool::Search],
+            Source::Qdrant {
+                collection: CollectionName::new("handbook").unwrap(),
+                vector: None,
+            },
+        )
+    }
+
+    /// One retriever, with one field a filter may name and a ceiling of its own.
+    fn built(id: &str, tools: &[RetrieverTool], source: ip_retrieve::Source) -> Retriever {
+        use ip_retrieve::{
+            MaxHits, MetaField, MetaNote, MetaSchema, RetrieverAuth, RetrieverEndpoint,
+            RetrieverName, RetrieverParts, RetrieverTools,
+        };
+
+        Retriever::new(RetrieverParts {
+            id: RetrieverId::new(id).unwrap(),
+            name: RetrieverName::new("the handbook").unwrap(),
+            endpoint: RetrieverEndpoint::new("https://store.acme.test:6333").unwrap(),
+            auth: RetrieverAuth::None,
+            source,
+            tools: RetrieverTools::new(tools.to_vec()).unwrap(),
+            meta: MetaSchema::new(
+                [(
+                    MetaField::new("team").unwrap(),
+                    MetaNote::new("Which team the page belongs to").unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap(),
+            max_hits: MaxHits::new(6).unwrap(),
+        })
+        .unwrap()
+    }
+
+    /// Both kinds in one tool set, which is the point of the second source: a template may name
+    /// a server's tool and a corpus to look things up in, and the model is told about both.
+    #[test]
+    fn a_tool_set_naming_both_kinds_resolves_to_both() {
+        let warehouse = id("warehouse");
+        let held = [retriever("kb", &[RetrieverTool::Search])];
+        let registries = Registries {
+            servers: std::slice::from_ref(&warehouse),
+            retrievers: &held,
+        };
+        let asked = set(&["warehouse.get_stock", "kb.search"]);
+
+        let named = sources_named(&asked, registries).unwrap();
+        assert_eq!(named.servers, [warehouse.clone()].into());
+        assert_eq!(named.retrievers, [RetrieverId::new("kb").unwrap()].into());
+
+        let box_of = Toolbox::assemble(
+            &asked,
+            &[Offered {
+                server: &warehouse,
+                offering: &offering(&["get_stock"]),
+            }],
+            registries,
+        )
+        .unwrap();
+
+        let names: Vec<&str> = box_of
+            .declared()
+            .iter()
+            .map(|one| one.name.as_str())
+            .collect();
+        // In the order the set holds them, which is the template's own sorted order.
+        assert_eq!(names, ["kb__search", "warehouse__get_stock"]);
+        assert_eq!(
+            box_of.find(&ToolName::new("kb__search").unwrap()),
+            Some(&Addressed::Retriever {
+                retriever: RetrieverId::new("kb").unwrap(),
+                tool: RetrieverTool::Search,
+            }),
+            "a retriever's tool resolved somewhere else"
+        );
+        assert_eq!(
+            box_of.find(&ToolName::new("warehouse__get_stock").unwrap()),
+            Some(&Addressed::Mcp {
+                server: warehouse,
+                tool: McpToolName::new("get_stock").unwrap(),
+            })
+        );
+    }
+
+    /// What the operator wrote for the model is what reaches the model, through the same
+    /// declaration an MCP tool's description travels in.
+    #[test]
+    fn a_retrievers_own_words_are_what_the_model_is_told() {
+        let held = [collection("kb")];
+        let box_of = Toolbox::assemble(
+            &set(&["kb.search"]),
+            &[],
+            Registries {
+                servers: &[],
+                retrievers: &held,
+            },
+        )
+        .unwrap();
+
+        let declared = &box_of.declared()[0];
+        let description = declared.description.as_deref().expect("its own words");
+        assert!(description.contains("the handbook"), "{description}");
+        assert!(
+            description.contains("`team` (Which team the page belongs to)"),
+            "the fields a filter may name did not reach the model: {description}"
+        );
+        assert_eq!(declared.schema["properties"]["hits"]["maximum"], 6);
+    }
+
+    /// A retriever's tools are a closed set, so this is answered without asking anything — and
+    /// the answer says what it does offer, which an MCP server's cannot.
+    #[test]
+    fn a_tool_a_retriever_does_not_offer_refuses_the_run() {
+        let held = [retriever(
+            "kb",
+            &[RetrieverTool::Search, RetrieverTool::Rank],
+        )];
+        let registries = Registries {
+            servers: &[],
+            retrievers: &held,
+        };
+        for asked in ["kb.cluster", "kb.sql"] {
+            assert_eq!(
+                Toolbox::assemble(&set(&[asked]), &[], registries),
+                Err(RunError::NoSuchRetrieverTool {
+                    tool: asked.to_owned(),
+                    retriever: "kb".to_owned(),
+                    offered: "search, rank".to_owned(),
+                }),
+                "{asked} resolved to something"
+            );
+        }
+    }
+
+    /// The fifth finding: one name, two readings, and no way to tell which the template meant.
+    #[test]
+    fn a_name_both_registries_answer_to_refuses_the_run() {
+        let kb = id("kb");
+        let held = [retriever("kb", &[RetrieverTool::Search])];
+        let registries = Registries {
+            servers: std::slice::from_ref(&kb),
+            retrievers: &held,
+        };
+
+        assert_eq!(
+            Toolbox::assemble(
+                &set(&["kb.search"]),
+                &[Offered {
+                    server: &kb,
+                    offering: &offering(&["search"]),
+                }],
+                registries,
+            ),
+            Err(RunError::ToolSourceAmbiguous {
+                tool: "kb.search".to_owned(),
+                named: "kb".to_owned(),
+            })
+        );
+        assert_eq!(
+            sources_named(&set(&["kb.search"]), registries),
+            Err(RunError::ToolSourceAmbiguous {
+                tool: "kb.search".to_owned(),
+                named: "kb".to_owned(),
+            }),
+            "what is opened must refuse it too, before a connection is made"
+        );
+    }
+
+    /// The ceiling is on the name a model is told, whichever kind of source it names.
+    #[test]
+    fn a_retriever_whose_declared_name_is_too_long_refuses_the_run() {
+        let id = "k".repeat(60);
+        let held = [retriever(&id, &[RetrieverTool::Search])];
+        let asked = format!("{id}.search");
+
+        assert_eq!(
+            Toolbox::assemble(
+                &set(&[&asked]),
+                &[],
+                Registries {
+                    servers: &[],
+                    retrievers: &held,
+                },
+            ),
+            Err(RunError::ToolNameTooLong {
+                tool: asked.clone(),
+                wire: format!("{id}__search"),
+                max: WIRE_MAX_BYTES,
+            }),
+            "{asked} was declared at {} bytes",
+            asked.len() + 1
+        );
     }
 
     #[test]
@@ -259,7 +663,7 @@ mod tests {
 
         assert_eq!(
             box_of.find(&ToolName::new("warehouse__get_stock").unwrap()),
-            Some(&Addressed {
+            Some(&Addressed::Mcp {
                 server: id("warehouse"),
                 tool: McpToolName::new("get_stock").unwrap(),
             })
@@ -275,7 +679,7 @@ mod tests {
 
     #[test]
     fn a_run_may_ask_for_no_tools_at_all() {
-        let box_of = Toolbox::assemble(&ToolSet::default(), &[]).unwrap();
+        let box_of = Toolbox::assemble(&ToolSet::default(), &[], mcp_only()).unwrap();
 
         assert!(box_of.is_empty());
         assert_eq!(box_of.declared(), []);
@@ -299,6 +703,7 @@ mod tests {
                     offering: &offering(&["sql"]),
                 },
             ],
+            mcp_only(),
         )
         .unwrap();
 
@@ -309,11 +714,11 @@ mod tests {
             .collect();
         assert_eq!(names, ["ledger__sql", "warehouse__sql"]);
         assert_eq!(
-            box_of
-                .find(&ToolName::new("ledger__sql").unwrap())
-                .unwrap()
-                .server,
-            ledger
+            box_of.find(&ToolName::new("ledger__sql").unwrap()),
+            Some(&Addressed::Mcp {
+                server: ledger,
+                tool: McpToolName::new("sql").unwrap(),
+            })
         );
     }
 
@@ -324,7 +729,7 @@ mod tests {
         let stored: ToolSet = serde_json::from_str(r#"["sql","search"]"#).unwrap();
 
         assert_eq!(
-            Toolbox::assemble(&stored, &[]),
+            Toolbox::assemble(&stored, &[], mcp_only()),
             Err(RunError::UnqualifiedTool {
                 tool: "search".to_owned()
             })
@@ -413,6 +818,7 @@ mod tests {
                     offering: &offering(&["b"]),
                 },
             ],
+            mcp_only(),
         )
         .unwrap_err();
 
@@ -438,6 +844,7 @@ mod tests {
                 server: &dotted,
                 offering: &offering(&["sql"]),
             }],
+            mcp_only(),
         );
         assert!(
             matches!(

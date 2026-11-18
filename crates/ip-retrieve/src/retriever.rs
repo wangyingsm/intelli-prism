@@ -8,7 +8,7 @@ use crate::id::RetrieverId;
 use crate::meta::MetaSchema;
 use crate::source::Source;
 use crate::spelling::prose;
-use crate::tool::{RetrieverTool, RetrieverTools};
+use crate::tool::RetrieverTools;
 
 /// The longest a name may be, in bytes.
 const NAME_MAX_BYTES: usize = 64;
@@ -392,24 +392,11 @@ impl TryFrom<RetrieverParts> for Retriever {
     }
 }
 
-/// A look-up as a model asked for it, before a backend has been told anything.
-///
-/// Carried as a type of its own because the two backends take the same three things and nothing
-/// else: which tool, the words to look up or the hits to walk from, and how many to answer with.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Asked {
-    /// Which tool the model called.
-    pub tool: RetrieverTool,
-    /// What it asked, as it wrote it.
-    pub words: String,
-    /// How many hits it asked for, and none where it did not say.
-    pub hits: Option<u32>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::source::{CollectionName, PlaneName, VectorProperty};
+    use crate::tool::RetrieverTool;
 
     /// The parts of a retriever over a plane, offering `tools`.
     fn over_a_plane(tools: Vec<RetrieverTool>) -> RetrieverParts {

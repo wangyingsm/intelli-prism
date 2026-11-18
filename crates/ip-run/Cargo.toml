@@ -22,6 +22,7 @@ ip-core = { version = "0.1.0", path = "../ip-core" }
 ip-gateway = { version = "0.1.0", path = "../ip-gateway" }
 ip-mcp = { version = "0.1.0", path = "../ip-mcp" }
 ip-protocol = { version = "0.1.0", path = "../ip-protocol" }
+ip-retrieve = { version = "0.1.0", path = "../ip-retrieve" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

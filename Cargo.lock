@@ -1905,6 +1905,7 @@ dependencies = [
 name = "ip-retrieve"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1930,6 +1931,7 @@ dependencies = [
  "ip-gateway",
  "ip-mcp",
  "ip-protocol",
+ "ip-retrieve",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
