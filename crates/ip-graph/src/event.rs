@@ -135,7 +135,7 @@ pub enum GraphEvent {
     },
     /// The graph is over, and this is all of it.
     Done {
-        /// What it answered: every node nothing reads from, keyed by name.
+        /// What it answered: every node nothing read from, keyed by name.
         answer: Value,
         /// The node that stopped it, where one did.
         stopped_at: Option<NodeName>,

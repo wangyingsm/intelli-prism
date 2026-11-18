@@ -293,11 +293,15 @@ pub struct Graphing {
 /// What running a whole graph came to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphRan {
-    /// The graph's answer: what each node nothing reads from said, keyed by its name.
+    /// The graph's answer: what each node nothing read from said, keyed by its name.
     ///
     /// Keyed even where a graph has one such node, for the reason a node's input is keyed even
     /// where it has one parent: a shape that is always the same is one a caller can read without
     /// knowing which graph it asked.
+    ///
+    /// Nothing *read from* rather than nothing reads from: a branch that was not taken read
+    /// nothing, so which nodes answer for a conditional graph is a property of the run it made and
+    /// not of the graph it was written as.
     pub answer: Value,
     /// What each node that ran came to.
     pub nodes: BTreeMap<NodeName, NodeRan>,
@@ -683,12 +687,31 @@ fn node_of(graph: &RunGraph, name: &NodeName) -> Option<GraphNode> {
         .cloned()
 }
 
-/// The nodes nothing reads from, which between them are what the graph answered.
-fn answer_of(graph: &RunGraph, answered: &BTreeMap<NodeName, NodeRan>) -> Value {
-    let read_from: BTreeSet<&NodeName> = graph.edges().iter().map(|edge| &edge.from).collect();
+/// The nodes nothing read from, which between them are what the graph answered.
+///
+/// **The run's shape rather than the graph's**, which is the difference a condition makes. An edge
+/// is only read from where it *delivered*, so a node that took none of its branches is a node
+/// nothing read from however many branches leave it in the graph — and that node's answer is the
+/// graph's, which is what makes taking no branch a complete answer rather than a run with nothing
+/// to show. The same filter answers the node every reader of which was skipped.
+///
+/// A node skipped since it answered is left out of both halves. It is in `answered`, because it
+/// ran and was paid for and [`GraphRan::nodes`] says so, but a later pass of the run decided
+/// against it and what it said is not the run's to answer with.
+fn answer_of(
+    graph: &RunGraph,
+    answered: &BTreeMap<NodeName, NodeRan>,
+    branched: &Branched,
+) -> Value {
+    let read_from: BTreeSet<&NodeName> = graph
+        .edges()
+        .iter()
+        .filter(|edge| delivered(edge, answered, branched))
+        .map(|edge| &edge.from)
+        .collect();
     let mut answer = Map::new();
     for node in graph.nodes() {
-        if read_from.contains(&node.name) {
+        if read_from.contains(&node.name) || branched.skipped.contains(&node.name) {
             continue;
         }
         if let Some(ran) = answered.get(&node.name) {
@@ -815,7 +838,7 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
     let ran = GraphRan {
         answer: match stopped_at {
             Some(_) => json!({}),
-            None => answer_of(&graphing.graph, &answered),
+            None => answer_of(&graphing.graph, &answered, &branched),
         },
         nodes: answered,
         stopped_at,
@@ -2338,12 +2361,12 @@ mod tests {
         );
     }
 
-    /// Ruling 4: naming none of them is an answer, and the run ends on it normally.
+    /// Ruling 4: naming none of them is an answer, the run ends on it, and it *is* the answer.
     ///
-    /// **The answer asserted here is the one the next commit changes**, and it is asserted rather
-    /// than left out so that it has to be: `answer_of` calls a node a leaf when nothing in the
-    /// *graph* reads from it, which is a property of the graph and not of the run, so a node that
-    /// branched nowhere is not yet in what the graph answered.
+    /// The last of those is what [`answer_of`] reads the run's own shape for. Nothing read from
+    /// this node, both branches leaving it in the graph notwithstanding, so what it said is what
+    /// the graph said — a triage step that judged there was nothing to do has an answer, and the
+    /// caller gets it rather than an empty object.
     #[tokio::test]
     async fn a_node_that_names_no_branch_ends_the_run_where_it_stands() {
         let chose = taking(&[]);
@@ -2385,7 +2408,11 @@ mod tests {
             ],
             "the skips are not in the order the generation places them"
         );
-        assert_eq!(ran.answer, json!({}), "see this test's own doc comment");
+        assert_eq!(
+            ran.answer,
+            json!({"intake": chose}),
+            "the node that branched nowhere is not what the graph answered"
+        );
     }
 
     /// A name the graph does not branch to is refused, and the names beside it still stand.
@@ -2492,6 +2519,11 @@ mod tests {
             ],
             "a skip did not carry the whole way down"
         );
+        assert_eq!(
+            ran.answer,
+            json!({"close": "close is content"}),
+            "the path nobody took is in what the graph answered"
+        );
     }
 
     /// Ruling 3: a node runs on what arrived, and a branch nobody took arrived as nothing.
@@ -2503,7 +2535,7 @@ mod tests {
     async fn a_node_runs_on_what_arrived_when_a_parent_of_it_was_skipped() {
         let chose = taking(&["left"]);
         let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
-        let (graphing, _) = looping(
+        let (graphing, events) = looping(
             branching_graph(
                 &["intake", "left", "right", "merge"],
                 &[("left", "merge"), ("right", "merge")],
@@ -2518,12 +2550,24 @@ mod tests {
             None,
         );
 
-        run(&graphing).await;
+        let ran = run(&graphing).await;
 
         assert_eq!(
             serde_json::from_str::<Value>(&runner.given("merge")).expect("a keyed input"),
             json!({"left": "left is content"}),
             "the skipped path left a key behind"
+        );
+        assert_eq!(
+            ran.answer,
+            json!({"merge": "merge is content"}),
+            "a merge of two paths answered with more than the merge"
+        );
+        assert_eq!(
+            branches_said(&said(events))
+                .into_iter()
+                .filter(|(said, _)| said == "node_skipped")
+                .collect::<Vec<_>>(),
+            vec![("node_skipped".to_owned(), json!({"node": "right"}))]
         );
     }
 
@@ -2576,6 +2620,50 @@ mod tests {
                 ("node_skipped".to_owned(), json!({"node": "escalate"})),
             ],
             "the pass that was not taken is the wrong one"
+        );
+        assert_eq!(
+            ran.answer,
+            json!({"close": "close is content"}),
+            "a node that answered and was then skipped is in what the graph answered"
+        );
+        assert!(
+            ran.nodes.contains_key(&name("escalate")),
+            "the node that was skipped on the second pass lost the record of its first"
+        );
+    }
+
+    /// What a graph answered is the shape the run made, which a node in the middle of one can be.
+    ///
+    /// The clearest case for reading the run rather than the graph: `review` is neither a root nor
+    /// a leaf of the graph as it was written — something feeds it and something reads from it — and
+    /// it is what this run answered, because the one thing that reads from it read nothing.
+    #[tokio::test]
+    async fn a_node_in_the_middle_is_the_answer_where_nothing_read_what_it_said() {
+        let chose = taking(&[]);
+        let runner = Scripted::over(&[("review", &[chose.as_str()])]);
+        let (graphing, _) = looping(
+            branching_graph(
+                &["intake", "review", "publish"],
+                &[("intake", "review")],
+                &[("review", "publish", "the draft is ready to go out")],
+                &[],
+            ),
+            order(&[("intake", 0), ("review", 1), ("publish", 2)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(
+            runner.order(),
+            vec!["intake", "review"],
+            "the step nobody chose ran anyway"
+        );
+        assert_eq!(
+            ran.answer,
+            json!({"review": chose}),
+            "the graph answered with its own leaf rather than the run's"
         );
     }
 
