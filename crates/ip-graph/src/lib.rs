@@ -36,6 +36,6 @@ pub use order::{Generation, Placed, RunOrder};
 pub use placement::Placement;
 pub use plane::{FEEDS, GRAPH_LABEL, GraphPlane, GraphSummary, Listing, NODE_LABEL};
 pub use run::{
-    AGAIN_KEY, Downstream, GRAPH_INPUT_KEY, GraphRan, Graphing, LOOP_BACK_KEY, NodeRan,
-    RunningNode, RunsNode, Stopping, loop_advice, run,
+    AGAIN_KEY, BRANCH_KEY, Downstream, GRAPH_INPUT_KEY, GraphRan, Graphing, LOOP_BACK_KEY, NodeRan,
+    RunningNode, RunsNode, Stopping, branch_advice, graph_advice, loop_advice, run,
 };

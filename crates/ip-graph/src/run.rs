@@ -17,8 +17,8 @@ use tokio::task::JoinSet;
 
 use crate::error::GraphError;
 use crate::event::{GraphEvent, GraphReporting, GraphSaid, LoopRefusal};
-use crate::graph::{GraphNode, GraphOwner, LoopBack, RunGraph};
-use crate::id::{GraphId, GraphRunId, NodeName};
+use crate::graph::{GraphEdge, GraphNode, GraphOwner, LoopBack, RunGraph};
+use crate::id::{Condition, GraphId, GraphRunId, NodeName};
 use crate::order::RunOrder;
 use crate::plane::GraphPlane;
 
@@ -105,6 +105,13 @@ pub trait Stopping: Send + Sync {
 /// something left.
 pub const LOOP_BACK_KEY: &str = "loop_back";
 
+/// The key a node's answer names the branches it is taking under.
+///
+/// A list rather than a name, because a node may take any subset of the branches it declares: one,
+/// several, or none at all. `{"branch": ["escalate", "notify"]}` takes both, and `{"branch": []}`
+/// takes neither and ends the run with what that node said.
+pub const BRANCH_KEY: &str = "branch";
+
 /// The key a node's own run-again arrives under, holding what each node that sent work back said.
 ///
 /// Keyed by the asking node, as fan-in is, because several nodes may declare a loop back to one
@@ -170,6 +177,66 @@ pub fn loop_advice(loops: &[LoopBack], node: &NodeName) -> Option<String> {
          Answer normally wherever you can — a step you may not name, or one already sent work back \
          as often as it may be, is refused, and the answer you gave stands as it is."
     ))
+}
+
+/// What a node that may choose where the work goes next is told, beyond what its own template says.
+///
+/// Takes every edge and filters, rather than taking the branches alone, so the one function serves
+/// both callers: the machine holding the graph passes [`RunGraph::edges`] and a member running one
+/// node of somebody else's graph passes the branch read of the plane they share. An edge without a
+/// condition is not a branch and is not mentioned — it delivers whatever this node answers.
+///
+/// Nothing, where no branch leaves this node, for [`loop_advice`]'s reason: a node that chooses
+/// nothing is told nothing about choosing, so one template reads the same in any graph.
+///
+/// **The case spelled out at length is the one where nothing holds**, and that is not politeness.
+/// A node told it may choose will choose, and M28's example ended with a model sending work back
+/// while stating in the same breath that the work had passed. So taking no branch is given a shape
+/// of its own — `{"branch": []}`, an answer and not an omission — and said in as many words to be
+/// a complete answer rather than a failure, which is what this milestone ruled it is.
+#[must_use]
+pub fn branch_advice(edges: &[GraphEdge], node: &NodeName) -> Option<String> {
+    let mut declared: Vec<(&GraphEdge, &Condition)> = edges
+        .iter()
+        .filter(|edge| &edge.from == node)
+        .filter_map(|edge| edge.condition.as_ref().map(|when| (edge, when)))
+        .collect();
+    if declared.is_empty() {
+        return None;
+    }
+    declared.sort_by(|one, two| one.0.to.cmp(&two.0.to));
+    let steps = declared
+        .iter()
+        .map(|(edge, when)| format!("{} (when {})", edge.to, when))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Which steps run after you is yours to decide. To send the work on, answer with nothing \
+         but this json: {{\"{BRANCH_KEY}\": [\"<step>\"], \"notes\": \"<anything those steps \
+         should know>\"}}. Judge each step below on its own and name every one whose condition \
+         holds — one of them, several, or all. Anything else you put in that object reaches them \
+         too. The steps you may name are: {steps}. If no condition holds, name none of them: \
+         answer {{\"{BRANCH_KEY}\": []}} and nothing further runs, which is a complete answer and \
+         not a failure. A step that is not listed is refused, and the answer you gave stands as it \
+         is."
+    ))
+}
+
+/// Everything a node is told about the graph it is running in, in the order it is told.
+///
+/// One function rather than each caller joining the pieces, because the callers are two machines:
+/// a node dispatched elsewhere must read exactly what it would have read had the coordinator run
+/// it, and the order the pieces arrive in is part of what it reads.
+///
+/// Loop back first, where a node carries both. What to do with what arrived comes before where to
+/// send what you make of it.
+#[must_use]
+pub fn graph_advice(loops: &[LoopBack], edges: &[GraphEdge], node: &NodeName) -> Option<String> {
+    let said: Vec<String> = [loop_advice(loops, node), branch_advice(edges, node)]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!said.is_empty()).then(|| said.join("\n\n"))
 }
 
 /// Whatever can say which nodes one node's answer reaches.
@@ -685,6 +752,15 @@ mod tests {
             from: name(from),
             to: name(to),
             condition: None,
+        }
+    }
+
+    /// The same edge, carrying the condition that makes it a branch.
+    fn branch(from: &str, to: &str, when: &str) -> GraphEdge {
+        GraphEdge {
+            from: name(from),
+            to: name(to),
+            condition: Some(Condition::new(when).expect("a condition")),
         }
     }
 
@@ -1730,6 +1806,123 @@ mod tests {
             loop_advice(graph(&["only"], &[]).loops(), &name("only")),
             None,
             "a graph with no loop back at all told a node about one"
+        );
+    }
+
+    /// A node is told what it may choose between, in the words the graph's conditions are written
+    /// in, and told it as a list because any subset of them may be taken.
+    #[test]
+    fn a_node_that_may_choose_what_runs_next_is_told_the_steps_and_their_conditions() {
+        let edges = [
+            branch("triage", "refund", "the customer asks for their money back"),
+            branch("triage", "escalate", "the complaint names a legal risk"),
+            edge("refund", "close"),
+        ];
+
+        let told = branch_advice(&edges, &name("triage")).expect("the node declares two branches");
+
+        assert!(
+            told.contains(
+                r#"{"branch": ["<step>"], "notes": "<anything those steps should know>"}"#
+            ),
+            "the shape to answer in was not spelled out: {told}"
+        );
+        assert!(
+            told.contains(
+                "escalate (when the complaint names a legal risk), refund (when the customer asks \
+                 for their money back)"
+            ),
+            "the steps and their conditions were not named, in name order: {told}"
+        );
+        assert!(
+            told.contains("several, or all"),
+            "nothing said more than one branch may be taken: {told}"
+        );
+    }
+
+    /// The case the M28 example was tuned for: taking nothing has a shape and a name of its own.
+    ///
+    /// A node told it may choose will choose unless the no-branch case is as concrete as the
+    /// others, so this asserts both halves of it — the json to answer with, and that it is not a
+    /// failure.
+    #[test]
+    fn taking_no_branch_is_spelled_out_as_an_answer_rather_than_an_omission() {
+        let edges = [branch("triage", "refund", "the customer asks for a refund")];
+
+        let told = branch_advice(&edges, &name("triage")).expect("the node declares a branch");
+
+        assert!(
+            told.contains(r#"{"branch": []}"#),
+            "the way to take no branch was not spelled out: {told}"
+        );
+        assert!(
+            told.contains("not a failure"),
+            "taking no branch was left looking like a failure: {told}"
+        );
+    }
+
+    /// An edge without a condition is not a branch, so a plain chain tells its nodes nothing.
+    #[test]
+    fn a_node_with_no_branch_leaving_it_is_told_nothing_about_choosing() {
+        let edges = [
+            edge("intake", "reply"),
+            branch("reply", "escalate", "it is still unresolved"),
+        ];
+
+        assert_eq!(
+            branch_advice(&edges, &name("intake")),
+            None,
+            "a node whose only edge delivers unconditionally was told it may choose"
+        );
+        assert!(branch_advice(&edges, &name("reply")).is_some());
+        assert_eq!(
+            branch_advice(
+                graph(&["intake", "reply"], &[("intake", "reply")]).edges(),
+                &name("intake")
+            ),
+            None,
+            "a graph with no branch at all told a node about one"
+        );
+    }
+
+    /// A node may carry both, and then it is told both — the loop back first.
+    ///
+    /// The order is asserted because it is what a member running this node elsewhere must read
+    /// too: what to do with what arrived comes before where to send what you make of it.
+    #[test]
+    fn a_node_that_may_both_double_back_and_choose_is_told_about_both_in_that_order() {
+        let loops = [LoopBack {
+            from: name("review"),
+            to: name("draft"),
+            cap: LoopCap::new(2).expect("a cap"),
+        }];
+        let edges = [
+            edge("draft", "review"),
+            branch("review", "publish", "the draft is ready to go out"),
+        ];
+        let node = name("review");
+
+        let told = graph_advice(&loops, &edges, &node).expect("the node carries both");
+
+        let doubling = told
+            .find("send this work back")
+            .expect("the loop back advice");
+        let choosing = told
+            .find("Which steps run after you")
+            .expect("the branch advice");
+        assert!(
+            doubling < choosing,
+            "the branch was put before the loop back: {told}"
+        );
+        assert_eq!(
+            graph_advice(&loops, &edges, &name("draft")),
+            None,
+            "a node that neither doubles back nor chooses was told something"
+        );
+        assert_eq!(
+            graph_advice(&[], &edges, &node).as_deref(),
+            branch_advice(&edges, &node).as_deref(),
+            "a node that only chooses was told more than the branch advice"
         );
     }
 

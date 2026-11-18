@@ -202,7 +202,7 @@ async fn node_config(state: &AppState, work: &Dispatch) -> Result<AgentConfig, S
         }
         Err(error) => return Err(format!("the templates could not be read: {error}")),
     };
-    told_about_looping(state, work, config).await
+    told_what_the_graph_says(state, work, config).await
 }
 
 /// The dispatched node's configuration with what the graph lets it ask for added to its prompt.
@@ -214,13 +214,14 @@ async fn node_config(state: &AppState, work: &Dispatch) -> Result<AgentConfig, S
 /// taking the coordinator's word for it would be told what a node may do by something other than
 /// the graph that declares it.
 ///
-/// One statement rather than a whole graph read: only the loop backs decide this.
+/// Two statements rather than a whole graph read: only the loop backs and the branches decide
+/// this, and each is one read of its own.
 ///
 /// A member that cannot reach the plane refuses the node. It cannot tell a graph with no loop
-/// backs from one it failed to read, and running a node that may send its work back without
-/// telling it so is the defect this exists to close — the same node would have been told, had the
-/// coordinator run it itself.
-async fn told_about_looping(
+/// backs and no branches from one it failed to read, and running a node that may send its work
+/// back, or choose what follows it, without telling it so is the defect this exists to close —
+/// the same node would have been told, had the coordinator run it itself.
+async fn told_what_the_graph_says(
     state: &AppState,
     work: &Dispatch,
     config: AgentConfig,
@@ -232,12 +233,16 @@ async fn told_about_looping(
         .loops(&work.owner, &work.graph)
         .await
         .map_err(|error| format!("the graph's loop backs could not be read: {error}"))?;
-    let Some(advice) = ip_graph::loop_advice(&loops, &work.node) else {
+    let branches = plane
+        .branches(&work.owner, &work.graph)
+        .await
+        .map_err(|error| format!("the graph's branches could not be read: {error}"))?;
+    let Some(advice) = ip_graph::graph_advice(&loops, &branches, &work.node) else {
         return Ok(config);
     };
     let told = Prompt::new(&format!("{}\n\n{advice}", config.prompt().as_str())).map_err(|_| {
         format!(
-            "the node {} declares a loop back, and its prompt has no room to be told so",
+            "the node {} is told what its graph lets it ask for, and its prompt has no room for it",
             work.node
         )
     })?;
@@ -565,8 +570,11 @@ upstream_speaks = "anthropic"
         }
     }
 
-    /// What a plane answers a worker's loop-back read with when the graph declares none.
-    fn no_loops() -> Replies {
+    /// What a plane answers a worker's two reads with when the graph declares nothing.
+    ///
+    /// One empty table serves both the loop backs and the branches, because a scripted reply
+    /// answers per *method* and both are `plane.cypher`. What the columns are called is not read.
+    fn nothing_declared() -> Replies {
         Replies::scripted([(
             "plane.cypher",
             serde_json::json!({"columns": ["from", "to", "cap"], "rows": []}),
@@ -593,7 +601,7 @@ upstream_speaks = "anthropic"
 
     /// The same over a graph that declares no loop back, which is every test but one.
     async fn worker() -> Worker {
-        let (router, plane) = worker_over(no_loops()).await;
+        let (router, plane) = worker_over(nothing_declared()).await;
         Worker { router, plane }
     }
 
@@ -673,21 +681,29 @@ upstream_speaks = "anthropic"
     /// A node that runs here is told what a node of that graph may ask for, derived here.
     ///
     /// **The point of the test is that nothing told it.** The dispatch carries the node, the
-    /// graph and the owner, and no instruction; this machine reads the loop backs from the plane
-    /// both machines share and works out the same text the coordinator would have. A member that
-    /// believed a dispatch instead could be told a node may do what its graph does not say.
+    /// graph and the owner, and no instruction; this machine reads the loop backs and the branches
+    /// from the plane both machines share and works out the same text the coordinator would have.
+    /// A member that believed a dispatch instead could be told a node may do what its graph does
+    /// not say.
+    ///
+    /// Answered in turn rather than per method, because the two reads are both `plane.cypher` and
+    /// each wants its own table — the second being the one a scripted reply would have fed the
+    /// loop backs' cap to as a condition.
     #[tokio::test]
     async fn a_dispatched_node_is_told_what_the_graph_lets_it_ask_for() {
         let upstream = Arc::new(Recording {
             seen: std::sync::Mutex::new(Vec::new()),
         });
-        let plane = StubPlane::start(Replies::scripted([(
-            "plane.cypher",
+        let plane = StubPlane::start(Replies::in_turn([
             serde_json::json!({
                 "columns": ["from", "to", "cap"],
                 "rows": [["triage", "intake", 3]],
             }),
-        )]))
+            serde_json::json!({
+                "columns": ["from", "to", "condition"],
+                "rows": [["triage", "escalate", "the complaint names a legal risk"]],
+            }),
+        ]))
         .await;
         let state = super::super::harness::serving(
             store().await,
@@ -719,6 +735,11 @@ upstream_speaks = "anthropic"
         assert!(
             told.contains(ip_graph::LOOP_BACK_KEY) && told.contains("intake (at most 3 times)"),
             "a node dispatched here was not told what its graph lets it ask for: {told}"
+        );
+        assert!(
+            told.contains(ip_graph::BRANCH_KEY)
+                && told.contains("escalate (when the complaint names a legal risk)"),
+            "a node dispatched here was not told what its graph lets it choose: {told}"
         );
     }
 
@@ -1051,7 +1072,7 @@ upstream_speaks = "anthropic"
 
     /// A worker taking its time over each turn, so a stop has somewhere to land.
     async fn slow_worker() -> (Router, AppState, StubPlane) {
-        let plane = StubPlane::start(no_loops()).await;
+        let plane = StubPlane::start(nothing_declared()).await;
         let state = super::super::harness::serving(store().await, SERVING, Arc::new(Slowly))
             .with_cluster_secret(Secret::from(STUB_SECRET))
             .with_graphs(Arc::new(GraphPlane::new(plane.client())));
@@ -1160,7 +1181,7 @@ upstream_speaks = "anthropic"
     /// before the stop existed.
     #[tokio::test]
     async fn a_worker_that_cannot_follow_the_signals_runs_the_node_to_completion() {
-        let plane = StubPlane::start(no_loops()).await;
+        let plane = StubPlane::start(nothing_declared()).await;
         let state = super::super::harness::serving(store().await, SERVING, Arc::new(Answering))
             .with_cluster_secret(Secret::from(STUB_SECRET))
             .with_graphs(Arc::new(GraphPlane::new(plane.client())));

@@ -1001,7 +1001,7 @@ async fn prepare(
             }
             Err(error) => return Err(Box::new(store_refusal(error))),
         };
-        let config = match told_about_looping(&config, graph, &node.name) {
+        let config = match told_what_the_graph_says(&config, graph, &node.name) {
             Ok(config) => config,
             Err(refusal) => return Err(refusal),
         };
@@ -1044,19 +1044,19 @@ async fn prepare(
 
 /// The node's configuration with what the graph lets it ask for added to its prompt.
 ///
-/// The template as stored where the graph declares no loop back from this node, so a template is
-/// only ever told about a graph that gave it something to say.
+/// The template as stored where the graph declares neither a loop back nor a branch from this node,
+/// so a template is only ever told about a graph that gave it something to say.
 ///
 /// A prompt that will not take the addition refuses the run rather than running a node that cannot
-/// be told what it may do: a graph declares the loop back, so a node silently unable to ask for it
-/// would be a feature that is there in the graph and missing in the run. It needs a stored prompt
-/// within a few hundred bytes of the 32 KiB ceiling to happen at all.
-fn told_about_looping(
+/// be told what it may do: a graph declares the loop back and the branches, so a node silently
+/// unable to use them would be a feature that is there in the graph and missing in the run. It
+/// needs a stored prompt within a few hundred bytes of the 32 KiB ceiling to happen at all.
+fn told_what_the_graph_says(
     config: &AgentConfig,
     graph: &RunGraph,
     node: &NodeName,
 ) -> Result<AgentConfig, Refusal> {
-    let Some(advice) = ip_graph::loop_advice(graph.loops(), node) else {
+    let Some(advice) = ip_graph::graph_advice(graph.loops(), graph.edges(), node) else {
         return Ok(config.clone());
     };
     let told = Prompt::new(&format!("{}\n\n{advice}", config.prompt().as_str())).map_err(|_| {
@@ -1064,7 +1064,8 @@ fn told_about_looping(
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!(
-                    "the node {node} declares a loop back, and its prompt has no room to be told so"
+                    "the node {node} is told what its graph lets it ask for, and its prompt has \
+                     no room for it"
                 ),
             )
                 .into_response(),
@@ -1456,7 +1457,7 @@ mod tests {
 
     /// A prompt with no room for the instruction refuses the run rather than losing the feature.
     #[test]
-    fn a_node_whose_prompt_cannot_be_told_about_looping_refuses_the_run() {
+    fn a_node_whose_prompt_cannot_be_told_what_the_graph_says_refuses_the_run() {
         use ip_agents::{AgentConfigParts, AgentRole, MaxTurns, ReqTimeout, TimeLimit, ToolSet};
 
         let full = AgentConfig::new(AgentConfigParts {
@@ -1502,11 +1503,11 @@ mod tests {
         let intake = NodeName::new("intake").unwrap();
         let reply = NodeName::new("reply").unwrap();
         assert!(
-            told_about_looping(&full, &graph, &intake).is_ok(),
+            told_what_the_graph_says(&full, &graph, &intake).is_ok(),
             "a node with nothing to be told was refused for a prompt that is long"
         );
         assert!(
-            told_about_looping(&full, &graph, &reply).is_err(),
+            told_what_the_graph_says(&full, &graph, &reply).is_err(),
             "a prompt with no room for the instruction ran anyway"
         );
     }
@@ -1549,6 +1550,48 @@ mod tests {
         assert!(
             told.contains("Be helpful."),
             "the template's own prompt was replaced rather than added to: {told}"
+        );
+    }
+
+    /// The node that may choose what follows it is told so, and the one with nothing after it is not.
+    ///
+    /// Read off the upstream for the loop back's reason: the two nodes share one stored template,
+    /// so the only place the prompts differ is in what each was actually sent.
+    #[tokio::test]
+    async fn a_node_that_may_choose_what_runs_next_is_told_what_it_may_choose() {
+        let (router, state, _plane, upstream) = recorded(
+            &["intake-agent", "reply-agent"],
+            branching_chain(sorted_chain()),
+        )
+        .await;
+
+        let answered = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/graph_run/triage?tenant=acme",
+        )
+        .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let _ = body_of(answered).await;
+
+        let sent = upstream.sent();
+        assert_eq!(sent.len(), 2, "a chain of two took other than two turns");
+        let said = |one: &serde_json::Value| one["system"].to_string();
+        let told = said(&sent[0]);
+        assert!(
+            told.contains(ip_graph::BRANCH_KEY)
+                && told.contains("reply (when the ticket needs an answer)"),
+            "the node that chooses was not told what it may choose: {told}"
+        );
+        assert!(
+            told.contains("Be helpful."),
+            "the template's own prompt was replaced rather than added to: {told}"
+        );
+        assert!(
+            !said(&sent[1]).contains(ip_graph::BRANCH_KEY),
+            "the second node, which nothing follows, was told it may choose: {}",
+            said(&sent[1])
         );
     }
 
@@ -2169,6 +2212,28 @@ upstream_speaks = "anthropic"
                 "rows": [["reply", "intake", 2]],
             }),
             no_branches(),
+            order,
+            nodes(),
+        ])
+    }
+
+    /// The same script, for a graph where whether the second node runs is the first node's to say.
+    fn branching_chain(order: serde_json::Value) -> Replies {
+        let nodes = || {
+            serde_json::json!([
+                node_row(2, "acme", "triage", "intake", "intake-agent"),
+                node_row(3, "acme", "triage", "reply", "reply-agent"),
+            ])
+        };
+        Replies::in_turn([
+            serde_json::json!([graph_row("acme", "triage")]),
+            nodes(),
+            serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
+            no_loops(),
+            serde_json::json!({
+                "columns": ["from", "to", "condition"],
+                "rows": [["intake", "reply", "the ticket needs an answer"]],
+            }),
             order,
             nodes(),
         ])
