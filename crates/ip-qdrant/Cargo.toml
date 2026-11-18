@@ -1,0 +1,35 @@
+[package]
+name = "ip-qdrant"
+description = "A REST client for one qdrant collection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The stub collection in `testing`, which answers real http over a loopback socket. Behind a
+# feature rather than `#[cfg(test)]` because the code that registers and dispatches a look-up
+# lives in other crates, and what their tests have to assert is the body that crossed the wire.
+testing = ["hyper/server"]
+
+[dependencies]
+bytes = "1.12.1"
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "ring", "webpki-roots", "tls12"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "tokio"] }
+ip-config = { version = "0.1.0", path = "../ip-config" }
+ip-retrieve = { version = "0.1.0", path = "../ip-retrieve" }
+rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+hyper = { version = "1.11.1", features = ["server"] }

@@ -1882,6 +1882,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-qdrant"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "ip-config",
+ "ip-retrieve",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "ip-retrieve"
 version = "0.1.0"
 dependencies = [
