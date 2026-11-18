@@ -2,6 +2,11 @@
 # refuse at the door, and that a key goes in and never comes back out — not counts, which would
 # move whenever an earlier file changes. Nothing looks anything up yet, so there is nothing else
 # to see.
+#
+# **Every retriever written here offers the tools that walk edges and no `search`**, because this
+# suite's server is built without the `semantic` feature and so embeds nothing: a `search` is the
+# one tool whose width a registration compares against the embedder's, and one offered to a
+# deployment that has none is refused — which this file checks for its own sake, further down.
 
 POST {{host}}/_ip/login
 {"user": "root", "passphrase": "{{passphrase}}"}
@@ -12,10 +17,10 @@ PUT {{host}}/_ip/retrievers/handbook
 x-ip-csrf: 1
 {
   "name": "The handbook",
-  "endpoint": "https://qdrant.acme.test:6333",
+  "endpoint": "https://drsg.acme.test:8443/rpc",
   "auth": {"kind": "key", "key": "qd-live-9f2c4a7b1e"},
-  "source": {"kind": "qdrant", "collection": "handbook"},
-  "tools": ["search"],
+  "source": {"kind": "drsg", "plane": "handbook", "property": "embedding"},
+  "tools": ["neighbors", "rank"],
   "meta": {
     "team": "Which team the page belongs to",
     "quarter": "Which quarter the figure is for, as 2026Q1"
@@ -27,10 +32,12 @@ HTTP 201
 jsonpath "$.id" == "handbook"
 jsonpath "$.name" == "The handbook"
 jsonpath "$.tenant" not exists
-jsonpath "$.endpoint" == "https://qdrant.acme.test:6333"
-jsonpath "$.source.kind" == "qdrant"
-jsonpath "$.source.collection" == "handbook"
-jsonpath "$.tools" contains "search"
+jsonpath "$.endpoint" == "https://drsg.acme.test:8443/rpc"
+jsonpath "$.source.kind" == "drsg"
+jsonpath "$.source.plane" == "handbook"
+jsonpath "$.tools" contains "rank"
+# Nothing was asked of the backend, so nothing is reported as measured.
+jsonpath "$.measured" not exists
 jsonpath "$.meta.team" == "Which team the page belongs to"
 jsonpath "$.max_hits" == 8
 jsonpath "$.created_at" isInteger
@@ -61,20 +68,21 @@ jsonpath "$[0].entity" == "retriever"
 jsonpath "$[0].entity_id" == "handbook"
 body not contains "qd-live-9f2c4a7b1e"
 
-# A plane, which is the other kind, and the only one that answers the four graph tools.
+# A plane is the only kind that answers the four tools that walk edges, and a label narrows what
+# it reads.
 PUT {{host}}/_ip/retrievers/graph
 x-ip-csrf: 1
 {
   "name": "The code graph",
   "endpoint": "http://127.0.0.1:44453",
   "source": {"kind": "drsg", "plane": "handbook", "label": "Document", "property": "embedding"},
-  "tools": ["search", "neighbors", "rank", "relate", "cluster"]
+  "tools": ["neighbors", "rank", "relate", "cluster"]
 }
 HTTP 201
 [Asserts]
 jsonpath "$.source.plane" == "handbook"
 jsonpath "$.source.label" == "Document"
-jsonpath "$.tools" count == 5
+jsonpath "$.tools" count == 4
 jsonpath "$.auth" == "none"
 jsonpath "$.max_hits" == 5
 
@@ -82,14 +90,14 @@ jsonpath "$.max_hits" == 5
 PUT {{host}}/_ip/retrievers/graph
 x-ip-csrf: 1
 {
-  "name": "The code graph, searched only",
+  "name": "The code graph, related only",
   "endpoint": "http://127.0.0.1:44453",
   "source": {"kind": "drsg", "plane": "handbook", "property": "embedding"},
-  "tools": ["search"]
+  "tools": ["relate"]
 }
 HTTP 201
 [Asserts]
-jsonpath "$.name" == "The code graph, searched only"
+jsonpath "$.name" == "The code graph, related only"
 jsonpath "$.tools" count == 1
 jsonpath "$.source.label" not exists
 
@@ -177,6 +185,38 @@ x-ip-csrf: 1
 }
 HTTP 422
 
+# A `search` is the one tool whose width is compared against the embedder's, and this deployment
+# has none: so it is refused here, while an operator is reading the answer, rather than at search
+# time inside a run they are paying for. Both kinds, because neither can be asked.
+PUT {{host}}/_ip/retrievers/searching
+x-ip-csrf: 1
+{
+  "name": "Searching",
+  "endpoint": "https://qdrant.acme.test:6333",
+  "source": {"kind": "qdrant", "collection": "handbook"},
+  "tools": ["search"]
+}
+HTTP 422
+[Asserts]
+body contains "embeds nothing"
+body contains "semantic"
+
+PUT {{host}}/_ip/retrievers/searching
+x-ip-csrf: 1
+{
+  "name": "Searching",
+  "endpoint": "http://127.0.0.1:44453",
+  "source": {"kind": "drsg", "plane": "handbook", "property": "embedding"},
+  "tools": ["search", "rank"]
+}
+HTTP 422
+[Asserts]
+body contains "embeds nothing"
+
+# And it was refused rather than half-written.
+GET {{host}}/_ip/retrievers/searching
+HTTP 404
+
 # An id that is not one, which the path carries and the type refuses.
 PUT {{host}}/_ip/retrievers/not%20an%20id
 x-ip-csrf: 1
@@ -213,20 +253,20 @@ PUT {{host}}/_ip/retrievers/handbook?tenant=acme
 x-ip-csrf: 1
 {
   "name": "Acme's handbook",
-  "endpoint": "https://qdrant.acme.test:6333",
-  "source": {"kind": "qdrant", "collection": "acme-handbook"},
-  "tools": ["search"]
+  "endpoint": "https://drsg.acme.test:8443/rpc",
+  "source": {"kind": "drsg", "plane": "acme-handbook", "property": "embedding"},
+  "tools": ["neighbors"]
 }
 HTTP 201
 [Asserts]
 jsonpath "$.tenant" == "acme"
-jsonpath "$.source.collection" == "acme-handbook"
+jsonpath "$.source.plane" == "acme-handbook"
 
 GET {{host}}/_ip/retrievers?tenant=acme
 HTTP 200
 [Asserts]
 jsonpath "$[?(@.id == 'handbook')]" count == 1
-jsonpath "$[?(@.source.collection == 'handbook')]" count == 0
+jsonpath "$[?(@.source.plane == 'handbook')]" count == 0
 
 # The deployment's own is not a tenant's, and a tenant owner does not manage it.
 GET {{host}}/_ip/retrievers
@@ -323,9 +363,9 @@ PUT {{host}}/_ip/retrievers/bobs?tenant=acme
 x-ip-csrf: 1
 {
   "name": "Bob's",
-  "endpoint": "https://qdrant.acme.test:6333",
-  "source": {"kind": "qdrant", "collection": "bobs"},
-  "tools": ["search"]
+  "endpoint": "https://drsg.acme.test:8443/rpc",
+  "source": {"kind": "drsg", "plane": "bobs", "property": "embedding"},
+  "tools": ["cluster"]
 }
 HTTP 201
 

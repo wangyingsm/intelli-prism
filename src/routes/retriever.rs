@@ -8,12 +8,14 @@ use axum::routing::get;
 use ip_core::{Capability, CapabilityScope, TenantId, Timestamp};
 use ip_retrieve::{
     MaxHits, MetaSchema, Retriever, RetrieverAuth, RetrieverEndpoint, RetrieverId, RetrieverName,
-    RetrieverParts, RetrieverTools, Source,
+    RetrieverParts, RetrieverTool, RetrieverTools, Source,
 };
 use ip_storage::{By, NewRetriever, RetrieverOwner, StoredRetriever};
 
 use super::{Paged, store_refusal};
+use crate::error::Unanswered;
 use crate::manage::Manager;
+use crate::retrieve::Backend;
 use crate::state::AppState;
 
 /// A refusal, boxed so the ordinary answer is not paid for by every caller.
@@ -58,6 +60,23 @@ pub struct RetrieverView {
     pub max_hits: MaxHits,
     /// When it was written, in seconds since the unix epoch.
     pub created_at: Timestamp,
+    /// What its backend said about its vectors, on the answer to the write that asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured: Option<Measured>,
+}
+
+/// What a retriever's backend said about its vectors when it was registered.
+///
+/// **On the answer to a write and on no other answer**, because the write is the one moment the
+/// backend is asked: the width is not stored, so a later read has nothing of its own to report and
+/// says nothing rather than repeating what was true once.
+#[derive(Debug, serde::Serialize)]
+pub struct Measured {
+    /// How wide they are, and absent where the backend held none to measure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// What that means for this retriever, in words an operator reads.
+    pub note: &'static str,
 }
 
 impl From<StoredRetriever> for RetrieverView {
@@ -73,6 +92,7 @@ impl From<StoredRetriever> for RetrieverView {
             meta: stored.retriever.meta().clone(),
             max_hits: stored.retriever.max_hits(),
             created_at: stored.created_at,
+            measured: None,
         }
     }
 }
@@ -189,6 +209,10 @@ async fn put(
         Ok(retriever) => retriever,
         Err(error) => return *unprocessable(error),
     };
+    let measured = match measure(&state, &retriever).await {
+        Ok(measured) => measured,
+        Err(refusal) => return *refusal,
+    };
     let by = By::new(manager.user().clone(), ENDPOINT);
     match state
         .store()
@@ -196,8 +220,67 @@ async fn put(
         .await
     {
         // The retriever as stored, so the caller learns when it was written without asking again.
-        Ok(stored) => (StatusCode::CREATED, Json(RetrieverView::from(stored))).into_response(),
+        Ok(stored) => {
+            let mut view = RetrieverView::from(stored);
+            view.measured = measured;
+            (StatusCode::CREATED, Json(view)).into_response()
+        }
         Err(error) => store_refusal(error),
+    }
+}
+
+/// What this deployment can say about the vectors a retriever's backend holds, before it is
+/// stored, or what the caller is told instead.
+///
+/// **Asked here rather than at search time**, which is the whole of this: a query is embedded by
+/// the one artefact this process holds, so a backend whose vectors are another width answers a
+/// search with a bad answer rather than an error — nothing in a vector comparison says the two
+/// came from different models. An operator learns it while writing the row.
+///
+/// Three things are refused, and each is the operator's to fix: a `search` in a deployment that
+/// embeds nothing, a backend that answered about something other than a width, and a width that
+/// disagrees with ours. One is not: a backend that cannot be reached at all is nobody's fault and
+/// worth trying again, which is the 503 a plane gets everywhere else in this api.
+///
+/// Nothing is asked where no `search` is offered. The four graph tools walk edges and compare
+/// nothing, so a plane offering only those is searched with no vector of ours and has no width to
+/// agree with — which is also what lets a deployment with no artefact hold one.
+async fn measure(state: &AppState, retriever: &Retriever) -> Result<Option<Measured>, Refusal> {
+    if !retriever.tools().offers(RetrieverTool::Search) {
+        return Ok(None);
+    }
+    let Some(ours) = state.embedder_width() else {
+        return Err(unprocessable(
+            "this deployment embeds nothing, so a retriever offering `search` could never be              asked: configure a `[semantic]` artefact, or offer only the tools that walk edges",
+        ));
+    };
+    let backend = Backend::open(retriever).map_err(unanswered)?;
+    match backend.width().await.map_err(unanswered)? {
+        Some(width) if width != ours => Err(unprocessable(format!(
+            "its vectors are {width} numbers wide and this deployment embeds a query into {ours},              so a search of it would compare two models' vectors"
+        ))),
+        Some(width) => Ok(Some(Measured {
+            width: Some(width),
+            note: "its vectors are the width this deployment embeds a query into",
+        })),
+        None => Ok(Some(Measured {
+            width: None,
+            note: "it holds no vector under that property yet, so nothing could disagree: a                    search answers nothing until it does, and nothing rather than an error if what                    it is embedded with turns out to be another model",
+        })),
+    }
+}
+
+/// What a caller is told when a retriever's own backend would not answer.
+fn unanswered(error: Unanswered) -> Refusal {
+    match error {
+        Unanswered::Unreachable(said) => Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("its backend could not be reached: {said}"),
+            )
+                .into_response(),
+        ),
+        Unanswered::Refused(said) => unprocessable(said),
     }
 }
 
@@ -285,7 +368,9 @@ mod tests {
     use std::sync::Arc;
 
     use ip_core::{Grant, TnKey, UserId};
-    use ip_retrieve::{CollectionName, RetrieverTool};
+    use ip_drsg::{Replies, StubPlane};
+    use ip_qdrant::{Answers, StubQdrant};
+    use ip_retrieve::CollectionName;
     use ip_storage::{
         AccountKind, Membership, MembershipStore, NewTenant, NewUser, RetrieverStore, SqliteStore,
         Standing, TenantStore, UserStore,
@@ -449,10 +534,17 @@ mod tests {
     }
 
     /// A retriever as a caller writes one, without the id the path carries.
+    ///
+    /// It offers the tools that walk edges and no `search`, which is what keeps every test of who
+    /// may manage what from needing a backend to answer: a search is the one tool whose width this
+    /// deployment compares against its own, and the tests of that comparison are below, each with
+    /// a stub of its own.
     fn written(name: &str) -> String {
         format!(
             r#"{{"name":"{name}","endpoint":"https://qdrant.acme.test:6333",
-               "source":{{"kind":"qdrant","collection":"handbook"}},"tools":["search"],
+               "source":{{"kind":"drsg","plane":"handbook","label":"Document",
+                          "property":"embedding"}},
+               "tools":["neighbors","rank"],
                "meta":{{"team":"Which team the page belongs to"}},"max_hits":8}}"#
         )
     }
@@ -609,13 +701,229 @@ mod tests {
         let held: serde_json::Value = serde_json::from_str(&body_of(read).await).unwrap();
         assert_eq!(held["id"], "handbook");
         assert_eq!(held["tenant"], "acme");
-        assert_eq!(held["source"]["kind"], "qdrant");
-        assert_eq!(held["source"]["collection"], "handbook");
-        assert_eq!(held["tools"][0], "search");
+        assert_eq!(held["source"]["kind"], "drsg");
+        assert_eq!(held["source"]["plane"], "handbook");
+        assert_eq!(held["tools"], serde_json::json!(["neighbors", "rank"]));
         assert_eq!(held["meta"]["team"], "Which team the page belongs to");
         assert_eq!(held["max_hits"], 8);
         assert_eq!(held["auth"], "none");
         assert!(held["created_at"].is_i64());
+    }
+
+    /// The same fixture over a deployment that embeds a query into `width` numbers.
+    async fn embedding(width: u32) -> (Router, AppState) {
+        let state = state_over_shared(store().await).with_embedder_width(width);
+        (super::super::router(state.clone()), state)
+    }
+
+    /// A retriever that offers a search, which is the one tool a width is compared for.
+    fn seeking(endpoint: &str, source: serde_json::Value) -> String {
+        serde_json::json!({
+            "name": "The handbook",
+            "endpoint": endpoint,
+            "source": source,
+            "tools": ["search"],
+        })
+        .to_string()
+    }
+
+    fn collection() -> serde_json::Value {
+        serde_json::json!({"kind": "qdrant", "collection": "handbook"})
+    }
+
+    /// Writes one, and answers what the api said about it.
+    async fn register(router: &Router, state: &AppState, body: &str) -> (StatusCode, String) {
+        let answered = send(
+            router,
+            state,
+            "PUT",
+            "alice",
+            "/_ip/retrievers/handbook?tenant=acme",
+            Some(body),
+        )
+        .await;
+        let status = answered.status();
+        (status, body_of(answered).await)
+    }
+
+    /// Nothing could ever ask it, so it is refused while the operator is here to read why.
+    #[tokio::test]
+    async fn a_search_in_a_deployment_that_embeds_nothing_is_refused() {
+        let (router, state) = fixture().await;
+        let (status, said) = register(
+            &router,
+            &state,
+            &seeking("https://qdrant.acme.test:6333", collection()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(said.contains("embeds nothing"), "{said}");
+        assert!(said.contains("semantic"), "{said}");
+    }
+
+    /// Ruling 2, and the reason it is a registration and not a search: two widths are two models,
+    /// and comparing their vectors answers a wrong answer rather than an error.
+    #[tokio::test]
+    async fn a_collection_whose_vectors_are_another_models_is_refused() {
+        let stub = StubQdrant::start(Answers::Collection {
+            vectors: serde_json::json!({"size": 768, "distance": "Cosine"}),
+        })
+        .await;
+        let (router, state) = embedding(384).await;
+
+        let (status, said) = register(
+            &router,
+            &state,
+            &seeking(&format!("http://{}", stub.address()), collection()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(said.contains("768") && said.contains("384"), "{said}");
+        assert!(
+            state
+                .store()
+                .retriever(
+                    &RetrieverOwner::Tenant(tenant("acme")),
+                    &RetrieverId::new("handbook").unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused retriever was stored anyway"
+        );
+    }
+
+    /// What the api says it measured, and that it says it on the write and on nothing after.
+    #[tokio::test]
+    async fn a_collection_of_the_right_width_is_registered_and_says_what_was_measured() {
+        let stub = StubQdrant::start(Answers::Collection {
+            vectors: serde_json::json!({"size": 384, "distance": "Cosine"}),
+        })
+        .await;
+        let (router, state) = embedding(384).await;
+
+        let (status, said) = register(
+            &router,
+            &state,
+            &seeking(&format!("http://{}", stub.address()), collection()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        let answered: serde_json::Value = serde_json::from_str(&said).unwrap();
+        assert_eq!(answered["measured"]["width"], 384);
+        assert!(
+            answered["measured"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("width this deployment"),
+            "{said}"
+        );
+        assert_eq!(stub.only().path, "/collections/handbook");
+
+        let read = send(
+            &router,
+            &state,
+            "GET",
+            "alice",
+            "/_ip/retrievers/handbook?tenant=acme",
+            None,
+        )
+        .await;
+        let held: serde_json::Value = serde_json::from_str(&body_of(read).await).unwrap();
+        assert!(
+            held.get("measured").is_none(),
+            "a read reported a measurement nothing took: {held}"
+        );
+    }
+
+    /// The case the plan calls out: a plane holds no width to report, and one holding no vector
+    /// yet has nothing to disagree with — so it is registered, and the api says as much rather
+    /// than leaving an operator to find out mid-run.
+    #[tokio::test]
+    async fn a_plane_with_nothing_to_measure_is_registered_and_says_so() {
+        let stub =
+            StubPlane::start(Replies::scripted([("plane.query", serde_json::json!([]))])).await;
+        let (router, state) = embedding(384).await;
+
+        let (status, said) = register(
+            &router,
+            &state,
+            &seeking(
+                &format!("http://{}/rpc", stub.address()),
+                serde_json::json!({
+                    "kind": "drsg", "plane": "handbook", "property": "embedding",
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        let answered: serde_json::Value = serde_json::from_str(&said).unwrap();
+        assert!(
+            answered["measured"].get("width").is_none(),
+            "a plane holding nothing reported a width: {said}"
+        );
+        assert!(
+            answered["measured"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("no vector"),
+            "{said}"
+        );
+        assert_eq!(stub.only().method, "plane.query");
+    }
+
+    /// A backend nothing answers on is nobody's fault and worth trying again, which is the one
+    /// refusal here that is not the operator's body to fix.
+    #[tokio::test]
+    async fn a_backend_that_cannot_be_reached_is_unavailable() {
+        let (router, state) = embedding(384).await;
+        let (status, said) = register(
+            &router,
+            &state,
+            // A port nothing listens on, which is what a typo in an endpoint looks like.
+            &seeking("http://127.0.0.1:1", collection()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(said.contains("could not be reached"), "{said}");
+    }
+
+    /// The four graph tools compare nothing of ours, so a plane offering only those is registered
+    /// without being asked anything — which is also what lets a deployment with no artefact hold
+    /// one at all.
+    #[tokio::test]
+    async fn a_retriever_offering_no_search_is_registered_without_its_backend_being_asked() {
+        let stub =
+            StubPlane::start(Replies::scripted([("plane.query", serde_json::json!([]))])).await;
+        let (router, state) = fixture().await;
+
+        let (status, said) = register(
+            &router,
+            &state,
+            &serde_json::json!({
+                "name": "The handbook",
+                "endpoint": format!("http://{}/rpc", stub.address()),
+                "source": {"kind": "drsg", "plane": "handbook", "property": "embedding"},
+                "tools": ["neighbors", "rank", "relate", "cluster"],
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED, "{said}");
+        let answered: serde_json::Value = serde_json::from_str(&said).unwrap();
+        assert!(
+            answered.get("measured").is_none(),
+            "nothing was measured, so nothing should be reported: {said}"
+        );
+        assert!(
+            stub.seen().is_empty(),
+            "a plane was asked about a retriever that compares nothing: {:?}",
+            stub.seen()
+        );
     }
 
     /// The whole point of the view's shape: a key goes in and nothing ever answers with it.
@@ -625,7 +933,8 @@ mod tests {
         let body = format!(
             r#"{{"name":"The handbook","endpoint":"https://qdrant.acme.test:6333",
                "auth":{{"kind":"key","key":"{KEY}"}},
-               "source":{{"kind":"qdrant","collection":"handbook"}},"tools":["search"]}}"#
+               "source":{{"kind":"drsg","plane":"handbook","property":"embedding"}},
+               "tools":["rank"]}}"#
         );
 
         let created = send(

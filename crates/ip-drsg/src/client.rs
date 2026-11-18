@@ -11,7 +11,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use ip_config::Secret;
-use ip_retrieve::NodeLabel;
+use ip_retrieve::{NodeLabel, VectorProperty};
 
 use crate::error::DrsgError;
 use crate::look;
@@ -23,6 +23,13 @@ use crate::rpc::{RpcRequest, RpcResponse};
 ///
 /// A graph is small, so this bounds a store that answers a query with the whole plane.
 const MAX_ANSWER_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many nodes [`DrsgClient::width`] reads to find one carrying a vector.
+///
+/// More than one, because a plane need not hold the embedding on every node it holds — a corpus
+/// part-way through being embedded has some that do and some that do not — and few, because they
+/// are read for one property of one of them.
+const MEASURED_NODES: u64 = 64;
 
 /// How long a connection may take to establish.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -201,6 +208,34 @@ impl DrsgClient {
             }
         }
         look::rows(self.call("plane.search", params).await?, "a search")
+    }
+
+    /// How wide the vectors under one label and property are, and none where the plane holds none.
+    ///
+    /// **Measured rather than asked for**, because no verb reports a property's dimension: a read
+    /// answers each vector as a marker saying how many numbers it left out, so a handful of nodes
+    /// are read and the first that carries one is measured. [`look::marker_width`] is where that
+    /// is unpicked.
+    ///
+    /// None is a plane with nothing to measure yet rather than a plane that disagrees — a label
+    /// nobody has embedded under answers the same way an empty plane does, and neither is a reason
+    /// to refuse a retriever.
+    pub async fn width(
+        &self,
+        label: Option<&NodeLabel>,
+        property: &VectorProperty,
+    ) -> Result<Option<u32>, DrsgError> {
+        let source = match label {
+            Some(label) => serde_json::json!({"ScanLabel": label.as_str()}),
+            None => serde_json::json!("ScanAll"),
+        };
+        let read = self
+            .query(serde_json::json!({"source": source, "steps": [{"Limit": MEASURED_NODES}]}))
+            .await?;
+        let rows: Vec<Hit> = look::rows(read, "a plane's nodes")?;
+        Ok(rows
+            .iter()
+            .find_map(|node| look::marker_width(node.properties.get(property.as_str()))))
     }
 
     /// What one hop reaches from a node, each hop carrying the node it reached and the edge it
@@ -434,7 +469,6 @@ fn install_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ip_retrieve::VectorProperty;
 
     use crate::look::{Direction, Metric};
     use crate::testing::{
@@ -459,6 +493,99 @@ mod tests {
             only(&record).authorization.as_deref(),
             Some(format!("Bearer {TOKEN}").as_str())
         );
+    }
+
+    /// The width is measured out of a read, since no verb reports a property's dimension.
+    #[tokio::test]
+    async fn a_plane_is_measured_by_reading_what_it_holds_under_the_property() {
+        let (client, record) = client(Answers::scripted([(
+            "plane.query",
+            serde_json::json!([
+                {"id": 1, "labels": ["Document"], "properties": {"title": "Leave"}},
+                {"id": 2, "labels": ["Document"], "properties": {
+                    "title": "Pay", "embedding": "$vector(384 dims, omitted)",
+                }},
+            ]),
+        )]))
+        .await;
+
+        let measured = client
+            .width(
+                Some(&NodeLabel::new("Document").unwrap()),
+                &VectorProperty::new("embedding").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            measured,
+            Some(384),
+            "a node without the property is read past rather than measured"
+        );
+        let seen = only(&record);
+        assert_eq!(seen.method, "plane.query");
+        assert_eq!(seen.params["plan"]["source"]["ScanLabel"], "Document");
+        assert_eq!(
+            seen.params["plan"]["steps"],
+            serde_json::json!([{"Limit": MEASURED_NODES}]),
+            "a measurement reads a handful of nodes and not the plane"
+        );
+    }
+
+    /// A retriever naming no label searches every node, so the read does too.
+    #[tokio::test]
+    async fn a_measurement_of_no_label_scans_every_node() {
+        let (client, record) = client(Answers::scripted([(
+            "plane.query",
+            serde_json::json!([{"id": 1, "properties": {"vec": "$vector(1024 dims, omitted)"}}]),
+        )]))
+        .await;
+
+        let measured = client
+            .width(None, &VectorProperty::new("vec").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(measured, Some(1024));
+        assert_eq!(only(&record).params["plan"]["source"], "ScanAll");
+    }
+
+    /// Nothing to measure is not a disagreement: a plane nobody has embedded in yet answers this
+    /// way, and so does one whose vectors are under another name.
+    #[tokio::test]
+    async fn a_plane_holding_no_vector_there_is_measured_as_nothing() {
+        for held in [
+            serde_json::json!([]),
+            serde_json::json!([{"id": 1, "properties": {"title": "Leave"}}]),
+            serde_json::json!([{"id": 1, "properties": {"other": "$vector(384 dims, omitted)"}}]),
+        ] {
+            let (client, _) = client(Answers::scripted([("plane.query", held.clone())])).await;
+            assert_eq!(
+                client
+                    .width(None, &VectorProperty::new("embedding").unwrap())
+                    .await
+                    .unwrap(),
+                None,
+                "{held} was read as a width"
+            );
+        }
+    }
+
+    /// The same refusal as every other verb's: a store that answers a read with something that is
+    /// not rows is not the store this is talking to.
+    #[tokio::test]
+    async fn a_measurement_of_an_answer_that_is_not_rows_is_refused() {
+        let (client, _) = client(Answers::scripted([(
+            "plane.query",
+            serde_json::json!({"nodes": []}),
+        )]))
+        .await;
+        assert!(matches!(
+            client
+                .width(None, &VectorProperty::new("embedding").unwrap())
+                .await,
+            Err(DrsgError::Malformed { .. })
+        ));
     }
 
     #[tokio::test]

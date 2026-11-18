@@ -149,6 +149,22 @@ mod tests {
     }
 }
 
+/// Why a retriever's own backend did not answer.
+///
+/// Two, because a caller does something different about each, and the api says them with two
+/// different codes: a backend that cannot be reached is nobody's fault and worth trying again,
+/// while one that answered is describing something the operator has to change.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Unanswered {
+    /// It could not be reached, or did not answer in time.
+    #[error("{0}")]
+    Unreachable(String),
+
+    /// It answered, and what it said is the operator's to act on.
+    #[error("{0}")]
+    Refused(String),
+}
+
 /// Every way publishing the rules for the other nodes can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum FeedError {

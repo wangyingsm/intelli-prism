@@ -101,6 +101,13 @@ pub struct AppState {
     failing_cache: Option<Arc<ip_cache::FailingCache>>,
     /// The revision this node's rules were built from, which is where following starts.
     started_at: RuleRevision,
+    /// How wide the vectors this deployment's embedder makes are, where it has one.
+    ///
+    /// Absent is a deployment that cannot turn a query into a vector at all, which is why a
+    /// retriever offering a search is refused rather than registered against it. A number rather
+    /// than [`ip_embed::Width`] because that type lives behind the `semantic` feature, and a
+    /// build without it still has to answer the question.
+    embedder_width: Option<u32>,
 }
 
 impl AppState {
@@ -154,6 +161,14 @@ impl AppState {
                 feature: "semantic",
             });
         }
+        // Read here rather than from the gateway, which the encoder is moved into below: a
+        // retriever is registered against the width of the one embedder this process holds.
+        #[cfg(feature = "semantic")]
+        let embedder_width = encoder
+            .as_ref()
+            .and_then(|encoder| u32::try_from(encoder.width().get()).ok());
+        #[cfg(not(feature = "semantic"))]
+        let embedder_width: Option<u32> = None;
         let graphs = open_graphs(config)?;
         let cluster = cluster_address(config)?;
         let cluster_secret = cluster_secret(config, cluster.as_ref())?;
@@ -325,6 +340,7 @@ impl AppState {
             feed,
             reloader,
             started_at,
+            embedder_width,
             graphs,
             cluster,
             cluster_secret,
@@ -387,6 +403,7 @@ impl AppState {
             feed,
             reloader,
             started_at: RuleRevision::new(0),
+            embedder_width: None,
             graphs: None,
             cluster: None,
             cluster_secret: None,
@@ -436,6 +453,18 @@ impl AppState {
     /// The cache as a backend: what a run's signals travel over and its answers are kept in.
     pub fn shared_cache(&self) -> &Arc<dyn CacheBackend> {
         &self.shared_cache
+    }
+
+    /// How wide a vector this deployment embeds a query into, where it embeds one at all.
+    pub fn embedder_width(&self) -> Option<u32> {
+        self.embedder_width
+    }
+
+    /// The same state over an embedder of that width, for a test that works on one.
+    #[cfg(test)]
+    pub fn with_embedder_width(mut self, width: u32) -> Self {
+        self.embedder_width = Some(width);
+        self
     }
 
     /// The same state over a graph store, for a test that works on one.

@@ -36,6 +36,7 @@ ip-graph = { version = "0.1.0", path = "crates/ip-graph" }
 ip-mcp = { version = "0.1.0", path = "crates/ip-mcp" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
 ip-retrieve = { version = "0.1.0", path = "crates/ip-retrieve" }
+ip-qdrant = { version = "0.1.0", path = "crates/ip-qdrant" }
 ip-run = { version = "0.1.0", path = "crates/ip-run" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }
 tokio-stream = "0.1.19"
@@ -117,6 +118,7 @@ wildcard_imports = "warn"           # name what a module takes, `super` and prel
 hex.workspace = true
 ip-cluster = { version = "0.1.0", path = "crates/ip-cluster", features = ["testing"] }
 ip-drsg = { version = "0.1.0", path = "crates/ip-drsg", features = ["testing"] }
+ip-qdrant = { version = "0.1.0", path = "crates/ip-qdrant", features = ["testing"] }
 sha2.workspace = true
 bytes = "1.12.1"
 http-body-util = "0.1.5"

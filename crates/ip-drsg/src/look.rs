@@ -196,6 +196,26 @@ pub struct Path {
     pub cost: f64,
 }
 
+/// What a vector property reads as when a plane answers without the floats, and what comes before
+/// the width in it.
+const MARKER: (&str, &str) = ("$vector(", " dims, omitted)");
+
+/// How many numbers a rendered property holds, and none where it is not a vector at all.
+///
+/// **The width is in that text and nowhere else.** No verb a plane offers reports a property's
+/// dimension, and a read answers a vector as `$vector(384 dims, omitted)` rather than as its
+/// floats — which is what keeps an embedding out of a prompt, and the only place the number
+/// appears. A property that is text, or a marker whose width is not a number, is none rather than
+/// a refusal: it is a plane holding something else under that name.
+pub(crate) fn marker_width(rendered: Option<&serde_json::Value>) -> Option<u32> {
+    rendered?
+        .as_str()?
+        .strip_prefix(MARKER.0)?
+        .strip_suffix(MARKER.1)?
+        .parse()
+        .ok()
+}
+
 /// Reads an answer that must be a list of one shape, and refuses one that is not.
 ///
 /// A store answering a verb with something other than what that verb promises is the same
@@ -241,7 +261,7 @@ mod tests {
                 "id": 7,
                 "external_key": "doc:handbook:leave",
                 "labels": ["Document"],
-                "properties": {"title": "Leave", "embedding": {"vector": 384}},
+                "properties": {"title": "Leave", "embedding": "$vector(384 dims, omitted)"},
                 "score": 0.83,
             }]),
             "a search",
@@ -253,6 +273,39 @@ mod tests {
         assert_eq!(one.labels, ["Document"]);
         assert_eq!(one.properties["title"], "Leave");
         assert_eq!(one.score, Some(0.83));
+        assert_eq!(
+            marker_width(one.properties.get("embedding")),
+            Some(384),
+            "an embedding reads as a marker saying how wide it is"
+        );
+    }
+
+    /// Everything a property can be under the name a retriever named, other than a vector.
+    #[test]
+    fn a_property_that_is_not_a_vector_is_no_width() {
+        let text = serde_json::json!({
+            "embedding": "the leave policy",
+            "marked": "$vector(wide dims, omitted)",
+            "floats": [0.1, 0.2],
+            "counted": 384,
+        });
+        assert_eq!(marker_width(text.get("embedding")), None);
+        assert_eq!(
+            marker_width(text.get("marked")),
+            None,
+            "a marker whose width is a word is not a width"
+        );
+        assert_eq!(
+            marker_width(text.get("floats")),
+            None,
+            "a read answers markers, so floats under that name are something else"
+        );
+        assert_eq!(marker_width(text.get("counted")), None);
+        assert_eq!(
+            marker_width(text.get("nothing")),
+            None,
+            "a node need not carry the property at all"
+        );
     }
 
     /// A node created without one, and an unscored verb: neither is a malformed answer.
