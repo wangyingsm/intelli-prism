@@ -1,0 +1,19 @@
+[package]
+name = "ip-retrieve"
+description = "What an agent may look something up in: the retriever a tenant describes, and the tools it offers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
