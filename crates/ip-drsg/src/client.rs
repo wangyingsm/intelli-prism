@@ -11,8 +11,11 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use ip_config::Secret;
+use ip_retrieve::NodeLabel;
 
 use crate::error::DrsgError;
+use crate::look;
+use crate::look::{Across, Apart, Around, Grouped, Hit, Hop, Nearest, Path, Placed};
 use crate::plane::{DrsgEndpoint, PlaneName};
 use crate::rpc::{RpcRequest, RpcResponse};
 
@@ -168,14 +171,138 @@ impl DrsgClient {
         edge_type: &str,
         extra: serde_json::Value,
     ) -> Result<serde_json::Value, DrsgError> {
-        let mut params = serde_json::json!({
-            "plane": self.settings.plane.as_str(),
-            "algo": algo,
-            "label": label,
-            "edge_type": edge_type,
-        });
+        let mut params = serde_json::json!({ "edge_type": edge_type });
         if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
             params.extend(extra.clone());
+        }
+        self.run(algo, Some(label), params).await
+    }
+
+    /// What is nearest a query vector, as scored node records.
+    ///
+    /// **An empty answer is three things this client cannot tell apart**: a plane holding no
+    /// embeddings of that `(label, property)`, embeddings of a different width than the query,
+    /// and nothing near enough to answer with. The store's own doc says so, and it reports no
+    /// width to compare against — which is why a retriever's width is measured when it is
+    /// registered rather than asked for here.
+    pub async fn search(&self, asked: &Nearest) -> Result<Vec<Hit>, DrsgError> {
+        let mut params = serde_json::json!({
+            "plane": self.settings.plane.as_str(),
+            "property": asked.property.as_str(),
+            "query": asked.query,
+            "k": asked.hits,
+        });
+        if let Some(params) = params.as_object_mut() {
+            if let Some(label) = &asked.label {
+                params.insert("label".to_owned(), serde_json::json!(label.as_str()));
+            }
+            if let Some(metric) = asked.metric {
+                params.insert("metric".to_owned(), serde_json::json!(metric.as_str()));
+            }
+        }
+        look::rows(self.call("plane.search", params).await?, "a search")
+    }
+
+    /// What one hop reaches from a node, each hop carrying the node it reached and the edge it
+    /// crossed.
+    ///
+    /// Hydrated, so a hop is a record rather than a pair of ids: what a look-up is for is text a
+    /// model can read, and ids would mean one call per hop to find any. Lean with it, so a node's
+    /// embedding crosses the wire as a marker rather than as its floats.
+    pub async fn neighbors(&self, asked: &Around) -> Result<Vec<Hop>, DrsgError> {
+        let mut params = serde_json::json!({
+            "plane": self.settings.plane.as_str(),
+            "id": asked.node,
+            "direction": asked.direction.as_str(),
+            "hydrate": true,
+            "lean": true,
+        });
+        if let (Some(params), Some(kind)) = (params.as_object_mut(), &asked.edge_type) {
+            params.insert("type".to_owned(), serde_json::json!(kind));
+        }
+        look::rows(self.call("plane.neighbors", params).await?, "a walk")
+    }
+
+    /// Which nodes matter most, by how much of the graph leads to them.
+    pub async fn rank(&self, asked: &Across) -> Result<Vec<Placed>, DrsgError> {
+        self.placed("pagerank", asked, "a ranking").await
+    }
+
+    /// Which groups the nodes fall into.
+    pub async fn cluster(&self, asked: &Across) -> Result<Vec<Grouped>, DrsgError> {
+        let answer = self
+            .run(
+                "louvain",
+                asked.label.as_ref().map(NodeLabel::as_str),
+                serde_json::json!({ "limit": asked.limit }),
+            )
+            .await?;
+        look::rows(answer["results"].clone(), "a clustering")
+    }
+
+    /// How two nodes are connected, and nothing where nothing connects them.
+    ///
+    /// The absence is an answer rather than a refusal: two documents with no path between them is
+    /// what a model asked about and is worth being told.
+    pub async fn relate(&self, asked: &Apart) -> Result<Option<Path>, DrsgError> {
+        let answer = self
+            .run(
+                "shortest_path",
+                None,
+                serde_json::json!({
+                    "src": asked.from,
+                    "dst": asked.to,
+                    "dir": asked.direction.as_str(),
+                }),
+            )
+            .await?;
+        match answer.get("path") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(path) => serde_json::from_value(path.clone())
+                .map(Some)
+                .map_err(|error| DrsgError::Malformed {
+                    detail: format!("a path holds something else: {error}"),
+                }),
+        }
+    }
+
+    /// One algorithm answering `{id, score}` rows, which is pagerank and would be degree.
+    async fn placed(
+        &self,
+        algo: &str,
+        asked: &Across,
+        promised: &str,
+    ) -> Result<Vec<Placed>, DrsgError> {
+        let answer = self
+            .run(
+                algo,
+                asked.label.as_ref().map(NodeLabel::as_str),
+                serde_json::json!({ "limit": asked.limit }),
+            )
+            .await?;
+        look::rows(answer["results"].clone(), promised)
+    }
+
+    /// Carries one `plane.algo` call, naming the plane and the algorithm last.
+    ///
+    /// Last so that neither is something a caller's own parameters can replace, and the label
+    /// optional because only this crate's own graph methods have a label they must always send.
+    async fn run(
+        &self,
+        algo: &str,
+        label: Option<&str>,
+        extra: serde_json::Value,
+    ) -> Result<serde_json::Value, DrsgError> {
+        let mut params = extra;
+        if let Some(params) = params.as_object_mut() {
+            if let Some(label) = label {
+                params.insert("label".to_owned(), serde_json::json!(label));
+            }
+            params.insert("algo".to_owned(), serde_json::json!(algo));
+            params.insert(
+                "plane".to_owned(),
+                serde_json::json!(self.settings.plane.as_str()),
+            );
         }
         self.call("plane.algo", params).await
     }
@@ -307,6 +434,9 @@ fn install_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ip_retrieve::VectorProperty;
+
+    use crate::look::{Direction, Metric};
     use crate::testing::{
         Replies as Answers, STUB_TOKEN as TOKEN, Seen, SilentPlane, StubPlane, stub_settings,
     };
@@ -569,6 +699,332 @@ mod tests {
         );
         assert_eq!(stub.calls("plane.query").len(), 1);
         assert_eq!(stub.calls("node.create").len(), 0);
+    }
+
+    /// What a plane is asked for a search: the plane it is bound to, where the embeddings are,
+    /// the query as a vector and how many hits — and not a metric nobody named.
+    #[tokio::test]
+    async fn a_search_names_the_plane_the_property_and_the_query() {
+        let (client, record) = client(Answers::Echo).await;
+        let _ = client.search(&nearest(None, None)).await;
+        let seen = only(&record);
+        assert_eq!(seen.method, "plane.search");
+        assert_eq!(seen.params["plane"], "graphs");
+        assert_eq!(seen.params["property"], "embedding");
+        assert_eq!(seen.params["query"], serde_json::json!([0.5, 0.25]));
+        assert_eq!(seen.params["k"], 4);
+        assert!(seen.params.get("label").is_none(), "{:?}", seen.params);
+        assert!(seen.params.get("metric").is_none(), "{:?}", seen.params);
+    }
+
+    /// Both are sent when they are given, and the metric is worth a test of its own: the store
+    /// assumes cosine for an absent one rather than reading the index's.
+    #[tokio::test]
+    async fn a_search_scoped_to_a_label_or_compared_another_way_says_so() {
+        let (client, record) = client(Answers::Echo).await;
+        let _ = client
+            .search(&nearest(Some("Document"), Some(Metric::Dot)))
+            .await;
+        let seen = only(&record);
+        assert_eq!(seen.params["label"], "Document");
+        assert_eq!(seen.params["metric"], "dot");
+    }
+
+    #[tokio::test]
+    async fn a_search_answers_the_rows_the_store_scored() {
+        let stub = StubPlane::start(Answers::scripted([(
+            "plane.search",
+            serde_json::json!([
+                {"id": 7, "external_key": "doc:leave", "labels": ["Document"],
+                 "properties": {"title": "Leave"}, "score": 0.9},
+                {"id": 8, "labels": ["Document"], "properties": {}},
+            ]),
+        )]))
+        .await;
+
+        let hits = stub
+            .client()
+            .search(&nearest(None, None))
+            .await
+            .expect("the store answered rows");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].key.as_deref(), Some("doc:leave"));
+        assert_eq!(hits[0].properties["title"], "Leave");
+        assert_eq!(hits[1].score, None);
+    }
+
+    /// The store's own answer to a search is a list; an object where one belongs is a store this
+    /// client is not speaking to, and is not read as "nothing found".
+    #[tokio::test]
+    async fn a_search_answered_with_something_else_is_not_an_empty_result() {
+        let stub = StubPlane::start(Answers::scripted([(
+            "plane.search",
+            serde_json::json!({"hits": []}),
+        )]))
+        .await;
+        assert!(matches!(
+            stub.client().search(&nearest(None, None)).await,
+            Err(DrsgError::Malformed { .. })
+        ));
+    }
+
+    /// Hydrated and lean, which is what makes a hop readable without a call per hop and keeps an
+    /// embedding out of the answer.
+    #[tokio::test]
+    async fn a_walk_asks_for_records_rather_than_ids_and_for_markers_rather_than_floats() {
+        let (client, record) = client(Answers::Echo).await;
+        let _ = client
+            .neighbors(&Around {
+                node: 7,
+                direction: Direction::Both,
+                edge_type: Some("CITES".to_owned()),
+            })
+            .await;
+        let seen = only(&record);
+        assert_eq!(seen.method, "plane.neighbors");
+        assert_eq!(seen.params["plane"], "graphs");
+        assert_eq!(seen.params["id"], 7);
+        assert_eq!(seen.params["direction"], "both");
+        assert_eq!(seen.params["type"], "CITES");
+        assert_eq!(seen.params["hydrate"], true);
+        assert_eq!(seen.params["lean"], true);
+    }
+
+    #[tokio::test]
+    async fn a_walk_that_names_no_edge_type_follows_every_type() {
+        let (client, record) = client(Answers::Echo).await;
+        let _ = client
+            .neighbors(&Around {
+                node: 7,
+                direction: Direction::default(),
+                edge_type: None,
+            })
+            .await;
+        let seen = only(&record);
+        assert_eq!(seen.params["direction"], "out");
+        assert!(seen.params.get("type").is_none(), "{:?}", seen.params);
+    }
+
+    #[tokio::test]
+    async fn a_walk_answers_what_is_joined_and_what_joins_it() {
+        let stub = StubPlane::start(Answers::scripted([(
+            "plane.neighbors",
+            serde_json::json!([{
+                "node": {"id": 9, "labels": ["Document"], "properties": {"title": "Pay"}},
+                "edge": {"id": 4, "type": "CITES", "properties": {}},
+            }]),
+        )]))
+        .await;
+
+        let hops = stub
+            .client()
+            .neighbors(&Around {
+                node: 7,
+                direction: Direction::Out,
+                edge_type: None,
+            })
+            .await
+            .expect("the store answered hops");
+
+        assert_eq!(hops[0].node.properties["title"], "Pay");
+        assert_eq!(hops[0].edge.kind.as_deref(), Some("CITES"));
+    }
+
+    /// The three algorithm-backed verbs are one method with different parameters, and each names
+    /// the algorithm it is.
+    #[tokio::test]
+    async fn ranking_and_clustering_name_their_algorithm_their_label_and_their_limit() {
+        let across = Across {
+            label: Some(NodeLabel::new("Document").expect("a label")),
+            limit: 6,
+        };
+
+        let (ranking, ranked) = client(Answers::Echo).await;
+        let _ = ranking.rank(&across).await;
+        let (clustering, clustered) = client(Answers::Echo).await;
+        let _ = clustering.cluster(&across).await;
+
+        for (seen, algo) in [(only(&ranked), "pagerank"), (only(&clustered), "louvain")] {
+            assert_eq!(seen.method, "plane.algo");
+            assert_eq!(seen.params["algo"], algo);
+            assert_eq!(seen.params["plane"], "graphs");
+            assert_eq!(seen.params["label"], "Document");
+            assert_eq!(seen.params["limit"], 6);
+            assert!(
+                seen.params.get("edge_type").is_none(),
+                "neither narrows to an edge type: {:?}",
+                seen.params
+            );
+        }
+    }
+
+    /// A plane holding one corpus is ranked whole, and the label is then absent rather than
+    /// empty: an empty one would scope to a label of that name.
+    #[tokio::test]
+    async fn an_unscoped_ranking_names_no_label_at_all() {
+        let (client, record) = client(Answers::Echo).await;
+        let _ = client
+            .rank(&Across {
+                label: None,
+                limit: 3,
+            })
+            .await;
+        assert!(
+            only(&record).params.get("label").is_none(),
+            "an unscoped ranking named a label"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ranking_answers_what_scored_and_a_clustering_what_grouped() {
+        let stub = StubPlane::start(Answers::scripted([(
+            "plane.algo",
+            serde_json::json!({
+                "algo": "pagerank",
+                "results": [{"id": 7, "score": 0.42}],
+                "count": 1,
+            }),
+        )]))
+        .await;
+        let across = Across {
+            label: None,
+            limit: 3,
+        };
+        let placed = stub
+            .client()
+            .rank(&across)
+            .await
+            .expect("the store answered a ranking");
+        assert_eq!(placed[0].id, 7);
+        assert!((placed[0].score - 0.42).abs() < f64::EPSILON);
+
+        let grouping = StubPlane::start(Answers::scripted([(
+            "plane.algo",
+            serde_json::json!({
+                "algo": "louvain",
+                "results": [{"id": 7, "community": 3}, {"id": 8, "community": 3}],
+                "count": 1,
+            }),
+        )]))
+        .await;
+        let grouped = grouping
+            .client()
+            .cluster(&across)
+            .await
+            .expect("the store answered a clustering");
+        assert_eq!(grouped[1].group, 3);
+    }
+
+    /// A path takes two nodes and a direction and no label: the store's own shortest path is over
+    /// the nodes it is given rather than over a scope.
+    #[tokio::test]
+    async fn a_relate_names_both_ends_and_which_way_an_edge_may_be_crossed() {
+        let (client, record) = client(Answers::Echo).await;
+        let _ = client
+            .relate(&Apart {
+                from: 7,
+                to: 9,
+                direction: Direction::Both,
+            })
+            .await;
+        let seen = only(&record);
+        assert_eq!(seen.params["algo"], "shortest_path");
+        assert_eq!(seen.params["plane"], "graphs");
+        assert_eq!(seen.params["src"], 7);
+        assert_eq!(seen.params["dst"], 9);
+        assert_eq!(seen.params["dir"], "both");
+        assert!(seen.params.get("label").is_none(), "{:?}", seen.params);
+    }
+
+    #[tokio::test]
+    async fn a_relate_answers_the_ids_along_the_way() {
+        let stub = StubPlane::start(Answers::scripted([(
+            "plane.algo",
+            serde_json::json!({
+                "algo": "shortest_path",
+                "found": true,
+                "path": {"nodes": [7, 8, 9], "edges": [4, 5], "cost": 2.0},
+            }),
+        )]))
+        .await;
+
+        let path = stub
+            .client()
+            .relate(&apart())
+            .await
+            .expect("the store answered a path")
+            .expect("one was found");
+
+        assert_eq!(path.nodes, [7, 8, 9]);
+        assert_eq!(path.edges, [4, 5]);
+    }
+
+    /// Nothing connecting them is an answer a model asked for, not a refusal.
+    #[tokio::test]
+    async fn two_nodes_nothing_connects_are_answered_with_nothing() {
+        let stub = StubPlane::start(Answers::scripted([(
+            "plane.algo",
+            serde_json::json!({"algo": "shortest_path", "found": false, "path": null}),
+        )]))
+        .await;
+        assert_eq!(
+            stub.client()
+                .relate(&apart())
+                .await
+                .expect("the store answered"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_that_is_not_one_is_refused_rather_than_read() {
+        let stub = StubPlane::start(Answers::scripted([(
+            "plane.algo",
+            serde_json::json!({"found": true, "path": {"nodes": "everything"}}),
+        )]))
+        .await;
+        assert!(matches!(
+            stub.client().relate(&apart()).await,
+            Err(DrsgError::Malformed { .. })
+        ));
+    }
+
+    /// The plane and the algorithm are named last, so what one algorithm needs cannot replace
+    /// what every call means.
+    #[tokio::test]
+    async fn a_callers_own_parameters_cannot_replace_the_plane_or_the_algorithm() {
+        let (client, record) = client(Answers::Echo).await;
+        let _ = client
+            .algo(
+                "cycles",
+                "Graph/acme/triage",
+                "FEEDS",
+                serde_json::json!({"plane": "somebody-elses", "algo": "pagerank"}),
+            )
+            .await;
+        let seen = only(&record);
+        assert_eq!(seen.params["plane"], "graphs");
+        assert_eq!(seen.params["algo"], "cycles");
+    }
+
+    /// A query vector over the plane's own property, as a look-up sends one.
+    fn nearest(label: Option<&str>, metric: Option<Metric>) -> Nearest {
+        Nearest {
+            property: VectorProperty::new("embedding").expect("a property"),
+            label: label.map(|label| NodeLabel::new(label).expect("a label")),
+            query: vec![0.5, 0.25],
+            hits: 4,
+            metric,
+        }
+    }
+
+    fn apart() -> Apart {
+        Apart {
+            from: 7,
+            to: 9,
+            direction: Direction::Out,
+        }
     }
 
     /// Two calls in flight must not read each other's answer, which is what the id is for.

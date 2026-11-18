@@ -2,9 +2,9 @@
 //!
 //! A run graph is stored in a dr-strange plane rather than in this project's own tables, so the
 //! graph routes reach it over the wire. This crate is that reach and nothing else: it holds the
-//! JSON-RPC envelope, the six methods a graph needs, and the types that say where a plane is and
-//! what it is called. What a graph *is* lives in `ip-graph`, and what a query asks for is built
-//! by its caller — a plan arrives here as json and is passed through.
+//! JSON-RPC envelope, the methods a graph and a look-up need, and the types that say where a
+//! plane is and what it is called. What a graph *is* lives in `ip-graph`, and what a query asks
+//! for is built by its caller — a plan arrives here as json and is passed through.
 //!
 //! One client is bound to one plane, named once in [`DrsgSettings`], because a deployment has one
 //! graph store. **The plane is never a caller's argument**, so a route cannot be made to read
@@ -18,6 +18,7 @@
 
 mod client;
 mod error;
+mod look;
 mod plane;
 mod rpc;
 #[cfg(any(feature = "testing", test))]
@@ -25,6 +26,9 @@ pub mod testing;
 
 pub use client::{DrsgClient, DrsgSettings};
 pub use error::DrsgError;
+pub use look::{
+    Across, Apart, Around, Direction, Edge, Grouped, Hit, Hop, Metric, Nearest, Path, Placed,
+};
 pub use plane::{DrsgEndpoint, PlaneName};
 pub use rpc::{RpcFailure, RpcRequest, RpcResponse, VERSION};
 #[cfg(any(feature = "testing", test))]

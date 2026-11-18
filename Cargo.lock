@@ -1738,6 +1738,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "ip-config",
+ "ip-retrieve",
  "rustls",
  "serde",
  "serde_json",
