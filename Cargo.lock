@@ -1923,6 +1923,7 @@ dependencies = [
  "ip-agents",
  "ip-core",
  "ip-mcp",
+ "ip-retrieve",
  "serde",
  "serde_json",
  "sqlx",

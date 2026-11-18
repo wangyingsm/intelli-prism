@@ -5,6 +5,7 @@ use ip_core::{
     Redacted, Served, TenantId, TnKey, TokenCount, UserId,
 };
 use ip_mcp::{McpAuth, McpError, McpToken};
+use ip_retrieve::{RetrieveError, RetrieverAuth, RetrieverKey};
 
 use crate::error::{Entity, StorageError};
 use crate::model::{AccountKind, Standing};
@@ -293,6 +294,35 @@ pub(crate) fn mcp_auth(kind: &str, token: Option<String>) -> Result<McpAuth, Sto
 pub(crate) fn mcp_refused(error: McpError) -> StorageError {
     StorageError::Malformed {
         entity: Entity::Mcp,
+        detail: error.to_string(),
+    }
+}
+
+/// Rebuilds what a retriever's backend requires from the two columns that hold it.
+///
+/// The same shape as an MCP server's, and for the same reason: the kind and the key are stored
+/// apart with no constraint pairing them, so a pair that disagrees is a row a database will hold.
+pub(crate) fn retriever_auth(
+    kind: &str,
+    key: Option<String>,
+) -> Result<RetrieverAuth, StorageError> {
+    match (kind, key) {
+        ("none", None) => Ok(RetrieverAuth::None),
+        ("key", Some(key)) => Ok(RetrieverAuth::Key {
+            key: RetrieverKey::new(&key).map_err(retriever_refused)?,
+        }),
+        ("none" | "key", _) => Err(retriever_refused(RetrieveError::MisplacedKey)),
+        (other, _) => Err(StorageError::Malformed {
+            entity: Entity::Retriever,
+            detail: format!("unknown credential kind {other:?}"),
+        }),
+    }
+}
+
+/// A stored value a retriever's own type refuses, reported against the retriever it was read for.
+pub(crate) fn retriever_refused(error: RetrieveError) -> StorageError {
+    StorageError::Malformed {
+        entity: Entity::Retriever,
         detail: error.to_string(),
     }
 }

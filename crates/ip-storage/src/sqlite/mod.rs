@@ -8,6 +8,7 @@ mod list;
 mod mcp;
 mod plugin;
 mod price;
+mod retriever;
 mod revision;
 mod route;
 mod usage;

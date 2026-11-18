@@ -19,6 +19,7 @@ pub(crate) mod member_add;
 pub(crate) mod member_remove;
 pub(crate) mod plugin;
 pub(crate) mod price;
+pub(crate) mod retriever;
 pub(crate) mod revision;
 pub(crate) mod route;
 pub(crate) mod usage;
@@ -254,6 +255,24 @@ macro_rules! backend_suite {
             deleting_a_tenant_leaves_every_server_where_it_was,
         ]);
     };
+    (retriever, $open:path) => {
+        $crate::suite::backend_suite!(@module retriever, $open, [
+            a_retriever_round_trips,
+            every_part_of_a_retriever_survives_the_database,
+            a_key_survives_the_database,
+            a_retriever_that_stops_requiring_a_key_keeps_none,
+            one_id_names_a_different_retriever_under_each_owner,
+            one_tenant_cannot_read_another_tenants_retriever_by_id,
+            writing_a_retriever_again_replaces_it,
+            removing_a_retriever_leaves_the_others,
+            removing_a_retriever_that_is_absent_reports_it_missing,
+            removing_one_owners_retriever_leaves_the_other_owners,
+            a_retriever_for_a_tenant_that_is_not_there_is_refused,
+            a_read_for_a_tenant_that_is_not_there_answers_with_nothing_of_the_deployments,
+            retrievers_come_newest_first_a_page_at_a_time,
+            deleting_a_tenant_takes_its_retrievers_with_it,
+        ]);
+    };
     (audit, $open:path) => {
         $crate::suite::backend_suite!(@module audit, $open, [
             setting_a_limit_records_who_set_it,
@@ -271,6 +290,8 @@ macro_rules! backend_suite {
             a_template_that_was_refused_records_nothing,
             registering_a_server_records_everything_but_its_token,
             rewriting_and_removing_a_server_record_what_it_said,
+            writing_a_retriever_records_everything_but_its_key,
+            rewriting_and_removing_a_retriever_record_what_it_said,
             routing_a_key_somewhere_else_records_both_targets,
             removing_a_route_records_where_it_pointed,
             whose_a_stored_plugin_is_comes_from_who_stored_it,
@@ -382,6 +403,7 @@ macro_rules! backend_suite {
         $crate::suite::backend_suite!(price, $open);
         $crate::suite::backend_suite!(agent, $open);
         $crate::suite::backend_suite!(mcp, $open);
+        $crate::suite::backend_suite!(retriever, $open);
         $crate::suite::backend_suite!(isolation, $open);
     };
 }

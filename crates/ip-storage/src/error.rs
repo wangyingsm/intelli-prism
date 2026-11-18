@@ -109,6 +109,8 @@ pub enum Entity {
     Agent,
     /// An MCP server an agent's tools are reached over.
     Mcp,
+    /// Something a tenant's agents may look a fact up in.
+    Retriever,
 }
 
 impl Entity {
@@ -133,6 +135,7 @@ impl Entity {
             Self::Audit => "audit",
             Self::Agent => "agent",
             Self::Mcp => "mcp",
+            Self::Retriever => "retriever",
         }
     }
 
@@ -153,6 +156,7 @@ impl Entity {
             "audit" => Ok(Self::Audit),
             "agent" => Ok(Self::Agent),
             "mcp" => Ok(Self::Mcp),
+            "retriever" => Ok(Self::Retriever),
             other => Err(StorageError::Malformed {
                 entity: Self::Audit,
                 detail: format!("unknown entity {other:?}"),
@@ -178,6 +182,7 @@ impl fmt::Display for Entity {
             Self::Audit => "audit",
             Self::Agent => "agent template",
             Self::Mcp => "MCP server",
+            Self::Retriever => "retriever",
         })
     }
 }
@@ -205,6 +210,7 @@ mod tests {
             (Entity::Audit, "audit"),
             (Entity::Agent, "agent template"),
             (Entity::Mcp, "MCP server"),
+            (Entity::Retriever, "retriever"),
         ] {
             assert_eq!(entity.to_string(), name);
         }
@@ -227,6 +233,7 @@ mod tests {
             Entity::Audit,
             Entity::Agent,
             Entity::Mcp,
+            Entity::Retriever,
         ] {
             assert_eq!(Entity::named(entity.name()).unwrap(), entity);
         }

@@ -12,6 +12,7 @@ use crate::mcp::McpStore;
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{PluginRuleStore, PluginStore};
 use crate::price::PriceStore;
+use crate::retriever::RetrieverStore;
 use crate::revision::RevisionStore;
 use crate::route::RouteStore;
 use crate::usage::UsageStore;
@@ -141,6 +142,7 @@ pub trait Backend:
     Storage
     + AgentStore
     + McpStore
+    + RetrieverStore
     + RouteStore
     + PluginStore
     + PluginRuleStore
@@ -157,6 +159,7 @@ impl<T> Backend for T where
     T: Storage
         + AgentStore
         + McpStore
+        + RetrieverStore
         + RouteStore
         + PluginStore
         + PluginRuleStore

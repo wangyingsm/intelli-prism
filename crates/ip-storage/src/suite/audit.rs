@@ -1112,6 +1112,83 @@ pub(crate) async fn registering_a_server_records_everything_but_its_token(store:
     );
 }
 
+/// The other record in this trail with a credential behind it, and it carries none of it.
+pub(crate) async fn writing_a_retriever_records_everything_but_its_key(store: &impl Backend) {
+    const KEY: &str = "qd-live-9f2c4a7b1e";
+    let (tenant, _) = crate::suite::fixture::tenant_with_user(store).await;
+    store
+        .put_retriever(
+            crate::retriever::NewRetriever {
+                owner: crate::retriever::RetrieverOwner::Tenant(tenant.id.clone()),
+                retriever: crate::suite::retriever::keyed("handbook", "The handbook", KEY),
+            },
+            &crate::suite::retriever::by(),
+        )
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Retriever).await;
+    assert_eq!(trail.len(), 1, "one change, one record");
+    let one = &trail[0];
+    assert_eq!(one.actor, UserId::new("alice").unwrap());
+    assert_eq!(one.entity_id, "handbook");
+    assert_eq!(one.through, "/_ip/retrievers");
+    assert_eq!(
+        one.tenant,
+        Some(tenant.id),
+        "a retriever is a tenant's, unlike a server"
+    );
+    assert_eq!(one.before, None);
+    let after = one.after.as_ref().unwrap();
+    assert_eq!(after["name"], "The handbook");
+    assert_eq!(after["endpoint"], "https://qdrant.acme.test:6333");
+    assert_eq!(after["auth"], "key");
+    assert_eq!(after["source"]["collection"], "handbook");
+
+    // Asked of the row as the database handed it back, rather than of the value that built it.
+    let whole = serde_json::to_string(one.after.as_ref().unwrap()).unwrap();
+    assert!(
+        !whole.contains(KEY),
+        "the trail carries a credential: {whole}"
+    );
+}
+
+pub(crate) async fn rewriting_and_removing_a_retriever_record_what_it_said(store: &impl Backend) {
+    let by = crate::suite::retriever::by();
+    let owner = crate::retriever::RetrieverOwner::Global;
+    store
+        .put_retriever(
+            crate::suite::retriever::written_by(owner.clone(), "handbook", "First"),
+            &by,
+        )
+        .await
+        .unwrap();
+    store
+        .put_retriever(
+            crate::suite::retriever::written_by(owner.clone(), "handbook", "Second"),
+            &by,
+        )
+        .await
+        .unwrap();
+    store
+        .remove_retriever(
+            &owner,
+            &ip_retrieve::RetrieverId::new("handbook").unwrap(),
+            &by,
+        )
+        .await
+        .unwrap();
+
+    let trail = trail_of(store, Entity::Retriever).await;
+    assert_eq!(trail.len(), 3);
+    let removal = &trail[0];
+    assert_eq!(removal.before.as_ref().unwrap()["name"], "Second");
+    assert_eq!(removal.after, None, "nothing is left to describe");
+    let rewrite = &trail[1];
+    assert_eq!(rewrite.before.as_ref().unwrap()["name"], "First");
+    assert_eq!(rewrite.after.as_ref().unwrap()["name"], "Second");
+}
+
 pub(crate) async fn rewriting_and_removing_a_server_record_what_it_said(store: &impl Backend) {
     let by = crate::suite::mcp::by();
     store

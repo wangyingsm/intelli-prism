@@ -10,6 +10,7 @@ use ip_core::{
     PluginKind, PluginOrder, PluginRule, RouteKey, RouteRule, TenantId, Timestamp, UserId,
 };
 use ip_mcp::{McpId, McpServer};
+use ip_retrieve::RetrieverId;
 
 use crate::agent::{AgentOwner, AgentStore, NewAgent, StoredAgent};
 use crate::audit::{AuditFilter, AuditStore, Audited, By};
@@ -20,6 +21,7 @@ use crate::mcp::{McpStore, StoredMcp};
 use crate::model::{Membership, NewTenant, NewUser, Tenant, User};
 use crate::plugin::{NewPlugin, Plugin, PluginOwner, PluginRecord, PluginRuleStore, PluginStore};
 use crate::price::{NewPrice, PriceStore, Priced};
+use crate::retriever::{NewRetriever, RetrieverOwner, RetrieverStore, StoredRetriever};
 use crate::revision::{RevisionStore, RuleRevision, RuleSet};
 use crate::route::RouteStore;
 use crate::store::{Backend, GrantStore, MembershipStore, TenantStore, UserStore};
@@ -482,6 +484,46 @@ impl McpStore for FailingStore {
     async fn mcps(&self, page: Page) -> Result<Vec<StoredMcp>, StorageError> {
         self.answering()?;
         self.inner.mcps(page).await
+    }
+}
+
+#[async_trait]
+impl RetrieverStore for FailingStore {
+    async fn put_retriever(
+        &self,
+        retriever: NewRetriever,
+        by: &By,
+    ) -> Result<StoredRetriever, StorageError> {
+        self.answering()?;
+        self.inner.put_retriever(retriever, by).await
+    }
+
+    async fn remove_retriever(
+        &self,
+        owner: &RetrieverOwner,
+        id: &RetrieverId,
+        by: &By,
+    ) -> Result<(), StorageError> {
+        self.answering()?;
+        self.inner.remove_retriever(owner, id, by).await
+    }
+
+    async fn retriever(
+        &self,
+        owner: &RetrieverOwner,
+        id: &RetrieverId,
+    ) -> Result<Option<StoredRetriever>, StorageError> {
+        self.answering()?;
+        self.inner.retriever(owner, id).await
+    }
+
+    async fn retrievers(
+        &self,
+        owner: &RetrieverOwner,
+        page: Page,
+    ) -> Result<Vec<StoredRetriever>, StorageError> {
+        self.answering()?;
+        self.inner.retrievers(owner, page).await
     }
 }
 

@@ -65,6 +65,14 @@ pub enum RetrieveError {
         max: u32,
     },
 
+    /// A key stored against a credential that requires none, or a kind requiring one with none.
+    ///
+    /// Unreachable from the api, where the key sits inside the variant that requires it. It is
+    /// reachable from a row: the kind and the key are two columns, nothing pairs them, and this
+    /// is what refuses a pair that disagrees.
+    #[error("a key belongs with the credential that requires one, and nowhere else")]
+    MisplacedKey,
+
     /// A retriever offering no tool at all, which nothing could ever call.
     ///
     /// Unlike a template's tool set, which is empty for an agent that is a conversation: a
