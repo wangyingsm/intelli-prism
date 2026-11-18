@@ -1,0 +1,1 @@
+Add a nullable varchar column invoice_pdf_key to the billing.invoices table, write it from the existing PdfRenderer worker, and serve it from GET /billing/invoices/:id/pdf behind the existing tenant check. Nothing else changes.

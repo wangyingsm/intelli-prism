@@ -1,0 +1,3 @@
+{
+  "judge": "{\"branch\": [\"estimate\"], \"notes\": \"Every item names the thing that has to change: 1. table/column billing.invoices.invoice_pdf_key; 2. class PdfRenderer; 3. endpoint GET /billing/invoices/:id/pdf; 4. same endpoint's tenant check. Scope is specific enough to estimate, item by item, in order.\\n\\n1. Add a nullable varchar `invoice_pdf_key` column to `billing.invoices`.\\n2. Write `invoice_pdf_key` from the existing `PdfRenderer` worker.\\n3. Serve the key from `GET /billing/invoices/:id/pdf`.\\n4. Keep the existing tenant check on that endpoint.\"}"
+}

@@ -1,0 +1,21 @@
+  scope     begins                             
+  scope     answered  in   143/   67 tokens,    247 characters out
+  judge     begins on scope                    
+  judge     answered  in   573/  154 tokens,    547 characters out
+  - judge passes over dig
+  > judge sends the work on to estimate
+    notes: Every item names the thing that has to change: 1. table/column billing.invoices.invoi...
+  . dig does not run: nothing reached it
+  estimate  begins on judge                    
+  estimate  answered  in   315/  109 tokens,    410 characters out
+
+  loops taken:      0
+  branches taken:   estimate
+  branches passed:  dig
+  nodes skipped:    dig
+  answered with:    estimate
+  ran but dropped:  none
+  stopped at:       nothing — every node that ran answered
+  spent:            1031/330 tokens, 0 micros
+  run id:           bad588f6c735a34138424059748f1ce6
+  nodes, in the order they finished: scope -> judge -> estimate

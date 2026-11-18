@@ -1,0 +1,9 @@
+{
+  "$again": {
+    "dig": {
+      "attempt": 2,
+      "notes": "1. Add an Export PDF button to the BillingPage component that calls POST /billing/invoices/export with the selected invoice filters\n2. Add a three-year date range filter to the invoice query in InvoiceExportService so exports only include invoices from the last three years\n3. Add a generateInvoicePdf method to InvoicePdfGenerator that builds the PDF from the billing data returned by InvoiceExportService"
+    }
+  },
+  "scope": "1. Add a PDF export control to the billing page for customers.\n2. Scope the export to invoices going back three years.\n3. Generate invoice PDFs from the billing data."
+}

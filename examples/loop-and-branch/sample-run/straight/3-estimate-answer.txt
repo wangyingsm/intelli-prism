@@ -1,0 +1,6 @@
+1. Add nullable varchar invoice_pdf_key column to billing.invoices: 1
+2. Write invoice_pdf_key from the existing PdfRenderer worker: 2
+3. Serve the key from GET /billing/invoices/:id/pdf: 1
+4. Keep the existing tenant check on that endpoint: 0.5
+Total: 4.5 days
+Wrong if the PdfRenderer worker lacks a persistence path and needs refactoring to record the key, or if a backfill of existing invoices is required.

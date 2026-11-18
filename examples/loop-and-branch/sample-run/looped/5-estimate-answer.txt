@@ -1,0 +1,5 @@
+Add an Export PDF button to the BillingPage component that calls POST /billing/invoices/export with the selected invoice filters: 1.5
+Add a three-year date range filter to the invoice query in InvoiceExportService: 1
+Add a generateInvoicePdf method to InvoicePdfGenerator that builds the PDF from the billing data returned by InvoiceExportService: 3
+Total: 5.5
+Wrong if the PDF library or template is not already available in the codebase, or if the existing invoice query is too tangled to add a date bound cleanly.

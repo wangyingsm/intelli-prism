@@ -1,0 +1,4 @@
+1. Add a nullable varchar `invoice_pdf_key` column to `billing.invoices`.
+2. Write `invoice_pdf_key` from the existing `PdfRenderer` worker.
+3. Serve the key from `GET /billing/invoices/:id/pdf`.
+4. Keep the existing tenant check on that endpoint.

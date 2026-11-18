@@ -1,0 +1,29 @@
+  scope     begins                             
+  scope     answered  in   117/   37 tokens,    166 characters out
+  judge     begins on scope                    
+  judge     answered  in   540/  137 tokens,    576 characters out
+  > judge sends the work on to dig
+    notes: None of the three items names the thing that has to change. Item 1 says what to add (...
+  - judge passes over estimate
+  dig       begins on judge                    
+  dig       answered  in   764/   97 tokens,    443 characters out
+  ^ dig sends the work back to judge, taken 1 of 2
+  judge     begins on scope                    attempt 2, on what dig said
+  judge     answered  in   638/  198 tokens,    890 characters out
+  - judge passes over dig
+  > judge sends the work on to estimate
+    notes: Scope to estimate, each item as given by the dig step, with the verdict on each: 1. A...
+  . dig does not run: nothing reached it — having already answered once
+  estimate  begins on judge                    
+  estimate  answered  in   356/  120 tokens,    516 characters out
+
+  loops taken:      1
+  branches taken:   dig, estimate
+  branches passed:  estimate, dig
+  nodes skipped:    dig
+  answered with:    estimate
+  ran but dropped:  dig
+  stopped at:       nothing — every node that ran answered
+  spent:            2415/589 tokens, 0 micros
+  run id:           fabeb29be38f6abbc7ea06bdb16b894d
+  nodes, in the order they finished: scope -> judge -> dig -> judge -> estimate

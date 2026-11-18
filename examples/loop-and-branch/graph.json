@@ -1,0 +1,27 @@
+{
+  "name": "Scope, judge, dig if it has to, then estimate",
+  "max_nodes": 8,
+  "nodes": [
+    {"name": "scope",    "agent": "scope"},
+    {"name": "judge",    "agent": "judge"},
+    {"name": "dig",      "agent": "dig"},
+    {"name": "estimate", "agent": "estimate"}
+  ],
+  "edges": [
+    {"from": "scope", "to": "judge"},
+    {
+      "from": "judge",
+      "to": "dig",
+      "condition": "some item of the scope does not name the thing that has to change, and has to be made specific first"
+    },
+    {
+      "from": "judge",
+      "to": "estimate",
+      "condition": "every item of the scope names the thing that has to change, so it can be estimated"
+    },
+    {"from": "dig", "to": "estimate"}
+  ],
+  "loops": [
+    {"from": "dig", "to": "judge", "cap": 2}
+  ]
+}
