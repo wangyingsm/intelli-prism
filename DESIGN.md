@@ -493,9 +493,12 @@ endpoint. The system cache and the request/response cache come first.
 
 #### Run Graph
 
-- A `dr-strange` stored graph plane to run multiple agents/subagents in a DAG mode. each node in the plane is a agent initialization setup. with the `agent_id` property as the DB key. 
-- Each edge between 2 nodes are dependency order of the 2 agents/subagents. the input of the dependentee is the output of the dependenter.
-- Invoking a graph run is just a API endpoint call, say `POST /_ip/graph_run/1` with init_message and option extra_prompt to the first node(main agent) of the graph.
+- A `dr-strange` stored graph plane to run multiple agents/subagents in a DAG mode. each node in the plane is a name inside the graph plus the `agent_id` of the template it runs, which is the DB key. a graph also carries a `max_nodes` ceiling of its own.
+- Each edge between 2 nodes are dependency order of the 2 agents/subagents. the input of the dependentee is a json object keyed by the name of every node feeding it, holding what that node answered, so one parent is an object with one key and fan-in needs no special case. the run's own init_message sits beside it under `$input` for a node nothing feeds.
+- A generation — every node whose dependencies are met — runs at once, and the graph answers with every node nothing reads from, keyed by name.
+- An edge may carry an optional `condition`, a sentence saying when it is worth taking. a node with conditional edges out of it is told them and chooses in its own answer, eg, `{"branch": ["escalate"]}`, naming one of them, several or none. an edge nobody named delivers nothing, a node nothing delivered to is skipped along with everything only it fed, and a node that names none of its branches ends the run with its own answer.
+- A graph may declare loop backs, each a `{from, to, cap}`: the `from` node may answer `{"loop_back": "survey", "notes": "…"}`, and up to the cap that target and everything after it runs again, reading what the asker said under `$again`. loop backs are the only cycles permitted — the topological sort and the acyclicity check are over the feeding edges alone.
+- Invoking a graph run is just a API endpoint call, say `POST /_ip/graph_run/1` with init_message and option extra_prompt, which reach every node nothing feeds. the graphs themselves are managed over `/_ip/graphs`.
 
 ### Web UI
 
