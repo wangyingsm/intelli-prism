@@ -604,6 +604,45 @@ What the run comes to holds the last attempt of each node, while every attempt i
 Every ask is answered there, the refused ones too (`unknown`, `undeclared`, `spent`,
 `unreachable`), and a refusal leaves the answer the node gave standing rather than failing the run.
 A node that stopped the graph does not also get to ask.
+- **Which steps run after a node can be the node's own choice.** An edge may carry a `condition` —
+a sentence saying when it is worth taking, at most 512 bytes because every condition a node
+declares is appended to that node's prompt — and a node with conditional edges out of it is told
+what they are and answers `{"branch": ["escalate"], "notes": "…"}`, the `loop_back` mechanism
+again. It may name one of them, several, or all; a switch is written as conditions that exclude
+each other rather than as a kind of node, and there is no cap of its own, since what bounds a run
+is still its node count and skipping only ever removes work. The condition sits **on the feeding
+edge** rather than in a list beside it, which is the inverse of the loop back's arrangement: a
+branch edge *is* a feeding edge, so every reader of `edges` — the keying of a node's input, what
+the graph answers with, the plane's topological sort and its cycle check — goes on working with no
+filter to forget. In the plane that edge is written twice, `FEEDS` for the algorithms and
+`BRANCH_FEEDS` carrying the condition, because `plane.algo` walks exactly one edge type and
+widening it to all of them would read a `LOOPS_BACK` as a cycle. A person reading a plane meets
+both.
+- **A branch nobody named is skipped, and skipping is transitive.** The unchosen node is marked
+done without an answer — a generation is advanced by a filter rather than a walk, so a node the run
+will not take has to be done for the next generation to come up, while contributing no key to
+anything downstream — and a node whose every incoming edge delivered nothing is skipped in its
+turn. A `FEEDS` edge delivers when its source answered; a `BRANCH_FEEDS` edge delivers when its
+source answered **and** named it. A root always runs. So one condition can drop a whole arm of a
+graph, and nothing about that arm has to be declared for it to happen.
+- **A node runs on what arrived.** Where one parent answered and another was skipped, the input is
+the keyed object with the skipped parent's key simply absent, rather than a key holding nothing or
+a refusal to run — which is what lets a step after a branch be written once and work either way. A
+template that can meet this is worth telling that a key may be missing.
+- **A node that names none of its branches ends the run, and that is an answer rather than a
+failure.** A triage step may decide that nothing further is needed. What a run answers with is
+therefore the leaves of the subgraph it realized — a node answered, and no edge *that delivered*
+reads from it — so a node that took no branch is the answer, as is one whose every reader was
+skipped.
+- **A loop back wins over a branch in one answer**, and the advice says so: the work is going back
+rather than on, so the branch keys are ignored. A node sent work back forgets what it chose, or a
+second attempt could not choose differently — and that is the one state a graph with both reaches:
+a node that answered, was passed over when the node that chose it ran again, and has its answer
+dropped from the run's while its record of having run is kept.
+- **Every branch is answered in the stream, taken or not**: `branch_taken`, `branch_not_taken`,
+`node_skipped`, and `branch_refused` with `unknown` for a name the graph has not got and
+`undeclared` for a node it has but declares no branch to from there. A refusal leaves the rest of
+the choice standing, and the naming node's own answer with it, as a refused loop back does.
 - **A node that does not answer stops the graph, and its siblings are told to stop.** They end
 `cut_short`, and they are told *between turns* and never interrupted mid-turn: aborting a request
 in flight leaves the provider billing tokens this process then never records, so a dropped turn is
@@ -729,6 +768,20 @@ trail instead, which is a different place to look and a different format to read
 - **A graph composes templates and nothing else.** An agent calling another agent, or a template
 naming a sub-agent — neither exists; a node is a template, and every edge, the feeding ones and the
 loop backs alike, is declared when the graph is written.
+- **A branch is read off the whole of a node's answer, so prose around the json takes none.**
+`{"branch": […]}` is parsed from the answer entire, as a loop back is. A node that explains itself
+first and answers after has named nothing: both its branches are passed over, the run ends with
+that answer standing, and nothing in the stream says the answer could not be read. A template for a
+branching node therefore has to say that the json is the whole answer, which is the first thing
+`examples/loop-and-branch` had to be tuned for.
+- **A branch is only as good as the model's judgement, and asking it *whether* any condition holds
+is the weak case.** Measured against `deepseek-chat` over eight runs and four wordings of the
+advice: given an incident report where neither of two conditions held, it named one of them every
+time, while its own summary of that report said correctly that neither did. Declaring a third
+branch, for the case that wanted none, fixed it — a model asked *which of these* is far more
+reliable than one asked *whether any*. So the stop a node makes by naming nothing is a safety net
+rather than control flow to plan around, and a graph whose conditions do not cover the ground will
+take a branch rather than stop. `examples/branch/README.md` keeps the runs.
 - **Nothing rate-limits a run as a run.** Each turn is counted and capped like any other request,
 so a run is limited turn by turn; the run itself is not. A template with a high turn ceiling is a
 loop that may make many requests before a per-request limit notices.

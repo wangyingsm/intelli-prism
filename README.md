@@ -64,7 +64,12 @@ back, the one cycle permitted: a node unsatisfied with what it was given answers
 declares that loop and its own cap has something left, that node and everything after it runs
 again — the survey reading what the review made of its last answer, under `$again`. A node that
 may double back is told so by the run itself, which names the steps it may send work back to and
-how often, so no template has to repeat the graph in prose.
+how often, so no template has to repeat the graph in prose. An edge may also carry a condition, and
+then which of the steps after a node run is that node's own choice: it is told each condition and
+answers `{"branch": ["escalate"]}`, naming one of them, several or none. A step nobody named is
+skipped, along with everything only it fed; a step after a branch runs on what arrived, with the
+skipped parent's key absent; and a node that names nothing ends the run with its own answer, which
+is a decision rather than a failure.
 Where a deployment is a cluster, its nodes are spread over the live members — the one the caller asked included, since it
 is a machine with a gateway on it like the rest — and a node sent elsewhere streams back the same
 events a local one says, the member authenticating itself with a shared cluster secret and
@@ -108,6 +113,8 @@ does, and runs the `.hurl` files beside it in order.
 ```
 examples/graph-run/run.sh                                # a five-node graph, a real model
 examples/loop-back/run.sh                                # a graph that doubles back on itself
+examples/branch/run.sh                                   # one node choosing between three ways out
+examples/loop-and-branch/run.sh                          # a loop back and a branch in one graph
 examples/cluster-run/run.sh                              # the same, across three machines
 ```
 
@@ -121,6 +128,18 @@ drafter to a house style the drafter was never told, so the first pass fails and
 succeeds on the notes the reviewer wrote. The recorded run beside it keeps every step's input, one
 of which is the feature in a single file, and the README says what the example was tuned to avoid —
 including a model that sent work back while saying it had passed.
+
+`examples/branch` sends three incident reports past one triage node with a condition on each of its
+three outgoing edges, and each report leaves by a different one. Its README carries the finding that
+cost the most to learn: a model asked *which of these* conditions holds is far more reliable than
+one asked *whether any* does, so the third branch exists because the two-branch version named a
+branch for a report that matched neither.
+
+`examples/loop-and-branch` puts both mechanisms in one graph, which is the only way to reach the
+state neither reaches alone: a node that answered, was passed over when the node that chose it ran
+again, and had its answer dropped from the run's. The recorded runs keep every step's input, and the
+README says what six rounds of tuning taught — including that a formatting example in a template
+teaches the shape of the whole answer, and beats the advice the engine appends.
 
 `examples/cluster-run` is the half of that a single process cannot show: three gateways sharing one
 store, one cache and one plane, a graph started on one of them, and its nodes spread over all
