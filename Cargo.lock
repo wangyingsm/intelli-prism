@@ -1596,6 +1596,7 @@ dependencies = [
  "ip-mcp",
  "ip-onnx",
  "ip-plugin",
+ "ip-retrieve",
  "ip-run",
  "ip-storage",
  "opentelemetry",

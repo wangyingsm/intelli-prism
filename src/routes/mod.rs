@@ -13,6 +13,7 @@ mod mcp;
 mod member;
 mod plugin;
 mod price;
+mod retriever;
 mod route;
 mod tenant;
 mod usage;
@@ -73,6 +74,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/_ip/graphs", graph::router())
         .nest("/_ip/graph_run", graph::run_router())
         .nest("/_ip/mcps", mcp::router())
+        .nest("/_ip/retrievers", retriever::router())
         // Mounted at the path `ip-cluster` dials rather than at a prefix of our own, so the
         // client and the route cannot drift apart. Not nested, and so not covered by the
         // isolation audit that reads every `.nest(`: it is machine to machine, takes no tenant in

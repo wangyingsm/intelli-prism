@@ -35,6 +35,7 @@ ip-gateway = { version = "0.1.0", path = "crates/ip-gateway" }
 ip-graph = { version = "0.1.0", path = "crates/ip-graph" }
 ip-mcp = { version = "0.1.0", path = "crates/ip-mcp" }
 ip-plugin = { version = "0.1.0", path = "crates/ip-plugin" }
+ip-retrieve = { version = "0.1.0", path = "crates/ip-retrieve" }
 ip-run = { version = "0.1.0", path = "crates/ip-run" }
 ip-storage = { version = "0.1.0", path = "crates/ip-storage", default-features = false }
 tokio-stream = "0.1.19"
