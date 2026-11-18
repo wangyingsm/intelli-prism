@@ -366,7 +366,7 @@ impl RunGraph {
         self.max_nodes
     }
 
-    /// The nodes whose answers feed one node, which are the keys its input arrives under.
+    /// The nodes whose answers feed one node, a branch it may not take included.
     pub fn parents_of<'graph>(
         &'graph self,
         name: &'graph NodeName,

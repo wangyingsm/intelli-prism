@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::error::GraphError;
-use crate::event::{GraphEvent, GraphReporting, GraphSaid, LoopRefusal};
+use crate::event::{BranchRefusal, GraphEvent, GraphReporting, GraphSaid, LoopRefusal};
 use crate::graph::{GraphEdge, GraphNode, GraphOwner, LoopBack, RunGraph};
 use crate::id::{Condition, GraphId, GraphRunId, NodeName};
 use crate::order::RunOrder;
@@ -309,7 +309,91 @@ pub struct GraphRan {
     pub traces: Vec<TraceId>,
 }
 
-/// What a node is given: its parents' answers, keyed by the name the graph calls each parent.
+/// What a run has made of the branches its graph declares.
+///
+/// One structure rather than two, because a loop back has to forget both at once: a node that runs
+/// again may choose differently, and a node put back into a generation that then has nothing to run
+/// it on is skipped afresh. Forgetting the choice and keeping the skip, or the other way about,
+/// would leave a second attempt deciding on what the first one did.
+#[derive(Debug, Default)]
+struct Branched {
+    /// Which of its branches each node that chose named.
+    chosen: BTreeMap<NodeName, BTreeSet<NodeName>>,
+    /// The nodes nothing delivered to, which are done without having answered.
+    skipped: BTreeSet<NodeName>,
+}
+
+impl Branched {
+    /// Forgets everything recorded for one node, which running that node again must.
+    fn forget(&mut self, node: &NodeName) {
+        self.chosen.remove(node);
+        self.skipped.remove(node);
+    }
+}
+
+/// Whether one edge delivered its source's answer to its target.
+///
+/// A plain feeding edge delivers whenever its source answered — that is the whole of what an edge
+/// is, and it is why a graph carrying no condition runs exactly as it did before any of this
+/// existed. A branch delivers only where its source also *named* it.
+///
+/// A node skipped since it answered delivers nothing. A loop back is what can do that: it puts a
+/// node back into a generation that then has nothing to run it on, and the answer it gave on the
+/// pass before is no longer this run's to pass on.
+fn delivered(
+    edge: &GraphEdge,
+    answered: &BTreeMap<NodeName, NodeRan>,
+    branched: &Branched,
+) -> bool {
+    if !answered.contains_key(&edge.from) || branched.skipped.contains(&edge.from) {
+        return false;
+    }
+    edge.condition.is_none()
+        || branched
+            .chosen
+            .get(&edge.from)
+            .is_some_and(|named| named.contains(&edge.to))
+}
+
+/// The nodes of the generation coming up that have something to run on, and the ones that have not.
+///
+/// A node every edge into which delivered nothing has no run to make — the branch its input would
+/// have come through was not taken — and is skipped. A node nothing feeds at all is a root and
+/// always runs, the graph's own input being what it is given. Skipping is transitive by that one
+/// rule rather than by a walk of the graph, and it is applied as each generation comes up: the node
+/// after a skipped node is itself a node nothing delivered to.
+///
+/// The skipped ones are recorded and said here, and answered as well, because the caller has one
+/// thing left to do with them: [`RunOrder::ready_after`] is a filter over generations rather than a
+/// walk, so a node the run will not take has to be in the done set for the generation to advance.
+fn arrived(
+    graph: &RunGraph,
+    ready: Vec<NodeName>,
+    answered: &BTreeMap<NodeName, NodeRan>,
+    branched: &mut Branched,
+    say: &impl Fn(GraphEvent),
+) -> (Vec<NodeName>, Vec<NodeName>) {
+    let (runs, skipped): (Vec<NodeName>, Vec<NodeName>) = ready.into_iter().partition(|name| {
+        let mut into = graph
+            .edges()
+            .iter()
+            .filter(|edge| &edge.to == name)
+            .peekable();
+        into.peek().is_none() || into.any(|edge| delivered(edge, answered, branched))
+    });
+    for name in &skipped {
+        say(GraphEvent::NodeSkipped { name: name.clone() });
+        branched.skipped.insert(name.clone());
+    }
+    (runs, skipped)
+}
+
+/// What a node is given: the answers that reached it, keyed by the name the graph calls each sender.
+///
+/// **A node runs on what arrived.** Only the edges that delivered put a key here, so a node whose
+/// other parent was skipped is simply given one key fewer rather than an empty one: a template that
+/// asks for one answer out of several by name reads a branch that was not taken as an answer it was
+/// not given, which is what it is.
 ///
 /// A node nothing feeds is given the graph's own input, since there is no parent to key it by.
 ///
@@ -324,13 +408,16 @@ fn input_for(
     name: &NodeName,
     answered: &BTreeMap<NodeName, NodeRan>,
     taken: &BTreeMap<(NodeName, NodeName), u32>,
+    branched: &Branched,
 ) -> String {
     let mut from: Map<String, Value> = Map::new();
-    for parent in graphing.graph.parents_of(name) {
-        let answer = answered
-            .get(parent)
-            .map_or_else(String::new, |ran| ran.answer.clone());
-        from.insert(parent.to_string(), Value::String(answer));
+    for edge in graphing.graph.edges() {
+        if &edge.to != name || !delivered(edge, answered, branched) {
+            continue;
+        }
+        if let Some(ran) = answered.get(&edge.from) {
+            from.insert(edge.from.to_string(), Value::String(ran.answer.clone()));
+        }
     }
     let fed = !from.is_empty();
     let mut again: Map<String, Value> = Map::new();
@@ -479,6 +566,123 @@ async fn looped(
     again
 }
 
+/// The branches an answer names, in the order it named them.
+///
+/// A bare string is read as well as a list, because choosing one step is the common case and a
+/// model told to answer with a list of one will sometimes answer with the thing itself. An element
+/// that is not a string is carried through as the json it is, so that it is refused by name rather
+/// than dropped without a word.
+///
+/// Nothing, from an answer that is not json or carries no [`BRANCH_KEY`]: most answers are prose
+/// and are meant to be, so this is read as a question that was never put rather than one answered
+/// badly. An empty list is that same answer given deliberately, which is what [`branch_advice`]
+/// asks a node to do when no condition holds.
+fn names(answer: &str) -> Vec<String> {
+    let Ok(said) = serde_json::from_str::<Value>(answer) else {
+        return Vec::new();
+    };
+    match said.get(BRANCH_KEY) {
+        Some(Value::String(one)) => vec![one.clone()],
+        Some(Value::Array(many)) => many
+            .iter()
+            .map(|one| one.as_str().map_or_else(|| one.to_string(), str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The branch a named step resolves to, or why it does not resolve to one.
+fn branch_wanted(
+    graph: &RunGraph,
+    from: &NodeName,
+    named: &str,
+) -> Result<NodeName, BranchRefusal> {
+    let to = NodeName::new(named).map_err(|_| BranchRefusal::Unknown)?;
+    if !graph.nodes().iter().any(|node| node.name == to) {
+        return Err(BranchRefusal::Unknown);
+    }
+    if graph.branch(from, &to).is_none() {
+        return Err(BranchRefusal::Undeclared);
+    }
+    Ok(to)
+}
+
+/// Takes whatever branches the generation that just ran chose, recording what each one delivers.
+///
+/// Asked once the generation is whole, for [`looped`]'s reason, and *before* it: a node a loop back
+/// sends back into the run has what it chose forgotten along with the rest of what it did, so the
+/// choice recorded here is undone by the same line that takes the node out of the done set.
+///
+/// **An answer that asks to double back names no branch.** The work is going back rather than on,
+/// and one answer carrying both keys has to mean one thing whether the loop is taken or refused —
+/// a refusal that changed what a second key meant is not something an operator could reason about.
+///
+/// Every branch a node declares is answered in the stream, the ones it passed over included, and a
+/// name that is not a branch of it is refused while the names beside it still stand.
+fn chose(
+    graph: &RunGraph,
+    just_ran: &[NodeName],
+    answered: &BTreeMap<NodeName, NodeRan>,
+    branched: &mut Branched,
+    say: &impl Fn(GraphEvent),
+) {
+    for from in just_ran {
+        let declared: BTreeSet<NodeName> = graph
+            .branches()
+            .filter(|(edge, _)| &edge.from == from)
+            .map(|(edge, _)| edge.to.clone())
+            .collect();
+        if declared.is_empty() {
+            continue;
+        }
+        let Some(ran) = answered.get(from) else {
+            continue;
+        };
+        if asked_for(&ran.answer).is_some() {
+            continue;
+        }
+        let mut taking = BTreeSet::new();
+        for named in names(&ran.answer) {
+            match branch_wanted(graph, from, &named) {
+                Ok(to) => {
+                    taking.insert(to);
+                }
+                Err(why) => say(GraphEvent::BranchRefused {
+                    from: from.clone(),
+                    named,
+                    why,
+                }),
+            }
+        }
+        for to in declared {
+            say(if taking.contains(&to) {
+                GraphEvent::BranchTaken {
+                    from: from.clone(),
+                    to,
+                }
+            } else {
+                GraphEvent::BranchNotTaken {
+                    from: from.clone(),
+                    to,
+                }
+            });
+        }
+        branched.chosen.insert(from.clone(), taking);
+    }
+}
+
+/// The node of the graph one name belongs to.
+///
+/// Nothing, where the order places a name the graph has not got, which is `GraphPlane::order`'s to
+/// refuse: here it can only mean the two were taken from different graphs.
+fn node_of(graph: &RunGraph, name: &NodeName) -> Option<GraphNode> {
+    graph
+        .nodes()
+        .iter()
+        .find(|node| &node.name == name)
+        .cloned()
+}
+
 /// The nodes nothing reads from, which between them are what the graph answered.
 fn answer_of(graph: &RunGraph, answered: &BTreeMap<NodeName, NodeRan>) -> Value {
     let read_from: BTreeSet<&NodeName> = graph.edges().iter().map(|edge| &edge.from).collect();
@@ -508,6 +712,12 @@ fn answer_of(graph: &RunGraph, answered: &BTreeMap<NodeName, NodeRan>) -> Value 
 /// asker is downstream of what it sent the work back to. **A node that stopped the graph does not
 /// also get to ask**: the stop is read first, and the asks of that generation are not looked at.
 ///
+/// A node that declares branches says in its answer which of them it is taking, and only those
+/// deliver. A node that nothing delivered to is **done without having answered** — it is in the
+/// done set, so the generation advances, and out of the answers, so it feeds nothing — which is
+/// what makes a skip carry down the graph by itself. A node that names none of its branches ends
+/// the run where it stands, and that is a complete answer rather than a failure.
+///
 /// A sibling stopped that way comes back [`Stopped::CutShort`] and is never named as the cause:
 /// [`GraphRan::stopped_at`] is the node that broke, not the ones that were stopped because it did.
 /// The result carries everything spent up to that point — the shape `ip_run::Ran` has for the same
@@ -518,6 +728,7 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
     let mut traces: Vec<TraceId> = Vec::new();
     let mut spend = Spend::NOTHING;
     let mut taken: BTreeMap<(NodeName, NodeName), u32> = BTreeMap::new();
+    let mut branched = Branched::default();
     let mut stopped_at = None;
     let (stop, listen) = watch::channel(RunSignal::Carry);
     let say = |event| {
@@ -537,20 +748,14 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
         if ready.is_empty() {
             break;
         }
+        let (ready, skipped) = arrived(&graphing.graph, ready, &answered, &mut branched, &say);
+        done.extend(skipped);
         let mut running = JoinSet::new();
         for name in ready {
-            let Some(node) = graphing
-                .graph
-                .nodes()
-                .iter()
-                .find(|node| node.name == name)
-                .cloned()
-            else {
-                // An order the graph does not match is `GraphPlane::order`'s to refuse; here it
-                // can only mean the two were taken from different graphs.
+            let Some(node) = node_of(&graphing.graph, &name) else {
                 continue;
             };
-            let input = input_for(graphing, &name, &answered, &taken);
+            let input = input_for(graphing, &name, &answered, &taken, &branched);
             say(GraphEvent::Node {
                 name: name.clone(),
                 input: input.clone(),
@@ -599,8 +804,10 @@ pub async fn run(graphing: &Graphing) -> GraphRan {
             // Name order, so two nodes of one generation asking are resolved in an order a test
             // can state rather than the order the scheduler reaped them in.
             just_ran.sort();
+            chose(&graphing.graph, &just_ran, &answered, &mut branched, &say);
             for again in looped(graphing, &just_ran, &answered, &mut taken, &say).await {
                 done.remove(&again);
+                branched.forget(&again);
             }
         }
     }
@@ -825,11 +1032,14 @@ mod tests {
         )
     }
 
-    /// A run of a graph that declares loop backs, over whatever answers what they run again.
+    /// A run over a scripted runner and whatever answers what a loop back runs again.
+    ///
+    /// Generic in the runner rather than one of these per fixture: a graph that loops and a graph
+    /// that branches differ in what they are handed, not in how a run of one is assembled.
     fn looping(
         graph: RunGraph,
         order: RunOrder,
-        runner: Arc<Doubling>,
+        runner: Arc<impl RunsNode + 'static>,
         plane: Option<Arc<dyn Downstream>>,
     ) -> (Graphing, tokio::sync::mpsc::UnboundedReceiver<GraphSaid>) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1007,10 +1217,23 @@ mod tests {
         )
     }
 
-    /// A graph with loop backs declared on it.
+    /// A graph with loop backs declared on it and no condition on any edge.
     fn looping_graph(
         nodes: &[&str],
         edges: &[(&str, &str)],
+        loops: &[(&str, &str, u32)],
+    ) -> RunGraph {
+        branching_graph(nodes, edges, &[], loops)
+    }
+
+    /// A graph with a condition on some of its edges and whatever loop backs it declares.
+    ///
+    /// The one builder both kinds of declaration share, since the difference between them is all
+    /// there is to say: a branch is an edge carrying a condition, and a loop back is not an edge.
+    fn branching_graph(
+        nodes: &[&str],
+        edges: &[(&str, &str)],
+        branches: &[(&str, &str, &str)],
         loops: &[(&str, &str, u32)],
     ) -> RunGraph {
         RunGraph::checked(RunGraphParts {
@@ -1018,7 +1241,15 @@ mod tests {
             name: GraphName::new("Support triage").expect("a graph name"),
             owner: GraphOwner::Tenant(TenantId::new("acme").expect("a tenant id")),
             nodes: nodes.iter().map(|raw| node(raw)).collect(),
-            edges: edges.iter().map(|(from, to)| edge(from, to)).collect(),
+            edges: edges
+                .iter()
+                .map(|(from, to)| edge(from, to))
+                .chain(
+                    branches
+                        .iter()
+                        .map(|&(from, to, when)| branch(from, to, when)),
+                )
+                .collect(),
             loops: loops
                 .iter()
                 .map(|&(from, to, cap)| LoopBack {
@@ -1030,6 +1261,103 @@ mod tests {
             max_nodes: MaxNodes::new(8).expect("a ceiling"),
         })
         .expect("the fixture's own graph holds together")
+    }
+
+    /// A runner whose nodes answer from a script, one answer per attempt.
+    ///
+    /// Flexible rather than clever, and one fixture for the whole of the branching below: a choice,
+    /// a bare name, a list of none, prose, a name the graph has not got and an ask to double back
+    /// are all just *what a node answered*, so a second attempt differing from the first costs a
+    /// second entry rather than a second fixture. A node whose script has run out is content.
+    struct Scripted {
+        /// What each node answers, attempt by attempt, by its name.
+        says: Mutex<BTreeMap<String, Vec<String>>>,
+        /// Every node that ran and what it was given, in order.
+        seen: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Scripted {
+        fn over(says: &[(&str, &[&str])]) -> Arc<Self> {
+            Arc::new(Self {
+                says: Mutex::new(
+                    says.iter()
+                        .map(|&(node, answers)| {
+                            (
+                                node.to_owned(),
+                                answers.iter().map(|&one| one.to_owned()).collect(),
+                            )
+                        })
+                        .collect(),
+                ),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Every node that ran and what it was given, in order.
+        fn runs(&self) -> Vec<(String, String)> {
+            self.seen
+                .lock()
+                .expect("the record is not poisoned")
+                .clone()
+        }
+
+        /// The names alone, which is the run order.
+        fn order(&self) -> Vec<String> {
+            self.runs().into_iter().map(|(node, _)| node).collect()
+        }
+
+        /// What one node was given on its first run.
+        fn given(&self, node: &str) -> String {
+            self.runs()
+                .into_iter()
+                .find(|(ran, _)| ran == node)
+                .map(|(_, input)| input)
+                .unwrap_or_default()
+        }
+    }
+
+    #[async_trait]
+    impl RunsNode for Scripted {
+        async fn run(&self, running: RunningNode) -> NodeRan {
+            let node = running.node.name.to_string();
+            self.seen
+                .lock()
+                .expect("the record is not poisoned")
+                .push((node.clone(), running.input));
+            let answer = {
+                let mut says = self.says.lock().expect("the record is not poisoned");
+                let left = says.entry(node.clone()).or_default();
+                if left.is_empty() {
+                    format!("{node} is content")
+                } else {
+                    left.remove(0)
+                }
+            };
+            NodeRan {
+                answer,
+                stopped: Stopped::Answered,
+                spend: Spend::NOTHING,
+                traces: Vec::new(),
+            }
+        }
+    }
+
+    /// An answer naming the branches it takes, as a node that was told to choose writes one.
+    fn taking(branches: &[&str]) -> String {
+        json!({BRANCH_KEY: branches, "notes": "what the next steps should know"}).to_string()
+    }
+
+    /// Every branch or skip a run said, as the one word it is named by and what it carries.
+    fn branches_said(said: &[GraphSaid]) -> Vec<(String, Value)> {
+        said.iter()
+            .filter(|one| {
+                matches!(
+                    one.name(),
+                    "branch_taken" | "branch_not_taken" | "branch_refused" | "node_skipped"
+                )
+            })
+            .map(|one| (one.name().to_owned(), one.event.body()))
+            .collect()
     }
 
     /// Every loop event a run said, as the one word it is named by and what it carries.
@@ -1923,6 +2251,445 @@ mod tests {
             graph_advice(&[], &edges, &node).as_deref(),
             branch_advice(&edges, &node).as_deref(),
             "a node that only chooses was told more than the branch advice"
+        );
+    }
+
+    /// The shape this milestone exists for: a node judges, one step runs, the other does not.
+    #[tokio::test]
+    async fn one_branch_of_two_is_taken_and_the_other_is_skipped() {
+        let chose = taking(&["escalate"]);
+        let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
+        let (graphing, events) = looping(
+            branching_graph(
+                &["intake", "escalate", "close"],
+                &[],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "close", "the complaint is already settled"),
+                ],
+                &[],
+            ),
+            order(&[("intake", 0), ("escalate", 1), ("close", 1)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(
+            runner.order(),
+            vec!["intake", "escalate"],
+            "the branch that was not taken ran anyway"
+        );
+        assert_eq!(ran.stopped_at, None, "a branch taken stopped the graph");
+        assert_eq!(
+            branches_said(&said(events)),
+            vec![
+                (
+                    "branch_not_taken".to_owned(),
+                    json!({"node": "intake", "next": "close"}),
+                ),
+                (
+                    "branch_taken".to_owned(),
+                    json!({"node": "intake", "next": "escalate"}),
+                ),
+                ("node_skipped".to_owned(), json!({"node": "close"})),
+            ]
+        );
+        assert_eq!(
+            ran.answer,
+            json!({"escalate": "escalate is content"}),
+            "the graph answered with something the skipped branch said"
+        );
+    }
+
+    /// Ruling 1: the branches are judged one by one, so a node may take the lot.
+    #[tokio::test]
+    async fn a_node_may_take_every_branch_it_declares() {
+        let chose = taking(&["escalate", "close"]);
+        let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
+        let (graphing, events) = looping(
+            branching_graph(
+                &["intake", "escalate", "close"],
+                &[],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "close", "the complaint is already settled"),
+                ],
+                &[],
+            ),
+            order(&[("intake", 0), ("escalate", 1), ("close", 1)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(
+            ran.nodes.keys().collect::<Vec<_>>(),
+            vec![&name("close"), &name("escalate"), &name("intake")],
+            "a node that named both branches did not run both"
+        );
+        assert!(
+            branches_said(&said(events))
+                .iter()
+                .all(|(said, _)| said == "branch_taken"),
+            "something was passed over by a node that named every branch"
+        );
+    }
+
+    /// Ruling 4: naming none of them is an answer, and the run ends on it normally.
+    ///
+    /// **The answer asserted here is the one the next commit changes**, and it is asserted rather
+    /// than left out so that it has to be: `answer_of` calls a node a leaf when nothing in the
+    /// *graph* reads from it, which is a property of the graph and not of the run, so a node that
+    /// branched nowhere is not yet in what the graph answered.
+    #[tokio::test]
+    async fn a_node_that_names_no_branch_ends_the_run_where_it_stands() {
+        let chose = taking(&[]);
+        let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
+        let (graphing, events) = looping(
+            branching_graph(
+                &["intake", "escalate", "close"],
+                &[],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "close", "the complaint is already settled"),
+                ],
+                &[],
+            ),
+            order(&[("intake", 0), ("escalate", 1), ("close", 1)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(
+            runner.order(),
+            vec!["intake"],
+            "a node named no branch and something ran anyway"
+        );
+        assert_eq!(
+            ran.stopped_at, None,
+            "taking no branch was read as a failure rather than an answer"
+        );
+        assert_eq!(
+            branches_said(&said(events))
+                .into_iter()
+                .filter(|(said, _)| said == "node_skipped")
+                .collect::<Vec<_>>(),
+            vec![
+                ("node_skipped".to_owned(), json!({"node": "escalate"})),
+                ("node_skipped".to_owned(), json!({"node": "close"})),
+            ],
+            "the skips are not in the order the generation places them"
+        );
+        assert_eq!(ran.answer, json!({}), "see this test's own doc comment");
+    }
+
+    /// A name the graph does not branch to is refused, and the names beside it still stand.
+    ///
+    /// Two ways to get it wrong, and the second is the one worth the fixture: `log` *is* a node
+    /// this one feeds, and naming it is still refused, because an edge the graph did not declare
+    /// conditional is not a branch — it delivers whatever this node answers, which is why `log`
+    /// runs regardless of having been named.
+    #[tokio::test]
+    async fn a_step_the_graph_does_not_branch_to_is_refused_and_the_rest_still_stand() {
+        let chose = taking(&["escalate", "ghost", "log"]);
+        let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
+        let (graphing, events) = looping(
+            branching_graph(
+                &["intake", "escalate", "notify", "log"],
+                &[("intake", "log")],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "notify", "somebody outside has to be told"),
+                ],
+                &[],
+            ),
+            order(&[("intake", 0), ("escalate", 1), ("notify", 1), ("log", 1)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(
+            ran.nodes.keys().collect::<Vec<_>>(),
+            vec![&name("escalate"), &name("intake"), &name("log")],
+            "a refusal changed which nodes ran"
+        );
+        let told = branches_said(&said(events));
+        for expected in [
+            (
+                "branch_refused".to_owned(),
+                json!({
+                    "node": "intake", "next": "ghost", "refusal": "unknown",
+                    "why": "the graph holds no node of that name",
+                }),
+            ),
+            (
+                "branch_refused".to_owned(),
+                json!({
+                    "node": "intake", "next": "log", "refusal": "undeclared",
+                    "why": "the graph declares no branch to it from here",
+                }),
+            ),
+            (
+                "branch_taken".to_owned(),
+                json!({"node": "intake", "next": "escalate"}),
+            ),
+            ("node_skipped".to_owned(), json!({"node": "notify"})),
+        ] {
+            assert!(told.contains(&expected), "{expected:?} is not in {told:?}");
+        }
+    }
+
+    /// Skipping is transitive, and it is worked out one generation at a time rather than walked.
+    #[tokio::test]
+    async fn a_skip_carries_down_the_graph_rather_than_stopping_at_the_branch() {
+        let chose = taking(&["close"]);
+        let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
+        let (graphing, events) = looping(
+            branching_graph(
+                &["intake", "escalate", "notify", "settle", "close"],
+                &[("escalate", "notify"), ("notify", "settle")],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "close", "the complaint is already settled"),
+                ],
+                &[],
+            ),
+            order(&[
+                ("intake", 0),
+                ("escalate", 1),
+                ("close", 1),
+                ("notify", 2),
+                ("settle", 3),
+            ]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(
+            runner.order(),
+            vec!["intake", "close"],
+            "something downstream of a branch nobody took ran"
+        );
+        assert_eq!(ran.stopped_at, None, "a skip stopped the graph");
+        assert_eq!(
+            branches_said(&said(events))
+                .into_iter()
+                .filter(|(said, _)| said == "node_skipped")
+                .collect::<Vec<_>>(),
+            vec![
+                ("node_skipped".to_owned(), json!({"node": "escalate"})),
+                ("node_skipped".to_owned(), json!({"node": "notify"})),
+                ("node_skipped".to_owned(), json!({"node": "settle"})),
+            ],
+            "a skip did not carry the whole way down"
+        );
+    }
+
+    /// Ruling 3: a node runs on what arrived, and a branch nobody took arrived as nothing.
+    ///
+    /// This is what makes a merge after two alternative paths expressible without a word about
+    /// branches in its template: it asks for one answer by name, as every node does, and the name
+    /// of the path that was not taken is simply not there.
+    #[tokio::test]
+    async fn a_node_runs_on_what_arrived_when_a_parent_of_it_was_skipped() {
+        let chose = taking(&["left"]);
+        let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
+        let (graphing, _) = looping(
+            branching_graph(
+                &["intake", "left", "right", "merge"],
+                &[("left", "merge"), ("right", "merge")],
+                &[
+                    ("intake", "left", "the complaint names a loss"),
+                    ("intake", "right", "the complaint is already settled"),
+                ],
+                &[],
+            ),
+            order(&[("intake", 0), ("left", 1), ("right", 1), ("merge", 2)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        run(&graphing).await;
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&runner.given("merge")).expect("a keyed input"),
+            json!({"left": "left is content"}),
+            "the skipped path left a key behind"
+        );
+    }
+
+    /// A loop back forgets what the node it runs again chose, so a second pass may choose anew.
+    ///
+    /// The case the one structure exists for. Were the choice kept and only the done set undone,
+    /// the second attempt would run the branch the first one picked however it answered.
+    #[tokio::test]
+    async fn a_loop_back_lets_a_branching_node_choose_the_other_way() {
+        let first = taking(&["escalate"]);
+        let second = taking(&["close"]);
+        let back = json!({LOOP_BACK_KEY: "intake", "notes": "the loss is not ours"}).to_string();
+        let runner = Scripted::over(&[
+            ("intake", &[first.as_str(), second.as_str()]),
+            ("escalate", &[back.as_str()]),
+        ]);
+        let (graphing, events) = looping(
+            branching_graph(
+                &["intake", "escalate", "close"],
+                &[],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "close", "the complaint is already settled"),
+                ],
+                &[("escalate", "intake", 2)],
+            ),
+            order(&[("intake", 0), ("escalate", 1), ("close", 1)]),
+            Arc::clone(&runner),
+            Some(Reaching::over(&[(
+                "intake",
+                &["intake", "escalate", "close"],
+            )])),
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(
+            runner.order(),
+            vec!["intake", "escalate", "intake", "close"],
+            "the second pass did not choose the other way"
+        );
+        assert_eq!(ran.stopped_at, None, "a second choice stopped the graph");
+        assert_eq!(
+            branches_said(&said(events))
+                .into_iter()
+                .filter(|(said, _)| said == "node_skipped")
+                .collect::<Vec<_>>(),
+            vec![
+                ("node_skipped".to_owned(), json!({"node": "close"})),
+                ("node_skipped".to_owned(), json!({"node": "escalate"})),
+            ],
+            "the pass that was not taken is the wrong one"
+        );
+    }
+
+    /// Prose from a node that was offered branches names none of them, and is not refused for it.
+    #[tokio::test]
+    async fn a_node_that_answers_prose_takes_none_of_the_branches_it_was_offered() {
+        let runner = Scripted::over(&[("intake", &["the complaint is about the weather"])]);
+        let (graphing, events) = looping(
+            branching_graph(
+                &["intake", "escalate", "close"],
+                &[],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "close", "the complaint is already settled"),
+                ],
+                &[],
+            ),
+            order(&[("intake", 0), ("escalate", 1), ("close", 1)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        let ran = run(&graphing).await;
+
+        assert_eq!(runner.order(), vec!["intake"], "prose took a branch");
+        assert_eq!(ran.stopped_at, None, "prose was read as a failure");
+        let told = branches_said(&said(events));
+        assert!(
+            !told.iter().any(|(said, _)| said == "branch_refused"),
+            "a node that asked for nothing was refused something: {told:?}"
+        );
+    }
+
+    /// A node choosing one step is the common case, and a bare name is how a model will write it.
+    #[tokio::test]
+    async fn a_branch_named_as_a_bare_string_is_taken_as_a_list_of_one() {
+        let chose = json!({BRANCH_KEY: "escalate"}).to_string();
+        let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
+        let (graphing, _) = looping(
+            branching_graph(
+                &["intake", "escalate", "close"],
+                &[],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "close", "the complaint is already settled"),
+                ],
+                &[],
+            ),
+            order(&[("intake", 0), ("escalate", 1), ("close", 1)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        run(&graphing).await;
+
+        assert_eq!(
+            runner.order(),
+            vec!["intake", "escalate"],
+            "a branch named as a bare string was not taken"
+        );
+    }
+
+    /// One answer carrying both keys means one thing, and it means the work is going back.
+    ///
+    /// Asserted against a loop back that is *refused*, which is the half worth pinning: were the
+    /// branch read whenever the ask came to nothing, what a second key meant would depend on
+    /// whether the first one was allowed, and an operator could not reason about either.
+    #[tokio::test]
+    async fn an_ask_to_double_back_is_read_instead_of_any_branch_in_the_same_answer() {
+        let chose = json!({
+            LOOP_BACK_KEY: "intake",
+            BRANCH_KEY: ["escalate"],
+            "notes": "the figures are for the wrong year",
+        })
+        .to_string();
+        let runner = Scripted::over(&[("intake", &[chose.as_str()])]);
+        let (graphing, events) = looping(
+            branching_graph(
+                &["intake", "escalate", "close"],
+                &[],
+                &[
+                    ("intake", "escalate", "the complaint names a loss"),
+                    ("intake", "close", "the complaint is already settled"),
+                ],
+                &[],
+            ),
+            order(&[("intake", 0), ("escalate", 1), ("close", 1)]),
+            Arc::clone(&runner),
+            None,
+        );
+
+        run(&graphing).await;
+
+        let told = said(events);
+        assert_eq!(
+            runner.order(),
+            vec!["intake"],
+            "the branch in an answer that asked to double back was taken"
+        );
+        assert_eq!(
+            loops_said(&told),
+            vec![(
+                "loop_refused".to_owned(),
+                json!({
+                    "node": "intake", "back_to": "intake", "refusal": "undeclared",
+                    "why": "the graph declares no loop back to it from here",
+                }),
+            )]
+        );
+        assert!(
+            !branches_said(&told)
+                .iter()
+                .any(|(said, _)| said.starts_with("branch_")),
+            "a branch was answered for a node that asked to double back: {told:?}"
         );
     }
 

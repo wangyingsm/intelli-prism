@@ -1521,6 +1521,7 @@ mod tests {
         let (router, state, _plane, upstream) = recorded(
             &["intake-agent", "reply-agent"],
             looping_chain(sorted_chain()),
+            "four",
         )
         .await;
 
@@ -1557,11 +1558,17 @@ mod tests {
     ///
     /// Read off the upstream for the loop back's reason: the two nodes share one stored template,
     /// so the only place the prompts differ is in what each was actually sent.
+    ///
+    /// The upstream answers with the branch, which is what makes the second node run at all: the
+    /// whole path is here in one test — the prompt the engine writes, a model naming a step in it,
+    /// and that step running because it was named.
     #[tokio::test]
     async fn a_node_that_may_choose_what_runs_next_is_told_what_it_may_choose() {
+        let chooses = serde_json::json!({ip_graph::BRANCH_KEY: ["reply"]}).to_string();
         let (router, state, _plane, upstream) = recorded(
             &["intake-agent", "reply-agent"],
             branching_chain(sorted_chain()),
+            &chooses,
         )
         .await;
 
@@ -2029,6 +2036,25 @@ caller_speaks = "anthropic"
 upstream_speaks = "anthropic"
 "#;
 
+    /// One finished message, as an upstream here answers with it.
+    fn answered(text: &str) -> axum::http::Response<ip_gateway::body::GatewayBody> {
+        let body = serde_json::json!({
+            "id": "msg_1",
+            "model": "claude-opus-5",
+            "role": "assistant",
+            "type": "message",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        })
+        .to_string();
+        axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(ip_gateway::from_bytes(body.into()))
+            .unwrap()
+    }
+
     /// An upstream that answers every turn with the same finished message.
     struct Answering;
 
@@ -2039,34 +2065,26 @@ upstream_speaks = "anthropic"
             _request: axum::http::Request<ip_gateway::body::GatewayBody>,
         ) -> Result<axum::http::Response<ip_gateway::body::GatewayBody>, ip_gateway::UpstreamError>
         {
-            let body = serde_json::json!({
-                "id": "msg_1",
-                "model": "claude-opus-5",
-                "role": "assistant",
-                "type": "message",
-                "stop_reason": "end_turn",
-                "content": [{"type": "text", "text": "four"}],
-                "usage": {"input_tokens": 10, "output_tokens": 2},
-            })
-            .to_string();
-            Ok(axum::http::Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(ip_gateway::from_bytes(body.into()))
-                .unwrap())
+            Ok(answered("four"))
         }
     }
 
     /// The same, keeping every request body, so a test can read what the model was actually told.
+    ///
+    /// What it answers is the test's to choose, because what a node answers is now read: a graph
+    /// with a condition on an edge runs its second node only where the first one names it.
     struct Recording {
         /// Each request the gateway sent on, in order.
         seen: Mutex<Vec<serde_json::Value>>,
+        /// What every turn answers.
+        says: String,
     }
 
     impl Recording {
-        fn new() -> Arc<Self> {
+        fn new(says: &str) -> Arc<Self> {
             Arc::new(Self {
                 seen: Mutex::new(Vec::new()),
+                says: says.to_owned(),
             })
         }
 
@@ -2093,11 +2111,7 @@ upstream_speaks = "anthropic"
                     .expect("the record is not poisoned")
                     .push(said);
             }
-            Answering
-                .send(axum::http::Request::new(ip_gateway::from_bytes(
-                    Vec::new().into(),
-                )))
-                .await
+            Ok(answered(&self.says))
         }
     }
 
@@ -2156,13 +2170,14 @@ upstream_speaks = "anthropic"
         (super::super::router(state.clone()), state, plane)
     }
 
-    /// A router whose upstream keeps what it was sent, over a plane answering as scripted.
+    /// A router whose upstream keeps what it was sent and answers `says`, over a scripted plane.
     async fn recorded(
         named: &[&str],
         replies: Replies,
+        says: &str,
     ) -> (Router, AppState, StubPlane, Arc<Recording>) {
         let plane = StubPlane::start(replies).await;
-        let upstream = Recording::new();
+        let upstream = Recording::new(says);
         let state = super::super::harness::serving(
             store_with_templates(named).await,
             SERVING,

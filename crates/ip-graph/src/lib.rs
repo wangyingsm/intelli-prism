@@ -26,7 +26,7 @@ mod plane;
 mod run;
 
 pub use error::GraphError;
-pub use event::{GraphEvent, GraphReporting, GraphSaid, LoopRefusal};
+pub use event::{BranchRefusal, GraphEvent, GraphReporting, GraphSaid, LoopRefusal};
 pub use graph::{
     GraphEdge, GraphNode, GraphOwner, LoopBack, LoopCap, MaxNodes, RunGraph, RunGraphParts,
 };

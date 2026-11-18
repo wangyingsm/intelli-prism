@@ -63,6 +63,15 @@ pub enum GraphEvent {
         /// What it spent.
         spend: Spend,
     },
+    /// A node of the graph will not run: every edge into it delivered nothing.
+    ///
+    /// Said rather than passed over in silence, because a node that did not run is the whole point
+    /// of a conditional graph and nothing else in the stream would account for it: a reader given
+    /// only the nodes that ran cannot tell a branch that was not taken from a node that broke.
+    NodeSkipped {
+        /// Which node.
+        name: NodeName,
+    },
     /// Something the node currently running said, as that run said it.
     Turn {
         /// Which node said it.
@@ -94,6 +103,36 @@ pub enum GraphEvent {
         /// Why the answer is no.
         why: LoopRefusal,
     },
+    /// A node has named one of the branches leaving it, and the work is going that way.
+    BranchTaken {
+        /// The node that chose.
+        from: NodeName,
+        /// The node it chose, which runs next.
+        to: NodeName,
+    },
+    /// A node declared that branch and did not name it, so nothing goes that way.
+    ///
+    /// Said for every branch left unnamed, and not only for the ones taken: what a conditional
+    /// graph did is as much what it judged against as what it ran, and a node passed over here is
+    /// the reason for a [`GraphEvent::NodeSkipped`] further down.
+    BranchNotTaken {
+        /// The node that chose.
+        from: NodeName,
+        /// The node it passed over.
+        to: NodeName,
+    },
+    /// A node named a step that is not a branch of it, so nothing goes that way.
+    ///
+    /// Said for [`GraphEvent::LoopRefused`]'s reason: a template naming something it may not have
+    /// is what an operator needs to see, and the branches named beside it are still taken.
+    BranchRefused {
+        /// The node that named it.
+        from: NodeName,
+        /// What it named, as it named it — which may be no node's name at all.
+        named: String,
+        /// Why the answer is no.
+        why: BranchRefusal,
+    },
     /// The graph is over, and this is all of it.
     Done {
         /// What it answered: every node nothing reads from, keyed by name.
@@ -116,9 +155,13 @@ impl GraphEvent {
         match self {
             Self::Node { .. } => "node",
             Self::NodeDone { .. } => "node_done",
+            Self::NodeSkipped { .. } => "node_skipped",
             Self::Turn { event, .. } => event.name(),
             Self::LoopBack { .. } => "loop_back",
             Self::LoopRefused { .. } => "loop_refused",
+            Self::BranchTaken { .. } => "branch_taken",
+            Self::BranchNotTaken { .. } => "branch_not_taken",
+            Self::BranchRefused { .. } => "branch_refused",
             Self::Done { .. } => "done",
         }
     }
@@ -141,6 +184,7 @@ impl GraphEvent {
                 "tokens": tokens(*spend),
                 "cost_micros": spend.cost.micros(),
             }),
+            Self::NodeSkipped { name } => json!({"node": name.as_str()}),
             Self::Turn { node, event } => {
                 let mut body = event.body();
                 if let Some(body) = body.as_object_mut() {
@@ -162,6 +206,16 @@ impl GraphEvent {
             Self::LoopRefused { from, asked, why } => json!({
                 "node": from.as_str(),
                 "back_to": asked,
+                "refusal": why.name(),
+                "why": why.to_string(),
+            }),
+            Self::BranchTaken { from, to } | Self::BranchNotTaken { from, to } => json!({
+                "node": from.as_str(),
+                "next": to.as_str(),
+            }),
+            Self::BranchRefused { from, named, why } => json!({
+                "node": from.as_str(),
+                "next": named,
                 "refusal": why.name(),
                 "why": why.to_string(),
             }),
@@ -216,6 +270,43 @@ impl std::fmt::Display for LoopRefusal {
             Self::Undeclared => "the graph declares no loop back to it from here",
             Self::Unreachable => "what holds the graph could not say which nodes would run again",
             Self::Spent => "its loop back has been taken as often as it may be",
+        };
+        f.write_str(said)
+    }
+}
+
+/// Why a branch a node named is not being taken.
+///
+/// Not in this crate's `error.rs`, for [`LoopRefusal`]'s reason: none of these fails anything. A
+/// refused branch is a run carrying on with the branches that were named beside it, or with none.
+///
+/// Two where a loop back has four: a branch has no cap to spend, and nothing has to be read to work
+/// out what runs next, so the only ways to name one wrongly are naming no node and naming a node
+/// this one does not branch to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchRefusal {
+    /// The graph holds no node under the name that was named.
+    Unknown,
+    /// The graph holds that node, and declares no branch to it from the naming one.
+    Undeclared,
+}
+
+impl BranchRefusal {
+    /// The one word this is reported under.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Undeclared => "undeclared",
+        }
+    }
+}
+
+impl std::fmt::Display for BranchRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let said = match self {
+            Self::Unknown => "the graph holds no node of that name",
+            Self::Undeclared => "the graph declares no branch to it from here",
         };
         f.write_str(said)
     }
@@ -368,6 +459,74 @@ mod tests {
         assert_eq!(refused.body()["back_to"], "two words");
     }
 
+    /// A branch taken and one passed over carry the same two names, and differ only in the word.
+    ///
+    /// Deliberately the same body: what happened to a branch is which event it is, so a reader
+    /// filtering on the name has the whole answer and one filtering on the body has none of it.
+    #[test]
+    fn a_branch_says_which_step_it_is_about_whether_it_was_taken_or_not() {
+        let from = name("intake");
+        let to = name("escalate");
+        let taken = GraphEvent::BranchTaken {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        let passed = GraphEvent::BranchNotTaken { from, to };
+
+        assert_eq!(taken.name(), "branch_taken");
+        assert_eq!(passed.name(), "branch_not_taken");
+        assert_eq!(
+            taken.body(),
+            json!({"node": "intake", "next": "escalate"}),
+            "a branch said something other than whose it is and where it goes"
+        );
+        assert_eq!(taken.body(), passed.body());
+    }
+
+    /// Each reason in turn, since what the operator does about it differs: a name that is no node
+    /// of the graph is a prompt to fix, and a node this one does not branch to is a graph to fix.
+    #[test]
+    fn a_branch_refused_says_what_was_named_and_why_it_is_not_a_branch() {
+        for (why, word) in [
+            (BranchRefusal::Unknown, "unknown"),
+            (BranchRefusal::Undeclared, "undeclared"),
+        ] {
+            let refused = GraphEvent::BranchRefused {
+                from: name("intake"),
+                named: "two words".to_owned(),
+                why,
+            };
+
+            assert_eq!(refused.name(), "branch_refused");
+            assert_eq!(
+                refused.body(),
+                json!({
+                    "node": "intake",
+                    "next": "two words",
+                    "refusal": word,
+                    "why": why.to_string(),
+                }),
+                "a name no node could hold was not carried as it was named"
+            );
+            assert_eq!(why.name(), word);
+            assert!(
+                !why.to_string().is_empty(),
+                "{word} explains itself to nobody"
+            );
+        }
+    }
+
+    /// A node that did not run is in the stream, because nothing else would account for it.
+    #[test]
+    fn a_node_that_was_skipped_says_which_node_it_was() {
+        let skipped = GraphEvent::NodeSkipped {
+            name: name("escalate"),
+        };
+
+        assert_eq!(skipped.name(), "node_skipped");
+        assert_eq!(skipped.body(), json!({"node": "escalate"}));
+    }
+
     /// A reader that understands a template run's stream understands a graph's.
     #[test]
     fn a_nodes_turn_keeps_its_own_name_and_gains_the_node() {
@@ -449,11 +608,27 @@ mod tests {
                 stopped: Stopped::Answered,
                 spend: Spend::NOTHING,
             },
+            GraphEvent::NodeSkipped {
+                name: name("escalate"),
+            },
             GraphEvent::Turn {
                 node: name("intake"),
                 event: RunEvent::Text {
                     text: "four".to_owned(),
                 },
+            },
+            GraphEvent::BranchTaken {
+                from: name("intake"),
+                to: name("escalate"),
+            },
+            GraphEvent::BranchNotTaken {
+                from: name("intake"),
+                to: name("close"),
+            },
+            GraphEvent::BranchRefused {
+                from: name("intake"),
+                named: "ghost".to_owned(),
+                why: BranchRefusal::Unknown,
             },
             GraphEvent::Done {
                 answer: json!({}),
