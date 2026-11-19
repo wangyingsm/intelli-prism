@@ -111,6 +111,50 @@ impl TryFrom<String> for Prompt {
     }
 }
 
+/// What a caller tells one run on top of what its template says.
+///
+/// Its own type rather than a [`Prompt`], because the two are refused for different reasons and a
+/// caller is owed the right one: a template's prompt is an operator's and is checked when the
+/// template is written, while this arrives per run and is the one part a caller can get wrong
+/// while holding a template that is perfectly good.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct ExtraPrompt(Box<str>);
+
+impl ExtraPrompt {
+    /// Name of this kind, as it appears in errors.
+    pub const KIND: &'static str = "extra prompt";
+
+    /// Validates and wraps what a caller adds to a prompt.
+    pub fn new(raw: &str) -> Result<Self, AgentError> {
+        Self::try_from(raw.to_owned())
+    }
+
+    /// The text itself.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ExtraPrompt {
+    type Error = AgentError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        if raw.is_empty() {
+            return Err(AgentError::Empty { kind: Self::KIND });
+        }
+        if raw.len() > PROMPT_MAX_BYTES {
+            return Err(AgentError::TooLong {
+                kind: Self::KIND,
+                len: raw.len(),
+                max: PROMPT_MAX_BYTES,
+            });
+        }
+        Ok(Self(raw.into_boxed_str()))
+    }
+}
+
 /// How many turns one run may take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "u16")]
@@ -591,6 +635,28 @@ impl AgentConfig {
         self
     }
 
+    /// The same configuration with what a caller added to the prompt, after what it already said.
+    ///
+    /// **After, and separated by a blank line**, so a template's own instruction is what the model
+    /// reads first and the caller's context follows it — and so that whatever the engine appends
+    /// afterwards, the advice naming a node's loop backs and branches, still comes last. The three
+    /// then arrive in the order each was decided: the operator's, the caller's, the graph's.
+    ///
+    /// Fallible where [`AgentConfig::with_prompt`] is not, and that is the whole reason this is a
+    /// method rather than a line at each call site: the two texts are each inside the cap and their
+    /// combination need not be, so the refusal has to name the combination rather than either part.
+    pub fn told_also(self, extra: &ExtraPrompt) -> Result<Self, AgentError> {
+        let combined = format!("{}\n\n{}", self.0.prompt.as_str(), extra.as_str());
+        if combined.len() > PROMPT_MAX_BYTES {
+            return Err(AgentError::TooLong {
+                kind: "prompt and extra prompt together",
+                len: combined.len(),
+                max: PROMPT_MAX_BYTES,
+            });
+        }
+        Ok(self.with_prompt(Prompt::try_from(combined)?))
+    }
+
     /// Every tool it asks for.
     #[must_use]
     pub const fn tool_set(&self) -> &ToolSet {
@@ -852,6 +918,85 @@ mod tests {
             Err(AgentError::TooLong {
                 kind: Prompt::KIND,
                 len: PROMPT_MAX_BYTES + 1,
+                max: PROMPT_MAX_BYTES,
+            })
+        );
+    }
+
+    /// The same two refusals as a prompt's, and each naming *this* kind: a caller holding a good
+    /// template must not be told its prompt is the problem.
+    #[test]
+    fn an_extra_prompt_is_refused_empty_and_past_the_ceiling_under_its_own_name() {
+        assert_eq!(
+            ExtraPrompt::new(""),
+            Err(AgentError::Empty {
+                kind: ExtraPrompt::KIND
+            })
+        );
+
+        let longest = "a".repeat(PROMPT_MAX_BYTES);
+        assert_eq!(ExtraPrompt::new(&longest).unwrap().as_str(), longest);
+
+        let over = "a".repeat(PROMPT_MAX_BYTES + 1);
+        assert_eq!(
+            ExtraPrompt::new(&over),
+            Err(AgentError::TooLong {
+                kind: ExtraPrompt::KIND,
+                len: PROMPT_MAX_BYTES + 1,
+                max: PROMPT_MAX_BYTES,
+            })
+        );
+    }
+
+    /// The order the ruling asked for, and that a blank line separates the two.
+    #[test]
+    fn what_a_caller_adds_follows_what_the_template_already_said() {
+        let told = AgentConfig::new(parts())
+            .unwrap()
+            .told_also(&ExtraPrompt::new("The manifest table has a checksum column.").unwrap())
+            .unwrap();
+
+        assert_eq!(
+            told.prompt().as_str(),
+            "You are a helpful assistant.\n\nThe manifest table has a checksum column."
+        );
+    }
+
+    /// What the engine appends afterwards still comes last, which is what makes the order the three
+    /// were decided in — the operator's, the caller's, the graph's — the order a node reads.
+    #[test]
+    fn the_engines_own_advice_still_lands_after_both() {
+        let told = AgentConfig::new(parts())
+            .unwrap()
+            .told_also(&ExtraPrompt::new("Context.").unwrap())
+            .unwrap();
+        let advised = told.clone().with_prompt(
+            Prompt::new(&format!("{}\n\nYou may send work back.", told.prompt().as_str())).unwrap(),
+        );
+
+        assert!(
+            advised.prompt().as_str().ends_with("You may send work back."),
+            "{}",
+            advised.prompt().as_str()
+        );
+        assert!(advised.prompt().as_str().contains("\n\nContext.\n\n"));
+    }
+
+    /// Two texts each inside the cap whose combination is not, which is the one refusal this method
+    /// exists to name rather than leave to `Prompt`.
+    #[test]
+    fn a_combination_past_the_ceiling_is_refused_as_the_combination() {
+        let whole = "a".repeat(PROMPT_MAX_BYTES);
+        let mut asked = parts();
+        asked.prompt = Prompt::new(&whole).unwrap();
+        let extra = ExtraPrompt::new(&whole).unwrap();
+
+        assert_eq!(
+            AgentConfig::new(asked).unwrap().told_also(&extra),
+            Err(AgentError::TooLong {
+                kind: "prompt and extra prompt together",
+                // The blank line between them counts, because it is sent.
+                len: PROMPT_MAX_BYTES * 2 + 2,
                 max: PROMPT_MAX_BYTES,
             })
         );
