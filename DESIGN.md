@@ -65,6 +65,24 @@ with interfaces can import into it.
 - Graph RAG: a mechanism for users/agents to quickly fetch the Field knowledges to enhance LLM generation.
 - Graph directed agent run: still `drsg` storage of run graph, automatically deal with dependencies/subagents spawn/inner run loop,
 etc.
+- A corpus is described as a *retriever*, managed over `/_ip/retrievers` and owned by one tenant the way an agent
+template is, because a collection holds that tenant's documents where an MCP endpoint is the deployment's. It names a
+backend — a dr-strange plane, with a label and the property holding its embeddings, or a qdrant collection — an
+endpoint, an optional credential, which of five tools it offers, a ceiling on how many hits one look-up may answer
+with, and a `meta` schema describing the payload fields a filter may narrow by.
+- The five tools are `search`, `neighbors`, `rank`, `relate` and `cluster`, each declared to a model as its own tool
+with its own schema, so nothing is ever asked to fill in a parameter belonging to a different algorithm. A collection
+answers `search` alone; the other four walk edges, which only a graph has, and a collection asked for one is refused
+when the retriever is written.
+- **The query is embedded by this deployment's own `[semantic]` artefact and the backend is handed a vector.** No
+retrieval verb that spends a credential of the store's own is used — not `plane.hybrid`, not `plane.ask` — because a
+run may not spend a key the usage rows cannot see, the prices cannot price and the limits cannot cap. A width that
+disagrees with ours is refused when the retriever is registered, not when a run searches: two models' vectors compared
+answer a plausible wrong answer rather than an error.
+- A retriever is addressed as `retriever.tool` in a tool set, beside `server.tool` for MCP, and a name held by both
+registries is refused rather than resolved. A look-up that cannot be made is a failed tool result carrying why, never
+the end of a run. What it found is one json object per line, the id first because that is what a further look-up is
+addressed by.
 
 #### Configuration
 
@@ -498,6 +516,7 @@ endpoint. The system cache and the request/response cache come first.
 - A generation — every node whose dependencies are met — runs at once, and the graph answers with every node nothing reads from, keyed by name.
 - An edge may carry an optional `condition`, a sentence saying when it is worth taking. a node with conditional edges out of it is told them and chooses in its own answer, eg, `{"branch": ["escalate"]}`, naming one of them, several or none. an edge nobody named delivers nothing, a node nothing delivered to is skipped along with everything only it fed, and a node that names none of its branches ends the run with its own answer.
 - A graph may declare loop backs, each a `{from, to, cap}`: the `from` node may answer `{"loop_back": "survey", "notes": "…"}`, and up to the cap that target and everything after it runs again, reading what the asker said under `$again`. loop backs are the only cycles permitted — the topological sort and the acyclicity check are over the feeding edges alone.
+- A node may name tools of its own, which are *added* to its template's rather than replacing them, so one template can serve two nodes that look different things up. a name in both is one tool and not a collision, and the union is refused only where it is over the template cap. there is no wildcard: what a node may ask for is always a list somebody wrote. a node's tools are stored in the plane with the node, and a worker running a dispatched node reads them from the plane both machines share rather than from the dispatch, for the reason the loop backs are read that way.
 - Invoking a graph run is just a API endpoint call, say `POST /_ip/graph_run/1` with init_message and option extra_prompt, which reach every node nothing feeds. the graphs themselves are managed over `/_ip/graphs`.
 
 ### Web UI

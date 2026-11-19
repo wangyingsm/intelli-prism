@@ -75,6 +75,17 @@ is a machine with a gateway on it like the rest — and a node sent elsewhere st
 events a local one says, the member authenticating itself with a shared cluster secret and
 building the caller's authority from its own reads, so a dispatch buys the right to say which run
 a node belongs to and never what that caller may do.
+- **Looking a fact up, over a graph or a vector store.** A corpus is registered over
+`/_ip/retrievers` — a `dr-strange` plane or a `qdrant` collection, belonging to one tenant — and
+becomes tool addresses a template or a graph node may ask for: `search` for what is nearest,
+`neighbors`, `rank`, `relate` and `cluster` for what a graph holds and a collection has not got. A
+graph node may name retrievers of its own on top of its template's, so one template serves two
+nodes that read different things. The query is embedded by this deployment's own `[semantic]`
+artefact and the backend is handed numbers, never words and never a key, so nothing is spent
+anywhere the usage rows cannot see it; a corpus whose vectors are another model's width is refused
+while the operator is reading the answer rather than at search time. What comes back is one json
+object a line, id first, and a look-up that goes wrong is a failed tool result the model is told
+about rather than the end of the run.
 - **Two storage backends.** sqlite for a single node, postgres for a cluster, behind one trait and
 one conformance suite so neither drifts from the other.
 - **Two cache backends.** sled for a single node, redis for a cluster, same arrangement. The
@@ -116,6 +127,7 @@ examples/loop-back/run.sh                                # a graph that doubles 
 examples/branch/run.sh                                   # one node choosing between three ways out
 examples/loop-and-branch/run.sh                          # a loop back and a branch in one graph
 examples/cluster-run/run.sh                              # the same, across three machines
+examples/retrieval/run.sh                                # looking a fact up, over both backends
 ```
 
 `examples/graph-run` runs a graph that writes a merge sort in Rust and in Go, benchmarks each and
@@ -147,6 +159,15 @@ three. It needs a postgres and a redis as well, since a cluster is machines that
 a cache. The recorded run beside it shows which member ran each node — the coordinator included,
 since it is a candidate for its own work — and the four answers left in the shared cache under the
 run that paid for them.
+
+`examples/retrieval` puts one corpus of twelve pages into both a qdrant collection and a
+dr-strange plane, embedded by the deployment's own artefact, and asks the same question of each
+through two graphs that differ only in the tools their `look` node names. It needs a qdrant — it
+starts one in docker — and `IP_EMBED_ARTIFACT` beside the key. Its README keeps what three real
+runs found, including the one that matters most: a node was handed a different node's answer by the
+semantic cache, because that cache's question is the conversation's opening text and does not
+include the tools declared with it, and the embedder a look-up needs cannot be configured without
+that cache.
 
 ## Status
 

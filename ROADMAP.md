@@ -662,6 +662,9 @@ deleted after a graph names it, so "every node names a template that exists" is 
 this store can hold; checking it at write time would buy an early error for a typo, charge an
 ordering constraint for it, and still let the reference rot. The run is where the check can mean
 something.
+- **A node may name tools of its own**, which are added to its template's rather than replacing
+them, so one template can serve two nodes that reach different things. See *Looking a fact up*
+below, which is what it was built for.
 
 ### Running a graph across a cluster
 
@@ -721,8 +724,133 @@ node here. A stop that cannot be published is a warning. A cache that cannot ans
 rather than refusing it. The alternative in each case is a cluster whose degraded parts stop graph
 runs that would otherwise have finished.
 
+### Looking a fact up
+
+`/_ip/retrievers` manages the corpora a run may read: a `dr-strange` plane or a `qdrant`
+collection, each named, each offering some of five tools, and each a tool address a template or a
+graph node may ask for. A retriever is written `PUT /_ip/retrievers/{id}?tenant=acme` and read back
+without its credential.
+
+- **A retriever is a tenant's, which breaks the MCP precedent deliberately.** An MCP endpoint is
+the deployment's, because a tool server is infrastructure; a collection holds one tenant's
+documents, so one id names a different corpus in each tenant and every read filters on the owner,
+the way a template and a stored plugin do. A retriever with no tenant is the deployment's own, and
+only a sysadmin manages those. **The capability is `SysAgent` and deliberately not a new one**, for
+the reason a graph's is not: a retriever is what a template looks something up in, so whoever may
+write the templates may describe what they read. It governs reading too — an endpoint and a payload
+schema say where a tenant keeps its documents, which is not something every member of it needs.
+- **It is a built-in tool source rather than another MCP server.** The drsg half is new read verbs
+on the client this deployment already holds for its graphs, the qdrant half is a REST client of our
+own, and both are declared beside MCP tools in one toolbox, so a model cannot tell them apart. The
+reason is a credential: **one drsg token collapses that store's access tiers**, and ours has to be
+write-capable to keep graphs at all — behind an MCP server a model would reach every write verb the
+token can. Here it reaches five read verbs and no others, and the payload schema an operator
+describes stays inside this api instead of being configured in a second place.
+- **Five tools, declared per retriever, and one tool per thing it can be asked.** `search` for what
+is nearest, `neighbors` for what is joined to a hit, `rank` for what is most joined to, `relate`
+for how two things connect, `cluster` for what groups they fall in. Not `toposort` or `cycles`:
+those answer whether a graph is a DAG, which is the run engine's own business. Never one tool with
+a mode flag, because a model filling in a parameter that applies to one algorithm and not another
+gets it wrong and every mistake costs a paid turn — so a search is shown a query and a filter, a
+relate is shown two ids, and neither is shown the other's fields. What the operator decides is
+which are offered, how many hits one look-up may answer with, and which payload fields a filter may
+name; a collection asked for a tool that needs edges is refused when it is written, since a vector
+store answers what is nearest and nothing else.
+- **A query is embedded by this deployment's own artefact, and a backend is never handed words.**
+`plane.search` takes a vector, so the thing that embeds is the thing that calls: there is no second
+credential, nothing is spent anywhere this gateway cannot meter, and a build without `--features
+semantic` can hold no searchable retriever at all. The embedder is the `[semantic]` one, which is
+also the semantic cache's — see the caveat.
+- **A backend's width is measured while the operator is reading the answer, not during a run they
+are paying for.** Two models' vectors compared answer a plausible wrong answer rather than an
+error; nothing in a cosine says the two came from different models. So a `search` offered by a
+deployment that embeds nothing is refused, a width that disagrees with ours is refused and says
+both numbers, and a backend that cannot be reached is a 503 and worth retrying. A collection
+declares its width; a plane reports none and is measured by reading what it holds. The answer to
+the write says what was measured, and no answer after it does — the width is not stored, so a later
+read would be repeating what was true once.
+- **A graph node may name tools of its own, added to its template's.** One template can then serve
+two nodes that look different things up; a name in both is one tool and not a collision, and the
+union is refused only where it is over the cap. There is no wildcard — no `kb.*` — so what a node
+may ask for is always a list somebody wrote. A node's tools are written in the plane with the node,
+and **a worker running a dispatched node reads them from the plane both machines share** rather
+than being sent them, for the reason the loop backs are read that way: a dispatch that carried them
+could carry tools the graph does not say.
+- **A look-up that goes wrong never ends a run.** Arguments that will not read, words the encoder
+will not commit to, a plane that refuses the token: each is a tool result the model is told failed,
+carrying the whole sentence, because a model told only "it failed" asks the same thing again — and
+one told what was wrong fixes the arguments and often asks again correctly. Nothing matching is not
+a failure at all: it answers `nothing matched` in words, since an empty list reads to a model as a
+tool that broke.
+- **What was found is one json object per line, id first.** `{"id":…,"score":…,"found":…}` — the id
+first because that is what a further look-up is addressed by, the payload as json because what it
+holds is the operator's own and prose would mean inventing a shape for it, and the score kept as
+the `f32` the store scored it with rather than widened, which would spend a dozen tokens a row
+printing the binary expansion of a number good to seven digits. A row the verb scored not at all
+carries no score rather than a null one. A plane's embedding crosses back as a marker saying how
+many numbers it left out, so 384 floats never land in a prompt.
+- **A look-up does not go through the gateway, and that is worth saying because every other
+outbound call in a run does.** A node's turns are routed, filtered, cached, metered, priced and
+limited; a look-up is none of those, because it is not a model turn — it spends no provider tokens
+and there is nothing to price. What bounds it is the retriever's own hit ceiling and the turn count
+that already bounds the loop, and what it costs is paid on the turns after it, since every row it
+answered stays in the conversation. That is why the declaration a model reads tells it to ask for
+fewer hits where fewer will do.
+- **Nothing holds a retriever in memory, so a write publishes no revision.** Every other management
+write moves a revision on and each node rebuilds what it holds; whatever runs a node reads this
+table when a tool it was given names a retriever. Its absence is a decision rather than an
+omission.
+
 ## Shipped with a caveat
 
+- **`plane.hybrid` and `plane.ask` are not built, and that is the price of the metering
+guarantee.** They are the best retrieval verbs dr-strange has — one blends vector and keyword
+scoring, the other answers a question from the plane — and each spends drsg's *own* embedding or
+chat key. A run may not spend a key this deployment cannot see: there would be no usage row, no
+price to apply and no limit that could cap it, which is the guarantee this gateway exists for.
+What is offered instead is `search` over a vector we embedded and the four verbs that walk edges.
+- **A plane's width is unknowable until it holds a vector, so a plane registered empty is accepted
+unmeasured.** No dr-strange verb reports a property's dimension; the only place the number appears
+is the marker a read answers a vector as, so registration reads a handful of nodes and measures the
+first vector it finds. A plane holding none under that property is not a disagreement and is not
+refused — the api says so in the `measured` note — and what follows is that a corpus embedded
+afterwards by another model is never caught. **A dimension mismatch at search time is silent**: an
+empty answer covers a plane with no embeddings, a width that does not match and nothing near enough
+to answer with, alike, and no verb tells them apart.
+- **Retrieval cannot be had without the semantic cache, and that cache does not know about tools.**
+The embedder a look-up needs is configured by the `[semantic]` stanza, which exists to switch the
+third cache level on; there is no way to have one without the other. A node's turn is an ordinary
+request as far as the gateway is concerned, so it passes that cache like any other — and what the
+cache asks by is the conversation's **opening text**, with the tools declared alongside it left
+out. Two nodes given the same prompt and different tools are therefore one question to it, and a
+higher threshold does not help: at `nearness = 1.0` `examples/retrieval` had a node handed another
+node's answer, including a call to a tool that node did not hold. The run recovered, because a tool
+that is not there is a failed result and not an error, but the answer was not the one that node
+would have given.
+- **A plane holds a vector only if it is written in the `$vector` dialect.** Written as a plain
+array of numbers it is accepted, stored, and read back as exactly that array — and indexed as
+nothing, so every search over it answers an empty list. Not an error: an empty answer, which is
+also what the two cases above look like. Writing a corpus is outside this gateway, so this is a
+caveat about the store rather than about our code, and it is the one mistake in this area that
+fails silently in all three directions at once.
+- **A corpus must be embedded the way this gateway embeds, query prefix and all.** The manifest's
+`query_prefix` is applied to everything the artefact is given, so a corpus prepared with a
+passage prefix — which is what the e5 family was trained for — sits in a slightly different
+geometry from the queries searching it, and the scores come back looking perfectly reasonable.
+Matching what the gateway does matters more than being right about the model.
+- **Three of the five answer ids rather than records.** `rank`, `cluster` and `relate` carry no
+properties, because that is the shape of the store's answer: a ranking and a clustering are ids and
+scores, and hydrating them would be one call per row. The declaration a model reads says so and
+points it at `neighbors`, which does hydrate.
+- **A plane's search is scored by cosine and cannot be told otherwise.** A retriever says which
+property holds the embeddings and nothing about how they are compared, because the verb takes
+nothing about it: a corpus written for dot product or `l2` is searched by cosine anyway. A
+collection carries its own metric, so this is a caveat about one of the two backends, and the
+answer is to write the corpus for cosine — which is what `examples/retrieval/seed.py` does, on both.
+- **A retriever's credential is unencrypted at rest.** It is written and never reported back — the
+type has no `Serialize`, its `Debug` prints nothing of the value, and it is zeroized when dropped —
+but the column holds it in the clear, so the database is as sensitive as the keys in it. Exactly as
+with an MCP server's token, and for the same missing piece: a key the deployment manages.
 - **A dispatched node weakens "everything that can refuse is settled before the 200".** For a
 node that runs here that invariant holds: every template, model, target and tool set is resolved
 before the stream opens. A node that runs on another member is resolved *there*, after the stream
@@ -1063,7 +1191,12 @@ nowhere for an operator to declare a share.
 ### Persistence beyond configuration
 
 - Facts and chat session history as long term memory.
-- Knowledge and RAG with a graph run.
+- Importing a corpus. A retriever reads a plane or a collection and nothing here puts documents in
+one: whoever runs this embeds and writes their own, with the artefact this deployment was
+configured with and in the dialect the store wants. `examples/retrieval/seed.py` is what that takes
+and is an example rather than a feature.
+- Retrieval the gateway pays for on a model's behalf: `plane.hybrid` and `plane.ask`, which need a
+way to meter a key held by the store. See the caveat.
 
 ### Web UI
 
