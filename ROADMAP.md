@@ -1170,13 +1170,18 @@ default and the wrong answer for a deployment whose routes differ in what a near
 
 ### System agents and run graph
 
-- Something that runs a template: the sandbox mounted, the tool set resolved, the turns taken and
-the time limit enforced. The templates themselves are shipped, above.
+- **The sandbox mounted**, which is the one part of running a template that is left. The rest of
+what this entry used to ask for — the tool set resolved, the turns taken, the time limit enforced,
+and agent traffic going through the gateway so it is authenticated, authorized and processed like
+any other request — shipped at M24 and is described under *Running what an agent template
+describes* above. The entry stood here unchanged afterwards and said this was unbuilt while that
+section said it was built; it is corrected rather than deleted so that the next reader knows which
+of the two to believe.
 - Ip-VFS: a virtual file system over object storage that agents see as ordinary paths, with a new
 version per mutation and a CLI to sync up and down.
-- The preset tool set (core utilities, python, js/ts, bash) and optional MCP tools, all sandboxed.
-- Agent traffic routed through the gateway itself, so it is authenticated, authorized and processed
-like any other request.
+- The preset tool set — core utilities, python, js/ts, bash — all sandboxed. The optional MCP tools
+this entry used to name beside them shipped at M24; what is left is the presets, which need the
+sandbox above.
 - Least-loaded placement across a cluster. A coordinator picks the member a node runs on at
 random or each in turn, and both spread work without ever measuring it: a member publishes a
 heartbeat and nothing else, so there is no load to be the least of. Doing it means a member
