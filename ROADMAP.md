@@ -871,6 +871,25 @@ sandbox remains a description waiting for Ip-VFS.
 stored, checked against each other — a strategy named without the flag is refused — and answered
 back unchanged, as at M23: the loop does not consult them. They are in the api now so that a
 template written today needs no rewriting when something does.
+- **`role` is carried and read by nothing either**, which is the same shape as the pair above and
+was not written down until M30's close. It is stored, refused where it is not a role this code
+knows, and answered back; the loop then puts the prompt in the conversation's `system` field and the
+run's input as a user message, whatever the field says. So a template declaring `role: "user"` runs
+exactly like one declaring `role: "system"`. What it would mean to honour it is a design question
+rather than a missing line — a prompt sent as a user message is a different conversation, not a
+differently labelled one — which is why it is recorded here rather than fixed.
+- **A run takes no `extra_prompt`, though `DESIGN.md` asks for one.** Starting a run or a graph run
+carries the input and the model choice and nothing else, so there is no way for a caller to hand a
+run context its templates do not already hold — the schema of a database beside a SQL tool is the
+spec's own example. The *mechanism* is there and used: the engine appends to a node's prompt for
+every loop back and branch it may take, which is the same operation. What is missing is a
+caller-supplied one, and the reason it has not been added is that it would reach every node nothing
+feeds and nothing has decided whether a graph's nodes should all see it.
+- **A template's id is the caller's, not generated.** `DESIGN.md` says `agent_id` is
+auto-generated; `PUT /_ip/agents/{agent}` takes the id in the path, as every other management route
+in this api does, and a graph's nodes name templates by it. The api is the one that shipped and the
+spec line is the stale one — recorded here rather than corrected there, because which of the two
+is wrong is a decision and not an observation.
 - **An MCP token is unencrypted at rest.** It is stored as written and never reported back, but the
 column holds it in the clear, so the database is as sensitive as the tokens in it. Encrypting it
 needs a key the deployment manages, which is not built.
