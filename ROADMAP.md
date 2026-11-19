@@ -867,17 +867,20 @@ it, where a retry would have saved it.
 - **Nothing in the sandbox runs.** A template's file tree is stored, checked and read back, and no
 part of it is mounted, fetched or executed: a run reaches its tools over MCP and nothing else. The
 sandbox remains a description waiting for Ip-VFS.
-- **`use_best_effort` and `best_effort_strategy` are carried and read by nothing.** They are
-stored, checked against each other — a strategy named without the flag is refused — and answered
-back unchanged, as at M23: the loop does not consult them. They are in the api now so that a
-template written today needs no rewriting when something does.
-- **`role` is carried and read by nothing either**, which is the same shape as the pair above and
-was not written down until M30's close. It is stored, refused where it is not a role this code
-knows, and answered back; the loop then puts the prompt in the conversation's `system` field and the
-run's input as a user message, whatever the field says. So a template declaring `role: "user"` runs
-exactly like one declaring `role: "system"`. What it would mean to honour it is a design question
-rather than a missing line — a prompt sent as a user message is a different conversation, not a
-differently labelled one — which is why it is recorded here rather than fixed.
+- **`use_best_effort` and `best_effort_strategy` are carried and read by nothing, and they are
+waiting for a milestone of their own.** They are stored, checked against each other — a strategy
+named without the flag is refused — and answered back unchanged, as at M23: the loop does not
+consult them. What they will switch on is the separate best-effort route described under
+*Intelligent routing, what is left of it*, which is its own piece of work rather than a line the
+loop is missing. They are in the api now so that a template written today needs no rewriting when
+that lands.
+- **`role` changes nothing, and is descriptive by decision rather than unfinished.** It says which
+voice a template's prompt speaks in, which is a fact about the prompt for whoever reads the
+template; no path in this gateway branches on it, and none is meant to. What follows, and is the
+reason it is written here: the run puts the prompt in the conversation's `system` field and the
+input as a user message whatever the field holds, so a template declaring `role: "user"` behaves
+exactly like one declaring `role: "system"`. The api accepts a value that has no effect, which is
+worth knowing before writing a template that relies on one.
 - **A run takes no `extra_prompt`, though `DESIGN.md` asks for one.** Starting a run or a graph run
 carries the input and the model choice and nothing else, so there is no way for a caller to hand a
 run context its templates do not already hold — the schema of a database beside a SQL tool is the
@@ -1171,7 +1174,14 @@ it, but nothing removes it either until a sweep of unowned plugins exists.
 With a trained model rather than a decision tree that is not a code path but a pipeline —
 collecting what the arbiter said, assembling training data, retraining and exporting a new
 artefact — and it is the weight of that pipeline, not a gap in the gateway, that keeps it unbuilt.
-- The best-effort endpoint that asks every upstream and aggregates or picks one. Unrelated to the
+- The best-effort endpoint, **which is a milestone of its own** rather than a gap in another: a
+separate route that classifies nothing, sends the request to every available upstream endpoint and
+waits for all of them, then answers either `aggr`, the responses aggregated, or `one`, the best of
+them chosen by the arbiter — and with `one`, what it chose is a verdict the self-learning above
+could fold back. It is not M10's hedging, which races a request across `N` endpoints behind one
+rule and takes the *first* answer while cancelling the others; this one wants every answer before
+it decides, so the two share the dispatch and nothing else. A template's `use_best_effort` and
+`best_effort_strategy` are carried for it already — see the caveat above. Unrelated to the
 classifier, and unchanged.
 
 ### Semantic cache, what is left of it
