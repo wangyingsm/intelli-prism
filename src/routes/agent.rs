@@ -5,14 +5,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use ip_agents::{AgentConfig, AgentId, AgentName, AgentTemplate, Sandbox};
+use ip_agents::{AgentConfig, AgentId, AgentName, AgentTemplate, ExtraPrompt, Sandbox};
 use ip_core::{Capability, CapabilityScope, TenantId, Timestamp};
 use ip_storage::{AgentOwner, By, NewAgent, StoredAgent};
 
 use axum::response::sse::{Event as SseEvent, Sse};
 use futures_util::StreamExt;
 use ip_core::Protocol;
-use ip_run::{AsWhom, Pinned, Requested, RunError, RunId, RunSignal, Running, Target};
+use ip_run::{AsWhom, Pinned, Requested, RunError, RunId, RunSignal, Running, Target, Toolshed};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{Paged, store_refusal};
@@ -30,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list))
         .route("/{agent}", get(read).put(put).delete(remove))
         .route("/{agent}/run", post(start))
+        .route("/{agent}/run_with_prompt", post(start_told_more))
 }
 
 /// What the audit trail records a template written or removed as having come through.
@@ -196,13 +197,33 @@ struct Start {
     requested: Requested,
 }
 
+/// What starting a run with a prompt of the caller's own is asked for.
+#[derive(Debug, serde::Deserialize)]
+struct StartTold {
+    /// What the agent is being asked to do.
+    input: String,
+    /// What this caller adds to the template's prompt, for this run and no other.
+    extra_prompt: ExtraPrompt,
+    /// Which model, where the request names one rather than taking the template's.
+    #[serde(flatten)]
+    requested: Requested,
+}
+
+/// What one run is started from, however the caller asked for it.
+struct Starting {
+    /// Which template, as the path spells it.
+    id: String,
+    /// Whose templates the request is about.
+    owned: Owned,
+    /// Which model, where the request names one.
+    requested: Requested,
+    /// What the agent is being asked to do.
+    input: String,
+    /// What the caller added to the template's prompt, where it added anything.
+    told: Option<ExtraPrompt>,
+}
+
 /// Runs a stored template, streaming what it does as it does it.
-///
-/// Everything that can refuse a run is settled before the stream opens, so a caller gets a
-/// status code rather than one event saying it went wrong: the template is read, the tools are
-/// resolved against the registry, the servers are opened and the target is worked out, all
-/// first. Once the stream is open the run has begun and every outcome, refusals included,
-/// arrives as a `done` event.
 async fn start(
     State(state): State<AppState>,
     manager: Manager,
@@ -210,71 +231,66 @@ async fn start(
     Query(owned): Query<Owned>,
     Json(asked): Json<Start>,
 ) -> Response<Body> {
-    let id = match AgentId::new(&id) {
-        Ok(id) => id,
-        Err(error) => return *unprocessable(error),
-    };
-    // A run spends money, so it is charged to a tenant rather than to the deployment.
-    let Some(tenant) = owned.tenant.clone() else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "name the tenant this run is charged to",
-        )
-            .into_response();
-    };
-    let tenant = match TenantId::new(&tenant) {
-        Ok(tenant) => tenant,
-        Err(error) => return *unprocessable(error),
-    };
-    let owner = match owner_of(&state, &manager, owned).await {
-        Ok(owner) => owner,
+    begin(
+        state,
+        manager,
+        Starting {
+            id,
+            owned,
+            requested: asked.requested,
+            input: asked.input,
+            told: None,
+        },
+    )
+    .await
+}
+
+/// The same, with context this caller holds and the stored template does not.
+///
+/// A route of its own rather than a field on the one above, so that a caller asking for something
+/// the deployment does not carry is refused by the router rather than by a field being quietly
+/// ignored — and so that a template's own run endpoint keeps the body it has always taken.
+async fn start_told_more(
+    State(state): State<AppState>,
+    manager: Manager,
+    Path(id): Path<String>,
+    Query(owned): Query<Owned>,
+    Json(asked): Json<StartTold>,
+) -> Response<Body> {
+    begin(
+        state,
+        manager,
+        Starting {
+            id,
+            owned,
+            requested: asked.requested,
+            input: asked.input,
+            told: Some(asked.extra_prompt),
+        },
+    )
+    .await
+}
+
+/// Everything both routes do, which is all of it bar where the extra prompt came from.
+///
+/// Everything that can refuse a run is settled before the stream opens, so a caller gets a
+/// status code rather than one event saying it went wrong: the template is read, the tools are
+/// resolved against the registry, the servers are opened and the target is worked out, all
+/// first. Once the stream is open the run has begun and every outcome, refusals included,
+/// arrives as a `done` event.
+async fn begin(state: AppState, manager: Manager, starting: Starting) -> Response<Body> {
+    let settled = match settled(&state, &manager, starting).await {
+        Ok(settled) => settled,
         Err(refusal) => return *refusal,
     };
-    let template = match state.store().agent(&owner, &id).await {
-        Ok(Some(held)) => held.template,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return store_refusal(error),
-    };
-    let authority = match manager.authority(state.store().as_ref(), &tenant).await {
-        Ok(Some(authority)) => authority,
-        Ok(None) => return StatusCode::FORBIDDEN.into_response(),
-        Err(error) => return store_refusal(error),
-    };
-
-    let config = template.config.clone();
-    let pinned = match Pinned::resolve(&asked.requested, &config) {
-        Ok(pinned) => pinned,
-        Err(error) => return *unprocessable(error),
-    };
-    let target = match Target::aimed(
-        state.upstreams(),
-        &pinned,
-        AsWhom {
-            authority,
-            listen: state.listen(),
-            protocol: Protocol::Http,
-        },
-    ) {
-        Ok(target) => target,
-        // Nothing named a model, which is the request's own omission rather than the
-        // deployment's shape, so it is answered as the request's own mistake.
-        Err(error @ RunError::NoModelChosen { .. }) => {
-            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
-        }
-        Err(error) => return *unprocessable(error),
-    };
-    let shed = match toolshed(&state, &owner, config.tool_set()).await {
-        Ok(shed) => shed,
-        Err(Unopened::Storage(error)) => return store_refusal(error),
-        Err(error) => return *unprocessable(error),
-    };
-    let run_id = match RunId::generate() {
-        Ok(id) => id,
-        Err(error) => {
-            tracing::error!(%error, "could not name a run");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let Settled {
+        id: run_id,
+        target,
+        shed,
+        config,
+        pinned,
+        input,
+    } = settled;
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let gateway = state.shared_gateway();
@@ -290,7 +306,7 @@ async fn start(
                 reporting: &sender,
                 signals: &RunSignal::never(),
             },
-            &asked.input,
+            &input,
         )
         .await;
     });
@@ -302,6 +318,106 @@ async fn start(
         )
     }))
     .into_response()
+}
+
+/// Everything one run needs, resolved while a status code can still be answered.
+struct Settled {
+    /// What this run is called.
+    id: RunId,
+    /// Which endpoint its turns go to.
+    target: Target,
+    /// Everything it may call, opened.
+    shed: Toolshed,
+    /// What it runs under, the caller's own prompt folded in already.
+    config: AgentConfig,
+    /// Which model was settled on, and how.
+    pinned: Pinned,
+    /// What it is being asked to do.
+    input: String,
+}
+
+/// Settles everything that can refuse, so the stream only ever opens on a run that has begun.
+async fn settled(
+    state: &AppState,
+    manager: &Manager,
+    starting: Starting,
+) -> Result<Settled, Refusal> {
+    let Starting {
+        id,
+        owned,
+        requested,
+        input,
+        told,
+    } = starting;
+    let id = AgentId::new(&id).map_err(unprocessable)?;
+    // A run spends money, so it is charged to a tenant rather than to the deployment.
+    let Some(tenant) = owned.tenant.clone() else {
+        return Err(Box::new(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "name the tenant this run is charged to",
+            )
+                .into_response(),
+        ));
+    };
+    let tenant = TenantId::new(&tenant).map_err(unprocessable)?;
+    let owner = owner_of(state, manager, owned).await?;
+    let template = match state.store().agent(&owner, &id).await {
+        Ok(Some(held)) => held.template,
+        Ok(None) => return Err(Box::new(StatusCode::NOT_FOUND.into_response())),
+        Err(error) => return Err(Box::new(store_refusal(error))),
+    };
+    let authority = match manager.authority(state.store().as_ref(), &tenant).await {
+        Ok(Some(authority)) => authority,
+        Ok(None) => return Err(Box::new(StatusCode::FORBIDDEN.into_response())),
+        Err(error) => return Err(Box::new(store_refusal(error))),
+    };
+
+    let config = template.config.clone();
+    // Folded in here, before anything is resolved from it, so that what the run holds is one
+    // configuration rather than a stored one and a correction travelling beside it.
+    let config = match told {
+        Some(extra) => config.told_also(&extra).map_err(unprocessable)?,
+        None => config,
+    };
+    let pinned = Pinned::resolve(&requested, &config).map_err(unprocessable)?;
+    let target = match Target::aimed(
+        state.upstreams(),
+        &pinned,
+        AsWhom {
+            authority,
+            listen: state.listen(),
+            protocol: Protocol::Http,
+        },
+    ) {
+        Ok(target) => target,
+        // Nothing named a model, which is the request's own omission rather than the
+        // deployment's shape, so it is answered as the request's own mistake.
+        Err(error @ RunError::NoModelChosen { .. }) => {
+            return Err(Box::new(
+                (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+            ));
+        }
+        Err(error) => return Err(unprocessable(error)),
+    };
+    let shed = match toolshed(state, &owner, config.tool_set()).await {
+        Ok(shed) => shed,
+        Err(Unopened::Storage(error)) => return Err(Box::new(store_refusal(error))),
+        Err(error) => return Err(unprocessable(error)),
+    };
+    let id = RunId::generate().map_err(|error| {
+        tracing::error!(%error, "could not name a run");
+        Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    })?;
+
+    Ok(Settled {
+        id,
+        target,
+        shed,
+        config,
+        pinned,
+        input,
+    })
 }
 
 /// Whose templates this caller may manage, or what it is told when it may manage none.
@@ -1027,6 +1143,46 @@ upstream_speaks = "anthropic"
         (super::super::router(state.clone()), state)
     }
 
+    /// The same upstream, keeping what each turn was sent, so a test can read the prompt a run
+    /// really went out under rather than the one it was configured with.
+    struct Recording(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+    #[async_trait::async_trait]
+    impl ip_gateway::upstream::Upstream for Recording {
+        async fn send(
+            &self,
+            request: axum::http::Request<ip_gateway::body::GatewayBody>,
+        ) -> Result<axum::http::Response<ip_gateway::body::GatewayBody>, ip_gateway::UpstreamError>
+        {
+            use http_body_util::BodyExt;
+            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+            self.0
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&bytes).unwrap());
+            Answering.send(stub_request()).await
+        }
+    }
+
+    /// A request for `Answering` to answer, which it does not read.
+    fn stub_request() -> axum::http::Request<ip_gateway::body::GatewayBody> {
+        axum::http::Request::builder()
+            .body(ip_gateway::from_bytes(Bytes::new()))
+            .unwrap()
+    }
+
+    /// The fixture above, over an upstream that keeps what it was sent.
+    async fn recording_fixture() -> (Router, AppState, Arc<std::sync::Mutex<Vec<serde_json::Value>>>)
+    {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = super::super::harness::serving(
+            store().await,
+            SERVING,
+            Arc::new(Recording(Arc::clone(&sent))),
+        );
+        (super::super::router(state.clone()), state, sent)
+    }
+
     /// Stores a template under a tenant, overwriting whatever the fixture put there.
     async fn template_asking(state: &AppState, tools: &[&str]) {
         let mut stored = template("acme-triage", "Acme's");
@@ -1076,6 +1232,96 @@ upstream_speaks = "anthropic"
             Some(r#"{"input":"how many?"}"#),
         )
         .await
+    }
+
+    /// Ruling 3, end to end: what the caller added reaches the model, after the template's own
+    /// instruction and separated from it, and the stored template is not touched by it.
+    #[tokio::test]
+    async fn a_run_told_more_sends_both_prompts_and_leaves_the_template_alone() {
+        let (router, state, sent) = recording_fixture().await;
+        template_asking(&state, &[]).await;
+
+        let response = send(
+            &router,
+            &state,
+            "POST",
+            "alice",
+            "/_ip/agents/acme-triage/run_with_prompt?tenant=acme",
+            Some(r#"{"input":"how many?","extra_prompt":"The table has a checksum column."}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(streamed(response).await, ["turn", "text", "done"]);
+
+        let turns = sent.lock().unwrap().clone();
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert_eq!(
+            turns[0]["system"],
+            "Be helpful.\n\nThe table has a checksum column."
+        );
+
+        let held = state
+            .store()
+            .agent(
+                &AgentOwner::Tenant(tenant("acme")),
+                &AgentId::new("acme-triage").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.template.config.prompt().as_str(),
+            "Be helpful.",
+            "a run's own prompt was written back to the template"
+        );
+    }
+
+    /// The ordinary route is unchanged by the one above, and names the field nowhere.
+    #[tokio::test]
+    async fn a_run_not_told_more_sends_the_templates_prompt_alone() {
+        let (router, state, sent) = recording_fixture().await;
+        template_asking(&state, &[]).await;
+
+        let response = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/agents/acme-triage/run?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(streamed(response).await, ["turn", "text", "done"]);
+        assert_eq!(sent.lock().unwrap()[0]["system"], "Be helpful.");
+    }
+
+    /// An extra prompt its own type refuses is the caller's mistake, and is answered before
+    /// anything is read: the extractor never builds one.
+    #[tokio::test]
+    async fn an_extra_prompt_that_is_not_one_is_refused_before_the_run() {
+        let (router, state) = running_fixture().await;
+
+        for body in [
+            r#"{"input":"how many?","extra_prompt":""}"#,
+            r#"{"input":"how many?"}"#,
+        ] {
+            let response = send(
+                &router,
+                &state,
+                "POST",
+                "alice",
+                "/_ip/agents/acme-triage/run_with_prompt?tenant=acme",
+                Some(body),
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body} was taken"
+            );
+        }
     }
 
     /// Every `event:` line a stream carried, in the order it carried them.
