@@ -545,6 +545,14 @@ it spent. A call and its result are two events because the tool runs between the
 nothing until the result would learn what was asked for only once it no longer mattered. Everything
 that can refuse a run is settled before the stream opens, so a refusal is a status code rather than
 one event inside a 200.
+- **A caller may add a prompt of their own**, at `POST /_ip/agents/{agent}/run_with_prompt`, which
+takes an `extra_prompt` beside the input and folds it in after the template's own instruction —
+`DESIGN.md`'s own example is a database's schema beside a SQL tool, which the caller knows and the
+operator who wrote the template did not. A route of its own rather than a field on the one above, so
+a deployment that does not carry the feature refuses the request at the router instead of ignoring a
+field; the stored template is never touched, and the combination is refused if the two together pass
+the 32 KiB a prompt may hold. It is the same operation the engine already performs when it tells a
+node what its graph lets it ask for.
 
 ### Run graphs
 
@@ -604,6 +612,18 @@ What the run comes to holds the last attempt of each node, while every attempt i
 Every ask is answered there, the refused ones too (`unknown`, `undeclared`, `spent`,
 `unreachable`), and a refusal leaves the answer the node gave standing rather than failing the run.
 A node that stopped the graph does not also get to ask.
+- **A caller may give the first nodes a prompt of their own.** `POST
+/_ip/graph_run/{graph}/with_prompt` takes an `extra_prompt` beside the input, and every node nothing
+feeds is told it — after its template's instruction, before whatever the graph lets it ask for, so
+the three arrive in the order they were decided. A node *with* a parent gets none of it, which is a
+decision and not an omission: what a node partway down should carry is for the model running its
+parent to say, dynamically, and that is the piece still owed. **This one is carried over a dispatch
+rather than derived from the plane**, which is the exact opposite of the loop-back instruction above
+and worth the contrast: what a node may *ask for* is the graph's to declare, so a member reads it
+and takes nobody's word for it, while the caller's own words are not a graph fact and a member has
+no other way to learn them — a coordinator able to lie about this could already lie about the input.
+Without that field a clustered run would have folded the prompt or not depending on which machine
+the strategy picked, which is the kind of divergence nothing would have reported.
 - **Which steps run after a node can be the node's own choice.** An edge may carry a `condition` —
 a sentence saying when it is worth taking, at most 512 bytes because every condition a node
 declares is appended to that node's prompt — and a node with conditional edges out of it is told
@@ -881,13 +901,15 @@ reason it is written here: the run puts the prompt in the conversation's `system
 input as a user message whatever the field holds, so a template declaring `role: "user"` behaves
 exactly like one declaring `role: "system"`. The api accepts a value that has no effect, which is
 worth knowing before writing a template that relies on one.
-- **A run takes no `extra_prompt`, though `DESIGN.md` asks for one.** Starting a run or a graph run
-carries the input and the model choice and nothing else, so there is no way for a caller to hand a
-run context its templates do not already hold — the schema of a database beside a SQL tool is the
-spec's own example. The *mechanism* is there and used: the engine appends to a node's prompt for
-every loop back and branch it may take, which is the same operation. What is missing is a
-caller-supplied one, and the reason it has not been added is that it would reach every node nothing
-feeds and nothing has decided whether a graph's nodes should all see it.
+- **A caller's `extra_prompt` reaches a graph's first nodes and no others.** `POST
+/_ip/agents/{agent}/run_with_prompt` and `POST /_ip/graph_run/{graph}/with_prompt` take a prompt of
+the caller's own beside the input, and it is folded in after the template's own instruction and
+before whatever the engine adds, so a node reads the operator's words, then the caller's, then what
+its graph lets it ask for. An agent run has one prompt and the question does not arise. A graph run
+gives it only to the nodes nothing feeds: a node with a parent is left alone, because what *it*
+should carry is a decision for the model running its parent, and that is not built. So a graph three
+steps deep can be given context at its roots and nowhere else, which is the limit to know before
+relying on it. What makes it dynamic rather than a field on a graph is deliberate and still owed.
 - **An MCP token is unencrypted at rest.** It is stored as written and never reported back, but the
 column holds it in the clear, so the database is as sensitive as the tokens in it. Encrypting it
 needs a key the deployment manages, which is not built.
@@ -1201,6 +1223,20 @@ any other request — shipped at M24 and is described under *Running what an age
 describes* above. The entry stood here unchanged afterwards and said this was unbuilt while that
 section said it was built; it is corrected rather than deleted so that the next reader knows which
 of the two to believe.
+- **A node deciding what the nodes it feeds should carry.** A caller's `extra_prompt` reaches a
+graph's roots today and stops there, because a node with a parent has somebody better placed to
+speak for it: the model that just ran that parent, which has seen the work. So a node would be told
+it may write context for the steps after it, and whatever it writes is passed to them — the
+`loop_back` and `branch` mechanism a third time. Four things are undecided and want rulings before
+any code: whether a node with several parents is handed each one's words keyed by parent as its
+input already is, or them concatenated; what becomes of the text when a node answers a loop back in
+the same breath, since the nodes it feeds are then not what runs next; whether a dispatched node's
+answer carries it back over the stream, which is the one part that touches the cluster; and what the
+advice costs, since it is appended to every node that feeds anything. One design rule is settled in
+advance: the engine must never *ask* whether to pass something on. M29 measured that a model asked
+whether a condition holds is far less reliable than one asked which of several applies, and "should
+I pass this down?" is the weak form — so a node is told it may write context, writing nothing is the
+default, and no yes/no is ever put to it.
 - Ip-VFS: a virtual file system over object storage that agents see as ordinary paths, with a new
 version per mutation and a CLI to sync up and down.
 - The preset tool set — core utilities, python, js/ts, bash — all sandboxed. The optional MCP tools

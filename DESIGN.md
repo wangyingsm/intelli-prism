@@ -490,7 +490,7 @@ endpoint. The system cache and the request/response cache come first.
   - req_timeout: an integer for the maximum request timeout in seconds the agent/subagent can wait for a response from upstream LLM, eg, 10, etc.
   - use_best_effort: a boolean for whether the agent/subagent should use the best effort run endpoint, eg, true, false.
   - best_effort_strategy: an optional string of the best effort run strategy, eg, `aggr`, `one`.
-- The initialization of the template needs a init_chat_message string and an optional extra_prompt string. the latter is to provide additional messages for the LLM to a better understanding of the context. eg, to privide the data schema of a DB additional to system SQL tools.
+- Starting a run needs an input string, and may carry an extra_prompt of the caller's own. the latter is to provide additional context for the LLM to a better understanding, eg, the data schema of a DB additional to system SQL tools. it is the caller's rather than the template's, so it is taken by a route of its own — `POST /_ip/agents/{agent}/run_with_prompt` — and appended after the template's prompt, leaving the stored template untouched.
 
 #### Sandboxing
 
@@ -517,7 +517,7 @@ endpoint. The system cache and the request/response cache come first.
 - An edge may carry an optional `condition`, a sentence saying when it is worth taking. a node with conditional edges out of it is told them and chooses in its own answer, eg, `{"branch": ["escalate"]}`, naming one of them, several or none. an edge nobody named delivers nothing, a node nothing delivered to is skipped along with everything only it fed, and a node that names none of its branches ends the run with its own answer.
 - A graph may declare loop backs, each a `{from, to, cap}`: the `from` node may answer `{"loop_back": "survey", "notes": "…"}`, and up to the cap that target and everything after it runs again, reading what the asker said under `$again`. loop backs are the only cycles permitted — the topological sort and the acyclicity check are over the feeding edges alone.
 - A node may name tools of its own, which are *added* to its template's rather than replacing them, so one template can serve two nodes that look different things up. a name in both is one tool and not a collision, and the union is refused only where it is over the template cap. there is no wildcard: what a node may ask for is always a list somebody wrote. a node's tools are stored in the plane with the node, and a worker running a dispatched node reads them from the plane both machines share rather than from the dispatch, for the reason the loop backs are read that way.
-- Invoking a graph run is just a API endpoint call, say `POST /_ip/graph_run/1` with init_message and option extra_prompt, which reach every node nothing feeds. the graphs themselves are managed over `/_ip/graphs`.
+- Invoking a graph run is just a API endpoint call, say `POST /_ip/graph_run/1` with an input, which reaches every node nothing feeds. an optional extra_prompt is taken by `POST /_ip/graph_run/1/with_prompt` and is given to those same nodes, appended after each one's own prompt and before whatever the graph lets it ask for. a node with a parent is given none of it: what it should carry is for the model that ran its parent to decide, which is not built. the graphs themselves are managed over `/_ip/graphs`.
 
 ### Web UI
 

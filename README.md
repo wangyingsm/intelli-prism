@@ -39,7 +39,10 @@ is why no passphrase hash or tenant key is in it. Read back over `GET /_ip/audit
 limits, the tools it may call and the file tree it would see — stored for the deployment or for one
 tenant and managed over `/_ip/agents`, with every part checked before it lands. `POST
 /_ip/agents/{agent}/run` runs one and streams what it does as it does it: each turn, the text, every
-tool call and its result, and a final event saying why it stopped and what it spent.
+tool call and its result, and a final event saying why it stopped and what it spent. A caller with
+context the template does not hold — a database's schema, beside a SQL tool — adds it for one run at
+`POST /_ip/agents/{agent}/run_with_prompt`, which appends it after the template's own prompt and
+leaves the stored template as it was.
 - **Tools over MCP.** The servers a template's tools live on are registered over `/_ip/mcps`,
 addressed `server.tool`, and resolved against what each server really offers before a run's first
 turn — so a tool that cannot be reached refuses the run rather than failing partway through it. A
@@ -69,7 +72,10 @@ then which of the steps after a node run is that node's own choice: it is told e
 answers `{"branch": ["escalate"]}`, naming one of them, several or none. A step nobody named is
 skipped, along with everything only it fed; a step after a branch runs on what arrived, with the
 skipped parent's key absent; and a node that names nothing ends the run with its own answer, which
-is a decision rather than a failure.
+is a decision rather than a failure. A caller may give the graph's first nodes context of their own
+at `POST /_ip/graph_run/{id}/with_prompt`, which each of them reads after its template's prompt and
+before whatever the graph lets it ask for; a node with a parent gets none of it, since what it should
+carry is the model running its parent's to decide, and that is not built yet.
 Where a deployment is a cluster, its nodes are spread over the live members — the one the caller asked included, since it
 is a machine with a gateway on it like the rest — and a node sent elsewhere streams back the same
 events a local one says, the member authenticating itself with a shared cluster secret and
