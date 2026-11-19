@@ -1027,8 +1027,11 @@ async fn prepare(
             }
             Err(error) => return Err(unprocessable(error)),
         };
+        // The node's own tools added to its template's, which is what lets one template serve two
+        // nodes that look different things up.
+        let tools = config.tool_set().with(&node.tools).map_err(unprocessable)?;
         let shed = Toolshed::open(Opening {
-            set: config.tool_set(),
+            set: &tools,
             servers: preparing.registry,
             retrievers: preparing.retrievers,
             embedder: preparing.state.embedder(),
@@ -1341,6 +1344,12 @@ mod tests {
         })
     }
 
+    /// The same row with tools of the node's own on it, as a write stores them.
+    fn with_tools(mut row: serde_json::Value, tools: &[&str]) -> serde_json::Value {
+        row["properties"]["tools"] = serde_json::json!(serde_json::json!(tools).to_string());
+        row
+    }
+
     /// The graph's own row as the plane answers it.
     fn graph_row(owner: &str, graph: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1489,10 +1498,12 @@ mod tests {
                 GraphNode {
                     name: NodeName::new("intake").unwrap(),
                     agent: ip_agents::AgentId::new("intake-agent").unwrap(),
+                    tools: ToolSet::default(),
                 },
                 GraphNode {
                     name: NodeName::new("reply").unwrap(),
                     agent: ip_agents::AgentId::new("reply-agent").unwrap(),
+                    tools: ToolSet::default(),
                 },
             ],
             edges: vec![GraphEdge {
@@ -2488,6 +2499,50 @@ upstream_speaks = "anthropic"
         let said = body_of(answered).await;
         assert!(said.contains("reply"), "{said}");
         assert!(said.contains("reply-agent"), "{said}");
+    }
+
+    /// A node's own tools are resolved beside its template's, which is only observable through
+    /// what the resolution refuses: a node naming a server this deployment has not registered
+    /// stops the run, and nothing but the node's own tools could have named it.
+    ///
+    /// What the union *holds* is `ToolSet::with`'s own tests; what matters here is that the node's
+    /// half reaches the shed at all.
+    #[tokio::test]
+    async fn a_nodes_own_tools_reach_the_resolution_its_template_is_resolved_by() {
+        let nodes = || {
+            serde_json::json!([
+                with_tools(
+                    node_row(2, "acme", "triage", "intake", "intake-agent"),
+                    &["nowhere.sql"],
+                ),
+                node_row(3, "acme", "triage", "reply", "reply-agent"),
+            ])
+        };
+        let (router, state, _plane) = running(
+            &["intake-agent", "reply-agent"],
+            Replies::in_turn([
+                serde_json::json!([graph_row("acme", "triage")]),
+                nodes(),
+                serde_json::json!({"columns": ["from", "to"], "rows": [["intake", "reply"]]}),
+                no_loops(),
+                no_branches(),
+                sorted_chain(),
+                nodes(),
+            ]),
+        )
+        .await;
+
+        let answered = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/graph_run/triage?tenant=acme",
+        )
+        .await;
+
+        assert_eq!(answered.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let said = body_of(answered).await;
+        assert!(said.contains("nowhere"), "{said}");
     }
 
     #[tokio::test]
@@ -3957,6 +4012,7 @@ upstream_speaks = "anthropic"
                 node: GraphNode {
                     name: node,
                     agent: ip_agents::AgentId::new("intake-agent").expect("a template name"),
+                    tools: ip_agents::ToolSet::default(),
                 },
                 input: "asked again".to_owned(),
                 signals: ip_run::RunSignal::never(),

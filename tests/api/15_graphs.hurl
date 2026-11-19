@@ -399,6 +399,41 @@ x-ip-csrf: 1
 }
 HTTP 422
 
+# A node naming tools of its own, which the plane stores as text and answers as a list again.
+PUT {{host}}/_ip/graphs/tooled?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "Tooled",
+  "max_nodes": 4,
+  "nodes": [
+    {"name": "intake", "agent": "intake", "tools": ["kb.search", "kb.neighbors"]},
+    {"name": "reply", "agent": "reply"}
+  ],
+  "edges": [{"from": "intake", "to": "reply"}]
+}
+HTTP 201
+[Asserts]
+jsonpath "$.nodes[0].tools" count == 2
+
+# Out of the plane again, which is the half no stub can prove: a set, so in name order, and a
+# node that named none carries none rather than an empty list.
+GET {{host}}/_ip/graphs/tooled?tenant=graphers
+HTTP 200
+[Asserts]
+jsonpath "$.nodes[0].tools[0]" == "kb.neighbors"
+jsonpath "$.nodes[0].tools[1]" == "kb.search"
+jsonpath "$.nodes[1].tools" not exists
+
+# A node asking for a tool name no tool may be called is refused at the door.
+PUT {{host}}/_ip/graphs/mistooled?tenant=graphers
+x-ip-csrf: 1
+{
+  "name": "Mistooled",
+  "max_nodes": 4,
+  "nodes": [{"name": "only", "agent": "intake", "tools": ["two words"]}]
+}
+HTTP 422
+
 # A browser that sends its cookie without the header a page on another site cannot forge.
 PUT {{host}}/_ip/graphs/forged?tenant=graphers
 {"name": "Forged", "max_nodes": 2, "nodes": [{"name": "only", "agent": "intake"}]}
@@ -416,3 +451,7 @@ GET {{host}}/_ip/graphs?tenant=graphers
 HTTP 200
 [Asserts]
 jsonpath "$[?(@.id == 'triage')]" count == 0
+
+DELETE {{host}}/_ip/graphs/tooled?tenant=graphers
+x-ip-csrf: 1
+HTTP 204

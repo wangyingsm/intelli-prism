@@ -312,6 +312,15 @@ impl ToolSet {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// This set and `extra` as one, each name held once.
+    ///
+    /// What a graph's node adds to its template is added rather than replacing it, so a name in
+    /// both is one tool and not a collision. The union is refused only where it is over the cap,
+    /// which is what makes two sets that each fit a union that does not say so.
+    pub fn with(&self, extra: &Self) -> Result<Self, AgentError> {
+        Self::new([self.tools(), extra.tools()].concat())
+    }
 }
 
 impl TryFrom<Vec<ToolName>> for ToolSet {
@@ -1018,6 +1027,45 @@ mod tests {
             Err(AgentError::TooMany {
                 kind: ToolSet::KIND,
                 count: TOOL_SET_MAX + 1,
+                max: TOOL_SET_MAX,
+            })
+        );
+    }
+
+    /// What a graph's node adds to its template: a union, and a name in both held once.
+    #[test]
+    fn a_set_and_what_is_added_to_it_are_one_set() {
+        let template = ToolSet::new(vec![tool("python"), tool("kb.search")]).unwrap();
+        let node = ToolSet::new(vec![tool("kb.search"), tool("handbook.search")]).unwrap();
+
+        let both = template.with(&node).expect("two sets that fit");
+        let named: Vec<&str> = both.tools().iter().map(ToolName::as_str).collect();
+
+        assert_eq!(named, ["handbook.search", "kb.search", "python"]);
+        assert_eq!(
+            template.with(&ToolSet::default()).unwrap(),
+            template,
+            "adding nothing changed what the template asks for"
+        );
+    }
+
+    /// Two sets that each fit may not fit together, and the union is what says so.
+    #[test]
+    fn a_union_past_the_cap_is_refused() {
+        let half = |from: usize| {
+            ToolSet::new(
+                (from..from + TOOL_SET_MAX)
+                    .map(|n| tool(&format!("t{n}")))
+                    .collect(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            half(0).with(&half(TOOL_SET_MAX)),
+            Err(AgentError::TooMany {
+                kind: ToolSet::KIND,
+                count: TOOL_SET_MAX * 2,
                 max: TOOL_SET_MAX,
             })
         );

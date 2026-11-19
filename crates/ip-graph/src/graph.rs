@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use ip_agents::AgentId;
+use ip_agents::{AgentId, ToolSet};
 use ip_core::TenantId;
 
 use crate::error::GraphError;
@@ -135,13 +135,21 @@ impl TryFrom<u32> for LoopCap {
     }
 }
 
-/// One node of a graph: what it is called, and the template it runs.
+/// One node of a graph: what it is called, the template it runs, and what the graph lets it ask
+/// for beyond what that template already asks for.
+///
+/// The tools are **added to** the template's rather than replacing them, which is what makes one
+/// template usable at two nodes that may look different things up. Empty is the ordinary case and
+/// the one every graph written before this field existed reads as.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphNode {
     /// What this node is called inside the graph.
     pub name: NodeName,
     /// The template it runs.
     pub agent: AgentId,
+    /// What this node may ask for beyond its template's own tools.
+    #[serde(default, skip_serializing_if = "ToolSet::is_empty")]
+    pub tools: ToolSet,
 }
 
 /// One edge: whose answer feeds which node, and when it does.
@@ -390,6 +398,7 @@ mod tests {
         GraphNode {
             name: name(raw),
             agent: AgentId::new(raw).expect("a template id"),
+            tools: ToolSet::default(),
         }
     }
 

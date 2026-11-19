@@ -974,6 +974,7 @@ mod tests {
         GraphNode {
             name: name(raw),
             agent: AgentId::new(raw).expect("a template id"),
+            tools: ip_agents::ToolSet::default(),
         }
     }
 

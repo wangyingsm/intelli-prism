@@ -24,7 +24,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
-use ip_agents::{AgentConfig, Prompt};
+use ip_agents::{AgentConfig, Prompt, ToolSet};
 use ip_cache::CacheBackend;
 use ip_cluster::{Dispatch, NodeEvent};
 use ip_config::Secret;
@@ -204,6 +204,41 @@ async fn node_config(state: &AppState, work: &Dispatch) -> Result<AgentConfig, S
     told_what_the_graph_says(state, work, config).await
 }
 
+/// What this node may call: its template's tools, and the graph's own for this node added to them.
+///
+/// **Read from the plane both machines share rather than carried on the dispatch**, which is the
+/// same decision [`told_what_the_graph_says`] records and for its reason: a dispatch that carried
+/// the tool set could carry one the graph does not say, and what a node may call is the graph's to
+/// declare. One read, not a whole graph.
+///
+/// A member that cannot read the node refuses it, as it does for the advice: running a node
+/// without the tools its graph gives it would answer a question the node was built to look up.
+async fn node_tools(
+    state: &AppState,
+    work: &Dispatch,
+    config: &AgentConfig,
+) -> Result<ToolSet, String> {
+    let Some(plane) = state.graphs() else {
+        return Err("this deployment keeps no graphs, so a node of one cannot run here".to_owned());
+    };
+    let node = plane
+        .tools(&work.owner, &work.graph, &work.node)
+        .await
+        .map_err(|error| format!("the node's own tools could not be read: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "the graph {} no longer holds the node {}",
+                work.graph, work.node
+            )
+        })?;
+    config.tool_set().with(&node).map_err(|error| {
+        format!(
+            "the node {} asks for more tools than one run may hold: {error}",
+            work.node
+        )
+    })
+}
+
 /// The dispatched node's configuration with what the graph lets it ask for added to its prompt.
 ///
 /// **Derived here rather than carried on the dispatch**, which is the same decision
@@ -303,7 +338,11 @@ async fn dispatched(state: AppState, work: Dispatch, say: UnboundedSender<NodeEv
         Ok(target) => target,
         Err(error) => return refuse(error.to_string()),
     };
-    let shed = match toolshed(&state, &templates_of(&work.owner), config.tool_set()).await {
+    let tools = match node_tools(&state, &work, &config).await {
+        Ok(tools) => tools,
+        Err(why) => return refuse(why),
+    };
+    let shed = match toolshed(&state, &templates_of(&work.owner), &tools).await {
         Ok(shed) => shed,
         Err(error) => return refuse(error.to_string()),
     };
@@ -562,15 +601,36 @@ upstream_speaks = "anthropic"
         }
     }
 
-    /// What a plane answers a worker's two reads with when the graph declares nothing.
+    /// The dispatched node's own row as the plane answers it, carrying the tools it names.
+    fn node_row(tools: &[&str]) -> serde_json::Value {
+        serde_json::json!([{
+            "id": 2,
+            "external_key": "GraphNode/acme/support/triage",
+            "labels": ["GraphNode"],
+            "properties": {
+                "graph": "support",
+                "owner": "acme",
+                "name": "triage",
+                "agent": "summarise",
+                "tools": serde_json::json!(tools).to_string(),
+            },
+        }])
+    }
+
+    /// What a plane answers a worker's three reads with when the graph declares nothing.
     ///
     /// One empty table serves both the loop backs and the branches, because a scripted reply
     /// answers per *method* and both are `plane.cypher`. What the columns are called is not read.
+    /// The node's own row is the third read, and a different method, so it is scripted beside
+    /// them.
     fn nothing_declared() -> Replies {
-        Replies::scripted([(
-            "plane.cypher",
-            serde_json::json!({"columns": ["from", "to", "cap"], "rows": []}),
-        )])
+        Replies::scripted([
+            (
+                "plane.cypher",
+                serde_json::json!({"columns": ["from", "to", "cap"], "rows": []}),
+            ),
+            ("plane.query", node_row(&[])),
+        ])
     }
 
     /// A worker holding its cluster's secret, with a template its peers may dispatch.
@@ -695,6 +755,7 @@ upstream_speaks = "anthropic"
                 "columns": ["from", "to", "condition"],
                 "rows": [["triage", "escalate", "the complaint names a legal risk"]],
             }),
+            node_row(&[]),
         ]))
         .await;
         let state = super::super::harness::serving(
@@ -755,6 +816,91 @@ upstream_speaks = "anthropic"
             panic!("a worker with no plane ran the node anyway: {said:?}");
         };
         assert!(why.contains("keeps no graphs"), "{why}");
+    }
+
+    /// A dispatched node's own tools come from the plane, and the dispatch carries none.
+    ///
+    /// **The point of the test is again that nothing told it.** What is sent on the wire is
+    /// `stub_dispatch`, which has no tool set in it at all; the row the plane answers with is the
+    /// only thing naming `nowhere.sql`, and the node is refused by that name. A member that took
+    /// a dispatch's word for what a node may call could be handed tools its graph does not give
+    /// it.
+    #[tokio::test]
+    async fn a_dispatched_nodes_tools_are_read_from_the_plane_and_not_from_the_wire() {
+        let sending = stub_dispatch();
+        assert!(
+            !serde_json::to_string(&sending)
+                .expect("a dispatch serializes")
+                .contains("tools"),
+            "the wire carried a tool set after all"
+        );
+        let (router, _plane) = worker_over(Replies::scripted([
+            (
+                "plane.cypher",
+                serde_json::json!({"columns": ["from", "to", "cap"], "rows": []}),
+            ),
+            ("plane.query", node_row(&["nowhere.sql"])),
+        ]))
+        .await;
+
+        let answered = router
+            .oneshot(sent(Some(STUB_SECRET), &sending))
+            .await
+            .unwrap();
+
+        let said = streamed(answered).await;
+        let Some((_, NodeEvent::Refused(why))) = said.last() else {
+            panic!("a node naming a server nothing registered ran anyway: {said:?}");
+        };
+        assert!(why.contains("nowhere"), "{why}");
+    }
+
+    /// A node the graph no longer holds is refused rather than run with no tools at all.
+    #[tokio::test]
+    async fn a_node_the_graph_no_longer_holds_is_refused() {
+        let (router, _plane) = worker_over(Replies::scripted([
+            (
+                "plane.cypher",
+                serde_json::json!({"columns": ["from", "to", "cap"], "rows": []}),
+            ),
+            ("plane.query", serde_json::json!([])),
+        ]))
+        .await;
+
+        let answered = router
+            .oneshot(sent(Some(STUB_SECRET), &stub_dispatch()))
+            .await
+            .unwrap();
+
+        let said = streamed(answered).await;
+        let Some((_, NodeEvent::Refused(why))) = said.last() else {
+            panic!("a node the graph does not hold ran anyway: {said:?}");
+        };
+        assert!(why.contains("no longer holds the node"), "{why}");
+    }
+
+    /// A plane that will not answer the node's row refuses the node, as it does for the advice.
+    #[tokio::test]
+    async fn a_plane_that_will_not_answer_the_nodes_own_row_refuses_the_node() {
+        let (router, _plane) = worker_over(Replies::scripted([
+            (
+                "plane.cypher",
+                serde_json::json!({"columns": ["from", "to", "cap"], "rows": []}),
+            ),
+            ("plane.query", serde_json::json!({"rows": []})),
+        ]))
+        .await;
+
+        let answered = router
+            .oneshot(sent(Some(STUB_SECRET), &stub_dispatch()))
+            .await
+            .unwrap();
+
+        let said = streamed(answered).await;
+        let Some((_, NodeEvent::Refused(why))) = said.last() else {
+            panic!("a node whose row could not be read ran anyway: {said:?}");
+        };
+        assert!(why.contains("tools could not be read"), "{why}");
     }
 
     /// What a node said on the way is the run's own vocabulary, not a second one.

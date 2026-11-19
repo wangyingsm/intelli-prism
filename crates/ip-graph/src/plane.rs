@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use ip_agents::AgentId;
+use ip_agents::{AgentId, ToolName, ToolSet};
 use ip_drsg::DrsgClient;
 use serde_json::{Value, json};
 
@@ -85,6 +85,13 @@ const NAME: &str = "name";
 
 /// The template a node runs.
 const AGENT: &str = "agent";
+
+/// What a node may ask for beyond its template's own tools, as the text of a json array.
+///
+/// Text rather than a list, because a property holds a scalar: a plane takes a number, a string
+/// or a boolean, and a tool set is neither. What is stored is therefore read back through
+/// [`tools_of`], which refuses anything that is not the array this wrote.
+const TOOLS: &str = "tools";
 
 /// The ceiling a graph carries.
 const MAX_NODES: &str = "max_nodes";
@@ -223,6 +230,18 @@ fn nodes_plan(owner: &GraphOwner, id: &GraphId) -> Value {
     json!({
         "source": {"ScanLabel": NODE_LABEL},
         "steps": [{"Filter": owned_by(owner, id)}],
+    })
+}
+
+/// The plan that reads one node of one graph.
+///
+/// The owner filter the whole plan carries and then the name, as two steps: a third clause folded
+/// into [`owned_by`] would put the name where every other read's filter is and make that one
+/// expression mean two things.
+fn node_plan(owner: &GraphOwner, id: &GraphId, name: &NodeName) -> Value {
+    json!({
+        "source": {"ScanLabel": NODE_LABEL},
+        "steps": [{"Filter": owned_by(owner, id)}, {"Filter": eq(NAME, name.as_str())}],
     })
 }
 
@@ -533,7 +552,23 @@ fn node_properties(graph: &RunGraph, node: &GraphNode) -> Value {
         OWNER: graph.owner().written(),
         NAME: node.name.as_str(),
         AGENT: node.agent.as_str(),
+        TOOLS: written_tools(&node.tools),
     })
+}
+
+/// A node's own tools as the text a property holds, which is `[]` where it has none.
+///
+/// Built rather than serialized so the write has no failure to report: what a tool set holds is
+/// text, and text is a json array of strings whatever the names are.
+fn written_tools(tools: &ToolSet) -> String {
+    Value::Array(
+        tools
+            .tools()
+            .iter()
+            .map(|tool| Value::String(tool.as_str().to_owned()))
+            .collect(),
+    )
+    .to_string()
 }
 
 /// What one edge carries, which is only whose it is: the names it joins are the nodes it joins.
@@ -599,9 +634,31 @@ fn nodes_from(
                 agent: AgentId::new(text(row, AGENT)?).map_err(|error| GraphError::Unreadable {
                     detail: format!("a stored node's template id is not one: {error}"),
                 })?,
+                tools: tools_of(row)?,
             })
         })
         .collect()
+}
+
+/// One node row's own tools, which is none where the row carries no such property.
+///
+/// **A row without the property reads as a node with no tools of its own**, rather than as a row
+/// that cannot be read: every graph written before this field existed is one, and a graph that
+/// stopped being readable when the field arrived would be a migration nobody asked for.
+fn tools_of(row: &Value) -> Result<ToolSet, GraphError> {
+    let written = match &row["properties"][TOOLS] {
+        Value::Null => return Ok(ToolSet::default()),
+        value => value
+            .as_str()
+            .ok_or(GraphError::PropertyKind { property: TOOLS })?,
+    };
+    let named: Vec<ToolName> =
+        serde_json::from_str(written).map_err(|error| GraphError::Unreadable {
+            detail: format!("a stored node's tools are not a list of tool names: {error}"),
+        })?;
+    ToolSet::new(named).map_err(|error| GraphError::Unreadable {
+        detail: format!("a stored node's tools are not a tool set: {error}"),
+    })
 }
 
 /// The table of an edge read, as the edges of a graph.
@@ -1099,6 +1156,35 @@ impl GraphPlane {
         Ok(())
     }
 
+    /// One node's own tools, without reading the rest of the graph.
+    ///
+    /// A read of its own for [`loops`](Self::loops)' reason: a member running one node of somebody
+    /// else's graph needs what that node may ask for and nothing else of the graph, and this is one
+    /// read where [`get`](Self::get) is five.
+    ///
+    /// **Nothing rather than an empty set where the graph holds no such node**, which is the one
+    /// thing a caller cannot work out for itself: a node with no tools of its own and a node that
+    /// is not there would otherwise read alike, and a dispatch naming a node the graph has lost is
+    /// not a node to run with no tools.
+    pub async fn tools(
+        &self,
+        owner: &GraphOwner,
+        id: &GraphId,
+        name: &NodeName,
+    ) -> Result<Option<ToolSet>, GraphError> {
+        let rows = self.drsg.query(node_plan(owner, id, name)).await?;
+        let rows = rows.as_array().ok_or_else(|| GraphError::Unreadable {
+            detail: "a node read answered with something that is not rows".to_owned(),
+        })?;
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => {
+                ours(row, owner, id)?;
+                tools_of(row).map(Some)
+            }
+        }
+    }
+
     /// One graph's loop backs, without reading the rest of it.
     ///
     /// A read of its own because a member running one node of somebody else's graph needs this and
@@ -1268,6 +1354,7 @@ mod tests {
         GraphNode {
             name: name(raw),
             agent: AgentId::new(raw).expect("a template id"),
+            tools: ToolSet::default(),
         }
     }
 
@@ -2447,6 +2534,139 @@ mod tests {
             nodes_from(&json!({"rows": []}), &tenant(), &id()),
             Err(GraphError::Unreadable { .. })
         ));
+    }
+
+    /// A graph written before this field existed reads as nodes with no tools of their own, which
+    /// is what makes the field an addition rather than a migration.
+    #[test]
+    fn a_node_row_carrying_no_tools_reads_as_a_node_with_none() {
+        let read = read_node(json!({"name": "intake", "agent": "triage"}))
+            .expect("a row written before the property existed");
+
+        assert_eq!(read[0].tools, ToolSet::default());
+    }
+
+    /// What a write sent is what a read answers with, this property included.
+    #[test]
+    fn a_nodes_own_tools_survive_the_text_they_are_stored_as() {
+        let tools = ToolSet::new(vec![
+            ToolName::new("kb.search").unwrap(),
+            ToolName::new("python").unwrap(),
+        ])
+        .unwrap();
+
+        let read =
+            read_node(json!({"name": "intake", "agent": "triage", TOOLS: written_tools(&tools)}))
+                .expect("the text a write sends is readable");
+
+        assert_eq!(read[0].tools, tools);
+        assert_eq!(
+            written_tools(&ToolSet::default()),
+            "[]",
+            "a node with no tools of its own stores an empty list, not nothing"
+        );
+    }
+
+    /// Every way a stored `tools` can be one this cannot read, each refused by what is wrong.
+    #[test]
+    fn a_stored_tools_property_that_is_not_a_tool_set_is_refused() {
+        assert_eq!(
+            read_node(json!({"name": "a", "agent": "b", TOOLS: ["kb.search"]})),
+            Err(GraphError::PropertyKind { property: TOOLS }),
+            "a list where the property holds text was taken"
+        );
+        for written in [
+            "not json at all",
+            "{\"kb\": \"search\"}",
+            "[\"two words\"]",
+            "[7]",
+        ] {
+            assert!(
+                matches!(
+                    read_node(json!({"name": "a", "agent": "b", TOOLS: written})),
+                    Err(GraphError::Unreadable { .. })
+                ),
+                "{written:?} was read as a tool set"
+            );
+        }
+        let many: Vec<String> = (0..=64).map(|n| format!("t{n}")).collect();
+        assert!(
+            matches!(
+                read_node(json!({"name": "a", "agent": "b", TOOLS: json!(many).to_string()})),
+                Err(GraphError::Unreadable { .. })
+            ),
+            "a stored set past the cap was taken"
+        );
+    }
+
+    /// The read a worker makes: one node of somebody else's graph, and nothing else of it.
+    #[tokio::test]
+    async fn one_nodes_tools_are_read_without_the_rest_of_the_graph() {
+        let stub = StubPlane::start(Replies::scripted([(
+            "plane.query",
+            json!([{
+                "id": 1,
+                "external_key": format!("{NODE_LABEL}/acme/triage/intake"),
+                "labels": [NODE_LABEL],
+                "properties": {
+                    GRAPH: "triage", OWNER: "acme", NAME: "intake", AGENT: "triage",
+                    TOOLS: "[\"kb.search\"]",
+                },
+            }]),
+        )]))
+        .await;
+
+        let read = GraphPlane::new(stub.client())
+            .tools(&tenant(), &id(), &name("intake"))
+            .await
+            .expect("the plane answered")
+            .expect("the graph holds that node");
+
+        assert_eq!(
+            read.tools()
+                .iter()
+                .map(ToolName::as_str)
+                .collect::<Vec<_>>(),
+            ["kb.search"]
+        );
+        let plan = stub.only().params["plan"].clone();
+        assert_eq!(plan["source"]["ScanLabel"], NODE_LABEL);
+        assert_eq!(
+            plan["steps"][0]["Filter"],
+            owned_by(&tenant(), &id()),
+            "the owner filter was not in the plan"
+        );
+        assert_eq!(plan["steps"][1]["Filter"], eq(NAME, "intake"));
+    }
+
+    /// A dispatch naming a node the graph has lost is told so rather than run with no tools.
+    #[tokio::test]
+    async fn a_node_the_graph_does_not_hold_answers_nothing_rather_than_an_empty_set() {
+        let stub = StubPlane::start(Replies::scripted([("plane.query", json!([]))])).await;
+
+        assert_eq!(
+            GraphPlane::new(stub.client())
+                .tools(&tenant(), &id(), &name("intake"))
+                .await,
+            Ok(None)
+        );
+    }
+
+    /// The second lock on the same door, as every other read of a row has.
+    #[tokio::test]
+    async fn a_tools_read_answered_with_another_owners_row_is_refused() {
+        let stub = StubPlane::start(Replies::scripted([(
+            "plane.query",
+            json!([{"properties": {GRAPH: "triage", OWNER: "globex"}}]),
+        )]))
+        .await;
+
+        assert_eq!(
+            GraphPlane::new(stub.client())
+                .tools(&tenant(), &id(), &name("intake"))
+                .await,
+            Err(GraphError::Foreign { property: OWNER })
+        );
     }
 
     #[test]
