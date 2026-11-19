@@ -412,6 +412,13 @@ struct Prepared {
     target: Target,
     /// The servers its tools live on, already open.
     shed: Toolshed,
+    /// What the caller added to this node's prompt, folded into `config` already.
+    ///
+    /// Kept beside the configuration it is already part of, because a dispatch carries the
+    /// template's name rather than what was resolved from it: the member re-reads the template and
+    /// so must be handed the caller's words again. Recorded here rather than worked out a second
+    /// time at the dispatch, so which nodes the caller speaks for is decided in one place.
+    told: Option<ExtraPrompt>,
 }
 
 /// Runs one node of a graph, here or on another machine of this cluster.
@@ -501,6 +508,8 @@ struct OneNode<'a> {
     agent: &'a AgentId,
     /// What it is being asked to do.
     input: &'a str,
+    /// What the caller added to its prompt, which only a node nothing feeds is given.
+    told: Option<&'a ExtraPrompt>,
 }
 
 /// What came of trying to run a node somewhere else.
@@ -714,6 +723,7 @@ impl Dispatching {
             agent: one.agent.clone(),
             requested: self.sending.requested.clone(),
             input: one.input.to_owned(),
+            told: one.told.cloned(),
         }
     }
 
@@ -903,6 +913,7 @@ impl RunsNode for Nodes {
             node: &node.name,
             agent: &prepared.agent,
             input: &input,
+            told: prepared.told.as_ref(),
         };
         let sent = match &self.dispatching {
             Some(dispatching) => {
@@ -1025,11 +1036,13 @@ async fn prepare(
         // Only a node nothing feeds, because a node with a parent is told what to carry by the
         // model that ran that parent, and until that is built there is nobody but the caller to
         // speak for a root.
-        let config = match preparing.told {
-            Some(extra) if !fed(graph, &node.name) => {
-                config.told_also(extra).map_err(unprocessable)?
-            }
-            _ => config,
+        let told = preparing
+            .told
+            .filter(|_| !fed(graph, &node.name))
+            .cloned();
+        let config = match &told {
+            Some(extra) => config.told_also(extra).map_err(unprocessable)?,
+            None => config,
         };
         let config = match told_what_the_graph_says(&config, graph, &node.name) {
             Ok(config) => config,
@@ -1075,6 +1088,7 @@ async fn prepare(
                 pinned,
                 target,
                 shed,
+                told,
             },
         );
     }
@@ -3786,6 +3800,68 @@ upstream_speaks = "anthropic"
         .with_heartbeat(Duration::from_secs(10))
         .with_strategy(strategy);
         (super::super::router(state.clone()), state, plane)
+    }
+
+    /// The caller's words reach a root running on another member, and a fed node is handed none.
+    ///
+    /// The gap this closes is silent rather than visible: a dispatch carries the template's *name*
+    /// and the member reads the template itself, so without the field a clustered run would fold
+    /// the caller's prompt or not depending on which machine the strategy happened to pick.
+    #[tokio::test]
+    async fn a_dispatched_node_nothing_feeds_is_handed_what_the_caller_added() {
+        let one = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let other = ip_cluster::StubWorker::start(ip_cluster::Answers::Ran).await;
+        let (router, state, _plane) = spreading(
+            &["intake-agent", "reply-agent"],
+            dispatching_chain(&[
+                member_row(&one.address().to_string(), 1),
+                member_row(&other.address().to_string(), 1),
+            ]),
+            one.client(),
+            ip_core::route::ClusterStrategy::RoundRobin,
+        )
+        .await;
+
+        let answered = send(
+            &router,
+            &state,
+            "POST",
+            "alice",
+            "/_ip/graph_run/triage/with_prompt?tenant=acme",
+            Some(r#"{"input":"how many?","extra_prompt":"The table has a checksum column."}"#),
+        )
+        .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let _ = body_of(answered).await;
+
+        // Read by the node each dispatch names rather than by which member took it, because that
+        // is the strategy's decision and not this test's subject.
+        let told: BTreeMap<String, serde_json::Value> = one
+            .seen()
+            .into_iter()
+            .chain(other.seen())
+            .map(|seen| {
+                (
+                    seen.work["node"]
+                        .as_str()
+                        .expect("a dispatch names its node")
+                        .to_owned(),
+                    seen.work["told"].clone(),
+                )
+            })
+            .collect();
+
+        assert_eq!(told.len(), 2, "a chain of two was not dispatched twice");
+        assert_eq!(
+            told["intake"].as_str(),
+            Some("The table has a checksum column."),
+            "the node nothing feeds was dispatched without what the caller added: {told:?}"
+        );
+        assert_eq!(
+            told["reply"],
+            serde_json::Value::Null,
+            "a node with a parent was dispatched with what only a root is given: {told:?}"
+        );
     }
 
     /// Round-robin over two live members sends one node to each, which is the whole point of

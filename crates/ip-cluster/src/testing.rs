@@ -106,6 +106,7 @@ pub fn stub_dispatch() -> Dispatch {
             api: None,
         },
         input: "{\"intake\":\"41 crates missing\"}".to_owned(),
+        told: None,
     }
 }
 

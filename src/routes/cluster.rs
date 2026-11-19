@@ -201,6 +201,18 @@ async fn node_config(state: &AppState, work: &Dispatch) -> Result<AgentConfig, S
         }
         Err(error) => return Err(format!("the templates could not be read: {error}")),
     };
+    // Before the graph's own advice, so a dispatched node reads its prompt in the order a node run
+    // here does: the operator's instruction, then the caller's context, then what the graph lets it
+    // ask for.
+    let config = match &work.told {
+        Some(extra) => config.told_also(extra).map_err(|error| {
+            format!(
+                "the node {} is told what the caller added, and its prompt has no room for it: {error}",
+                work.node
+            )
+        })?,
+        None => config,
+    };
     told_what_the_graph_says(state, work, config).await
 }
 
@@ -728,6 +740,77 @@ upstream_speaks = "anthropic"
         assert_eq!(ran.answer, "four");
         assert_eq!(ran.stopped, ip_run::Stopped::Answered);
         assert_eq!(ran.traces.len(), 1, "one turn, followed under one trace");
+    }
+
+    /// A dispatched node is told what the caller added, and before what its graph lets it ask for.
+    ///
+    /// **The opposite point to the test below.** The advice is derived here because it is the
+    /// graph's to declare; the caller's own words are carried, because a member has no other way
+    /// to learn them and the dispatch already carries the input they belong with. What this pins is
+    /// the *order* — a dispatched node reads its prompt exactly as one run on the coordinator does.
+    #[tokio::test]
+    async fn a_dispatched_node_is_told_what_the_caller_added_before_what_its_graph_says() {
+        let upstream = Arc::new(Recording {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let plane = StubPlane::start(Replies::in_turn([
+            serde_json::json!({
+                "columns": ["from", "to", "cap"],
+                "rows": [["triage", "intake", 3]],
+            }),
+            serde_json::json!({"columns": ["from", "to", "condition"], "rows": []}),
+            node_row(&[]),
+        ]))
+        .await;
+        let state = super::super::harness::serving(
+            store().await,
+            SERVING,
+            Arc::clone(&upstream) as Arc<dyn ip_gateway::upstream::Upstream>,
+        )
+        .with_cluster_secret(Secret::from(STUB_SECRET))
+        .with_graphs(Arc::new(GraphPlane::new(plane.client())));
+        let router = super::super::router(state);
+        let work = Dispatch {
+            told: Some(
+                ip_agents::ExtraPrompt::new("The table has a checksum column.").expect("a prompt"),
+            ),
+            ..stub_dispatch()
+        };
+
+        let answered = router
+            .oneshot(sent(Some(STUB_SECRET), &work))
+            .await
+            .unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        let _ = streamed(answered).await;
+
+        let sent = upstream
+            .seen
+            .lock()
+            .expect("the record is not poisoned")
+            .clone();
+        let told = sent
+            .first()
+            .expect("the node took a turn")
+            .get("system")
+            .expect("a system prompt crossed")
+            .as_str()
+            .expect("a system prompt is text")
+            .to_owned();
+        let carried = told
+            .find("The table has a checksum column.")
+            .unwrap_or_else(|| panic!("a dispatched node was not told what the caller added: {told}"));
+        let advice = told
+            .find(ip_graph::LOOP_BACK_KEY)
+            .unwrap_or_else(|| panic!("a dispatched node lost its graph's advice: {told}"));
+        assert!(
+            carried < advice,
+            "the caller's words landed after the graph's advice rather than before it: {told}"
+        );
+        assert!(
+            told.starts_with("Be helpful."),
+            "the template's own prompt was replaced rather than added to: {told}"
+        );
     }
 
     /// A node that runs here is told what a node of that graph may ask for, derived here.

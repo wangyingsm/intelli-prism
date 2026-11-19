@@ -1,6 +1,6 @@
 //! One node's work, in the shape it crosses a wire in.
 
-use ip_agents::AgentId;
+use ip_agents::{AgentId, ExtraPrompt};
 use ip_core::{TenantId, UserId};
 use ip_graph::{GraphId, GraphOwner, GraphRunId, NodeName};
 use ip_run::Requested;
@@ -39,6 +39,18 @@ pub struct Dispatch {
     pub requested: Requested,
     /// What the graph built for this node: its parents' answers, keyed by their names.
     pub input: String,
+    /// What the caller added to this node's prompt, where the run was started with anything.
+    ///
+    /// Carried rather than derived, which is the opposite of the decision the worker's own
+    /// `told_what_the_graph_says` records, and for the reason that decision gives: what a node may
+    /// *ask for* is the graph's to declare, so a member reads it from the plane and takes nobody's
+    /// word for it. This is not a graph fact. It is the caller's own words, exactly as
+    /// [`Dispatch::input`] is, and a member has no other way to learn them. A coordinator that
+    /// could lie about this could already lie about the input.
+    ///
+    /// `None` for every node something feeds, because only a node nothing feeds is given what the
+    /// caller said — the coordinator decides that and the member does not revisit it.
+    pub told: Option<ExtraPrompt>,
 }
 
 #[cfg(test)]
@@ -49,7 +61,10 @@ mod tests {
     /// Every field, since what a wire loses it loses one field at a time.
     #[test]
     fn a_dispatch_survives_being_written_down_and_read_back() {
-        let work = stub_dispatch();
+        let work = Dispatch {
+            told: Some(ExtraPrompt::new("The table has a checksum column.").expect("a prompt")),
+            ..stub_dispatch()
+        };
         let written = serde_json::to_string(&work).expect("a dispatch writes down");
 
         assert_eq!(
