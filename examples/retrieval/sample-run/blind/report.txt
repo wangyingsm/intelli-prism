@@ -1,0 +1,21 @@
+  look     begins
+    ? kb__search           {"hits": 2, "query": "A reefer on the Rotterdam run logged two ...
+    = there is no tool called "kb__search" [the tool called it a failure]
+    ? kb__search           {"hits": 2, "query": "reefer temperature excursion out of band ...
+    = there is no tool called "kb__search" [the tool called it a failure]
+    ? docs__search         {"hits": 2, "query": "A reefer on the Rotterdam run logged two ...
+    = 2 rows: reefer-telemetry 0.884, cold-chain-r6! 0.876
+    ? docs__search         {"hits": 2, "query": "reefer temperature excursion out of band ...
+    = 2 rows: cold-chain-r7 0.875, cold-chain-r6! 0.864
+  look     answered  in  3517/  630 tokens,  1311 characters out
+  answer   begins
+  answer   answered  in   449/  143 tokens,   601 characters out
+
+  look-ups asked for:   4
+  joins followed:       0
+  superseded pages hit: cold-chain-r6, cold-chain-r6
+  looked nothing up:    answer
+  answered with:        answer
+  stopped at:           nothing — every node that ran answered
+  spent:                3966/773 tokens, 0 micros
+  nodes, in the order they finished: look -> answer

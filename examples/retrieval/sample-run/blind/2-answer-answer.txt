@@ -1,0 +1,11 @@
+Re-ice the container at the nearest hub now — don't wait for the consignee to answer [cold-chain-r7].
+
+Raise an Excursion ticket in Dockside; attach the telemetry reading to it. Form CX-11 is retired [cold-chain-r7].
+
+Notify the consignee within ninety minutes of the excursion being logged [cold-chain-r7].
+
+This qualifies as an excursion: outside the set band for more than twenty consecutive minutes [reefer-telemetry].
+
+Ignore `cold-chain-r6` — superseded, including its four-hour window [cold-chain-r7].
+
+A container that stops reporting is a telemetry fault, not an excursion [reefer-telemetry].

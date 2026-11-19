@@ -1,0 +1,47 @@
+event: node
+data: {"input":"The manifest the shipper sent tonight failed its checksum. What do we do, and how long have we got?","node":"look","run":"956fc633ea46d5a322091c1b63b6c21f"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"look","number":1,"run":"956fc633ea46d5a322091c1b63b6c21f"}
+
+event: text
+data: {"node":"look","run":"956fc633ea46d5a322091c1b63b6c21f","text":"I'll search the handbook for the procedure on failed manifest checksums."}
+
+event: tool_call
+data: {"arguments":{"hits":2,"query":"The manifest the shipper sent has failed its checksum, what do we do and how long have we got?"},"id":"call_00_iRoxOV7gL4g1ehCkOOWT1218","name":"docs__search","node":"look","run":"956fc633ea46d5a322091c1b63b6c21f"}
+
+event: tool_result
+data: {"failed":false,"id":"call_00_iRoxOV7gL4g1ehCkOOWT1218","node":"look","run":"956fc633ea46d5a322091c1b63b6c21f","text":"{\"id\":\"1\",\"score\":0.8997823,\"found\":{\"key\":\"manifest-checksum\",\"status\":\"current\",\"team\":\"dockside\",\"text\":\"A manifest whose checksum does not match the shipper's is parked in the quarantine bucket and is never retried on its own. Confirm the file with the shipper by mail, then requeue it with `hlctl manifest requeue --batch <id> --skip-checksum`. A parked batch is dropped six hours after it arrived, and after that the shipper has to send the whole night again. If the requeue has not been accepted within forty minutes, escalate to Dockside.\",\"title\":\"A nightly manifest that fails its checksum\"}}\n{\"id\":\"10\",\"score\":0.8775517,\"found\":{\"key\":\"claims-window\",\"status\":\"current\",\"team\":\"clearance\",\"text\":\"A claim against a shipment must be filed within eleven working days of the shipment being delivered or abandoned, whichever came first. A claim filed later is assessed only where the delay is ours, and the assessment is the duty controller's to make. The eleven days do not pause for a customs hold.\",\"title\":\"How long a claim may be filed in\"}}"}
+
+event: tool_call
+data: {"arguments":{"hits":2,"query":"incoming manifest integrity check failure deadline for resubmission"},"id":"call_01_tbwpamIvgsvFpIusAAqF0088","name":"docs__search","node":"look","run":"956fc633ea46d5a322091c1b63b6c21f"}
+
+event: tool_result
+data: {"failed":false,"id":"call_01_tbwpamIvgsvFpIusAAqF0088","node":"look","run":"956fc633ea46d5a322091c1b63b6c21f","text":"{\"id\":\"1\",\"score\":0.83028394,\"found\":{\"key\":\"manifest-checksum\",\"status\":\"current\",\"team\":\"dockside\",\"text\":\"A manifest whose checksum does not match the shipper's is parked in the quarantine bucket and is never retried on its own. Confirm the file with the shipper by mail, then requeue it with `hlctl manifest requeue --batch <id> --skip-checksum`. A parked batch is dropped six hours after it arrived, and after that the shipper has to send the whole night again. If the requeue has not been accepted within forty minutes, escalate to Dockside.\",\"title\":\"A nightly manifest that fails its checksum\"}}\n{\"id\":\"4\",\"score\":0.8250824,\"found\":{\"key\":\"cold-chain-r7\",\"status\":\"current\",\"team\":\"reefer\",\"text\":\"What changed from revision 6. Re-ice at the nearest hub first and do not wait for the consignee to answer; the telemetry reading is the evidence and it is kept for us. The notification window is ninety minutes, not four hours. Form CX-11 is retired: raise an Excursion ticket in Dockside instead, and attach the reading to that.\",\"title\":\"Cold-chain excursion response, revision 7\"}}"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"look","number":2,"run":"956fc633ea46d5a322091c1b63b6c21f"}
+
+event: text
+data: {"node":"look","run":"956fc633ea46d5a322091c1b63b6c21f","text":"A manifest whose checksum does not match the shipper's is parked in the quarantine bucket and is never retried on its own. Confirm the file with the shipper by mail, then requeue it with `hlctl manifest requeue --batch <id> --skip-checksum`. A parked batch is dropped six hours after it arrived, and after that the shipper has to send the whole night again. If the requeue has not been accepted within forty minutes, escalate to Dockside. (key: manifest-checksum, status: current)"}
+
+event: node_done
+data: {"cost_micros":0,"node":"look","run":"956fc633ea46d5a322091c1b63b6c21f","stop":"answered","text":"A manifest whose checksum does not match the shipper's is parked in the quarantine bucket and is never retried on its own. Confirm the file with the shipper by mail, then requeue it with `hlctl manifest requeue --batch <id> --skip-checksum`. A parked batch is dropped six hours after it arrived, and after that the shipper has to send the whole night again. If the requeue has not been accepted within forty minutes, escalate to Dockside. (key: manifest-checksum, status: current)","tokens":{"input":2184,"output":262},"why":"the model answered"}
+
+event: node
+data: {"input":"{\"look\":\"A manifest whose checksum does not match the shipper's is parked in the quarantine bucket and is never retried on its own. Confirm the file with the shipper by mail, then requeue it with `hlctl manifest requeue --batch <id> --skip-checksum`. A parked batch is dropped six hours after it arrived, and after that the shipper has to send the whole night again. If the requeue has not been accepted within forty minutes, escalate to Dockside. (key: manifest-checksum, status: current)\"}","node":"answer","run":"956fc633ea46d5a322091c1b63b6c21f"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"answer","number":1,"run":"956fc633ea46d5a322091c1b63b6c21f"}
+
+event: text
+data: {"node":"answer","run":"956fc633ea46d5a322091c1b63b6c21f","text":"Mail the shipper to confirm the file, then requeue it: `hlctl manifest requeue --batch <id> --skip-checksum`. [manifest-checksum]\n\nThe batch is dropped six hours after it arrived; after that the shipper must resend the whole night. [manifest-checksum]\n\nIf the requeue is not accepted within forty minutes, escalate to Dockside. [manifest-checksum]\n\nNo quarantined-batch lookup or contact details are in my input. [manifest-checksum]"}
+
+event: node_done
+data: {"cost_micros":0,"node":"answer","run":"956fc633ea46d5a322091c1b63b6c21f","stop":"answered","text":"Mail the shipper to confirm the file, then requeue it: `hlctl manifest requeue --batch <id> --skip-checksum`. [manifest-checksum]\n\nThe batch is dropped six hours after it arrived; after that the shipper must resend the whole night. [manifest-checksum]\n\nIf the requeue is not accepted within forty minutes, escalate to Dockside. [manifest-checksum]\n\nNo quarantined-batch lookup or contact details are in my input. [manifest-checksum]","tokens":{"input":259,"output":112},"why":"the model answered"}
+
+event: done
+data: {"answer":{"answer":"Mail the shipper to confirm the file, then requeue it: `hlctl manifest requeue --batch <id> --skip-checksum`. [manifest-checksum]\n\nThe batch is dropped six hours after it arrived; after that the shipper must resend the whole night. [manifest-checksum]\n\nIf the requeue is not accepted within forty minutes, escalate to Dockside. [manifest-checksum]\n\nNo quarantined-batch lookup or contact details are in my input. [manifest-checksum]"},"cost_micros":0,"run":"956fc633ea46d5a322091c1b63b6c21f","stopped_at":null,"tokens":{"input":2443,"output":374}}
+
+
+[status 200]

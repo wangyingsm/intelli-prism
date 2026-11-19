@@ -1,0 +1,21 @@
+  look     begins
+    ? kb__search           {"hits": 2, "query": "A reefer on the Rotterdam run logged two ...
+    = 2 rows: reefer-telemetry 0.884, cold-chain-r6! 0.876
+    ? kb__search           {"hits": 2, "query": "reefer temperature excursion out of band ...
+    = 2 rows: cold-chain-r7 0.875, cold-chain-r6! 0.864
+    ? kb__neighbors        {"direction": "both", "node": 129}
+    = 1 row: cold-chain-r7
+    ? kb__neighbors        {"direction": "both", "node": 193}
+    = 2 rows: reefer-telemetry, cold-chain-r6!
+  look     answered  in  4907/  460 tokens,   866 characters out
+  answer   begins
+  answer   answered  in   356/  131 tokens,   529 characters out
+
+  look-ups asked for:   4
+  joins followed:       2
+  superseded pages hit: cold-chain-r6, cold-chain-r6, cold-chain-r6
+  looked nothing up:    answer
+  answered with:        answer
+  stopped at:           nothing — every node that ran answered
+  spent:                5263/591 tokens, 0 micros
+  nodes, in the order they finished: look -> answer

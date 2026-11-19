@@ -1,0 +1,11 @@
+{
+  "name": "Look it up in the plane, follow the joins, then answer",
+  "max_nodes": 4,
+  "nodes": [
+    {"name": "look", "agent": "look", "tools": ["kb.search", "kb.neighbors", "kb.rank"]},
+    {"name": "answer", "agent": "answer"}
+  ],
+  "edges": [
+    {"from": "look", "to": "answer"}
+  ]
+}

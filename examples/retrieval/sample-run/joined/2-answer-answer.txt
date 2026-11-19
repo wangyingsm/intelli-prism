@@ -1,0 +1,9 @@
+Re-ice at the nearest hub first — do not wait for the consignee to answer [cold-chain-r7].
+
+You have ninety minutes to notify the consignee [cold-chain-r7].
+
+Raise an Excursion ticket in Dockside instead of form CX-11 (retired) and attach the reading to it [cold-chain-r7].
+
+Use revision 7 of the cold-chain excursion response; revision 6 is superseded [cold-chain-r7].
+
+Not answered by my input: the two-hour-over-band logging point is in the input but not tied to a page key, and nothing here covers any other deadline or step.

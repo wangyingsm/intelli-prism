@@ -1,0 +1,65 @@
+event: node
+data: {"input":"A reefer on the Rotterdam run logged two hours above its set band. What is the response, and how long have we got to tell the consignee?","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"look","number":1,"run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: text
+data: {"node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce","text":"I'll look this up in the handbook before answering."}
+
+event: tool_call
+data: {"arguments":{"hits":2,"query":"A reefer on the Rotterdam run logged two hours above its set band. What is the response, and how long have we got to tell the consignee?"},"id":"call_00_eYXw5TKl7drzZWkzlURq6529","name":"kb__search","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: tool_result
+data: {"failed":true,"id":"call_00_eYXw5TKl7drzZWkzlURq6529","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce","text":"there is no tool called \"kb__search\""}
+
+event: tool_call
+data: {"arguments":{"hits":2,"query":"reefer temperature excursion out of band notification deadline to consignee"},"id":"call_01_zxMvgFpwMCJ4z3ZA7RLd8668","name":"kb__search","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: tool_result
+data: {"failed":true,"id":"call_01_zxMvgFpwMCJ4z3ZA7RLd8668","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce","text":"there is no tool called \"kb__search\""}
+
+event: turn
+data: {"model":"deepseek-flash","node":"look","number":2,"run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: text
+data: {"node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce","text":"I called a tool that does not exist (`kb__search`); the only look-up tool I have is `docs__search`. Retrying with it now."}
+
+event: tool_call
+data: {"arguments":{"hits":2,"query":"A reefer on the Rotterdam run logged two hours above its set band. What is the response, and how long have we got to tell the consignee?"},"id":"call_00_jdxMc6VWsO2QApvpgJCy6552","name":"docs__search","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: tool_result
+data: {"failed":false,"id":"call_00_jdxMc6VWsO2QApvpgJCy6552","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce","text":"{\"id\":\"5\",\"score\":0.883912,\"found\":{\"key\":\"reefer-telemetry\",\"status\":\"current\",\"team\":\"reefer\",\"text\":\"Every reefer reports its set point, its return air temperature and its power state once a minute while it is powered. A reading outside the set band for more than twenty consecutive minutes is logged as an excursion, with the first and last minute of it. A container that stops reporting is not an excursion and is handled as a telemetry fault.\",\"title\":\"What the reefer telemetry feed reports\"}}\n{\"id\":\"3\",\"score\":0.8757266,\"found\":{\"key\":\"cold-chain-r6\",\"status\":\"superseded\",\"team\":\"reefer\",\"text\":\"Hold the shipment at whichever hub it is in and do not move it. Notify the consignee within four hours of the excursion being logged and raise form CX-11 with the reading attached. Do not re-ice before the consignee has answered, because re-icing destroys the evidence a claim is assessed on.\",\"title\":\"Cold-chain excursion response, revision 6\"}}"}
+
+event: tool_call
+data: {"arguments":{"hits":2,"query":"reefer temperature excursion out of band notification deadline to consignee"},"id":"call_01_PZbQy3iKHNGfo8WDmDqB8727","name":"docs__search","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: tool_result
+data: {"failed":false,"id":"call_01_PZbQy3iKHNGfo8WDmDqB8727","node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce","text":"{\"id\":\"4\",\"score\":0.8752122,\"found\":{\"key\":\"cold-chain-r7\",\"status\":\"current\",\"team\":\"reefer\",\"text\":\"What changed from revision 6. Re-ice at the nearest hub first and do not wait for the consignee to answer; the telemetry reading is the evidence and it is kept for us. The notification window is ninety minutes, not four hours. Form CX-11 is retired: raise an Excursion ticket in Dockside instead, and attach the reading to that.\",\"title\":\"Cold-chain excursion response, revision 7\"}}\n{\"id\":\"3\",\"score\":0.8636031,\"found\":{\"key\":\"cold-chain-r6\",\"status\":\"superseded\",\"team\":\"reefer\",\"text\":\"Hold the shipment at whichever hub it is in and do not move it. Notify the consignee within four hours of the excursion being logged and raise form CX-11 with the reading attached. Do not re-ice before the consignee has answered, because re-icing destroys the evidence a claim is assessed on.\",\"title\":\"Cold-chain excursion response, revision 6\"}}"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"look","number":3,"run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: text
+data: {"node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce","text":"The page that answers this directly, `cold-chain-r6` (Cold-chain excursion response, revision 6), is **superseded** — do not answer from it. Its replacement is `cold-chain-r7` (Cold-chain excursion response, revision 7), current, which states what changed: re-ice at the nearest hub first and do not wait for the consignee to answer, because the telemetry reading is the evidence and it is kept for us; the notification window is **ninety minutes**, not four hours; form CX-11 is retired — raise an Excursion ticket in Dockside instead and attach the reading to that (`cold-chain-r7`).\n\nTwo hours above the set band qualifies as an excursion under `reefer-telemetry` (current): a reading outside the set band for more than twenty consecutive minutes is logged as an excursion, with the first and last minute of it; a container that stops reporting is not an excursion and is handled as a telemetry fault (`reefer-telemetry`).\n\nSo: the superseded page's four-hour window and CX-11 form no longer apply; the current response is re-ice at the nearest hub immediately (no waiting on the consignee), raise an Excursion ticket in Dockside with the reading attached, and notify the consignee within ninety minutes of the excursion being logged (`cold-chain-r7`), the excursion being established per `reefer-telemetry`."}
+
+event: node_done
+data: {"cost_micros":0,"node":"look","run":"f91ea4dc2dfe7820cd3523642391e2ce","stop":"answered","text":"The page that answers this directly, `cold-chain-r6` (Cold-chain excursion response, revision 6), is **superseded** — do not answer from it. Its replacement is `cold-chain-r7` (Cold-chain excursion response, revision 7), current, which states what changed: re-ice at the nearest hub first and do not wait for the consignee to answer, because the telemetry reading is the evidence and it is kept for us; the notification window is **ninety minutes**, not four hours; form CX-11 is retired — raise an Excursion ticket in Dockside instead and attach the reading to that (`cold-chain-r7`).\n\nTwo hours above the set band qualifies as an excursion under `reefer-telemetry` (current): a reading outside the set band for more than twenty consecutive minutes is logged as an excursion, with the first and last minute of it; a container that stops reporting is not an excursion and is handled as a telemetry fault (`reefer-telemetry`).\n\nSo: the superseded page's four-hour window and CX-11 form no longer apply; the current response is re-ice at the nearest hub immediately (no waiting on the consignee), raise an Excursion ticket in Dockside with the reading attached, and notify the consignee within ninety minutes of the excursion being logged (`cold-chain-r7`), the excursion being established per `reefer-telemetry`.","tokens":{"input":3517,"output":630},"why":"the model answered"}
+
+event: node
+data: {"input":"{\"look\":\"The page that answers this directly, `cold-chain-r6` (Cold-chain excursion response, revision 6), is **superseded** — do not answer from it. Its replacement is `cold-chain-r7` (Cold-chain excursion response, revision 7), current, which states what changed: re-ice at the nearest hub first and do not wait for the consignee to answer, because the telemetry reading is the evidence and it is kept for us; the notification window is **ninety minutes**, not four hours; form CX-11 is retired — raise an Excursion ticket in Dockside instead and attach the reading to that (`cold-chain-r7`).\\n\\nTwo hours above the set band qualifies as an excursion under `reefer-telemetry` (current): a reading outside the set band for more than twenty consecutive minutes is logged as an excursion, with the first and last minute of it; a container that stops reporting is not an excursion and is handled as a telemetry fault (`reefer-telemetry`).\\n\\nSo: the superseded page's four-hour window and CX-11 form no longer apply; the current response is re-ice at the nearest hub immediately (no waiting on the consignee), raise an Excursion ticket in Dockside with the reading attached, and notify the consignee within ninety minutes of the excursion being logged (`cold-chain-r7`), the excursion being established per `reefer-telemetry`.\"}","node":"answer","run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: turn
+data: {"model":"deepseek-flash","node":"answer","number":1,"run":"f91ea4dc2dfe7820cd3523642391e2ce"}
+
+event: text
+data: {"node":"answer","run":"f91ea4dc2dfe7820cd3523642391e2ce","text":"Re-ice the container at the nearest hub now — don't wait for the consignee to answer [cold-chain-r7].\n\nRaise an Excursion ticket in Dockside; attach the telemetry reading to it. Form CX-11 is retired [cold-chain-r7].\n\nNotify the consignee within ninety minutes of the excursion being logged [cold-chain-r7].\n\nThis qualifies as an excursion: outside the set band for more than twenty consecutive minutes [reefer-telemetry].\n\nIgnore `cold-chain-r6` — superseded, including its four-hour window [cold-chain-r7].\n\nA container that stops reporting is a telemetry fault, not an excursion [reefer-telemetry]."}
+
+event: node_done
+data: {"cost_micros":0,"node":"answer","run":"f91ea4dc2dfe7820cd3523642391e2ce","stop":"answered","text":"Re-ice the container at the nearest hub now — don't wait for the consignee to answer [cold-chain-r7].\n\nRaise an Excursion ticket in Dockside; attach the telemetry reading to it. Form CX-11 is retired [cold-chain-r7].\n\nNotify the consignee within ninety minutes of the excursion being logged [cold-chain-r7].\n\nThis qualifies as an excursion: outside the set band for more than twenty consecutive minutes [reefer-telemetry].\n\nIgnore `cold-chain-r6` — superseded, including its four-hour window [cold-chain-r7].\n\nA container that stops reporting is a telemetry fault, not an excursion [reefer-telemetry].","tokens":{"input":449,"output":143},"why":"the model answered"}
+
+event: done
+data: {"answer":{"answer":"Re-ice the container at the nearest hub now — don't wait for the consignee to answer [cold-chain-r7].\n\nRaise an Excursion ticket in Dockside; attach the telemetry reading to it. Form CX-11 is retired [cold-chain-r7].\n\nNotify the consignee within ninety minutes of the excursion being logged [cold-chain-r7].\n\nThis qualifies as an excursion: outside the set band for more than twenty consecutive minutes [reefer-telemetry].\n\nIgnore `cold-chain-r6` — superseded, including its four-hour window [cold-chain-r7].\n\nA container that stops reporting is a telemetry fault, not an excursion [reefer-telemetry]."},"cost_micros":0,"run":"f91ea4dc2dfe7820cd3523642391e2ce","stopped_at":null,"tokens":{"input":3966,"output":773}}
+
+
+[status 200]

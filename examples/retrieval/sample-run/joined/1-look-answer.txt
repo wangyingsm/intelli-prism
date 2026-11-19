@@ -1,0 +1,7 @@
+The two hours above the set band is logged as an excursion: a reading outside the set band for more than twenty consecutive minutes is logged as an excursion, with the first and last minute of it (reefer-telemetry).
+
+The response and the consignee window are in revision 7 of the cold-chain excursion response (cold-chain-r7), which replaces revision 6 (cold-chain-r6, which I did not use — it is superseded and its four-hour window and form CX-11 are retired):
+
+- Re-ice at the nearest hub first and do not wait for the consignee to answer; the telemetry reading is the evidence and it is kept for us (cold-chain-r7).
+- The notification window is ninety minutes, not four hours — so you have ninety minutes to tell the consignee (cold-chain-r7).
+- Form CX-11 is retired: raise an Excursion ticket in Dockside instead, and attach the reading to that (cold-chain-r7).

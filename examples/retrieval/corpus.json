@@ -1,0 +1,99 @@
+{
+  "label": "Page",
+  "property": "embedding",
+  "pages": [
+    {
+      "key": "manifest-checksum",
+      "title": "A nightly manifest that fails its checksum",
+      "team": "dockside",
+      "status": "current",
+      "text": "A manifest whose checksum does not match the shipper's is parked in the quarantine bucket and is never retried on its own. Confirm the file with the shipper by mail, then requeue it with `hlctl manifest requeue --batch <id> --skip-checksum`. A parked batch is dropped six hours after it arrived, and after that the shipper has to send the whole night again. If the requeue has not been accepted within forty minutes, escalate to Dockside."
+    },
+    {
+      "key": "manifest-late",
+      "title": "A manifest that arrives after the cut-off",
+      "team": "dockside",
+      "status": "current",
+      "text": "The cut-off is 02:40 Rotterdam time. A manifest that arrives after it is accepted but lands in the next day's wave, which means the shipper's containers are not called forward that morning. Nothing has to be requeued. Tell the shipper which wave they are in, and escalate to Dockside only where they say the containers must move that morning anyway."
+    },
+    {
+      "key": "cold-chain-r6",
+      "title": "Cold-chain excursion response, revision 6",
+      "team": "reefer",
+      "status": "superseded",
+      "text": "Hold the shipment at whichever hub it is in and do not move it. Notify the consignee within four hours of the excursion being logged and raise form CX-11 with the reading attached. Do not re-ice before the consignee has answered, because re-icing destroys the evidence a claim is assessed on."
+    },
+    {
+      "key": "cold-chain-r7",
+      "title": "Cold-chain excursion response, revision 7",
+      "team": "reefer",
+      "status": "current",
+      "text": "What changed from revision 6. Re-ice at the nearest hub first and do not wait for the consignee to answer; the telemetry reading is the evidence and it is kept for us. The notification window is ninety minutes, not four hours. Form CX-11 is retired: raise an Excursion ticket in Dockside instead, and attach the reading to that."
+    },
+    {
+      "key": "reefer-telemetry",
+      "title": "What the reefer telemetry feed reports",
+      "team": "reefer",
+      "status": "current",
+      "text": "Every reefer reports its set point, its return air temperature and its power state once a minute while it is powered. A reading outside the set band for more than twenty consecutive minutes is logged as an excursion, with the first and last minute of it. A container that stops reporting is not an excursion and is handled as a telemetry fault."
+    },
+    {
+      "key": "customs-hold-r2",
+      "title": "A customs hold on a loaded container, revision 2",
+      "team": "clearance",
+      "status": "superseded",
+      "text": "Leave the container on the quay and open a hold file. The broker is told by telephone and the shipper by mail, in that order, and the file is reviewed every working day until the hold is lifted. Demurrage is charged to the shipper from the day the hold was placed."
+    },
+    {
+      "key": "customs-hold-r3",
+      "title": "A customs hold on a loaded container, revision 3",
+      "team": "clearance",
+      "status": "current",
+      "text": "What changed from revision 2. The container is moved to the bonded yard rather than left on the quay, because quay demurrage is four times the yard rate. The broker and the shipper are both told by mail, and the telephone call is no longer required. Demurrage is charged from the third day of the hold and not the first."
+    },
+    {
+      "key": "escalation-ladder",
+      "title": "Who to escalate to, and when",
+      "team": "platform",
+      "status": "current",
+      "text": "Dockside holds the first rung and answers within fifteen minutes during a wave. Above it is the duty controller, who may release a batch or a hold without the owning team. Above that is the night manager, who is woken only for a stopped wave or a reefer with no power. Nobody escalates past the night manager before the morning stand-up."
+    },
+    {
+      "key": "dockside-rota",
+      "title": "The Dockside rota",
+      "team": "platform",
+      "status": "current",
+      "text": "Dockside is two people on a wave: one on the manifest queue and one on exceptions. The wave runs from 01:00 to 05:00 Rotterdam time. Outside a wave Dockside is one person on call, and anything that needs two goes to the duty controller instead."
+    },
+    {
+      "key": "claims-window",
+      "title": "How long a claim may be filed in",
+      "team": "clearance",
+      "status": "current",
+      "text": "A claim against a shipment must be filed within eleven working days of the shipment being delivered or abandoned, whichever came first. A claim filed later is assessed only where the delay is ours, and the assessment is the duty controller's to make. The eleven days do not pause for a customs hold."
+    },
+    {
+      "key": "port-codes",
+      "title": "The port codes we use internally",
+      "team": "platform",
+      "status": "current",
+      "text": "Rotterdam is RTM-1 for the container terminal and RTM-4 for the bonded yard, which are two codes for one place and are not interchangeable in a manifest. Antwerp is ANR-2. Felixstowe is FXT-0, which is a legacy code and is still the one the manifests carry."
+    },
+    {
+      "key": "fuel-surcharge",
+      "title": "How the fuel surcharge is set",
+      "team": "clearance",
+      "status": "current",
+      "text": "The surcharge is set on the first working day of the month from the previous month's mean bunker price, and it holds for the whole month whatever the price does. A shipment is charged the surcharge of the month it was loaded in, not the month it was booked or delivered in."
+    }
+  ],
+  "edges": [
+    {"from": "cold-chain-r6", "to": "cold-chain-r7", "type": "SUPERSEDED_BY"},
+    {"from": "customs-hold-r2", "to": "customs-hold-r3", "type": "SUPERSEDED_BY"},
+    {"from": "cold-chain-r7", "to": "reefer-telemetry", "type": "MEASURED_BY"},
+    {"from": "manifest-checksum", "to": "escalation-ladder", "type": "ESCALATES_TO"},
+    {"from": "manifest-late", "to": "escalation-ladder", "type": "ESCALATES_TO"},
+    {"from": "customs-hold-r3", "to": "escalation-ladder", "type": "ESCALATES_TO"},
+    {"from": "escalation-ladder", "to": "dockside-rota", "type": "STAFFED_BY"}
+  ]
+}

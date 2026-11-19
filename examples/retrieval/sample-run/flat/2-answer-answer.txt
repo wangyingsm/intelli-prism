@@ -1,0 +1,7 @@
+Mail the shipper to confirm the file, then requeue it: `hlctl manifest requeue --batch <id> --skip-checksum`. [manifest-checksum]
+
+The batch is dropped six hours after it arrived; after that the shipper must resend the whole night. [manifest-checksum]
+
+If the requeue is not accepted within forty minutes, escalate to Dockside. [manifest-checksum]
+
+No quarantined-batch lookup or contact details are in my input. [manifest-checksum]

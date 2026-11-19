@@ -1,0 +1,17 @@
+  look     begins
+    ? docs__search         {"hits": 2, "query": "The manifest the shipper sent has failed its ...
+    = 2 rows: manifest-checksum 0.900, claims-window 0.878
+    ? docs__search         {"hits": 2, "query": "incoming manifest integrity check failure ...
+    = 2 rows: manifest-checksum 0.830, cold-chain-r7 0.825
+  look     answered  in  2184/  262 tokens,   480 characters out
+  answer   begins
+  answer   answered  in   259/  112 tokens,   432 characters out
+
+  look-ups asked for:   2
+  joins followed:       0
+  superseded pages hit: none
+  looked nothing up:    answer
+  answered with:        answer
+  stopped at:           nothing — every node that ran answered
+  spent:                2443/374 tokens, 0 micros
+  nodes, in the order they finished: look -> answer

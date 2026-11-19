@@ -1,0 +1,13 @@
+== kb__search {"hits": 2, "query": "A reefer on the Rotterdam run logged two hours above its set band. What is the response, and how long have we got to tell the consignee?"}
+there is no tool called "kb__search"
+
+== kb__search {"hits": 2, "query": "reefer temperature excursion out of band notification deadline to consignee"}
+there is no tool called "kb__search"
+
+== docs__search {"hits": 2, "query": "A reefer on the Rotterdam run logged two hours above its set band. What is the response, and how long have we got to tell the consignee?"}
+{"id":"5","score":0.883912,"found":{"key":"reefer-telemetry","status":"current","team":"reefer","text":"Every reefer reports its set point, its return air temperature and its power state once a minute while it is powered. A reading outside the set band for more than twenty consecutive minutes is logged as an excursion, with the first and last minute of it. A container that stops reporting is not an excursion and is handled as a telemetry fault.","title":"What the reefer telemetry feed reports"}}
+{"id":"3","score":0.8757266,"found":{"key":"cold-chain-r6","status":"superseded","team":"reefer","text":"Hold the shipment at whichever hub it is in and do not move it. Notify the consignee within four hours of the excursion being logged and raise form CX-11 with the reading attached. Do not re-ice before the consignee has answered, because re-icing destroys the evidence a claim is assessed on.","title":"Cold-chain excursion response, revision 6"}}
+
+== docs__search {"hits": 2, "query": "reefer temperature excursion out of band notification deadline to consignee"}
+{"id":"4","score":0.8752122,"found":{"key":"cold-chain-r7","status":"current","team":"reefer","text":"What changed from revision 6. Re-ice at the nearest hub first and do not wait for the consignee to answer; the telemetry reading is the evidence and it is kept for us. The notification window is ninety minutes, not four hours. Form CX-11 is retired: raise an Excursion ticket in Dockside instead, and attach the reading to that.","title":"Cold-chain excursion response, revision 7"}}
+{"id":"3","score":0.8636031,"found":{"key":"cold-chain-r6","status":"superseded","team":"reefer","text":"Hold the shipment at whichever hub it is in and do not move it. Notify the consignee within four hours of the excursion being logged and raise form CX-11 with the reading attached. Do not re-ice before the consignee has answered, because re-icing destroys the evidence a claim is assessed on.","title":"Cold-chain excursion response, revision 6"}}

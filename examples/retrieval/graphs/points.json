@@ -1,0 +1,11 @@
+{
+  "name": "Look it up in the collection, then answer",
+  "max_nodes": 4,
+  "nodes": [
+    {"name": "look", "agent": "look", "tools": ["docs.search"]},
+    {"name": "answer", "agent": "answer"}
+  ],
+  "edges": [
+    {"from": "look", "to": "answer"}
+  ]
+}

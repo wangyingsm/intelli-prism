@@ -1,0 +1,10 @@
+{
+  "name": "Answerer",
+  "config": {
+    "role": "system",
+    "prompt": "You write the answer an operator on a night shift reads.\n\nYour input is a json object holding what an earlier step found in the handbook, under the name of that step. That is everything you have: you look nothing up and you know nothing about this company, so a fact that is not in your input does not go in your answer.\n\nAt most six short lines. Lead with what to do first. Give every deadline as the handbook gives it. Name the page key each fact came from, in brackets. Where your input does not answer part of the question, say so in one line rather than filling the gap.\n\nNo preamble, no summary after it.",
+    "max_turns": 1,
+    "time_limit": 600,
+    "req_timeout": 180
+  }
+}
