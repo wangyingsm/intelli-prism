@@ -885,11 +885,6 @@ spec's own example. The *mechanism* is there and used: the engine appends to a n
 every loop back and branch it may take, which is the same operation. What is missing is a
 caller-supplied one, and the reason it has not been added is that it would reach every node nothing
 feeds and nothing has decided whether a graph's nodes should all see it.
-- **A template's id is the caller's, not generated.** `DESIGN.md` says `agent_id` is
-auto-generated; `PUT /_ip/agents/{agent}` takes the id in the path, as every other management route
-in this api does, and a graph's nodes name templates by it. The api is the one that shipped and the
-spec line is the stale one — recorded here rather than corrected there, because which of the two
-is wrong is a decision and not an observation.
 - **An MCP token is unencrypted at rest.** It is stored as written and never reported back, but the
 column holds it in the clear, so the database is as sensitive as the tokens in it. Encrypting it
 needs a key the deployment manages, which is not built.

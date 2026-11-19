@@ -456,7 +456,7 @@ endpoint. The system cache and the request/response cache come first.
 #### Agent Template
 
 - All system agents/subagents can be defined by editing a template. so a(n) agent/subagent can be initialized by this template. a well setup template is stored in postgresql or sqlite, and can be updated by system admin or TO. the template is a DB record with the following fields:
-  - agent_id: a unique id for the agent/subagent, auto-generated.
+  - agent_id: a unique id for the agent/subagent, named by whoever writes the template and carried in the path it is written at, as every other management route in this api does it. unique per owner, so one id may name a different template in each tenant, and it is what a graph's nodes name a template by.
   - agent_name: a name for the agent/subagent.
   - sandbox: a json object for specifying the virtual environment of the agent/subagent running. it is a file tree structure composed of relative path as key and object storage file path as its value. eg,
 ```json
