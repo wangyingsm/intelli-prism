@@ -11,7 +11,7 @@ use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
-use ip_agents::{AgentConfig, AgentId, Prompt};
+use ip_agents::{AgentConfig, AgentId, ExtraPrompt, Prompt};
 use ip_auth::Authority;
 use ip_cluster::{ClusterClient, Dispatch, NodeEvent};
 use ip_core::route::ClusterAddress;
@@ -20,8 +20,8 @@ use ip_gateway::Gateway;
 use ip_graph::{
     ClusterMember, Downstream, GraphEdge, GraphError, GraphEvent, GraphId, GraphName, GraphNode,
     GraphOwner, GraphPlane, GraphRunId, GraphSaid, GraphSummary, Graphing, Listing, LoopBack,
-    MaxNodes, NodeName, NodeRan, Placement, RunGraph, RunGraphParts, RunningNode, RunsNode,
-    Stopping,
+    MaxNodes, NodeName, NodeRan, Placement, RunGraph, RunGraphParts, RunOrder, RunningNode,
+    RunsNode, Stopping,
 };
 use ip_mcp::McpServer;
 use ip_run::{
@@ -373,7 +373,9 @@ fn unopened(error: Unopened) -> Refusal {
 
 /// Running one graph, under the prefix the router nests it at.
 pub fn run_router() -> Router<AppState> {
-    Router::new().route("/{graph}", post(start))
+    Router::new()
+        .route("/{graph}", post(start))
+        .route("/{graph}/with_prompt", post(start_told_more))
 }
 
 /// What starting a graph run is asked for.
@@ -381,6 +383,18 @@ pub fn run_router() -> Router<AppState> {
 struct Start {
     /// What the graph's first nodes are being asked to do.
     input: String,
+    /// Which model, where the request names one rather than taking each template's.
+    #[serde(flatten)]
+    requested: Requested,
+}
+
+/// What starting a graph run with a prompt of the caller's own is asked for.
+#[derive(Debug, serde::Deserialize)]
+struct StartTold {
+    /// What the graph's first nodes are being asked to do.
+    input: String,
+    /// What this caller adds to the prompt of every node nothing feeds, for this run and no other.
+    extra_prompt: ExtraPrompt,
     /// Which model, where the request names one rather than taking each template's.
     #[serde(flatten)]
     requested: Requested,
@@ -970,6 +984,8 @@ struct Preparing<'a> {
     retrievers: &'a [Held],
     /// Whose templates the nodes name.
     templates: AgentOwner,
+    /// What the caller added to the prompt of every node nothing feeds, where it added anything.
+    told: Option<&'a ExtraPrompt>,
 }
 
 /// Everything every node of the graph needs, or the refusal that stops the run before it opens.
@@ -1002,6 +1018,18 @@ async fn prepare(
                 ));
             }
             Err(error) => return Err(Box::new(store_refusal(error))),
+        };
+        // Before the graph's own advice, so a node reads the operator's instruction, then the
+        // caller's context, then what the graph lets it ask for — each in the order it was decided.
+        //
+        // Only a node nothing feeds, because a node with a parent is told what to carry by the
+        // model that ran that parent, and until that is built there is nobody but the caller to
+        // speak for a root.
+        let config = match preparing.told {
+            Some(extra) if !fed(graph, &node.name) => {
+                config.told_also(extra).map_err(unprocessable)?
+            }
+            _ => config,
         };
         let config = match told_what_the_graph_says(&config, graph, &node.name) {
             Ok(config) => config,
@@ -1051,6 +1079,16 @@ async fn prepare(
         );
     }
     Ok(prepared)
+}
+
+/// Whether anything in the graph feeds this node, which is what makes it a root or not.
+///
+/// Read off the edges rather than asked of the plane, because it is the same question the run
+/// engine answers the same way: a node no edge arrives at is a root and always runs. A branch's
+/// condition makes no difference here — an edge that may deliver nothing still means this node has
+/// a parent to be told what to carry by.
+fn fed(graph: &RunGraph, node: &NodeName) -> bool {
+    graph.edges().iter().any(|edge| &edge.to == node)
 }
 
 /// The node's configuration with what the graph lets it ask for added to its prompt.
@@ -1113,68 +1151,74 @@ async fn start(
     Query(owned): Query<Owned>,
     Json(asked): Json<Start>,
 ) -> Response<Body> {
-    let plane = match plane_of(&state) {
-        Ok(plane) => plane,
-        Err(refusal) => return *refusal,
-    };
-    let id = match GraphId::new(&id) {
-        Ok(id) => id,
-        Err(error) => return *unprocessable(error),
-    };
-    // A run spends money, so it is charged to a tenant rather than to the deployment.
-    let Some(named) = owned.tenant.clone() else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "name the tenant this graph run is charged to",
-        )
-            .into_response();
-    };
-    let tenant = match TenantId::new(&named) {
-        Ok(tenant) => tenant,
-        Err(error) => return *unprocessable(error),
-    };
-    let owner = match owner_of(&state, &manager, owned).await {
-        Ok(owner) => owner,
-        Err(refusal) => return *refusal,
-    };
-    let graph = match plane.get(&owner, &id).await {
-        Ok(Some(graph)) => graph,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return *graph_refusal(error),
-    };
-    // The plane's answer, not ours: a cycle is refused here and the order comes back with it.
-    let order = match plane.order(&owner, &id).await {
-        Ok(order) => order,
-        Err(error) => return *graph_refusal(error),
-    };
-    let authority = match manager.authority(state.store().as_ref(), &tenant).await {
-        Ok(Some(authority)) => authority,
-        Ok(None) => return StatusCode::FORBIDDEN.into_response(),
-        Err(error) => return store_refusal(error),
-    };
-    let templates = templates_of(&owner);
-    // Once for the whole graph, not once per node: every node resolves its tools against the
-    // same registry and the same retrievers.
-    let (registry, retrievers) = match sources(&state, &templates).await {
-        Ok(both) => both,
-        Err(error) => return *unopened(error),
-    };
-    let prepared = match prepare(
-        &Preparing {
-            state: &state,
-            requested: &asked.requested,
-            authority: &authority,
-            registry: &registry,
-            retrievers: &retrievers,
-            templates,
+    begin(
+        state,
+        manager,
+        Starting {
+            id,
+            owned,
+            requested: asked.requested,
+            input: asked.input,
+            told: None,
         },
-        &graph,
     )
     .await
-    {
-        Ok(prepared) => prepared,
+}
+
+/// The same, with context this caller holds and the stored templates do not.
+///
+/// A route of its own rather than a field on the one above, for the reason a template's is: a
+/// caller asking for something the deployment does not carry is refused by the router rather than
+/// by a field being quietly ignored.
+async fn start_told_more(
+    State(state): State<AppState>,
+    manager: Manager,
+    Path(id): Path<String>,
+    Query(owned): Query<Owned>,
+    Json(asked): Json<StartTold>,
+) -> Response<Body> {
+    begin(
+        state,
+        manager,
+        Starting {
+            id,
+            owned,
+            requested: asked.requested,
+            input: asked.input,
+            told: Some(asked.extra_prompt),
+        },
+    )
+    .await
+}
+
+/// What one graph run is started from, however the caller asked for it.
+struct Starting {
+    /// Which graph, as the path spells it.
+    id: String,
+    /// Whose graphs the request is about.
+    owned: Owned,
+    /// Which model, where the request names one.
+    requested: Requested,
+    /// What the graph's first nodes are being asked to do.
+    input: String,
+    /// What the caller added to their prompts, where it added anything.
+    told: Option<ExtraPrompt>,
+}
+
+/// Everything both routes do, which is all of it bar where the extra prompt came from.
+async fn begin(state: AppState, manager: Manager, starting: Starting) -> Response<Body> {
+    let settled = match settled(&state, &manager, starting).await {
+        Ok(settled) => settled,
         Err(refusal) => return *refusal,
     };
+    let Settled {
+        graph,
+        order,
+        prepared,
+        tenant,
+        requested,
+        input,
+    } = settled;
 
     let run = match GraphRunId::generate() {
         Ok(run) => run,
@@ -1189,7 +1233,7 @@ async fn start(
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let runner = driving(
         &state,
-        &Run::of(&graph, &tenant, manager.user(), &asked.requested),
+        &Run::of(&graph, &tenant, manager.user(), &requested),
         prepared,
         sender.clone(),
     );
@@ -1198,7 +1242,7 @@ async fn start(
         graph,
         order,
         runner: Arc::new(runner),
-        input: asked.input,
+        input,
         reporting: Arc::new(sender),
         stopping: stopping_for(&state),
         plane: reaching(&state),
@@ -1214,6 +1258,89 @@ async fn start(
         )
     }))
     .into_response()
+}
+
+/// Everything one graph run needs, resolved while a status code can still be answered.
+struct Settled {
+    /// The graph itself, as the plane holds it.
+    graph: RunGraph,
+    /// Which nodes may run together, in the generations the plane sorted them into.
+    order: RunOrder,
+    /// Every node's template, tools and target, the caller's own prompt folded in already.
+    prepared: BTreeMap<NodeName, Prepared>,
+    /// Which tenant the run is charged to.
+    tenant: TenantId,
+    /// Which model the request named, where it named one.
+    requested: Requested,
+    /// What the graph's first nodes are being asked to do.
+    input: String,
+}
+
+/// Settles everything that can refuse, so the stream only ever opens on a graph that has begun.
+async fn settled(
+    state: &AppState,
+    manager: &Manager,
+    starting: Starting,
+) -> Result<Settled, Refusal> {
+    let Starting {
+        id,
+        owned,
+        requested,
+        input,
+        told,
+    } = starting;
+    let plane = plane_of(state)?;
+    let id = GraphId::new(&id).map_err(unprocessable)?;
+    // A run spends money, so it is charged to a tenant rather than to the deployment.
+    let Some(named) = owned.tenant.clone() else {
+        return Err(Box::new(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "name the tenant this graph run is charged to",
+            )
+                .into_response(),
+        ));
+    };
+    let tenant = TenantId::new(&named).map_err(unprocessable)?;
+    let owner = owner_of(state, manager, owned).await?;
+    let graph = match plane.get(&owner, &id).await {
+        Ok(Some(graph)) => graph,
+        Ok(None) => return Err(Box::new(StatusCode::NOT_FOUND.into_response())),
+        Err(error) => return Err(graph_refusal(error)),
+    };
+    // The plane's answer, not ours: a cycle is refused here and the order comes back with it.
+    let order = plane.order(&owner, &id).await.map_err(graph_refusal)?;
+    let authority = match manager.authority(state.store().as_ref(), &tenant).await {
+        Ok(Some(authority)) => authority,
+        Ok(None) => return Err(Box::new(StatusCode::FORBIDDEN.into_response())),
+        Err(error) => return Err(Box::new(store_refusal(error))),
+    };
+    let templates = templates_of(&owner);
+    // Once for the whole graph, not once per node: every node resolves its tools against the
+    // same registry and the same retrievers.
+    let (registry, retrievers) = sources(state, &templates).await.map_err(unopened)?;
+    let prepared = prepare(
+        &Preparing {
+            state,
+            requested: &requested,
+            authority: &authority,
+            registry: &registry,
+            retrievers: &retrievers,
+            templates,
+            told: told.as_ref(),
+        },
+        &graph,
+    )
+    .await?;
+
+    Ok(Settled {
+        graph,
+        order,
+        prepared,
+        tenant,
+        requested,
+        input,
+    })
 }
 
 #[cfg(test)]
@@ -1572,6 +1699,101 @@ mod tests {
             told.contains("Be helpful."),
             "the template's own prompt was replaced rather than added to: {told}"
         );
+    }
+
+    /// What the caller added reaches the nodes nothing feeds, and no others.
+    ///
+    /// Read off the upstream for the same reason the loop back's test is: the two nodes share one
+    /// stored template, so what each was actually sent is the only place their prompts differ.
+    ///
+    /// A node with a parent is left alone deliberately — what it should carry is the model on its
+    /// parent's to decide, and until that is built there is nobody but the caller to speak for a
+    /// root. So this test pins the boundary, not only the addition.
+    #[tokio::test]
+    async fn a_graph_run_told_more_tells_the_nodes_nothing_feeds_and_no_others() {
+        let (router, state, _plane, upstream) = recorded(
+            &["intake-agent", "reply-agent"],
+            chain_of_two(sorted_chain()),
+            "four",
+        )
+        .await;
+
+        let answered = send(
+            &router,
+            &state,
+            "POST",
+            "alice",
+            "/_ip/graph_run/triage/with_prompt?tenant=acme",
+            Some(r#"{"input":"how many?","extra_prompt":"The table has a checksum column."}"#),
+        )
+        .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let _ = body_of(answered).await;
+
+        let sent = upstream.sent();
+        assert_eq!(sent.len(), 2, "a chain of two took other than two turns");
+        assert_eq!(
+            sent[0]["system"], "Be helpful.\n\nThe table has a checksum column.",
+            "the node nothing feeds was not told what the caller added"
+        );
+        assert_eq!(
+            sent[1]["system"], "Be helpful.",
+            "a node with a parent was told what only a root is told"
+        );
+    }
+
+    /// The route that takes no extra prompt is unchanged by the one that does.
+    #[tokio::test]
+    async fn a_graph_run_not_told_more_sends_the_templates_prompt_alone() {
+        let (router, state, _plane, upstream) = recorded(
+            &["intake-agent", "reply-agent"],
+            chain_of_two(sorted_chain()),
+            "four",
+        )
+        .await;
+
+        let answered = start_run(
+            &router,
+            &state,
+            "alice",
+            "/_ip/graph_run/triage?tenant=acme",
+        )
+        .await;
+        assert_eq!(answered.status(), StatusCode::OK);
+        let _ = body_of(answered).await;
+
+        let sent = upstream.sent();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["system"], "Be helpful.");
+        assert_eq!(sent[1]["system"], "Be helpful.");
+    }
+
+    /// An extra prompt its own type refuses is the caller's mistake, answered before the plane is
+    /// read: the extractor never builds one.
+    #[tokio::test]
+    async fn a_graph_run_told_something_that_is_not_a_prompt_is_refused() {
+        let (router, state, _plane) = running(&["intake-agent"], chain_of_two(sorted_chain())).await;
+
+        for body in [
+            r#"{"input":"how many?","extra_prompt":""}"#,
+            r#"{"input":"how many?"}"#,
+        ] {
+            let answered = send(
+                &router,
+                &state,
+                "POST",
+                "alice",
+                "/_ip/graph_run/triage/with_prompt?tenant=acme",
+                Some(body),
+            )
+            .await;
+
+            assert_eq!(
+                answered.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{body} was taken"
+            );
+        }
     }
 
     /// The node that may choose what follows it is told so, and the one with nothing after it is not.
